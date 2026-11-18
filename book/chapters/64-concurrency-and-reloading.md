@@ -771,6 +771,12 @@ not serve them.
   body, and `request.ip` is Apache's `REMOTE_ADDR`, with no [`--trust-proxy`](#options-of-quillo-run). The server
   does the rest as for any visitor: routes, sessions, limits, the log (on Apache's error
   log).
+- The scheme is the web server's: `HTTPS=on` (or `1`) is https, another value http, else
+  `REQUEST_SCHEME`; neither, unknown (hosts compared alone). It reaches the program as
+  `X-Forwarded-Proto`, and a visitor's own is dropped. Behind another proxy that ends TLS, set
+  `HTTPS` from it (Apache: `SetEnvIf X-Forwarded-Proto https HTTPS=on`) *(since 0.8.7)*. A write
+  refused for the scheme alone is said once in the log, naming the parameter (`HTTPS` or
+  `REQUEST_SCHEME`) and that line.
 - Its jobs and its own calls reach it through a socket only it can open, in a private
   folder under the system's temporary one.
 - What FastCGI cannot carry: WebSockets. Live data falls back to plain requests, each

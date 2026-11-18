@@ -87,7 +87,7 @@ options for `run`:
   --max-compute 2s  end a request that computes this long without letting go, as a 500
   --max-memory 512MB  end a request that would make one value bigger than this, as a 500
   --drain 30s    on a stop, cut off what is still running after this long (default: wait for it all)
-  --trust-proxy A,B believe X-Forwarded-For from these addresses or networks
+  --trust-proxy A,B believe X-Forwarded-For and X-Forwarded-Proto from these addresses or networks
   -- a b         what follows is the program's, for args()
   --allow-path DIR  read_file and write_file may use DIR too, for a script
                  used as a tool (any part of the program may then)
@@ -1636,6 +1636,10 @@ fn stop_with_app() {
     }
     std::env::remove_var(quillo::service::STOP_WITH_APP);
     WITH_APP.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The visitor's X-Forwarded-Proto comes to it from its app, and it is given no --trust-proxy
+    // of its own: it takes its app's signed word on the scheme, and says nothing of that header
+    // (FEEDBACK70.md, Q-986, recheck; branch security).
+    quillo::httpd::started_by_app();
     std::thread::spawn(|| {
         use std::io::Read;
         let mut stdin = std::io::stdin().lock();

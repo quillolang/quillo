@@ -419,28 +419,59 @@ fn cookie_line(it: &mut Interp, name: &str, value: &str, age: Option<u64>, opts:
 /// is not this machine's) is dropped by the browser: signing in there never
 /// sticks, and nothing else would say so. Said once (FEEDBACK13.md, Q-089;
 /// branch feedback13-fixes).
-/// Whether the request came over HTTPS, as far as this server can tell: a proxy says so.
+/// Whether the request came over HTTPS, as far as this server can tell: a proxy `--trust-proxy`
+/// names says so, or under `quillo fcgi` the web server, by the rule a form's gate reads the scheme
+/// by (`server::scheme_by`). Anyone's header was believed, where the gate believed only such a
+/// proxy's (FEEDBACK70.md, Q-986, Q-987; branch security).
 pub(crate) fn came_over_https(it: &mut Interp) -> bool {
-    header(it, "x-forwarded-proto").is_some_and(|p| p.eq_ignore_ascii_case("https"))
+    let Some(Value::Map(req)) = it.request_value() else { return false };
+    https_by(&req)
+}
+
+/// `came_over_https` of the request map, its headers and address read in place: nothing is made
+/// (FEEDBACK70.md, Q-986, review; branch security).
+fn https_by(req: &Map) -> bool {
+    let Some(Value::Map(h)) = req.get("headers") else { return false };
+    crate::server::scheme_by(|name| text_of(h.get(name)), text_of(req.get("ip")).unwrap_or("")) == Some("https")
+}
+
+/// A value of the request map as the text it is.
+fn text_of(v: Option<&Value>) -> Option<&str> {
+    match v {
+        Some(Value::Str(s)) => Some(s),
+        _ => None,
+    }
 }
 
 fn warn_if_dropped(it: &mut Interp, cookie: &str) {
     if WARNED_PLAIN.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
+    // Read in place: behind a proxy every `Secure` cookie comes this way until the line is said,
+    // which there it never is (FEEDBACK70.md, Q-986, review; branch security).
     let Some(Value::Map(req)) = it.request_value() else { return };
-    let ip = req.get("ip").map(|v| v.display()).unwrap_or_default();
-    let host = header(it, "host").unwrap_or_default();
-    let proto = header(it, "x-forwarded-proto").unwrap_or_default();
-    let name = host.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(host.as_str(), |(h, _)| h);
+    let Some(Value::Map(h)) = req.get("headers") else { return };
+    let ip = text_of(req.get("ip")).unwrap_or("");
+    let host = text_of(h.get("host")).unwrap_or("");
+    let name = host.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(host, |(h, _)| h);
     let local = |h: &str| h == "localhost" || h.ends_with(".localhost") || h.starts_with("127.") || h == "::1" || h == "[::1]";
-    if ip.is_empty() || local(&ip) || local(name) || proto.eq_ignore_ascii_case("https") {
+    if ip.is_empty() || local(ip) || local(name) {
+        return;
+    }
+    // Anyone's word that it came over HTTPS keeps this quiet, believed or not, by its last item as
+    // the gate reads it: where no proxy `--trust-proxy` names sent it, reading it as
+    // `came_over_https` does says once which address to name (FEEDBACK70.md, Q-986; branch
+    // security).
+    if crate::server::forwarded_scheme(text_of(h.get("x-forwarded-proto")).unwrap_or("")) == Some("https") {
+        https_by(&req);
         return;
     }
     if !WARNED_PLAIN.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // A proxy's word counts from one `--trust-proxy` names (FEEDBACK70.md, Q-986, review;
+        // branch security).
         eprintln!(
             "quillo: warning: the Secure cookie `{}` was sent to http://{} over plain HTTP, which browsers drop{}. \
-             Serve the site over HTTPS (a proxy with TLS in front, sending x-forwarded-proto: https), or run with --plain-http on a network you trust",
+             Serve the site over HTTPS (a proxy with TLS in front, named with --trust-proxy, sending x-forwarded-proto: https), or run with --plain-http on a network you trust",
             cookie,
             host,
             if cookie == COOKIE || cookie == HOST_COOKIE { ": sessions will not stick there" } else { "" }

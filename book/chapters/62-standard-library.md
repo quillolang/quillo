@@ -255,7 +255,8 @@ Safety built in:
   with a form, multipart or plain-text body that the browser marks as cross-site
   (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. An `Origin` alone must
   name the request's host and, where a `--trust-proxy` proxy says the scheme
-  (`X-Forwarded-Proto`), its scheme too: `http://` and `https://` of one host are two sites
+  (`X-Forwarded-Proto`), or under `quillo fcgi` the web server (`HTTPS`, else `REQUEST_SCHEME`),
+  its scheme too: `http://` and `https://` of one host are two sites
   *(since 0.8.7: the hosts alone were compared)*.
   JSON from another site needs the browser to ask first, which nothing here answers, and programs that
   call the site (webhooks, scripts) send no `Origin`, so both work as before. For a

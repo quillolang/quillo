@@ -93,6 +93,12 @@
   of its folders is made 700 and checked itself, links and other owners are refused, folders others
   could write in are tightened and rebuilt (never under `QUILLO_NATIVE_CACHE`, which is refused
   instead), and cargo is found first, then run in `/` (Q-983).
+- **The request's scheme**: `X-Forwarded-Proto` is believed only from a `--trust-proxy` proxy, for
+  `delete_cookie`'s `Secure` and a push subscription's origin as for the form gate; where it would
+  have counted, an unnamed sender is said once; `--split` services take the scheme from their app,
+  signed, and believe no visitor's header (FEEDBACK70.md, Q-986). Under `quillo fcgi` the web
+  server's `HTTPS` (else `REQUEST_SCHEME`) is the request's scheme and a visitor's own header is
+  dropped, so the gate, deletions and push origins follow it (Q-987).
 - `http.*`'s `public_only` no longer takes 64:ff9b:1::/48 (RFC 8215's local-use NAT64) as the
   public internet (found in FEEDBACK67's review).
 - `ask` and `notify` where the code surely runs on the server (a route, a `server fn`, a tick,

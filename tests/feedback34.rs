@@ -19,23 +19,20 @@ fn said(o: &Output) -> String {
 
 /// Serves the program in `d`, asks `/`, and gives its status and body.
 fn first_page(d: &Path) -> (u16, String) {
-    let port = support::free_port();
+    // The system picks the port and the server says which: a port picked here could be taken by
+    // another process first (a shown bug in the test; branch security).
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .current_dir(d)
         .env("QUILLO_SECRET", "a test secret, long enough to sign sessions")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let _g = support::Guard::new(child);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < deadline, "did not start");
-        std::thread::sleep(Duration::from_millis(30));
-    }
+    let mut _g = support::Guard::new(child);
+    let port = support::port_in_stderr(&mut _g.0, "main.qwe", Instant::now() + Duration::from_secs(20));
     let a = send(port, "GET", "/", &[], "");
     (a.status, a.body)
 }
@@ -153,7 +150,9 @@ fn delete_cookie_over_plain_http_is_not_secure_and_is_over_https() {
         "route GET /del = { delete_cookie(\"theme\"); \"deleted\" }\nroute GET /del-secure = { delete_cookie(\"theme\", { secure: true }); \"deleted\" }\nroute GET /del-host = { delete_cookie(\"__Host-x\"); \"deleted\" }\nroute GET /set = { set_cookie(\"theme\", \"dark\"); \"set\" }\n",
     )
     .unwrap();
-    let s = support::serve(&d.join("main.qwe"), &[]);
+    // The proxy named: since Q-986 only a `--trust-proxy` proxy's X-Forwarded-Proto says the request
+    // came over HTTPS (FEEDBACK70.md, Q-986; branch security: the decided change).
+    let s = support::serve_with(&d.join("main.qwe"), &["--trust-proxy", "127.0.0.1"]);
     let cookie = |path: &str, h: &[(&str, &str)]| send(s.port, "GET", path, h, "").header("set-cookie").unwrap_or("").to_string();
     let plain = cookie("/del", &[]);
     assert!(plain.starts_with("theme=; Path=/; Max-Age=0") && !plain.contains("Secure"), "{}", plain);

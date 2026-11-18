@@ -711,7 +711,8 @@ fn touch() {
   here, and without `x-forwarded-proto: https`). On a network you trust, start the program with
   [`--plain-http`](#options-of-quillo-run), `quillo run main.qwe --plain-http`, which leaves `Secure` out, as
   `--watch` does. `delete_cookie` is `Secure` only when the request
-  came over HTTPS (or a proxy's `X-Forwarded-Proto: https` says so), when the name needs it
+  came over HTTPS (a proxy [`--trust-proxy`](#options-of-quillo-run) names says `X-Forwarded-Proto: https`, or
+  under `quillo fcgi` the web server's `HTTPS` is on), when the name needs it
   (`__Host-`, `__Secure-`), or when `secure: true` is given, so a cookie set with `secure:
   false` can be removed over plain HTTP. `request.cookies` has what the browser sent, and
   `cookie(name)` one of them (or null), in any function the request runs, as
@@ -923,7 +924,8 @@ server's code:
   limited by itself: 256 large files being sent at once (8 per client), 4096 pages
   waiting for live data (256 per client), answered 503 with `retry-after: 5`.
 - **The visitor behind a proxy:** `request.ip` is the TCP peer, unless [`--trust-proxy`](#options-of-quillo-run)
-  names it (see [Live data](#live-data)): `X-Forwarded-For` is read from no one else. An
+  names it (see [Live data](#live-data)): `X-Forwarded-For` and `X-Forwarded-Proto` are read
+  from no one else. An
   `x-request-id` a proxy sends is kept and echoed.
 - **Matching the host or a subdomain in the route line:** no; match the `host` header
   in a request pattern, or use `tenant_from` (see [Many tenants](#many-tenants)).
@@ -2448,7 +2450,12 @@ last, the shared secret as a service without a name. A caller with `QUILLO_SERVI
 set signs every call with it, a bearer one too, and the token still names it. Under
 `--split` the services sign with the shared secret: one whose `accept_calls` names callers
 by keys, certificates or tokens takes the others as unnamed, so a `for` there needs callers
-with keys of their own (`auth: { key, as }` where they declare it).
+with keys of their own (`auth: { key, as }` where they declare it). A service `--split` starts takes the request's
+scheme from its app: each request the app passes on carries the app's verdict (what its
+`--trust-proxy` proxy said), signed with `QUILLO_SERVICE_SECRET` (`x-quillo-scheme`), so the
+service's deletions are `Secure` and its writes compared by scheme as the app's are. Only a service
+`--split` started reads that word, and only from this machine; the app and any other server ignore
+it, and the visitor's `X-Forwarded-Proto` passed on with it is not believed *(since 0.8.7)*.
 
 Answers are signed back with the key the call was signed with, and a caller that signs
 with a key of its own takes no answer without it (``service billing: the answer from

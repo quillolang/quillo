@@ -215,7 +215,9 @@ fn endpoint_ok(e: &str) -> Result<url::Url, String> {
 /// The origin the page was on, from the request itself: its Host, over https where the request
 /// came so (`session::came_over_https`). Never from what the page posted, which a client without
 /// an Origin header set to another site, and which became `navigate` and VAPID's `sub`
-/// (FEEDBACK67.md, B.3, review; branch pwa).
+/// (FEEDBACK67.md, B.3, review; branch pwa). That a request came over https is a proxy's word,
+/// one `--trust-proxy` names, or the web server's under `quillo fcgi`; a client's own header said
+/// so before (FEEDBACK70.md, Q-986, Q-987; branch security).
 fn origin_of(it: &mut Interp, req: &HttpRequest) -> Option<String> {
     let host = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.trim().to_string())?;
     let scheme = if crate::session::came_over_https(it) { "https" } else { "http" };

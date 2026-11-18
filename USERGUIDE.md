@@ -64,7 +64,7 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--max-tool-calls 60` | how many tool calls a minute each user of the MCP door may make (60 by default); one more is a `429` with `Retry-After` (see [Tools for AI clients](#tools-for-ai-clients)) |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64). Give fewer where an account limits its threads (shared hosting), more for many slow calls at once |
 | `--instances N` | to use N cores on one machine: run the program N times over, one event loop each, each with its own variables (see [Concurrency](#concurrency-and-reloading)); not with `--watch`, `--register` or `--split`; more than the machine's cores is warned of |
-| `--trust-proxy 10.0.0.0/8` *(since 0.7)* | when a proxy (limer, nginx, Apache) is in front: believe `X-Forwarded-For` from these addresses, so `request.ip` and the limits per client are the visitor's (see [Live data](#live-data)) |
+| `--trust-proxy 10.0.0.0/8` *(since 0.7)* | when a proxy (limer, nginx, Apache) is in front: believe `X-Forwarded-For` and `X-Forwarded-Proto` from these addresses, so `request.ip`, the limits per client and the request's scheme are the visitor's (see [Live data](#live-data)). The first time an `X-Forwarded-Proto` would have counted (a write with an `Origin`, a `delete_cookie`, a push subscription) but came from an address it does not name, the log says so once, with that address (`...if that address is your proxy, --trust-proxy <it>; if not, a visitor sent it and it is ignored`) *(since 0.8.7: anyone's `X-Forwarded-Proto` decided `delete_cookie`'s `Secure` and a push subscription's origin)* |
 | `--live-per-client N` *(since 0.7)* | when one address is many visitors (an office behind one address): the pages one client may have waiting for live data (default 256) |
 | `--plain-http` | when the site is served over plain HTTP on purpose, on a network you trust (a factory's kiosks at `http://10.0.0.5:8080`): cookies are not `Secure`, which browsers would drop there (see [Cookies and sessions](#cookies-and-sessions)) |
 | `--allow-path DIR` *(since 0.7)* | when a script used as a tool must read or write files outside its folder, or a deploy links a folder from elsewhere (`uploads -> /srv/shared/uploads`): `read_file` and `write_file` may use `DIR` too; any part of the program may then, routes too (see [Paths and links](#paths-and-links)) |
@@ -823,7 +823,9 @@ On the server:
   it, and an address is checked again as it resolves when a message is sent; a redirect is not
   followed. `QUILLO_PUSH_LOCAL=1` lets plain http to this machine through, for tests that play
   the push service; `--watch` does not. The site a notification opens is the one the page was
-  on (its `Host`), never what the page says.
+  on (its `Host`), never what the page says, over https where a proxy
+  [`--trust-proxy`](#options-of-quillo-run) names, or under `quillo fcgi` the web server, says so: behind a proxy,
+  name it, or the origin is `http://`.
 - **`/_quillo/push`** is where pages send subscriptions: `GET` gives the server's key, `POST`
   binds one, `DELETE` unbinds one. It takes JSON from the program's own pages only (another
   site's is a `403`), as a `server fn` does.
@@ -4832,7 +4834,8 @@ fn touch() {
   here, and without `x-forwarded-proto: https`). On a network you trust, start the program with
   [`--plain-http`](#options-of-quillo-run), `quillo run main.qwe --plain-http`, which leaves `Secure` out, as
   `--watch` does. `delete_cookie` is `Secure` only when the request
-  came over HTTPS (or a proxy's `X-Forwarded-Proto: https` says so), when the name needs it
+  came over HTTPS (a proxy [`--trust-proxy`](#options-of-quillo-run) names says `X-Forwarded-Proto: https`, or
+  under `quillo fcgi` the web server's `HTTPS` is on), when the name needs it
   (`__Host-`, `__Secure-`), or when `secure: true` is given, so a cookie set with `secure:
   false` can be removed over plain HTTP. `request.cookies` has what the browser sent, and
   `cookie(name)` one of them (or null), in any function the request runs, as
@@ -5044,7 +5047,8 @@ server's code:
   limited by itself: 256 large files being sent at once (8 per client), 4096 pages
   waiting for live data (256 per client), answered 503 with `retry-after: 5`.
 - **The visitor behind a proxy:** `request.ip` is the TCP peer, unless [`--trust-proxy`](#options-of-quillo-run)
-  names it (see [Live data](#live-data)): `X-Forwarded-For` is read from no one else. An
+  names it (see [Live data](#live-data)): `X-Forwarded-For` and `X-Forwarded-Proto` are read
+  from no one else. An
   `x-request-id` a proxy sends is kept and echoed.
 - **Matching the host or a subdomain in the route line:** no; match the `host` header
   in a request pattern, or use `tenant_from` (see [Many tenants](#many-tenants)).
@@ -6569,7 +6573,12 @@ last, the shared secret as a service without a name. A caller with `QUILLO_SERVI
 set signs every call with it, a bearer one too, and the token still names it. Under
 `--split` the services sign with the shared secret: one whose `accept_calls` names callers
 by keys, certificates or tokens takes the others as unnamed, so a `for` there needs callers
-with keys of their own (`auth: { key, as }` where they declare it).
+with keys of their own (`auth: { key, as }` where they declare it). A service `--split` starts takes the request's
+scheme from its app: each request the app passes on carries the app's verdict (what its
+`--trust-proxy` proxy said), signed with `QUILLO_SERVICE_SECRET` (`x-quillo-scheme`), so the
+service's deletions are `Secure` and its writes compared by scheme as the app's are. Only a service
+`--split` started reads that word, and only from this machine; the app and any other server ignore
+it, and the visitor's `X-Forwarded-Proto` passed on with it is not believed *(since 0.8.7)*.
 
 Answers are signed back with the key the call was signed with, and a caller that signs
 with a key of its own takes no answer without it (``service billing: the answer from
@@ -7152,7 +7161,8 @@ Safety built in:
   with a form, multipart or plain-text body that the browser marks as cross-site
   (`Sec-Fetch-Site`, or an `Origin` naming another host) gets a 403. An `Origin` alone must
   name the request's host and, where a `--trust-proxy` proxy says the scheme
-  (`X-Forwarded-Proto`), its scheme too: `http://` and `https://` of one host are two sites
+  (`X-Forwarded-Proto`), or under `quillo fcgi` the web server (`HTTPS`, else `REQUEST_SCHEME`),
+  its scheme too: `http://` and `https://` of one host are two sites
   *(since 0.8.7: the hosts alone were compared)*.
   JSON from another site needs the browser to ask first, which nothing here answers, and programs that
   call the site (webhooks, scripts) send no `Origin`, so both work as before. For a
@@ -9609,6 +9619,12 @@ not serve them.
   body, and `request.ip` is Apache's `REMOTE_ADDR`, with no [`--trust-proxy`](#options-of-quillo-run). The server
   does the rest as for any visitor: routes, sessions, limits, the log (on Apache's error
   log).
+- The scheme is the web server's: `HTTPS=on` (or `1`) is https, another value http, else
+  `REQUEST_SCHEME`; neither, unknown (hosts compared alone). It reaches the program as
+  `X-Forwarded-Proto`, and a visitor's own is dropped. Behind another proxy that ends TLS, set
+  `HTTPS` from it (Apache: `SetEnvIf X-Forwarded-Proto https HTTPS=on`) *(since 0.8.7)*. A write
+  refused for the scheme alone is said once in the log, naming the parameter (`HTTPS` or
+  `REQUEST_SCHEME`) and that line.
 - Its jobs and its own calls reach it through a socket only it can open, in a private
   folder under the system's temporary one.
 - What FastCGI cannot carry: WebSockets. Live data falls back to plain requests, each

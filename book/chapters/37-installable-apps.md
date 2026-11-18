@@ -459,7 +459,9 @@ On the server:
   it, and an address is checked again as it resolves when a message is sent; a redirect is not
   followed. `QUILLO_PUSH_LOCAL=1` lets plain http to this machine through, for tests that play
   the push service; `--watch` does not. The site a notification opens is the one the page was
-  on (its `Host`), never what the page says.
+  on (its `Host`), never what the page says, over https where a proxy
+  [`--trust-proxy`](#options-of-quillo-run) names, or under `quillo fcgi` the web server, says so: behind a proxy,
+  name it, or the origin is `http://`.
 - **`/_quillo/push`** is where pages send subscriptions: `GET` gives the server's key, `POST`
   binds one, `DELETE` unbinds one. It takes JSON from the program's own pages only (another
   site's is a `403`), as a `server fn` does.

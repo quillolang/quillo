@@ -1218,6 +1218,45 @@ pub fn signature(secret: &str, t: u64, to: &str, f: &str, tenant: &str, call: &s
     crate::crypto::hex(&crate::crypto::hmac_sha256(secret.as_bytes(), &msg))
 }
 
+// ---- the scheme of a request passed on (FEEDBACK70.md, Q-986, review; branch security) ----
+
+/// The header a request an app passes on to a service carries the app's own verdict on its scheme
+/// in, as `https;t=<seconds>;sig=<hex>`, signed with the shared secret: a service `--split` starts
+/// is given no `--trust-proxy`, and would believe no scheme at all; the visitor's
+/// `X-Forwarded-Proto`, passed on with it, it must not believe. Only such a service reads it, from
+/// a peer on this machine (`server::scheme_by`); one a client sends the app is dropped, never
+/// believed, and never signed again (FEEDBACK70.md, Q-986, recheck; branch security).
+pub const SCHEME_WORD: &str = "x-quillo-scheme";
+
+fn scheme_sig(key: &str, scheme: &str, t: u64) -> String {
+    crate::crypto::hex(&crate::crypto::hmac_sha256(key.as_bytes(), format!("quillo-scheme-1\n{}\n{}", scheme, t).as_bytes()))
+}
+
+/// The app's word on a scheme, signed now; none without a shared secret.
+pub(crate) fn scheme_word(scheme: &str) -> Option<String> {
+    let key = secret()?;
+    let t = now_secs();
+    Some(format!("{};t={};sig={}", scheme, t, scheme_sig(&key, scheme, t)))
+}
+
+/// The scheme in an app's word (`scheme_word`), when it is one: signed with a shared secret,
+/// within `WINDOW`. A word replayed says only the scheme of whoever replays it, as a client's own
+/// header would.
+pub(crate) fn scheme_of_word(word: &str) -> Option<&'static str> {
+    let mut parts = word.split(';');
+    let scheme = match parts.next()? {
+        "https" => "https",
+        "http" => "http",
+        _ => return None,
+    };
+    let t = parts.next()?.strip_prefix("t=")?.parse::<u64>().ok()?;
+    let sig = parts.next()?.strip_prefix("sig=")?;
+    if parts.next().is_some() || now_secs().abs_diff(t) > WINDOW {
+        return None;
+    }
+    shared_signed(sig, |k| scheme_sig(k, scheme, t)).map(|_| scheme)
+}
+
 // ---- channels across processes (FEEDBACK12.md, Q-087; branch open-fixes) ----
 
 /// Under `--split`, where the app listens, for its services' processes: what
@@ -2284,7 +2323,10 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest) -> H
     }
     let target = format!("{}{}", url, if rest.is_empty() || rest.starts_with('?') { format!("/{}", rest) } else { rest.to_string() });
     const HOP: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer", "proxy-authorization"];
-    let headers: Vec<(String, String)> = req.headers.iter().filter(|(k, _)| !HOP.iter().any(|h| k.eq_ignore_ascii_case(h))).cloned().collect();
+    // The app's verdict on the scheme goes signed, in place of any word a client sent
+    // (FEEDBACK70.md, Q-986, review; branch security).
+    let headers: Vec<(String, String)> = req.headers.iter().filter(|(k, _)| !HOP.iter().any(|h| k.eq_ignore_ascii_case(h)) && !k.eq_ignore_ascii_case(SCHEME_WORD)).cloned().collect();
+    let word = crate::server::known_scheme(req).and_then(scheme_word);
     let (method, body, remote) = (req.method.clone(), req.body.clone(), req.remote.clone());
     let host = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.clone()).unwrap_or_default();
     let prefix = prefix.to_string();
@@ -2294,6 +2336,9 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest) -> H
             rq = rq.set(k, v);
         }
         rq = rq.set("x-forwarded-for", &remote).set("x-forwarded-host", &host).set("x-forwarded-prefix", &prefix);
+        if let Some(w) = &word {
+            rq = rq.set(SCHEME_WORD, w);
+        }
         let resp = match if body.is_empty() { rq.call() } else { rq.send_bytes(&body) } {
             Ok(r) | Err(ureq::Error::Status(_, r)) => r,
             Err(e) => return Err(e.to_string()),

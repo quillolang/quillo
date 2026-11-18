@@ -66,6 +66,9 @@ pub fn from_fd0() -> Result<Source, String> {
 /// a body over `max_body` is refused.
 pub fn connections(source: Source, max_body: usize) -> Box<dyn FnOnce(Hand) + Send> {
     use std::sync::atomic::Ordering::SeqCst;
+    // Each request's scheme is the web server's, as `http_request` writes it (FEEDBACK70.md, Q-987;
+    // branch security).
+    crate::httpd::scheme_from_web_server();
     Box::new(move |hand: Hand| {
         let hand = Arc::new(hand);
         while !hand.stopping() {
@@ -213,8 +216,10 @@ pub fn http_request(params: &[(String, String)], body: &[u8]) -> (Vec<u8>, Socke
             "CONTENT_TYPE" => "content-type".to_string(),
             k => match k.strip_prefix("HTTP_").map(|h| h.to_ascii_uppercase()).filter(|h| a_name(h)) {
                 // Its length is the body's here; how it came is the server's business; and the
-                // token of this process's own jobs never comes from outside.
-                Some(h) if matches!(h.as_str(), "CONTENT_LENGTH" | "CONTENT_TYPE" | "CONNECTION" | "TRANSFER_ENCODING" | "PROXY" | "X_QUILLO_JOB") => continue,
+                // token of this process's own jobs never comes from outside. The scheme is the
+                // web server's to say, below: a client's own `X-Forwarded-Proto` is dropped
+                // (FEEDBACK70.md, Q-987; branch security).
+                Some(h) if matches!(h.as_str(), "CONTENT_LENGTH" | "CONTENT_TYPE" | "CONNECTION" | "TRANSFER_ENCODING" | "PROXY" | "X_QUILLO_JOB" | "X_FORWARDED_PROTO" | "X_QUILLO_SCHEME_FROM") => continue,
                 None => continue,
                 Some(h) => h.to_ascii_lowercase().replace('_', "-"),
             },
@@ -228,6 +233,20 @@ pub fn http_request(params: &[(String, String)], body: &[u8]) -> (Vec<u8>, Socke
     if !host {
         head.push_str(&format!("host: {}\r\n", get("SERVER_NAME").filter(|h| clean(h)).unwrap_or("localhost")));
     }
+    // The web server is the proxy here: the scheme it says is written as one in front would write
+    // it, and believed as a `--trust-proxy` proxy's is (see `httpd::scheme_from_web_server`), so
+    // that an `Origin` of the other scheme is another site's, a deletion is `Secure` over https and
+    // a push subscription's origin is https (FEEDBACK70.md, Q-987; branch security). Which
+    // parameter said it goes with it, for the warning a refusal for the scheme gives (review).
+    if let Some((scheme, from)) = scheme_of(&get) {
+        head.push_str("x-forwarded-proto: ");
+        head.push_str(scheme);
+        head.push_str("\r\n");
+        head.push_str(SCHEME_FROM);
+        head.push_str(": ");
+        head.push_str(from);
+        head.push_str("\r\n");
+    }
     head.push_str(&format!("content-length: {}\r\n\r\n", body.len()));
     let mut req = head.into_bytes();
     req.extend_from_slice(body);
@@ -235,6 +254,28 @@ pub fn http_request(params: &[(String, String)], body: &[u8]) -> (Vec<u8>, Socke
     let port = get("REMOTE_PORT").and_then(|p| p.parse().ok()).unwrap_or(0);
     (req, SocketAddr::new(ip, port))
 }
+
+/// The scheme the browser used, as the web server's parameters say it: `HTTPS` set to `on` (any
+/// case; `1` too) is https, and set to anything else (IIS's `off`) http, as CGI has it. Without
+/// it, `REQUEST_SCHEME` (Apache 2.4, nginx's `fastcgi_params`), when it is `http` or `https`.
+/// Neither: not known, and the hosts alone are compared, as before (FEEDBACK70.md, Q-987; branch
+/// security). With the scheme, the parameter that said it.
+fn scheme_of<'a>(get: &impl Fn(&str) -> Option<&'a str>) -> Option<(&'static str, &'static str)> {
+    match get("HTTPS").map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) if v.eq_ignore_ascii_case("on") || v == "1" => Some(("https", "HTTPS")),
+        Some(_) => Some(("http", "HTTPS")),
+        None => match get("REQUEST_SCHEME").map(str::trim) {
+            Some(s) if s.eq_ignore_ascii_case("https") => Some(("https", "REQUEST_SCHEME")),
+            Some(s) if s.eq_ignore_ascii_case("http") => Some(("http", "REQUEST_SCHEME")),
+            _ => None,
+        },
+    }
+}
+
+/// The header naming the web server's parameter the scheme came from (`HTTPS` or
+/// `REQUEST_SCHEME`), written beside `X-Forwarded-Proto`; a client's own is dropped. Read only by
+/// the warning a refusal for the scheme gives (FEEDBACK70.md, Q-987, review; branch security).
+pub const SCHEME_FROM: &str = "x-quillo-scheme-from";
 
 /// The CGI answer's head for an HTTP one: `Status:` for the status line, and the headers but
 /// those of the connection.

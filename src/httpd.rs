@@ -2202,6 +2202,80 @@ pub fn trusts_proxies() -> bool {
     TRUSTED.get().is_some()
 }
 
+/// Under `quillo fcgi` the web server is the proxy: each request's `X-Forwarded-Proto` is the one
+/// fcgi.rs writes from the web server's `HTTPS` parameter, a client's own dropped there, and it is
+/// believed as a `--trust-proxy` proxy's is. Set once, as `quillo fcgi` starts: no connection of
+/// that server comes from anywhere else (its own private socket is the process's own calls)
+/// (FEEDBACK70.md, Q-987; branch security).
+static WEB_SERVER_SCHEME: AtomicBool = AtomicBool::new(false);
+
+/// `quillo fcgi`, starting: see `WEB_SERVER_SCHEME`. Nothing is said of the header then, the web
+/// server having written it.
+pub fn scheme_from_web_server() {
+    WEB_SERVER_SCHEME.store(true, SeqCst);
+    PROTO_SAID.store(true, SeqCst);
+}
+
+/// Whether `quillo fcgi` serves, its requests' scheme the web server's.
+pub fn web_server_scheme() -> bool {
+    WEB_SERVER_SCHEME.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Said once a process: a request's `X-Forwarded-Proto` would have counted (a write's `Origin`, a
+/// deletion's `Secure`, a push subscription's origin) but came from a peer `--trust-proxy` does not
+/// name, as the site behind a proxy it never named would not know otherwise. Looked at where the
+/// header is read (`server::scheme_by`), never by the parser, which every request goes through
+/// (FEEDBACK70.md, Q-986; branch security).
+static PROTO_SAID: AtomicBool = AtomicBool::new(false);
+
+/// Whether the line of `PROTO_SAID` is said, or never to be.
+pub(crate) fn proto_said() -> bool {
+    PROTO_SAID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set in a service `--split` started (main.rs's `stop_with_app`): it believes its app's signed
+/// word on a request's scheme (`service::scheme_of_word`), from a peer on this machine alone. Any
+/// other server ignores the word, so that one a service echoed to a visitor is worth nothing
+/// anywhere it could be sent (FEEDBACK70.md, Q-986, recheck; branch security).
+static APP_WORD: AtomicBool = AtomicBool::new(false);
+
+/// A service `--split` started: it takes its app's word on the scheme (`APP_WORD`), and says
+/// nothing of the visitor's header, which its app sends it and no `--trust-proxy` of its own would
+/// name (FEEDBACK70.md, Q-986; branch security).
+pub fn started_by_app() {
+    APP_WORD.store(true, SeqCst);
+    PROTO_SAID.store(true, SeqCst);
+}
+
+/// Whether this process believes its app's word on the scheme (see `APP_WORD`).
+pub(crate) fn takes_app_word() -> bool {
+    APP_WORD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// See `PROTO_SAID`. The peer is the request's address, which for a peer no proxy names is the
+/// connection's. On a server reached directly it is whoever sent the header first, a visitor as
+/// likely as a proxy, so the line says what to do in either case: trusting a visitor would believe
+/// its `X-Forwarded-For` and certificate header too (FEEDBACK70.md, Q-986, review; branch security).
+#[cold]
+#[inline(never)]
+pub(crate) fn forwarded_proto_not_believed(peer: &str) {
+    if PROTO_SAID.swap(true, SeqCst) {
+        return;
+    }
+    let peer = named_address(peer);
+    eprintln!("quillo: a request came with X-Forwarded-Proto from {}, which --trust-proxy does not name: if that address is your proxy, --trust-proxy {}; if not, a visitor sent it and it is ignored", peer, peer);
+}
+
+/// An address for the log, as `--trust-proxy` takes it: an IPv4 address in IPv6's clothes (a
+/// listener on `::`) as IPv4; anything that is no address, only what an address is made of.
+fn named_address(peer: &str) -> String {
+    match peer.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(a)) => a.to_ipv4_mapped().map_or(a.to_string(), |v4| v4.to_string()),
+        Ok(a) => a.to_string(),
+        Err(_) => peer.chars().filter(|c| c.is_ascii_hexdigit() || matches!(c, '.' | ':')).take(45).collect(),
+    }
+}
+
 /// Takes `10.0.0.0/8,127.0.0.1`; false if a part of it is neither.
 pub fn trust_proxies(list: &str) -> bool {
     let mut nets = Vec::new();
@@ -2849,6 +2923,22 @@ pub(crate) fn flush_log() {
 
 #[cfg(test)]
 mod tests {
+    // Q-986: the address the once-line names, as --trust-proxy takes it: IPv4 and IPv6 as they
+    // are, an IPv4 address in IPv6's clothes as IPv4, and what is no address cut to what an
+    // address is made of (FEEDBACK70.md, review; branch security).
+    #[test]
+    fn the_address_named_for_trust_proxy() {
+        assert_eq!(super::named_address("203.0.113.9"), "203.0.113.9");
+        assert_eq!(super::named_address("2001:db8::1"), "2001:db8::1");
+        assert_eq!(super::named_address("::1"), "::1");
+        assert_eq!(super::named_address("::ffff:192.168.1.48"), "192.168.1.48");
+        assert_eq!(super::named_address("::ffff:7f00:1"), "127.0.0.1");
+        assert_eq!(super::named_address("10.0.0.1\u{1b}\n<xyz>"), "10.0.0.1");
+        assert_eq!(super::named_address("[::1]"), "::1");
+        assert_eq!(super::named_address(""), "");
+        assert_eq!(super::named_address(&"1".repeat(100)).len(), 45);
+    }
+
     // Q-672: a client holds so many connections, all clients so many, this machine and the
     // proxies --trust-proxy names no limit of the first.
     #[test]

@@ -333,7 +333,7 @@ pub(crate) fn cross_site(req: &HttpRequest) -> bool {
             // (FEEDBACK70.md, Q-966; branch security).
             match (scheme, known_scheme(req)) {
                 (Some(o), Some(r)) if !o.eq_ignore_ascii_case(r) => {
-                    scheme_differs(o, r);
+                    scheme_differs(req, o, r);
                     true
                 }
                 _ => false,
@@ -347,13 +347,57 @@ pub(crate) fn cross_site(req: &HttpRequest) -> bool {
 /// so that `http, https` and the two in two headers are one (RFC 9110, 5.3). Quillo serves no TLS
 /// of its own, and a request from anyone else says nothing that is believed. Without
 /// `--trust-proxy` nothing is looked for; the mark the server puts on a proxy's request is its own,
-/// put last, of its own spelling (FEEDBACK70.md, Q-966; branch security).
-fn known_scheme(req: &HttpRequest) -> Option<&'static str> {
-    if !crate::httpd::trusts_proxies() || !req.headers.iter().rev().any(|(k, _)| k == crate::httpd::PROXIED) {
+/// put last, of its own spelling (FEEDBACK70.md, Q-966; branch security). Under `quillo fcgi` the
+/// web server is that proxy, its `HTTPS` parameter written as the header (Q-987).
+pub(crate) fn known_scheme(req: &HttpRequest) -> Option<&'static str> {
+    scheme_by(|name| req.headers.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()), &req.remote)
+}
+
+/// `known_scheme`'s rule, which `session::came_over_https` reads the request map by too, so that a
+/// form's gate, a deletion's `Secure` and a push subscription's origin take one scheme from one
+/// word: `last(name)` is the value of the request's last header of that name. Believed from a proxy
+/// `--trust-proxy` names (the mark the server put on its request) or, under `quillo fcgi`, from the
+/// web server; from anyone else, nothing is (FEEDBACK70.md, Q-986, Q-987; branch security).
+/// Where the header would have counted but is not believed, the log says once which address to
+/// name (`peer`, the request's: the connection's, for a peer no proxy names). Looked at here and
+/// not in the parser, so that a request that never asks pays nothing (Q-986). A request an app
+/// passed on to a service carries the app's own verdict, signed (`service::scheme_of_word`): a
+/// service `--split` started, given no `--trust-proxy` of its own, believes that from a peer on
+/// this machine, and never the visitor's header the app passed on with it (Q-986, review). No other
+/// server looks at the word: the app's own verdict is its proxy's, and a word a service echoed to a
+/// visitor must decide nothing there (recheck).
+pub(crate) fn scheme_by<S: AsRef<str>>(mut last: impl FnMut(&str) -> Option<S>, peer: &str) -> Option<&'static str> {
+    let fcgi = crate::httpd::web_server_scheme();
+    if crate::httpd::takes_app_word() && local_peer(peer) {
+        if let Some(scheme) = last(crate::service::SCHEME_WORD).and_then(|w| crate::service::scheme_of_word(w.as_ref())) {
+            return Some(scheme);
+        }
+    }
+    let believed = fcgi || (crate::httpd::trusts_proxies() && last(crate::httpd::PROXIED).is_some());
+    if !believed {
+        if !crate::httpd::proto_said() && last("x-forwarded-proto").is_some() {
+            crate::httpd::forwarded_proto_not_believed(peer);
+        }
         return None;
     }
-    let (_, v) = req.headers.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-proto"))?;
-    let last = v.rfind(',').map_or(v.as_str(), |i| &v[i + 1..]).trim();
+    let v = last("x-forwarded-proto")?;
+    forwarded_scheme(v.as_ref())
+}
+
+/// Whether a request's address is this machine's, as a service's app's is: loopback, IPv4 in IPv6's
+/// clothes too (FEEDBACK70.md, Q-986, recheck; branch security).
+fn local_peer(peer: &str) -> bool {
+    match peer.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(a)) => a.is_loopback() || a.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+        Ok(a) => a.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+/// The scheme an `X-Forwarded-Proto` value says, `http` or `https`, by its last item, so that
+/// `http, https` and the two in two headers are one (RFC 9110, 5.3); anything else, none.
+pub(crate) fn forwarded_scheme(v: &str) -> Option<&'static str> {
+    let last = v.rfind(',').map_or(v, |i| &v[i + 1..]).trim();
     match last.len() {
         5 if last.eq_ignore_ascii_case("https") => Some("https"),
         4 if last.eq_ignore_ascii_case("http") => Some("http"),
@@ -367,12 +411,24 @@ fn known_scheme(req: &HttpRequest) -> Option<&'static str> {
 /// another TLS hop, older browsers' writes from `https://` pages (FEEDBACK70.md, Q-966, second
 /// review; branch security).
 #[cold]
-fn scheme_differs(origin: &str, proxy: &str) {
+fn scheme_differs(req: &HttpRequest, origin: &str, proxy: &str) {
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let origin: String = origin.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')).take(16).collect();
+    // Under `quillo fcgi` it is the web server that said, by the parameter fcgi.rs names
+    // (FEEDBACK70.md, Q-987, review; branch security).
+    if crate::httpd::web_server_scheme() {
+        let from = req.headers.iter().rev().find(|(k, _)| k == crate::fcgi::SCHEME_FROM).map_or("HTTPS", |(_, v)| if v == "REQUEST_SCHEME" { "REQUEST_SCHEME" } else { "HTTPS" });
+        let why = if proxy == "https" {
+            format!("Browsers send no Sec-Fetch-Site to an http:// page, so if this site is served over http:// too and the web server says https there (its {} parameter), every browser's write from an http:// page is refused: have it say http there, or send http:// to https://", from)
+        } else {
+            format!("If browsers reach this site over https://, TLS ends in front of the web server and its {} parameter is its own hop's scheme, and older browsers' writes are all refused: have it set HTTPS from the front's header (Apache: SetEnvIf X-Forwarded-Proto https HTTPS=on)", from)
+        };
+        eprintln!("quillo: warning: a request was taken as another site's: its Origin is {}:// and the web server's {} parameter says it came over {}. {}. Said once", origin, from, proxy, why);
+        return;
+    }
     let why = if proxy == "https" {
         "Browsers send no Sec-Fetch-Site to an http:// page, so if this site is served over http:// too and the proxy says https there (a fixed X-Forwarded-Proto on its port-80 site), every browser's write from an http:// page is refused: have it say http there, or send http:// to https://"
     } else {

@@ -142,18 +142,35 @@ impl Drop for Logged {
     }
 }
 
+/// The system picks the port (`--port 0`) and the log says which: a port picked here could be
+/// taken by another process before the server bound it (a shown bug in the test, as feedback31's
+/// and prefetching's on CI; branch security).
 fn logged(d: &Path, opts: &[&str]) -> (Logged, u16) {
-    let port = support::free_port();
-    (logged_at(d, port, opts), port)
+    let mut s = start_logged(d, "0", opts);
+    let port = support::port_in_log(&mut s.0, &s.1, Duration::from_secs(20));
+    (s, port)
 }
 
-/// `logged`, on `port`: a server started again where the one before was.
+/// `logged`, on `port`: a server started again where the one before was. The port must be that
+/// one, so it is given; the listener is checked to be this server, as another process could have
+/// taken the port between the two (branch security).
 fn logged_at(d: &Path, port: u16, opts: &[&str]) -> Logged {
+    let s = start_logged(d, &port.to_string(), opts);
+    let end = Instant::now() + Duration::from_secs(20);
+    while !support::listening(port) {
+        assert!(Instant::now() < end, "the server did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(support::listener_is(port, s.0.id()), "another process listens on {}", port);
+    s
+}
+
+fn start_logged(d: &Path, port: &str, opts: &[&str]) -> Logged {
     let log = d.join("server.log");
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("main.qwe"))
-        .args(["--port", &port.to_string()])
+        .args(["--port", port])
         .args(opts)
         .env("QUILLO_SECRET", "test secret for the tests")
         .current_dir(d)
@@ -163,13 +180,7 @@ fn logged_at(d: &Path, port: u16, opts: &[&str]) -> Logged {
         .spawn()
         .unwrap();
     support::stop_with_tests(&child);
-    let s = Logged(child, log);
-    let end = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < end, "the server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    s
+    Logged(child, log)
 }
 
 /// The log, once it holds `want`.
@@ -1170,8 +1181,8 @@ fn q957_review_a_server_started_again_under_a_worker_stops_and_says_why() {
         let d = dir(&format!("restart{}", why), &sw_program("/", "One"));
         std::fs::write(d.join("sw.js"), CACHE_FIRST).unwrap();
         std::fs::write(d.join("t.js"), PAGE_SCRIPT.replace("@WORKER@", "true")).unwrap();
-        let port = support::free_port();
-        let mut first = Some(logged_at(&d, port, opts));
+        let (first, port) = logged(&d, opts);
+        let mut first = Some(first);
         // Two saves: the page the worker keeps is version 3.
         let version = || {
             let html = page(port, "/");
@@ -1832,7 +1843,7 @@ http.createServer((req, res) => {
   const p = http.request({ host: "127.0.0.1", port: upstream, path: req.url.slice(base.length) || "/", method: req.method, headers: req.headers }, (u) => { res.writeHead(u.statusCode, u.headers); u.pipe(res); });
   p.on("error", () => { if (mode !== "502") return req.socket.destroy(); res.writeHead(502, { "content-type": "text/html" }); res.end("<html><body><p id=bad>bad gateway</p></body></html>"); });
   req.pipe(p);
-}).listen(listen, "127.0.0.1", () => console.log("ready"));
+}).listen(listen, "127.0.0.1", function () { console.log(this.address().port); });
 "#;
 
 const BASED: &str = r#"component Counter() {
@@ -1885,14 +1896,7 @@ fn b2_under_base_the_worker_and_its_pages_carry_the_prefix() {
     };
     let _turn = chrome_turn();
     let stages = support::serve(&dir("sw-stages5", STAGES).join("main.qwe"), &[]);
-    let listen = support::free_port();
-    let proxy = std::process::Command::new("node").arg("-e").arg(PROXY).arg(listen.to_string()).arg(port.to_string()).arg("/shop").stdout(std::process::Stdio::null()).spawn().unwrap();
-    let _proxy = support::Guard::new(proxy);
-    let end = Instant::now() + Duration::from_secs(20);
-    while !support::listening(listen) {
-        assert!(Instant::now() < end, "the proxy did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let (_proxy, listen) = proxy(port, "/shop", "");
     let (c, url, sp) = (chrome.clone(), format!("http://127.0.0.1:{}/shop/", listen), stages.port);
     let page = std::thread::spawn(move || in_chrome_staged(&c, &url, &BASED_SCRIPT.replace("@KIT@", SW_KIT), sp));
     stage_reached(stages.port, 1, &page);
@@ -2566,15 +2570,11 @@ fn b2_the_kept_pages_are_bounded_the_oldest_dropped_first() {
 
 /// The proxy in front of a server on `port`, at `base`, in `mode` ("" closes the connection when
 /// the server is down, "502" answers so).
+/// It listens on port 0 and prints the port it was given (branch security).
 fn proxy(port: u16, base: &str, mode: &str) -> (support::Guard, u16) {
-    let listen = support::free_port();
-    let child = std::process::Command::new("node").arg("-e").arg(PROXY).arg(listen.to_string()).arg(port.to_string()).arg(base).arg(mode).stdout(std::process::Stdio::null()).spawn().unwrap();
-    let g = support::Guard::new(child);
-    let end = Instant::now() + Duration::from_secs(20);
-    while !support::listening(listen) {
-        assert!(Instant::now() < end, "the proxy did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let child = std::process::Command::new("node").arg("-e").arg(PROXY).arg("0").arg(port.to_string()).arg(base).arg(mode).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut g = support::Guard::new(child);
+    let listen = support::port_on_stdout(&mut g.0, "the proxy", Duration::from_secs(20));
     (g, listen)
 }
 
@@ -3701,7 +3701,7 @@ fn q985_a_page_states_initializer_reads_the_session() {
 /// `pushManager.subscribe` makes them, whose push service answers 201 or as `kind` says; `/_got`:
 /// what came, in order, with the connection it came on; `/_reset`.
 const SINK: &str = r#"const crypto = require("crypto"), http = require("http");
-const PORT = +process.argv[2];
+let PORT = +process.argv[2];
 const subs = new Map();
 let got = [], n = 0;
 const b64u = (b) => Buffer.from(b).toString("base64url");
@@ -3769,7 +3769,7 @@ http.createServer((req, res) => {
     res.writeHead(status);
     res.end();
   });
-}).listen(PORT, "127.0.0.1", () => console.log("listening"));
+}).listen(PORT, "127.0.0.1", function () { PORT = this.address().port; console.log(PORT); });
 "#;
 
 /// The sink, running: killed with the test.
@@ -3779,23 +3779,24 @@ struct Sink {
 }
 
 fn sink() -> Sink {
-    let d = support::temp_dir("f67-sink");
+    // A folder of its own: tests run at once, and one folder for every sink was removed by one while
+    // another wrote into it (EINVAL, found in slice 7's runs; a shown bug in the test, branch
+    // security).
+    static SINKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let d = support::temp_dir(&format!("f67-sink-{}", SINKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     std::fs::write(d.join("sink.cjs"), SINK).unwrap();
-    let port = support::free_port();
+    // It listens on port 0 and prints the port it was given: one picked here was taken before it
+    // bound it, on CI (run 44152090200; a shown bug in the test, branch security).
     let child = std::process::Command::new("node")
         .arg(d.join("sink.cjs"))
-        .arg(port.to_string())
+        .arg("0")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .expect("node");
-    let node = support::Guard::new(child);
-    let end = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < end, "the sink did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    let mut node = support::Guard::new(child);
+    let port = support::port_on_stdout(&mut node.0, "the sink", Duration::from_secs(20));
     Sink { _node: node, port }
 }
 
@@ -3825,12 +3826,11 @@ impl Sink {
 /// `quillo run` of `d` with `env` after QUILLO_SECRET and QUILLO_PUSH_LOCAL=1 (the sink is on this
 /// machine): the server, its log in server.log, and its port.
 fn push_server(d: &Path, opts: &[&str], env: &[(&str, &str)]) -> (Logged, u16) {
-    let port = support::free_port();
     let log = d.join("server.log");
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
         .arg("run")
         .arg(d.join("main.qwe"))
-        .args(["--port", &port.to_string()])
+        .args(["--port", "0"])
         .args(opts)
         .env("QUILLO_SECRET", "test secret for the tests")
         .env("QUILLO_PUSH_LOCAL", "1")
@@ -3842,12 +3842,9 @@ fn push_server(d: &Path, opts: &[&str], env: &[(&str, &str)]) -> (Logged, u16) {
         .spawn()
         .unwrap();
     support::stop_with_tests(&child);
-    let s = Logged(child, log);
-    let end = Instant::now() + Duration::from_secs(20);
-    while !support::listening(port) {
-        assert!(Instant::now() < end, "the server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // The system picks the port, as `logged` has it (branch security).
+    let mut s = Logged(child, log);
+    let port = support::port_in_log(&mut s.0, &s.1, Duration::from_secs(20));
     (s, port)
 }
 
@@ -4180,7 +4177,9 @@ const IN_A_TRANSACTION: &str = "`notification.send` waits on push services, whic
 fn notification_the_origin_is_the_requests_and_errors_are_hidden() {
     let sink = sink();
     let d = dir("n-origin", PUSHER);
-    let (_s, port) = push_server(&d, &[], &[]);
+    // The proxy named: since Q-986 only a `--trust-proxy` proxy's X-Forwarded-Proto makes the origin
+    // https (FEEDBACK70.md, Q-986; branch security: the decided change).
+    let (_s, port) = push_server(&d, &["--trust-proxy", "127.0.0.1"], &[]);
     let (ivan, _) = session_step(port, "/in/ivan", "");
     let host = format!("127.0.0.1:{}", port);
     let mut body = sink.made(1, "ok").remove(0);
@@ -4709,7 +4708,7 @@ fn notification_on_the_wrong_side_it_fails_saying_why() {
     for (f, call) in [("send", "notification.send(\"x\", { title: \"t\" })"), ("user", "notification.user(\"x\")")] {
         let d = dir(&format!("n-sides-{}", f), &format!("component Bad() {{\n    let r = {}\n    <p>{{r}}</p>\n}}\nroute GET / = <html><body><Bad/></body></html>\n", call));
         let mut c = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"));
-        c.args(["run", "main.qwe", "--no-check", "--port", &support::free_port().to_string()]).current_dir(&d);
+        c.args(["run", "main.qwe", "--no-check", "--port", "0"]).current_dir(&d);
         let o = within(c, 30);
         let log = String::from_utf8_lossy(&o.stderr);
         assert!(!o.status.success() && log.contains(&format!("main.qwe:2: <Bad> (compiled for the browser): `notification.{}` is the server's: call it from a `server fn`", f)), "{}", log);
@@ -5180,7 +5179,7 @@ const srv = http.createServer((req, res) => {
   });
 });
 srv.keepAliveTimeout = 60000;
-srv.listen(+process.argv[2], "127.0.0.1", () => console.log("rst"));
+srv.listen(+process.argv[2], "127.0.0.1", () => console.log(srv.address().port));
 "#;
 
 // B.3, second review, 1: `http.*`'s agents are as they were, keeping one connection a host: after
@@ -5192,14 +5191,10 @@ srv.listen(+process.argv[2], "127.0.0.1", () => console.log("rst"));
 fn notification_a_reset_kept_connection_fails_nothing() {
     let d = support::temp_dir("f67-resets");
     std::fs::write(d.join("rst.cjs"), RESETS).unwrap();
-    let rst = support::free_port();
-    let child = std::process::Command::new("node").arg(d.join("rst.cjs")).arg(rst.to_string()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
-    let _rst = support::Guard::new(child);
-    let end = Instant::now() + Duration::from_secs(20);
-    while !support::listening(rst) {
-        assert!(Instant::now() < end, "the resetting server did not start");
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // On port 0, the port it was given printed, as the sink (branch security).
+    let child = std::process::Command::new("node").arg(d.join("rst.cjs")).arg("0").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null()).spawn().unwrap();
+    let mut _rst = support::Guard::new(child);
+    let rst = support::port_on_stdout(&mut _rst.0, "the resetting server", Duration::from_secs(20));
     let url = format!("http://127.0.0.1:{}/x", rst);
     let calls: Vec<String> = (0..8).map(|_| format!("() => http.post({:?}, \"a\")", url)).collect();
     let src = format!(
