@@ -861,6 +861,11 @@ fn sort_by(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     for x in l.iter() {
         items.push((it.call1(&f, x.clone(), line)?, x.clone()));
     }
+    // In a script, the keys compared are paid for as what a builtin reads: each could be one list
+    // near 1 MB (FEEDBACK75.md, Q-1055; branch feedback75).
+    if it.fuel != u64::MAX {
+        it.script_read(items.iter().map(|(k, _)| k), line)?;
+    }
     sort_values(items, "sort_by", line)
 }
 
@@ -1726,6 +1731,9 @@ fn own() -> std::sync::RwLockReadGuard<'static, Own> {
 pub(crate) const OWN_SOURCE: &str = "it is one of the program's own files";
 pub(crate) const OWN_SETTINGS: &str = "it is the program's settings (.env)";
 pub const OWN_TLS_KEY: &str = "it is the server's TLS key";
+/// A policy the program runs under, by its file's identity: a hard link to it under another name
+/// was served (FEEDBACK75.md, Q-1088, found in review; branch feedback75).
+pub const OWN_POLICY: &str = "it is the program's policy";
 
 /// Notes `p`, if it is there, as one of the program's own files. A source file's earlier
 /// versions at that path are let go, so `--watch` saving one again and again keeps one each; the
@@ -2073,8 +2081,10 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(v) => return fail(line, format!("`files` expects options as a map, got {}", v.type_name())),
     }
     let rel = path.trim_matches('/');
-    let hidden = hidden_path(rel);
     let base = it.base_dir.join(&*dir);
+    // And the policy in use, whatever `--policy` named it: `quillo serve . --policy prod.policy`
+    // served /prod.policy (FEEDBACK75.md, Q-1088, found in review; branch feedback75).
+    let hidden = hidden_path(rel) || policy_in_use(&base.join(rel));
     // What a link leads to is judged as its name is: `notes.txt -> ../main.qwe` served the
     // program's source and `settings.txt -> ../.env` its settings (FEEDBACK55.md, Q-701; branch
     // feedback55). A link out of the folder is not served, as `stays_in` says, though it leads
@@ -2207,7 +2217,35 @@ pub(crate) fn hidden_path(rel: &str) -> bool {
     // Folded as the file system folds it: `ſ` is `s` and `K` (U+212A) `k` on macOS, so `plug.rſ`
     // was `plug.rs` (found in review).
     let last = rel.rsplit('/').next().unwrap_or("").trim_end_matches(['.', ' ']).to_uppercase().to_lowercase();
-    rel.split('/').enumerate().any(|(i, seg)| seg.starts_with('.') && !(i == 0 && seg == ".well-known")) || last.ends_with(".qwe") || crate::native::is_rust(&last)
+    // And the program's policy, which names its secrets' variables, its inner hosts and its
+    // limits: `quillo serve` read DIR/quillo.policy as its own and served it (FEEDBACK75.md,
+    // Q-1088; branch feedback75).
+    rel.split('/').enumerate().any(|(i, seg)| seg.starts_with('.') && !(i == 0 && seg == ".well-known")) || last.ends_with(".qwe") || crate::native::is_rust(&last) || last == crate::policy::PROGRAM_FILE
+}
+
+/// Whether `path` is a policy file the program runs under (`policy::get().files`), by its name as
+/// the file system folds it first, then by the file itself (FEEDBACK75.md, Q-1088, found in review;
+/// branch feedback75). Only a request for a file of such a name looks at the disk.
+fn policy_in_use(path: &Path) -> bool {
+    let files = &crate::policy::get().files;
+    let Some(name) = path.file_name().filter(|_| !files.is_empty()) else { return false };
+    let fold = |n: &std::ffi::OsStr| n.to_string_lossy().trim_end_matches(['.', ' ']).to_uppercase().to_lowercase();
+    let asked = fold(name);
+    files.iter().any(|f| f.file_name().is_some_and(|n| fold(n) == asked) && same_file(f, path))
+}
+
+#[cfg(unix)]
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_file(a: &Path, b: &Path) -> bool {
+    matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
 }
 
 /// Whether `files`, serving the folder `served` of the program's folder `program` (both as the
@@ -2223,6 +2261,9 @@ pub(crate) fn hidden_path(rel: &str) -> bool {
 /// cookies, a tool's server code beside its output, and `.cache`, where tools keep tokens too
 /// (FEEDBACK55.md, Q-701; branch feedback55).
 fn hidden_target(program: &Path, served: &Path, real: &Path) -> bool {
+    if policy_in_use(real) {
+        return true;
+    }
     const STORES: [&str; 4] = [".pnpm", ".deno", ".bun", ".store"];
     const TOOLS: [&str; 6] = [".vitepress/dist", ".output/public", ".next/static", ".svelte-kit/output/client", ".nuxt/dist/client", ".vercel/output/static"];
     if let Ok(rel) = real.strip_prefix(served) {
@@ -3641,6 +3682,12 @@ fn group_by(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         // (FEEDBACK55.md, Q-784; branch feedback55).
         let k = match it.call1(&f, x.clone(), line)? {
             e @ Value::Err(..) => return Ok(e),
+            // In a script, the key written out is paid for as what a builtin reads
+            // (FEEDBACK75.md, Q-1055; branch feedback75).
+            k if it.fuel != u64::MAX => {
+                it.script_read([&k], line)?;
+                k.key_text_held().map_err(|o| o.at(line))?
+            }
             k => k.key_text_held().map_err(|o| o.at(line))?,
         };
         // A new group where the map has no room left: the room it grows to compared with
@@ -3931,15 +3978,21 @@ fn ask(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// (FEEDBACK67.md, Q-959; branch pwa).
 pub const IN_THE_BROWSER: &str = "`ask` and `notify` speak to someone in the browser, on a page that is open: call them from a component (an event handler); to reach someone who is not on the page, `notification.send(user, { title, body, url })` sends to their devices, and `publish` updates the pages that are open";
 
-/// `run_script(source, vars)`: users' code, run in a sandbox (script.rs).
+/// `run_script(source, vars, { timeout })`: users' code, run in a sandbox (script.rs), for 100 ms
+/// unless `timeout` says (FEEDBACK75.md, Q-1055; branch feedback75).
 fn run_script(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let src = s_arg(&args, 0, "run_script", line)?;
     let vars = match args.get(1) {
         None | Some(Value::Nil) => None,
         Some(_) => Some(m_arg(&args, 1, "run_script", line)?),
     };
+    let opts = match args.get(2) {
+        None | Some(Value::Nil) => None,
+        Some(_) => Some(m_arg(&args, 2, "run_script", line)?),
+    };
+    let ms = crate::script::timeout_of(opts.as_deref()).or_else(|why| fail(line, why))?;
     // `--max-memory`'s stop said at this call, the script's lines being its own.
-    crate::script::run_script(it, &src, vars.as_deref()).map_err(|c| match c {
+    crate::script::run_script_for(it, &src, vars.as_deref(), ms).map_err(|c| match c {
         Ctrl::Error(e) if e.memory_stop => crate::httpd::OverMemory.at(line),
         c => c,
     })

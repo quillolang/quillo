@@ -192,7 +192,8 @@ fn q965_each_write_and_each_read_is_said() {
 }
 
 // What must keep working, and is not said: a read written in SQL (`for update`, a `pragma`, a `with`
-// that selects, `db.exec` of a select), SQL and methods built as the program runs (never guessed),
+// that selects, `db.exec` of a select), SQL and methods built as the program runs (never guessed:
+// a `let` holding a literal is read as that literal, changed with FEEDBACK75.md, Q-1084),
 // a write that reads nothing of anyone's (a counter; the request's host), a write in a handler the
 // page runs (a server fn's own POST), a local of a global's name, a POST and a DELETE, a service's
 // functions that do not surely write (nothing, a select, SQL built as it runs), the program's own
@@ -291,7 +292,17 @@ route GET /r19 {
     let d = dir("not", &[("main.qwe", src), ("billing.qwe", SERVICE)]);
     assert_eq!(
         check(&d),
-        (true, vec!["main.qwe:6: warning: `publish` hides the builtin `publish`: the program's own is used everywhere, so pick another name".to_string(), warned(65, "ANY /r15", "`db.exec(\"delete from notes where owner = ?\")`", "`session()`")])
+        (
+            true,
+            vec![
+                "main.qwe:6: warning: `publish` hides the builtin `publish`: the program's own is used everywhere, so pick another name".to_string(),
+                // `/r2` and `/r16` hold their SQL and their method in a `let` of a literal, read as
+                // that literal (changed with FEEDBACK75.md, Q-1084; branch feedback75).
+                warned(19, "GET /r2", "`db.query(\"delete from notes\")`, SQL that writes", "`session()`"),
+                warned(65, "ANY /r15", "`db.exec(\"delete from notes where owner = ?\")`", "`session()`"),
+                warned(69, "GET /r16", "`http.request(\"DELETE\", ...)`", "`cookie()`"),
+            ]
+        )
     );
 }
 

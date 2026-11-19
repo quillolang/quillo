@@ -83,7 +83,34 @@ pub(crate) const CHANGES: &[&str] = &[
     "__service_later",
     // A message to someone's devices (FEEDBACK67.md, B.3; branch pwa).
     "notification.send",
+    // A packet, or a message to a channel's pages: a hover sent them as the visitor
+    // (FEEDBACK75.md, Q-1062; branch feedback75). `http.request` and `http.stream` change
+    // something by how they are called (`changes_as_called`).
+    "udp.send",
+    "udp.reply",
+    "channel.send",
+    "channel.broadcast",
 ];
+
+/// Whether `http.request` or `http.stream` changes something, as called: a method other than
+/// GET, HEAD or OPTIONS, or for `http.stream` a `body` (which makes it a POST). A prefetch ran
+/// `http.request("POST", ...)` and `http.stream(url, f, { method: "POST" })` as the visitor,
+/// where `http.post` was refused (FEEDBACK75.md, Q-1062; branch feedback75).
+pub(crate) fn changes_as_called(name: &str, args: &[Value]) -> bool {
+    let reads = |m: &Value| matches!(m, Value::Str(m) if ["GET", "HEAD", "OPTIONS"].iter().any(|r| m.trim().eq_ignore_ascii_case(r)));
+    match name {
+        "http.request" => !args.first().is_some_and(reads),
+        // As `fetch::stream` reads it: the method given, else POST with a body, else GET.
+        "http.stream" => match args.get(2) {
+            Some(Value::Map(o)) => match o.get("method") {
+                Some(m @ Value::Str(_)) => !reads(m),
+                _ => !matches!(o.get("body"), None | Some(Value::Nil)),
+            },
+            _ => false,
+        },
+        _ => false,
+    }
+}
 
 /// A run-time error, told the file it happened in (as the program was
 /// given it: relative to the folder it runs in, when it is inside it)
@@ -221,9 +248,11 @@ pub struct Interp {
     pub(crate) fuel: u64,
     /// Effects the running code may use, and the `with` function that limited them.
     pub(crate) allowed: u8,
-    /// While a sandboxed script runs: its outermost scope, and the effects
-    /// the program had (see `script_mask`).
-    pub(crate) script: Option<(Env, u8)>,
+    /// While a sandboxed script runs: its outermost scope, the effects
+    /// the program had (see `script_mask`), and when it is stopped with the
+    /// milliseconds that says (`run_script`'s `timeout`; FEEDBACK75.md, Q-1055;
+    /// branch feedback75).
+    pub(crate) script: Option<(Env, u8, std::time::Instant, u64)>,
     pub(crate) restrictor: Option<Arc<FnDef>>,
     /// The running request's route's `with`, for what its answer runs after the body: a
     /// stream's function, deferred parts (branch feedback40-43).
@@ -1912,7 +1941,10 @@ pub(crate) fn call_on(e: &Expr) -> Option<(Sym, &Expr, &[Expr], u32)> {
     match e {
         Expr::Call(f, args, line) => match (&**f, args.split_first()) {
             (Expr::Ident(f, _), Some((first, rest))) => Some((*f, first, rest, *line)),
-            (Expr::Field(o, f, _), _) => Some((Sym::new(f), o, args, *line)),
+            // Looked up, not made: a name no program has is none of the names the callers
+            // look for, and a visitor's script made each of its method names a name kept for
+            // good, 1 MB a request (FEEDBACK75.md, Q-1076; branch feedback75).
+            (Expr::Field(o, f, _), _) => Sym::known(f).map(|f| (f, &**o, args.as_slice(), *line)),
             _ => None,
         },
         Expr::Pipe(lhs, rhs, _) => match &**rhs {
@@ -2005,6 +2037,16 @@ fn pure(e: &Expr, env: &Env) -> bool {
         Expr::List(xs) => xs.iter().all(|x| pure(x, env)),
         Expr::Map(xs) => xs.iter().all(|(_, x)| pure(x, env)),
         _ => false,
+    }
+}
+
+/// A field's or a method's name as a message says it: past 100 characters, cut there. A
+/// visitor's script wrote a 1 MB name, and its error wrote it to the log with every request
+/// (FEEDBACK75.md, Q-1076; branch feedback75).
+pub(crate) fn said_name(name: &str) -> std::borrow::Cow<'_, str> {
+    match name.char_indices().nth(100) {
+        Some((at, _)) => format!("{}…", &name[..at]).into(),
+        None => name.into(),
     }
 }
 
@@ -3257,8 +3299,8 @@ impl Interp {
                 let o = self.eval(o, env)?;
                 self.eval(e, env)?;
                 let why = match o {
-                    Value::Map(_) => format!("a map's fields are not set in place: write `m = set(m, \"{}\", …)`", name),
-                    _ => format!("{} has no field `{}` to set: only the page's objects (an element, an event) do, in a component", o.type_name(), name),
+                    Value::Map(_) => format!("a map's fields are not set in place: write `m = set(m, \"{}\", …)`", said_name(name)),
+                    _ => format!("{} has no field `{}` to set: only the page's objects (an element, an event) do, in a component", o.type_name(), said_name(name)),
                 };
                 fail(*line, why)
             }
@@ -4192,17 +4234,26 @@ impl Interp {
             return fail(line, "the script took too many steps");
         }
         self.fuel -= cost;
+        // A KB made is as long as a KB read: the clock is looked at (FEEDBACK75.md, Q-1055;
+        // branch feedback75).
+        if cost > 0 {
+            self.script_clock(line)?;
+        }
         Ok(())
     }
 
     /// An operator in a sandboxed script: a range it may not make is
-    /// refused before it is made, and the result is paid for.
+    /// refused before it is made, what a comparison reads is paid for
+    /// (FEEDBACK75.md, Q-1055; branch feedback75), and the result is paid for.
     #[cold]
     fn script_binop(&mut self, op: BinOp, x: Value, y: Value, line: u32) -> Result<Value, Ctrl> {
         if let (BinOp::Range, Value::Int(a), Value::Int(b)) = (op, &x, &y) {
             if b.saturating_sub(*a).saturating_mul(8) > crate::script::SCRIPT_BYTES as i64 {
                 return fail(line, "the script made a value larger than 1 MB");
             }
+        }
+        if matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+            self.script_read([&x, &y], line)?;
         }
         let v = binop(op, x, y, line)?;
         self.script_made(v, line)
@@ -4853,7 +4904,7 @@ impl Interp {
                         argv.push(recv);
                         f
                     }
-                    None => return fail(line, format!("{} has no method `{}`", recv.type_name(), name)),
+                    None => return fail(line, format!("{} has no method `{}`", recv.type_name(), said_name(name))),
                 },
             }
         } else {
@@ -5027,7 +5078,7 @@ impl Interp {
             return Ok(Value::Nil);
         }
         let hint = if name == "length" && matches!(v, Value::List(_) | Value::Str(_)) { ": `len(x)` is how many it holds" } else { "" };
-        fail(line, format!("{} has no field `{}`{}", v.type_name(), name, hint))
+        fail(line, format!("{} has no field `{}`{}", v.type_name(), said_name(name), hint))
     }
 
     pub fn call(&mut self, f: &Value, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
@@ -5059,7 +5110,7 @@ impl Interp {
                 if self.allowed != ALL_EFFECTS {
                     self.check_builtin_effect(name, &args, line)?;
                 }
-                if self.writes_noted() && CHANGES.contains(name) {
+                if self.writes_noted() && (CHANGES.contains(name) || changes_as_called(name, &args)) {
                     self.no_writes(name, line)?;
                 }
                 // Another function of its `parallel` failed: not a write more (FEEDBACK55.md,
@@ -5245,12 +5296,17 @@ impl Interp {
     fn call_closure_with(&mut self, c: &Closure, args: impl IntoIterator<Item = Option<Value>>, nargs: usize, line: u32) -> Result<Value, Ctrl> {
         let def = c.def.clone();
         let mask = if self.fuel != u64::MAX { self.script_mask(c) } else { None };
-        let outer = mask.map(|m| std::mem::replace(&mut self.allowed, m));
+        let outer = mask.map(|(m, _)| std::mem::replace(&mut self.allowed, m));
         let r = self.enter_call(&def, nargs, line, |this| this.call_closure_inner(c, &def, args, line));
         if let Some(a) = outer {
             self.allowed = a;
         }
         let r = r?;
+        // A helper the program passed in may wait (a query, a call): the script's clock is looked
+        // at as it returns (FEEDBACK75.md, Q-1055; branch feedback75).
+        if let Some((_, true)) = mask {
+            self.script_clock(line)?;
+        }
         if let (Some(ety), Value::Err(payload, _, _)) = (&def.err, &r) {
             if !self.fits(ety, payload) {
                 return in_file(fail(
@@ -5407,28 +5463,77 @@ impl Interp {
     /// In a sandboxed script, the effects function `c` may use: none for the
     /// script's own, those the program had for a helper it passed in.
     #[cold]
-    fn script_mask(&self, c: &Closure) -> Option<u8> {
-        let (root, outer) = self.script.as_ref()?;
-        Some(if within(&c.env, root) { 0 } else { *outer })
+    fn script_mask(&self, c: &Closure) -> Option<(u8, bool)> {
+        let (root, outer, ..) = self.script.as_ref()?;
+        Some(if within(&c.env, root) { (0, false) } else { (*outer, true) })
     }
 
-    /// One step of a sandboxed script's budget.
+    /// One step of a sandboxed script's budget, and every 256th its clock: a step reads less than
+    /// 1 KB unless it pays for more, which looks at the clock itself, as a helper's call does as it
+    /// returns (FEEDBACK75.md, Q-1055; branch feedback75).
     #[cold]
     fn burn(&mut self, line: u32) -> Result<(), Ctrl> {
         if self.fuel == 0 {
             return fail(line, "the script took too many steps");
         }
         self.fuel -= 1;
+        if self.fuel & 255 == 0 {
+            self.script_clock(line)?;
+        }
         Ok(())
     }
 
+    /// A sandboxed script stopped at its time, `run_script`'s `timeout` (100 ms unless it says):
+    /// a step of a script that only computes keeps its instance's loop, and 20,000 of them each
+    /// reading a list of 90,000 items held every other request for 13 s (FEEDBACK75.md, Q-1055;
+    /// branch feedback75).
+    #[cold]
+    fn script_clock(&self, line: u32) -> Result<(), Ctrl> {
+        match &self.script {
+            Some((_, _, until, ms)) if std::time::Instant::now() >= *until => fail(line, format!("the script took longer than its {} ms", ms)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Steps for what a builtin or an operator in a sandboxed script reads, one for each KB, as
+    /// what it makes costs (`pay_for`): `unique`, `min` or `==` on a list near 1 MB cost one step
+    /// whatever they read (FEEDBACK75.md, Q-1055; branch feedback75). Counted no further than the
+    /// steps left, so the count costs no more than the steps would.
+    #[cold]
+    pub(crate) fn script_read<'a>(&mut self, read: impl IntoIterator<Item = &'a Value>, line: u32) -> Result<(), Ctrl> {
+        if self.fuel == u64::MAX {
+            return Ok(());
+        }
+        let most = (self.fuel as usize).saturating_add(1).saturating_mul(1024);
+        let mut n = 0usize;
+        for v in read {
+            n = n.saturating_add(crate::script::read_size(v, most.saturating_sub(n)));
+            if n >= most {
+                break;
+            }
+        }
+        let cost = (n / 1024) as u64;
+        if cost == 0 {
+            return Ok(());
+        }
+        if cost > self.fuel {
+            return fail(line, "the script took too many steps");
+        }
+        self.fuel -= cost;
+        self.script_clock(line)
+    }
+
     /// A builtin called by a sandboxed script: one that would make a value
-    /// over the limit is refused before it runs.
+    /// over the limit is refused before it runs, and what it reads is paid
+    /// for (`script_read`), but the list or map that `len`, `get`, `has`,
+    /// `first`, `last` and the like look into without reading it.
     #[cold]
     fn script_builtin(&mut self, name: &str, func: BuiltinFn, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
         if crate::script::would_be_too_big(name, &args) {
             return fail(line, "the script made a value larger than 1 MB");
         }
+        let skip = usize::from(crate::script::looks_into(name, &args));
+        self.script_read(args.iter().skip(skip), line)?;
         let v = func(self, args, line)?;
         self.script_made(v, line)
     }
@@ -6014,7 +6119,15 @@ impl Interp {
                     }
                 }
                 if let Some(Some(n)) = rest {
-                    binds.push((n.clone(), Value::list(l[items.len()..].to_vec())));
+                    // In a script, the rest is a list made, paid for as one: `let [h, ..t] = huge`
+                    // copied a list of 3 million for nothing, past the script's time
+                    // (FEEDBACK75.md, Q-1055, found in review; branch feedback75).
+                    if self.fuel != u64::MAX && (l.len() - items.len()).saturating_mul(8) > crate::script::SCRIPT_BYTES {
+                        return fail(0, "the script made a value larger than 1 MB");
+                    }
+                    let tail = Value::list(l[items.len()..].to_vec());
+                    let tail = if self.fuel != u64::MAX { self.script_made(tail, 0)? } else { tail };
+                    binds.push((n.clone(), tail));
                 }
                 Some(v.clone())
             }

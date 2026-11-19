@@ -129,6 +129,94 @@ struct Tables {
     elem_ids: HashMap<T, u32>,
     shapes: Vec<Shape>,
     shape_ids: HashMap<Shape, u32>,
+    /// Each element's and shape's size (the types it is made of, counted as a tree) and depth,
+    /// by index, so that none grows past `MOST_TYPE_SIZE` or `MOST_TYPE_DEPTH`; the cells all
+    /// the tables hold, to `MOST_TYPE_CELLS`; and the unions already made, by their two sides
+    /// (FEEDBACK75.md, Q-1053; branch feedback75).
+    elem_sizes: Vec<(u32, u32)>,
+    shape_sizes: Vec<(u32, u32)>,
+    cells: usize,
+    made: u32,
+    elem_unions: HashMap<(u32, u32), u32, crate::value::BuildFx>,
+    shape_unions: HashMap<(u32, u32), u32, crate::value::BuildFx>,
+}
+
+/// What a type may grow to before what it holds is taken as unknown, as for `any`: `[x, {a: x}]`
+/// made again on each of 26 lines doubled the type each time, and a 699-byte program checked by
+/// `check_program` took the server's memory until it was killed (FEEDBACK75.md, Q-1053; branch
+/// feedback75). Unknown never makes an error, so a type cut short only says less.
+/// That is a confined check's (`check_program`, of code from a program's users); another's are far
+/// larger, so that a data table written out (1,000 records of 10 fields, a translation table of 21
+/// languages) keeps its fields known and its mistakes said, as in 0.8.8 (FEEDBACK75.md, Q-1053,
+/// found in review; branch feedback75): the union memo and `side_by_side` keep them cheap.
+const MOST_TYPE_SIZE: u32 = 10_000;
+const MOST_TYPE_DEPTH: u32 = 16;
+const MOST_TYPE_SIZE_OWN: u32 = 1_000_000;
+const MOST_TYPE_DEPTH_OWN: u32 = 64;
+/// The cells (elements, and fields of shapes) one check keeps: past them a confined check ends with
+/// one error, as past `CONFINED_TIME`; another's further types are unknown, said nothing of, as
+/// 0.8.8 checked and ran such a program (FEEDBACK75.md, Q-1053, found in review; branch
+/// feedback75).
+const MOST_TYPE_CELLS: usize = 1 << 20;
+/// What one check measures for "did you mean" (`Checker::suggest`, `osa_band`'s cost, about 3 to 6
+/// ns a unit): a confined check's, about 200,000 names compared, and another's, about 1 to 2 s, in
+/// which 3,000 unknown names among 3,000 functions of 67 letters, or of letters not ASCII, each get
+/// theirs, as in 0.8.8, where they took 82 s and 5 s (FEEDBACK75.md, Q-1120, found in review;
+/// branch feedback75).
+const MOST_SUGGEST_COMPARED: u64 = 1_000_000;
+const MOST_SUGGEST_COST: u64 = 320_000_000;
+/// How long a confined check (`check_program`, of code from a program's users) may take.
+const CONFINED_TIME: std::time::Duration = std::time::Duration::from_secs(2);
+/// What a check that ran past its budget says, in place of all else.
+const TOO_COMPLEX: &str = "the code is too complex to check: its types grew past what a check keeps, or the check took too long";
+
+/// The most a type's size and depth may be in the check on this thread.
+fn type_limits() -> (u32, u32) {
+    if CONFINED.with(|c| c.get()) {
+        (MOST_TYPE_SIZE, MOST_TYPE_DEPTH)
+    } else {
+        (MOST_TYPE_SIZE_OWN, MOST_TYPE_DEPTH_OWN)
+    }
+}
+
+/// A type's size and depth, from its parts' recorded in the tables.
+fn t_size(t: T, tables: &Tables) -> (u32, u32) {
+    let (mut size, mut depth) = (1u32, 1u32);
+    if t.bits & LIST != 0 && t.elem != 0 {
+        let (s, d) = tables.elem_sizes[t.elem as usize - 1];
+        size = size.saturating_add(s);
+        depth = depth.max(d.saturating_add(1));
+    }
+    if t.bits & MAP != 0 && t.shape != 0 {
+        let (s, d) = tables.shape_sizes[t.shape as usize - 1];
+        size = size.saturating_add(s);
+        depth = depth.max(d.saturating_add(1));
+    }
+    (size, depth)
+}
+
+/// Whether one more entry of `cells` cells fits in the tables; past them the check is too
+/// complex, and ends (FEEDBACK75.md, Q-1053; branch feedback75).
+fn room_for(tables: &mut Tables, cells: usize) -> bool {
+    if OVER_BUDGET.with(|o| o.get()) {
+        return false;
+    }
+    // A confined check's time, looked at every 256th type made (FEEDBACK75.md, Q-1053; branch
+    // feedback75).
+    tables.made = tables.made.wrapping_add(1);
+    let late = tables.made % 256 == 0 && DEADLINE.with(|d| d.get()).is_some_and(|d| std::time::Instant::now() >= d);
+    if late {
+        OVER_BUDGET.with(|o| o.set(true));
+        return false;
+    }
+    if tables.cells.saturating_add(cells) > MOST_TYPE_CELLS {
+        if CONFINED.with(|c| c.get()) {
+            OVER_BUDGET.with(|o| o.set(true));
+        }
+        return false;
+    }
+    tables.cells += cells;
+    true
 }
 
 thread_local! {
@@ -146,6 +234,12 @@ thread_local! {
     /// Working out what `User(...)` takes: in it, and in the records inside,
     /// a field with a default may be left out.
     static RECORD_INPUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// When a confined check must end, and whether the check on this thread has run past its
+    /// time or its tables' room (FEEDBACK75.md, Q-1053; branch feedback75).
+    static DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    /// Whether the check on this thread is a confined one, and so its types' limits.
+    static CONFINED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static OVER_BUDGET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 thread_local! {
@@ -259,7 +353,15 @@ fn elem_id(e: T) -> u32 {
         if let Some(i) = t.elem_ids.get(&e) {
             return *i;
         }
+        // Past its size or depth what a list holds is unknown (FEEDBACK75.md, Q-1053; branch
+        // feedback75).
+        let (size, depth) = t_size(e, &t);
+        let (most_size, most_depth) = type_limits();
+        if size > most_size || depth > most_depth || !room_for(&mut t, 1) {
+            return 0;
+        }
         t.elems.push(e);
+        t.elem_sizes.push((size, depth));
         let i = t.elems.len() as u32;
         t.elem_ids.insert(e, i);
         i
@@ -282,7 +384,20 @@ fn shape_id(mut fields: Vec<(Arc<str>, T)>) -> u32 {
         if let Some(i) = t.shape_ids.get(&shape) {
             return *i;
         }
+        // Past its size or depth a map's fields are unknown (FEEDBACK75.md, Q-1053; branch
+        // feedback75).
+        let (mut size, mut depth) = (0u32, 0u32);
+        for (_, ft) in shape.iter() {
+            let (s, d) = t_size(*ft, &t);
+            size = size.saturating_add(s);
+            depth = depth.max(d);
+        }
+        let (most_size, most_depth) = type_limits();
+        if size > most_size || depth > most_depth || !room_for(&mut t, shape.len().max(1)) {
+            return 0;
+        }
         t.shapes.push(shape.clone());
+        t.shape_sizes.push((size, depth));
         let i = t.shapes.len() as u32;
         t.shape_ids.insert(shape, i);
         i
@@ -349,53 +464,101 @@ fn join_part(a_has: bool, a: u32, b_has: bool, b: u32, join: fn(u32, u32) -> u32
     }
 }
 
+/// A union already made of the two sides, in either order (FEEDBACK75.md, Q-1053; branch
+/// feedback75): `[x, {a: x}]` on each line joined the same parts again, twice as often each line.
+fn union_made(shapes: bool, a: u32, b: u32, make: impl FnOnce() -> u32) -> u32 {
+    fn pick(t: &mut Tables, shapes: bool) -> &mut HashMap<(u32, u32), u32, crate::value::BuildFx> {
+        if shapes { &mut t.shape_unions } else { &mut t.elem_unions }
+    }
+    let key = (a.min(b), a.max(b));
+    if let Some(i) = TABLES.with(|t| pick(&mut t.borrow_mut(), shapes).get(&key).copied()) {
+        return i;
+    }
+    let i = make();
+    TABLES.with(|t| pick(&mut t.borrow_mut(), shapes).insert(key, i));
+    i
+}
+
 fn union_elems(a: u32, b: u32) -> u32 {
-    elem_id(elem_of(a).union(elem_of(b)))
+    union_made(false, a, b, || elem_id(elem_of(a).union(elem_of(b))))
 }
 
 /// One map or the other: every field either has, null where one has none.
 fn union_shapes(a: u32, b: u32) -> u32 {
-    let (Some(x), Some(y)) = (shape_of(a), shape_of(b)) else { return 0 };
-    let find = |s: &Shape, k: &str| s.iter().find(|(n, _)| &**n == k).map(|(_, t)| *t);
-    let mut out: Vec<(Arc<str>, T)> = Vec::new();
-    for (k, t) in x.iter() {
-        out.push((k.clone(), t.union(find(&y, k).unwrap_or(T::of(NIL)))));
-    }
-    for (k, t) in y.iter() {
-        if find(&x, k).is_none() {
-            out.push((k.clone(), t.union(T::of(NIL))));
+    union_made(true, a, b, || union_shapes_made(a, b))
+}
+
+/// The fields of two shapes, which `shape_id` keeps sorted by name, side by side in one pass: each
+/// field with the other's of its name, or `None`. It looked up each of one's fields in the other,
+/// and two maps of 10,000 fields took 10^8 steps a union (FEEDBACK75.md, Q-1053; branch
+/// feedback75).
+fn side_by_side<'s>(x: &'s Shape, y: &'s Shape) -> Vec<(&'s Arc<str>, Option<T>, Option<T>)> {
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::with_capacity(x.len().max(y.len()));
+    loop {
+        match (x.get(i), y.get(j)) {
+            (Some((kx, tx)), Some((ky, ty))) if kx == ky => {
+                out.push((kx, Some(*tx), Some(*ty)));
+                (i, j) = (i + 1, j + 1);
+            }
+            (Some((kx, tx)), Some((ky, _))) if kx < ky => {
+                out.push((kx, Some(*tx), None));
+                i += 1;
+            }
+            (_, Some((ky, ty))) => {
+                out.push((ky, None, Some(*ty)));
+                j += 1;
+            }
+            (Some((kx, tx)), None) => {
+                out.push((kx, Some(*tx), None));
+                i += 1;
+            }
+            (None, None) => return out,
         }
     }
-    shape_id(out)
+}
+
+fn union_shapes_made(a: u32, b: u32) -> u32 {
+    let (Some(x), Some(y)) = (shape_of(a), shape_of(b)) else { return 0 };
+    let nil = T::of(NIL);
+    shape_id(side_by_side(&x, &y).into_iter().map(|(k, tx, ty)| (k.clone(), tx.unwrap_or(nil).union(ty.unwrap_or(nil)))).collect())
 }
 
 /// `merge(a, b)` and `a + b` on maps: b's fields over a's.
 fn merge_maps(a: T, b: T) -> T {
     match (a.fields(), b.fields()) {
+        // In one pass, as `side_by_side` reads two shapes (FEEDBACK75.md, Q-1053; branch
+        // feedback75).
         (Some(x), Some(y)) if a.bits & NIL == 0 && b.bits & NIL == 0 => {
-            let mut out: Vec<(Arc<str>, T)> = y.iter().cloned().collect();
-            out.extend(x.iter().filter(|(k, _)| !y.iter().any(|(n, _)| n == k)).cloned());
-            map_of(out)
+            map_of(side_by_side(&x, &y).into_iter().filter_map(|(k, tx, ty)| ty.or(tx).map(|t| (k.clone(), t))).collect())
         }
         _ => T::of(MAP),
     }
 }
 
-/// A type as the checker knows it: `list<int>`, `{ id: int, title: str } | null`.
+/// A type as the checker knows it: `list<int>`, `{ id: int, title: str } | null`. Past 64
+/// lists and maps, what is left is said by its kind: the parts of a type are shared, and a type
+/// made of two of the one before it, 26 times over, was written out as 2^26 copies
+/// (FEEDBACK75.md, Q-1053; branch feedback75).
 fn t_text(t: T) -> String {
-    if t.is_any() || (t.elem == 0 && t.shape == 0) {
+    t_text_in(t, &mut 64)
+}
+
+fn t_text_in(t: T, left: &mut u32) -> String {
+    if t.is_any() || (t.elem == 0 && t.shape == 0) || *left == 0 {
         return bits_text(t.bits);
     }
+    *left -= 1;
     let mut parts: Vec<String> = Vec::new();
     let rest = t.bits & !(NIL | if t.elem != 0 { LIST } else { 0 } | if t.shape != 0 { MAP } else { 0 });
     if rest != 0 {
         parts.push(bits_text(rest));
     }
     if t.elem != 0 && t.bits & LIST != 0 {
-        parts.push(format!("list<{}>", t_text(elem_of(t.elem))));
+        parts.push(format!("list<{}>", t_text_in(elem_of(t.elem), left)));
     }
     if let Some(s) = shape_of(t.shape).filter(|_| t.bits & MAP != 0) {
-        let mut fs: Vec<String> = s.iter().take(6).map(|(k, ft)| format!("{}: {}", k, t_text(*ft))).collect();
+        let mut fs: Vec<String> = s.iter().take(6).map(|(k, ft)| format!("{}: {}", k, t_text_in(*ft, left))).collect();
         if s.len() > 6 {
             fs.push("…".into());
         }
@@ -970,7 +1133,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("markdown", "str, map | null=", "html"),
     ("markdown_page", "str, map | null=", "html"),
     ("highlight", "str, str | null=", "html"),
-    ("run_script", "str, map | null=", "any"),
+    ("run_script", "str, map | null=, map | null=", "any"),
     ("sql_name", "str | list", "str"),
     ("sql_param", "str | list", "str"),
     // `ask(message, options)` on a page, `about(question, choices, default)` in a tool, once
@@ -1809,6 +1972,21 @@ pub struct Options {
     /// Warn of classes markup writes that no style sheet has a rule for
     /// (`quillo check`, and `quillo lsp`; branch class-tools).
     pub classes: bool,
+    /// How long a confined check may take: 2 s unless given (FEEDBACK75.md, Q-1053; branch
+    /// feedback75).
+    pub time: Option<std::time::Duration>,
+}
+
+/// A problem the native parser found in a `.rs` file, as a confined check says it: the function's
+/// name, when it is one, and none of the file's text (FEEDBACK75.md, Q-1095; branch feedback75).
+fn unquoted_native(msg: &str) -> String {
+    let name = msg.strip_prefix('`').and_then(|rest| rest.split_once('`')).filter(|(n, tail)| {
+        tail.starts_with(" is not exported") && !n.is_empty() && n.len() <= 64 && n.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    match name {
+        Some((n, _)) => format!("`{}` is not exported: its parameters, its result or its name cannot cross between Rust and Quillo (a check of code from a program's users quotes no file's text)", n),
+        None => "this line of a Rust file cannot be used from Quillo (a check of code from a program's users quotes no file's text)".to_string(),
+    }
 }
 
 /// Why a confined check reads no other file (FEEDBACK55.md, Q-703; branch feedback55).
@@ -1912,10 +2090,26 @@ fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: Hash
     });
     if outermost {
         TABLES.with(|t| *t.borrow_mut() = Tables::default());
+        // A check's budget: its tables' room, and for a confined one its time (FEEDBACK75.md,
+        // Q-1053; branch feedback75).
+        OVER_BUDGET.with(|o| o.set(false));
+        CONFINED.with(|c| c.set(opts.confined));
+        DEADLINE.with(|d| d.set(opts.confined.then(|| std::time::Instant::now() + opts.time.unwrap_or(CONFINED_TIME))));
     }
     // A mounted program's types are its own.
     let outer_records = RECORDS.with(|r| std::mem::take(&mut *r.borrow_mut()));
     let mut a = check_source_in(src, file, base_dir, overrides, opts);
+    // Past its budget, a check ends with one error in place of what it said, which a walk cut
+    // short cannot be sure of (FEEDBACK75.md, Q-1053; branch feedback75). The tables are given
+    // back at once, not kept until the thread's next check.
+    if outermost && OVER_BUDGET.with(|o| o.get()) {
+        a.diagnostics = vec![Diagnostic { file: file.to_string(), line: 0, severity: Severity::Error, message: TOO_COMPLEX.to_string() }];
+        TABLES.with(|t| *t.borrow_mut() = Tables::default());
+    }
+    if outermost {
+        DEADLINE.with(|d| d.set(None));
+        CONFINED.with(|c| c.set(false));
+    }
     // What AI clients are told of the program, its main file's `//!` block among it, past what a
     // client may keep (FEEDBACK56.md, Part D; branch feedback56).
     // A character in the block that a reader of the file does not see is an error, so the program
@@ -2240,6 +2434,14 @@ struct Checker {
     /// body is known (`idempotent_reaches_outside`).
     idempotent_at: Vec<(Arc<str>, u32, Arc<FnDef>)>,
     walked: std::cell::Cell<usize>,
+    /// What "did you mean" measured in this check (`suggest`), and the names' lower case it keeps.
+    suggested: std::cell::Cell<u64>,
+    lowered: std::cell::RefCell<Lowered>,
+    /// Expressions walked, and whether the check has run past its budget (FEEDBACK75.md,
+    /// Q-1053; branch feedback75).
+    steps: u32,
+    budget_left: u32,
+    over_budget: bool,
     /// The parameters' types of the lambda about to be checked, from the
     /// list a builtin gives it: `xs | map((x) => ...)`.
     hint: Option<Vec<T>>,
@@ -2272,6 +2474,18 @@ struct Checker {
     /// The program's functions that give only SQL-safe text (each result
     /// `sql_name(...)`, say): calling one is as safe as `sql_name` itself.
     sql_name_fns: HashSet<String>,
+    /// The program's functions that give back SQL built from values, as `notes_of(owner)` with
+    /// `return "... '" + owner + "'"` (FEEDBACK75.md, Q-1085; branch feedback75).
+    sql_built_fns: HashMap<String, bool>,
+    /// What `SqlVar::Parts` stands for: the fields or items of a map or list written out that hold
+    /// built SQL (FEEDBACK75.md, Q-1085, found in review; branch feedback75).
+    sql_parts: Vec<SqlParts>,
+    /// While `gives_sql_built` reads a function as given SQL-safe values: `str`, `trim`, `lower`
+    /// and `upper` of safe text are safe too.
+    sql_pass_safe: bool,
+    /// Every name given built SQL in this check, in any scope: where `sql_var` is looked at for a
+    /// call of a variable's lambda (FEEDBACK75.md, Q-1085; branch feedback75).
+    sql_built_vars: HashSet<String>,
     /// The program has `tenant_from`: a global written by a request is every tenant's.
     tenants: bool,
     /// What is known of variables' text for the SQL warning, innermost
@@ -2321,6 +2535,27 @@ fn both_run(a: &[Step], b: &[Step]) -> bool {
 }
 
 /// What a variable holds, as far as SQL goes.
+/// The parts of a map or a list written out that hold SQL built from values: its fields by name,
+/// its items by place, and whether joining it builds SQL (FEEDBACK75.md, Q-1085, found in review;
+/// branch feedback75).
+/// Past 64 parts, any part is taken as built: a part's place is kept for so many only.
+#[derive(Debug, Default)]
+struct SqlParts {
+    fields: Vec<String>,
+    items: Vec<usize>,
+    joined: bool,
+    many: bool,
+}
+
+impl SqlParts {
+    fn field(&self, k: &str) -> bool {
+        self.many || self.fields.iter().any(|f| f == k)
+    }
+    fn item(&self, i: usize) -> bool {
+        self.many || self.items.contains(&i)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum SqlVar {
     Other,
@@ -2331,6 +2566,8 @@ enum SqlVar {
     Built,
     /// A connection from `db.connect`.
     Conn,
+    /// A map or list written out with built SQL in some parts (`Checker::sql_parts`).
+    Parts(u32),
 }
 
 fn def_key(d: &Arc<FnDef>) -> usize {
@@ -2403,6 +2640,11 @@ impl Checker {
             idempotent_at: Vec::new(),
             reached_types: Default::default(),
             walked: Default::default(),
+            suggested: Default::default(),
+            lowered: Default::default(),
+            steps: 0,
+            budget_left: 256,
+            over_budget: false,
             hint: None,
             strict_null: false,
             letting: Vec::new(),
@@ -2427,6 +2669,10 @@ impl Checker {
             unparsed_names: HashSet::new(),
             unparsed_texts: Vec::new(),
             sql_name_fns: HashSet::new(),
+            sql_built_fns: HashMap::new(),
+            sql_parts: Vec::new(),
+            sql_pass_safe: false,
+            sql_built_vars: HashSet::new(),
             tenants: false,
             sql_vars: Vec::new(),
             next_sql: SqlVar::Other,
@@ -2483,7 +2729,7 @@ impl Checker {
     }
 
     fn options(&self) -> Options {
-        Options { strict_null: self.strict_null, confined: self.confined, css: false, classes: false }
+        Options { strict_null: self.strict_null, confined: self.confined, css: false, classes: false, time: None }
     }
 
     /// The file a `use`, `mount` or `service` names; when confined, none
@@ -2775,6 +3021,10 @@ impl Checker {
                         Ok(src) => {
                             let parsed = crate::native::parse(&src);
                             for (l, msg) in parsed.problems {
+                                // A confined check quotes no file's text: a type was quoted from
+                                // its `:` to the next `,` or `)`, across lines (FEEDBACK75.md,
+                                // Q-1095; branch feedback75).
+                                let msg = if self.confined { unquoted_native(&msg) } else { msg };
                                 self.diag_at(fname.clone(), l, Severity::Warning, msg);
                             }
                             let short = full.file_name().map_or(String::new(), |f| f.to_string_lossy().to_string());
@@ -2934,16 +3184,40 @@ impl Checker {
         // Helpers such as `fn table_of(id) = sql_name(`obj_${id}`)`, found
         // again until no more are: one may call another.
         let defs: Vec<&FnDef> = order.iter().filter_map(|it| if let Stmt::Fn(d) = &it.stmt { Some(&**d) } else { None }).collect();
-        loop {
-            let found: Vec<String> = defs
-                .iter()
-                .filter(|d| !d.component && !self.sql_name_fns.contains(&d.name) && gives_sql_safe(&d.body, &self.sql_name_fns))
-                .map(|d| d.name.clone())
-                .collect();
-            if found.is_empty() {
-                break;
+        // Each function read once, and again only when one it calls is found: a round over every
+        // function for each one found took 23 s on a chain of 30,000 (FEEDBACK75.md, Q-1053,
+        // found in review; branch feedback75). A confined check's clock is read as it goes.
+        // Read in an order that has the functions a function calls read first, so a chain of
+        // helpers is found in one pass, not one helper a round with its callers read again each
+        // round (found in review).
+        let callers = callers_by_name(&defs);
+        let order_read = callees_first(&defs, &callers);
+        let mut graphs: Vec<GraphSlot> = defs.iter().map(|_| GraphSlot::Unread).collect();
+        let mut queue = Worklist::new(&order_read);
+        while let Some(i) = queue.next() {
+            let d = defs[i];
+            if d.component || self.sql_name_fns.contains(&d.name) || !gives_sql_safe(&d.body, &self.sql_name_fns, &mut graphs[i]) {
+                continue;
             }
-            self.sql_name_fns.extend(found);
+            self.sql_name_fns.insert(d.name.clone());
+            queue.again(callers.get(d.name.as_str()));
+        }
+        // And those that give back SQL built from values: from what they are given, or whatever
+        // they are given (FEEDBACK75.md, Q-1085; branch feedback75). Only a function a result of
+        // which may be built text is read at all.
+        let maybe: Vec<bool> = defs.iter().map(|d| !d.component && !self.sql_name_fns.contains(&d.name) && fn_results(d).iter().any(|x| may_build(x))).collect();
+        let mut queue = Worklist::new(&order_read);
+        while let Some(i) = queue.next() {
+            let d = defs[i];
+            if !maybe[i] || self.sql_built_fns.get(&d.name) == Some(&true) {
+                continue;
+            }
+            let was = self.sql_built_fns.get(&d.name).copied();
+            let Some(always) = self.gives_sql_built(d) else { continue };
+            if was != Some(always) {
+                self.sql_built_fns.insert(d.name.clone(), always);
+                queue.again(callers.get(d.name.as_str()));
+            }
         }
         self.check_nesting(&order);
         self.page_states_through_calls(&order);
@@ -3102,6 +3376,9 @@ impl Checker {
                         if !self.assigned.contains(n.as_str()) {
                             let k = self.sql_kind(e);
                             self.sql_vars.push((0, n.to_string(), k));
+                            if matches!(k, SqlVar::Built | SqlVar::Parts(_)) {
+                                self.sql_built_vars.insert(n.to_string());
+                            }
                             let u = self.url_fixed(e);
                             self.url_vars.push((0, n.to_string(), u));
                         }
@@ -4148,6 +4425,9 @@ impl Checker {
     fn define(&mut self, name: &str, t: T, sig: Option<Arc<Sig>>, kind: Kind) {
         let sql = std::mem::replace(&mut self.next_sql, SqlVar::Other);
         self.sql_vars.push((self.scopes.len(), name.to_string(), sql));
+        if matches!(sql, SqlVar::Built | SqlVar::Parts(_)) {
+            self.sql_built_vars.insert(name.to_string());
+        }
         let url = std::mem::replace(&mut self.next_url, false);
         self.url_vars.push((self.scopes.len(), name.to_string(), url));
         let v = Var { t, sig, file: self.file.clone(), line: self.line, kind, used: false, ready: true };
@@ -4411,10 +4691,14 @@ impl Checker {
     /// (FEEDBACK45.md, Q-524). Says which letter, by its code point.
     fn lookalike(&self, name: &str) -> Option<String> {
         let key: String = name.chars().map(latin_lookalike).collect();
-        let mut cands: Vec<(&str, u32)> = self.scopes.iter().flat_map(|s| s.iter().map(|(k, v)| (k.as_str(), v.line))).collect();
-        cands.extend(self.globals.iter().filter(|(_, v)| &*v.file != "<builtin>").map(|(k, v)| (k.as_str(), v.line)));
-        cands.sort_unstable();
-        let (other, line) = cands.into_iter().find(|(c, _)| *c != name && c.chars().map(latin_lookalike).collect::<String>() == key)?;
+        let count = name.chars().count();
+        // The first by name and line, as when they were sorted, without sorting every name for
+        // each unknown one; two ASCII names look alike only if they are one, and letters are taken
+        // one for one (FEEDBACK75.md, Q-1120, found in review; branch feedback75).
+        let cands = self.scopes.iter().flat_map(|s| s.iter().map(|(k, v)| (k.as_str(), v.line))).chain(self.globals.iter().filter(|(_, v)| &*v.file != "<builtin>").map(|(k, v)| (k.as_str(), v.line)));
+        let (other, line) = cands
+            .filter(|(c, _)| *c != name && !(name.is_ascii() && c.is_ascii()) && c.chars().count() == count && c.chars().map(latin_lookalike).collect::<String>() == key)
+            .min()?;
         let odd = |w: &str| w.chars().find(|c| latin_lookalike(*c) != *c);
         let (c, whose) = match odd(name) {
             Some(c) => (c, "this one".to_string()),
@@ -4442,12 +4726,19 @@ impl Checker {
         if let Some(q) = other_language(name) {
             return format!(" (did you mean `{}`?)", q);
         }
-        // The same answer every run: the candidates in a fixed order, ties broken by `closest`.
-        let mut cands: Vec<&str> = self.scopes.iter().flat_map(|s| s.keys().map(|k| k.as_str())).collect();
-        cands.extend(self.globals.keys().map(|k| k.as_str()));
-        cands.sort_unstable();
-        cands.dedup();
-        match closest(name, cands.into_iter()) {
+        // The same answer every run, whatever the order: `closest` breaks ties by name. Past what
+        // one check may measure, no more are looked for: 4,000 names a letter off 4,000 functions
+        // took 11 s, and 3,000 of 67 letters 82 s (FEEDBACK75.md, Q-1120, found in review; branch
+        // feedback75). A confined check measures less, and names of at most 64 letters.
+        let (most, most_len) = if self.confined { (MOST_SUGGEST_COMPARED, 64) } else { (MOST_SUGGEST_COST, 1024) };
+        let mut cost = self.suggested.get();
+        if cost > most {
+            return String::new();
+        }
+        let cands = self.scopes.iter().flat_map(|s| s.keys().map(|k| k.as_str())).chain(self.globals.keys().map(|k| k.as_str()));
+        let near = closest_within(name, cands, &mut cost, most_len, &mut self.lowered.borrow_mut());
+        self.suggested.set(cost);
+        match near {
             Some(n) => format!(" (did you mean `{}`?)", n),
             None => String::new(),
         }
@@ -5112,6 +5403,9 @@ impl Checker {
                 if let Some(k) = now {
                     if let Some(v) = self.sql_vars.iter_mut().rev().find(|(_, n, _)| n == name) {
                         v.2 = k;
+                        if matches!(k, SqlVar::Built | SqlVar::Parts(_)) {
+                            self.sql_built_vars.insert(name.to_string());
+                        }
                     }
                 }
                 let url = matches!(op, AssignOp::Set) && self.url_fixed(e);
@@ -6072,10 +6366,33 @@ impl Checker {
 
     // ---- expressions ---------------------------------------------------
 
+    /// Whether the check has run past its budget, looked at once `budget_left` runs out: then each
+    /// expression asks again, and is not walked (FEEDBACK75.md, Q-1053; branch feedback75).
+    #[cold]
+    fn past_budget(&mut self) -> bool {
+        if !self.over_budget {
+            self.over_budget = OVER_BUDGET.with(|o| {
+                if DEADLINE.with(|d| d.get()).is_some_and(|d| std::time::Instant::now() >= d) {
+                    o.set(true);
+                }
+                o.get()
+            });
+        }
+        self.budget_left = if self.over_budget { 1 } else { 256 };
+        self.over_budget
+    }
+
     fn expr(&mut self, e: &Expr) -> T {
         // The parser refuses code that nests deeper; a guard all the same.
         if self.depth >= 2 * crate::parser::MAX_NESTING {
             self.error("the code nests too deeply");
+            return T::ANY;
+        }
+        // A check past its budget walks no further: what it says is replaced by one error at
+        // its end. The time is looked at every 256th expression, counted down so an expression
+        // pays one subtraction (FEEDBACK75.md, Q-1053; branch feedback75).
+        self.budget_left -= 1;
+        if self.budget_left == 0 && self.past_budget() {
             return T::ANY;
         }
         self.depth += 1;
@@ -6114,17 +6431,25 @@ impl Checker {
             }
             Expr::Map(entries) => {
                 let mut fields: Vec<(Arc<str>, T)> = Vec::new();
+                // Each key's place, so a map of 100,000 fields is not read once for each, as it
+                // was in 14.9 s (FEEDBACK75.md, Q-1053, found in review; branch feedback75).
+                let mut at: HashMap<&str, usize> = HashMap::new();
                 for (k, v) in entries {
                     let t = self.expr(v);
                     // A key written twice: the last value is kept, with nothing said, however each
                     // was written (`a`, `"a"`, `{ a, a: 2 }`). A spread between them is no map
                     // literal's key: the parser makes a map of each part (FEEDBACK55.md, Q-794;
                     // branch feedback55).
-                    if fields.iter().any(|(n, _)| &**n == k) {
-                        self.warn(format!("the key `{}` is written twice in this map: the last value is the one kept", k));
+                    match at.get(k.as_str()) {
+                        Some(&i) => {
+                            self.warn(format!("the key `{}` is written twice in this map: the last value is the one kept", k));
+                            fields[i].1 = t;
+                        }
+                        None => {
+                            at.insert(k.as_str(), fields.len());
+                            fields.push((Arc::from(k.as_str()), t));
+                        }
                     }
-                    fields.retain(|(n, _)| &**n != k);
-                    fields.push((Arc::from(k.as_str()), t));
                 }
                 // `{}` is a map things are added to: what it holds is not known.
                 if fields.is_empty() { T::of(MAP) } else { map_of(fields) }
@@ -8345,9 +8670,38 @@ impl Checker {
         self.sql_vars.iter().rev().find(|(_, n, _)| n == name).map_or(SqlVar::Other, |v| v.2)
     }
 
-    /// What a `let` of `e` holds.
-    fn sql_kind(&self, e: &Expr) -> SqlVar {
-        if self.sql_built(e) {
+    /// What a `let` of `e` holds. A list or a map written out with built SQL in it, or text
+    /// next to a value in a list, and a lambda that gives back built SQL, hold it too
+    /// (FEEDBACK75.md, Q-1085; branch feedback75).
+    fn sql_kind(&mut self, e: &Expr) -> SqlVar {
+        let parts = match e {
+            Expr::List(items) => {
+                // Each name in it read once, not once for each place it is in: a list of 250,000 of
+                // one variable looked the variable up 750,000 times (found in review).
+                let mut names: HashMap<&str, (bool, bool, bool)> = HashMap::new();
+                let mut kind = |x: &Expr| match x {
+                    Expr::Ident(n, _) => *names.entry(n.as_str()).or_insert_with(|| (self.sql_built(x), self.sql_text(x), self.sql_safe(x))),
+                    _ => (self.sql_built(x), self.sql_text(x), self.sql_safe(x)),
+                };
+                let kinds: Vec<(bool, bool, bool)> = items.iter().map(&mut kind).collect();
+                let built: Vec<usize> = kinds.iter().enumerate().filter(|(_, k)| k.0).map(|(i, _)| i).collect();
+                let joined = !built.is_empty() || (kinds.iter().any(|k| k.1) && kinds.iter().any(|k| !k.2));
+                let many = built.len() > 64;
+                joined.then(|| SqlParts { fields: Vec::new(), items: if many { Vec::new() } else { built }, joined, many })
+            }
+            Expr::Map(es) => {
+                let fields: Vec<String> = es.iter().filter(|(_, x)| self.sql_built(x)).map(|(k, _)| k.clone()).collect();
+                let many = fields.len() > 64;
+                (!fields.is_empty()).then(|| SqlParts { fields: if many { Vec::new() } else { fields }, items: Vec::new(), joined: false, many })
+            }
+            _ => None,
+        };
+        if let Some(p) = parts {
+            self.sql_parts.push(p);
+            return SqlVar::Parts(self.sql_parts.len() as u32 - 1);
+        }
+        let lambda = matches!(e, Expr::Lambda(d) if self.sql_built(&d.body) || matches!(&d.body, Expr::Block(stmts) if stmts.iter().any(|s| matches!(s, Stmt::Return(Some(x), _) if self.sql_built(x)))));
+        if lambda || self.sql_built(e) {
             SqlVar::Built
         } else if self.sql_safe(e) {
             SqlVar::Safe
@@ -8355,6 +8709,214 @@ impl Checker {
             SqlVar::Conn
         } else {
             SqlVar::Other
+        }
+    }
+
+    /// A rule for every stream a name ending in `*` starts that never reads which stream is asked
+    /// for, its second parameter (`(peer, name) =>`): a page it lets in for one stream may send into
+    /// every one, or watch every one, as the guide's call did (FEEDBACK75.md, Q-1050, the user's
+    /// decision of 2026-11-18; branch feedback75). A function the checker cannot read is not said.
+    /// Only `media.on`'s: a channel's name holds no `*` (src/wt.rs `name_ok`).
+    fn star_rules(&mut self, arg_exprs: &[Expr]) {
+        let fname = "media.on";
+        let Some(Expr::Lit(Lit::Str(name))) = arg_exprs.first() else { return };
+        let Some(prefix) = name.strip_suffix('*') else { return };
+        let Some(Expr::Map(es)) = arg_exprs.get(1) else { return };
+        for (rule, does) in [("publish", "send into"), ("watch", "watch")] {
+            let Some((_, f)) = es.iter().find(|(k, _)| k == rule) else { continue };
+            let def = match f {
+                Expr::Lambda(d) => Some(d.clone()),
+                Expr::Ident(n, _) => self.scopes.iter().rev().find_map(|sc| sc.get(n.as_str())).or_else(|| self.globals.get(n.as_str())).and_then(|v| v.sig.as_ref()).and_then(|s| s.def.clone()),
+                _ => None,
+            };
+            let Some(d) = def else { continue };
+            // A rule that lets no one in needs no name (found in review).
+            let nobody = |e: &Expr| matches!(e, Expr::Lit(Lit::Bool(false)));
+            if nobody(&d.body) || matches!(&d.body, Expr::Block(stmts) if matches!(stmts.as_slice(), [Stmt::Expr(e) | Stmt::Return(Some(e), _)] if nobody(e))) {
+                continue;
+            }
+            let reads = d.params.get(1).is_some_and(|p| {
+                let mut seen = false;
+                for code in fn_code(&d) {
+                    walk_expr(code, &mut |x| seen |= matches!(x, Expr::Ident(n, _) if *n == p.name));
+                }
+                seen
+            });
+            if !reads {
+                self.warn(format!(
+                    "`{}(\"{}\")`'s `{}` never reads which stream is asked for: it is called as `(peer, name)`, and one that lets a page in for one `{}` stream lets it {} every one; check `name`, as `{}: (peer, name) => name == \"{}\" + session().user`",
+                    fname, name, rule, prefix, does, rule, prefix
+                ));
+            }
+        }
+    }
+
+    /// Whether a call of `n` gives back built SQL: a function of the program's that does, or a
+    /// lambda a variable holds that does. A name a global function or a builtin has, and no local,
+    /// is not looked for among the variables (FEEDBACK75.md, Q-1085; branch feedback75).
+    /// Whether variable `n` holds built SQL here, looked for only where some variable of its name
+    /// was given some (FEEDBACK75.md, Q-1085; branch feedback75).
+    fn var_built(&self, n: &str) -> bool {
+        self.sql_built_vars.contains(n) && self.sql_var(n) == SqlVar::Built
+    }
+
+    fn calls_built(&self, n: &str, args: &[Expr]) -> bool {
+        let given = |a: &Expr| self.sql_safe(a) || matches!(a, Expr::List(items) if items.iter().all(|x| self.sql_safe(x)));
+        match self.sql_built_fns.get(n) {
+            Some(always) if !self.is_local(n) => *always || !args.iter().all(given),
+            _ => self.var_built(n),
+        }
+    }
+
+    /// The parts of a map or list variable `n` that hold built SQL, if it holds some.
+    fn parts_of(&self, n: &str) -> Option<&SqlParts> {
+        if !self.sql_built_vars.contains(n) {
+            return None;
+        }
+        match self.sql_var(n) {
+            SqlVar::Parts(i) => self.sql_parts.get(i as usize),
+            _ => None,
+        }
+    }
+
+    /// Whether the program's function `d` gives back SQL built from values: what it returns,
+    /// with its `let`s read as the checker reads them, its parameters none of the program's
+    /// texts (FEEDBACK75.md, Q-1085; branch feedback75).
+    /// What `d` gives back: None if never built SQL, Some(false) if built from what it is given
+    /// (`notes_of(owner)`), Some(true) if built whatever it is given. Its code is read in order, its
+    /// `let`s and assignments as the checker reads them (`s = s + n`, in a loop too), and each
+    /// `return`, inside an `if` too; not the lambdas in it (FEEDBACK75.md, Q-1085; branch
+    /// feedback75).
+    fn gives_sql_built(&mut self, d: &FnDef) -> Option<bool> {
+        let read = |c: &mut Self, safe: bool| {
+            let mark = c.sql_vars.len();
+            // The parts a read makes are its own: let go of after it (found in review).
+            let parts = c.sql_parts.len();
+            let given = if safe { SqlVar::Safe } else { SqlVar::Other };
+            c.sql_vars.extend(d.params.iter().map(|p| (usize::MAX, p.name.to_string(), given)));
+            let was = std::mem::replace(&mut c.sql_pass_safe, safe);
+            let mut built = false;
+            match &d.body {
+                Expr::Block(stmts) => c.sql_flow(stmts, true, &mut built, 0),
+                e => built = c.sql_built(e),
+            }
+            c.sql_pass_safe = was;
+            c.sql_vars.truncate(mark);
+            c.sql_parts.truncate(parts);
+            built
+        };
+        if !read(self, false) {
+            return None;
+        }
+        Some(read(self, true))
+    }
+
+    /// `gives_sql_built`'s reading of a block: `last` when its last expression is the function's
+    /// result. The stack grows every 8th block, as `Returns::deep` grows it.
+    fn sql_flow(&mut self, stmts: &[Stmt], last: bool, built: &mut bool, depth: u32) {
+        let mark = self.sql_vars.len();
+        for (i, st) in stmts.iter().enumerate() {
+            // A confined check's clock, read every 256th statement (FEEDBACK75.md, Q-1053, found
+            // in review; branch feedback75).
+            self.steps = self.steps.wrapping_add(1);
+            if self.steps % 256 == 0 && DEADLINE.with(|d| d.get()).is_some_and(|d| std::time::Instant::now() >= d) {
+                OVER_BUDGET.with(|o| o.set(true));
+            }
+            if OVER_BUDGET.with(|o| o.get()) {
+                break;
+            }
+            match st {
+                Stmt::Let(p, x, _) => {
+                    self.sql_flow_in(x, built, depth);
+                    let k = if matches!(p, Pattern::Bind(_)) { self.sql_kind(x) } else { SqlVar::Other };
+                    let mut names = Vec::new();
+                    pattern_names(p, &mut names);
+                    for n in names {
+                        if matches!(k, SqlVar::Built | SqlVar::Parts(_)) {
+                            self.sql_built_vars.insert(n.clone());
+                        }
+                        self.sql_vars.push((usize::MAX, n, k));
+                    }
+                }
+                Stmt::Assign(n, op, x, _) => {
+                    self.sql_flow_in(x, built, depth);
+                    let was = self.sql_var(n);
+                    let now = match op {
+                        AssignOp::Set => Some(self.sql_kind(x)),
+                        AssignOp::Add if matches!(was, SqlVar::Safe | SqlVar::Built) && !self.sql_safe(x) => Some(SqlVar::Built),
+                        _ => None,
+                    };
+                    if let Some(k) = now {
+                        if matches!(k, SqlVar::Built | SqlVar::Parts(_)) {
+                            self.sql_built_vars.insert(n.to_string());
+                        }
+                        if let Some(v) = self.sql_vars.iter_mut().rev().find(|(_, m, _)| m == n.as_str()) {
+                            v.2 = k;
+                        }
+                    }
+                }
+                Stmt::Return(Some(x), _) => *built |= self.sql_built(x),
+                Stmt::Expr(x) => {
+                    if last && i + 1 == stmts.len() {
+                        *built |= self.sql_built(x);
+                    }
+                    self.sql_flow_in(x, built, depth);
+                }
+                _ => {}
+            }
+        }
+        self.sql_vars.truncate(mark);
+    }
+
+    /// The blocks inside `e` that run where it does (a choice's, a loop's), for `sql_flow`; a loop
+    /// over SQL-safe values gives SQL-safe values. Not a lambda's. A branch that is one expression
+    /// is read as it is, not copied into a statement: 200 `match` arms one inside another, around a
+    /// list of 200,000, held a copy at each, 2.6 GB (FEEDBACK75.md, Q-1085, found in review; branch
+    /// feedback75).
+    fn sql_flow_in(&mut self, e: &Expr, built: &mut bool, depth: u32) {
+        match e {
+            Expr::Block(_) => self.sql_flow_body(e, built, depth),
+            Expr::If(_, a, b) => {
+                self.sql_flow_body(a, built, depth);
+                if let Some(b) = b {
+                    self.sql_flow_body(b, built, depth);
+                }
+            }
+            Expr::For(p, it, body, _) => {
+                let k = if self.sql_safe(it) || matches!(&**it, Expr::List(items) if items.iter().all(|x| self.sql_safe(x))) { SqlVar::Safe } else { SqlVar::Other };
+                let mark = self.sql_vars.len();
+                let mut names = Vec::new();
+                pattern_names(p, &mut names);
+                self.sql_vars.extend(names.into_iter().map(|n| (usize::MAX, n, k)));
+                self.sql_flow_body(body, built, depth);
+                self.sql_vars.truncate(mark);
+            }
+            Expr::While(_, body, _) => self.sql_flow_body(body, built, depth),
+            Expr::Match(_, arms, _) => {
+                for a in arms {
+                    let mark = self.sql_vars.len();
+                    let mut names = Vec::new();
+                    pattern_names(&a.pat, &mut names);
+                    self.sql_vars.extend(names.into_iter().map(|n| (usize::MAX, n, SqlVar::Other)));
+                    self.sql_flow_body(&a.body, built, depth);
+                    self.sql_vars.truncate(mark);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A branch's code for `sql_flow`: a block's statements, or the blocks inside one expression;
+    /// the stack grown every 8th level, as `Returns::deep` grows it.
+    fn sql_flow_body(&mut self, x: &Expr, built: &mut bool, depth: u32) {
+        let mut go = |c: &mut Self| match x {
+            Expr::Block(stmts) => c.sql_flow(stmts, false, built, depth + 1),
+            other => c.sql_flow_in(other, built, depth + 1),
+        };
+        if depth % 8 == 7 {
+            crate::stack::maybe_grow(256 << 10, 4 << 20, || go(self))
+        } else {
+            go(self)
         }
     }
 
@@ -8378,18 +8940,55 @@ impl Checker {
     /// holding such text.
     fn sql_built(&self, e: &Expr) -> bool {
         let interpolates = |parts: &[TPart]| parts.iter().any(|p| matches!(p, TPart::Expr(e) if !self.sql_safe(e)));
+        // Text that `str`, `trim`, `lower`, `upper` and `replace` give back is what they were
+        // given, and `replace` puts its third into it (FEEDBACK75.md, Q-1085; branch feedback75).
+        let passes = |f: &str| matches!(f, "str" | "trim" | "lower" | "upper" | "replace");
+        let replaced = |text: &Expr, with: Option<&Expr>| self.sql_built(text) || (self.sql_text(text) && with.is_some_and(|w| !self.sql_safe(w)));
         match e {
-            Expr::Ident(n, _) => self.sql_var(n) == SqlVar::Built,
+            Expr::Ident(n, _) => self.var_built(n),
             Expr::Template(parts) => interpolates(parts),
             Expr::Call(f, _, _) if self.sql_safe_call(f) => false,
+            // A function of the program's that gives back built SQL, whatever it is given or from a
+            // value it is given, and a lambda a variable holds that does (FEEDBACK75.md, Q-1085;
+            // branch feedback75).
+            Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if self.calls_built(n, args)) => true,
+            Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if passes(n) && self.builtin_in_scope(n)) => match args.first() {
+                Some(text) => replaced(text, if self.builtin_named(f, "replace") { args.get(2) } else { None }),
+                None => false,
+            },
+            Expr::Call(f, args, _) if matches!(&**f, Expr::Field(_, n, _) if passes(n)) => match &**f {
+                Expr::Field(text, n, _) => replaced(text, if n == "replace" { args.get(1) } else { None }),
+                _ => false,
+            },
             Expr::Call(f, args, _) => match args.as_slice() {
                 [Expr::Template(parts)] => interpolates(parts),
                 [Expr::List(items), rest @ ..] if is_join(f) => items.iter().chain(rest).any(|x| !self.sql_safe(x)),
+                // A list a variable holds, built from values (FEEDBACK75.md, Q-1085; branch
+                // feedback75).
+                [Expr::Ident(n, _), ..] if is_join(f) => self.parts_of(n).is_some_and(|p| p.joined),
+                _ => false,
+            },
+            // The field or item of a map or list a variable holds that is built SQL, and only
+            // that one (FEEDBACK75.md, Q-1085, found in review; branch feedback75).
+            Expr::Field(o, k, _) => matches!(&**o, Expr::Ident(n, _) if self.parts_of(n).is_some_and(|p| p.field(k))),
+            Expr::Index(o, k, _) => match (&**o, &**k) {
+                (Expr::Ident(n, _), Expr::Lit(Lit::Str(k))) => self.parts_of(n).is_some_and(|p| p.field(k)),
+                (Expr::Ident(n, _), Expr::Lit(Lit::Int(i))) => self.parts_of(n).is_some_and(|p| usize::try_from(*i).is_ok_and(|i| p.item(i))),
+                (Expr::Ident(n, _), _) => self.parts_of(n).is_some_and(|p| p.many || !p.items.is_empty() || !p.fields.is_empty()),
                 _ => false,
             },
             Expr::Pipe(lhs, rhs, _) => match (&**lhs, &**rhs) {
                 (Expr::List(items), Expr::Call(f, rest, _)) if is_join(f) => items.iter().chain(rest).any(|x| !self.sql_safe(x)),
                 (Expr::List(items), f) if is_join(f) => items.iter().any(|x| !self.sql_safe(x)),
+                (Expr::Ident(n, _), Expr::Call(f, _, _)) if is_join(f) => self.parts_of(n).is_some_and(|p| p.joined),
+                (Expr::Ident(n, _), f) if is_join(f) => self.parts_of(n).is_some_and(|p| p.joined),
+                (text, Expr::Call(f, rest, _)) if matches!(&**f, Expr::Ident(n, _) if passes(n) && self.builtin_in_scope(n)) => {
+                    replaced(text, if self.builtin_named(f, "replace") { rest.get(1) } else { None })
+                }
+                (text, f @ Expr::Ident(n, _)) if passes(n) && self.builtin_in_scope(n) => {
+                    let _ = f;
+                    self.sql_built(text)
+                }
                 _ => false,
             },
             Expr::Binary(BinOp::Add, a, b, _) => {
@@ -8420,6 +9019,11 @@ impl Checker {
     fn sql_safe(&self, e: &Expr) -> bool {
         match e {
             Expr::Lit(_) => true,
+            // Read as given safe values (`gives_sql_built`), `str(id)` of a safe `id` is safe
+            // (FEEDBACK75.md, Q-1085, found in review; branch feedback75).
+            Expr::Call(f, args, _) if self.sql_pass_safe && matches!(&**f, Expr::Ident(n, _) if matches!(n.as_str(), "str" | "trim" | "lower" | "upper")) => {
+                args.len() == 1 && self.sql_safe(&args[0])
+            }
             Expr::Ident(n, _) => self.sql_var(n) == SqlVar::Safe,
             // `join(map(cols, (c) => `${sql_name(c)} = ${sql_param(c)}`), ", ")`, and piped or
             // as methods, the pairs form the guide gives for an update: a list each of whose
@@ -8812,6 +9416,9 @@ impl Checker {
             if arg_exprs.first().map_or(false, |e| self.sql_built(e)) {
                 self.warn_sql(name);
             }
+        }
+        if sig.builtin && sig.name == "media.on" {
+            self.star_rules(arg_exprs);
         }
         if sig.builtin && matches!(sig.name.as_str(), "db.transaction" | "idempotent") {
             self.retried_effects(name, arg_exprs);
@@ -9367,7 +9974,9 @@ fn mismatch(a: T, want: T) -> Option<String> {
     }
     if let (Some(af), Some(wf)) = (a.fields(), want.fields()) {
         for (k, wt) in wf.iter() {
-            match af.iter().find(|(n, _)| n == k) {
+            // Found by name in the sorted fields, not one by one (FEEDBACK75.md, Q-1053; branch
+            // feedback75).
+            match af.binary_search_by(|(n, _)| n.cmp(k)).ok().map(|i| &af[i]) {
                 None if wt.bits & NIL == 0 => return Some(format!("has no field `{}`, which {} needs", k, t_text(want))),
                 Some((_, at)) if at.bits != 0 && at.bits & wt.bits == 0 => {
                     return Some(format!("has `{}` as {}, but it must be {}", k, t_text(*at), t_text(*wt)))
@@ -10334,6 +10943,12 @@ enum Bound {
     Conn,
     /// `let f = () => ...`, a local `fn`: read where it is called or handed on.
     Held(usize),
+    /// `let m = "POST"`, `let q = "insert ..."`: read as the text it holds until something assigns
+    /// it (`GetWalk::texts`; FEEDBACK75.md, Q-1084; branch feedback75).
+    Text(usize),
+    /// `let w = save_visit`: the program's function, called where it is called or handed on, until
+    /// something assigns it (`GetWalk::aliases`; FEEDBACK75.md, Q-1084; branch feedback75).
+    Alias(usize),
 }
 
 /// One walk of a function's or a route's code for `GetOwn`, in the order it runs, each name the code
@@ -10357,11 +10972,49 @@ struct GetWalk<'a, 'c> {
     uses: Vec<String>,
     held: Vec<Arc<FnDef>>,
     held_read: HashSet<usize>,
+    /// What `Bound::Text` and `Bound::Alias` stand for, and those assigned since, which stand for
+    /// nothing known from there on: the code is read in the order it runs, a held lambda where it is
+    /// called, so a use read before the assignment runs before it (a loop's first round).
+    texts: Vec<Expr>,
+    aliases: Vec<String>,
+    spoiled: HashSet<(bool, usize)>,
 }
 
 impl<'a, 'c> GetWalk<'a, 'c> {
     fn new(ck: &'a Checker, cx: &'a GetCx<'c>, names: &'a [&'a str], params: &[String]) -> Self {
-        GetWalk { ck, cx, scope: params.iter().map(|p| (p.clone(), Bound::Plain)).collect(), names, o: GetOwn::default(), said: HashMap::new(), uses: Vec::new(), held: Vec::new(), held_read: HashSet::new() }
+        GetWalk { ck, cx, scope: params.iter().map(|p| (p.clone(), Bound::Plain)).collect(), names, o: GetOwn::default(), said: HashMap::new(), uses: Vec::new(), held: Vec::new(), held_read: HashSet::new(), texts: Vec::new(), aliases: Vec::new(), spoiled: HashSet::new() }
+    }
+
+    /// Whether a `let` of `init` is followed (`Bound::Text`, `Bound::Alias`): a text as written,
+    /// or a name for a function, a held lambda, such a text or a connection (FEEDBACK75.md,
+    /// Q-1084; branch feedback75).
+    fn follows(&self, init: &Expr) -> bool {
+        match init {
+            Expr::Lit(Lit::Str(_)) => true,
+            Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_))),
+            Expr::Ident(f, _) => match self.bound(f.as_str()) {
+                Some(b) => !matches!(b, Bound::Plain),
+                None => self.cx.fns.contains_key(f.as_str()),
+            },
+            _ => false,
+        }
+    }
+
+    /// The text `e` surely is: written in place, or held by a `let` nothing assigns again
+    /// (FEEDBACK75.md, Q-1084; branch feedback75).
+    fn text_of<'e>(&'e self, e: &'e Expr) -> &'e Expr {
+        match e {
+            Expr::Ident(n, _) => match self.bound(n.as_str()) {
+                Some(Bound::Text(k)) if !self.spoiled.contains(&(true, k)) => &self.texts[k],
+                _ => e,
+            },
+            e => e,
+        }
+    }
+
+    /// The program's function a name stands for, if it still does.
+    fn alias(&self, k: usize) -> Option<String> {
+        (!self.spoiled.contains(&(false, k))).then(|| self.aliases[k].clone())
     }
 
     fn bound(&self, n: &str) -> Option<Bound> {
@@ -10514,6 +11167,23 @@ impl<'a, 'c> GetWalk<'a, 'c> {
                     self.held.push(d.clone());
                     self.scope.push((n.to_string(), Bound::Held(self.held.len() - 1)));
                 }
+                Stmt::Let(Pattern::Bind(n), init, _) if self.follows(init) => {
+                    self.expr(init);
+                    let b = match init {
+                        Expr::Ident(f, _) => match self.bound(f.as_str()) {
+                            Some(b) => b,
+                            None => {
+                                self.aliases.push(f.to_string());
+                                Bound::Alias(self.aliases.len() - 1)
+                            }
+                        },
+                        text => {
+                            self.texts.push(text.clone());
+                            Bound::Text(self.texts.len() - 1)
+                        }
+                    };
+                    self.scope.push((n.to_string(), b));
+                }
                 Stmt::Let(p, init, _) => {
                     // `let { cookies } = request`: what it takes.
                     if let Pattern::Record(fields) = p {
@@ -10532,6 +11202,16 @@ impl<'a, 'c> GetWalk<'a, 'c> {
                 }
                 Stmt::Assign(n, _, e, line) => {
                     self.expr(e);
+                    // What it held is known no more (FEEDBACK75.md, Q-1084; branch feedback75).
+                    match self.bound(n.as_str()) {
+                        Some(Bound::Text(k)) => {
+                            self.spoiled.insert((true, k));
+                        }
+                        Some(Bound::Alias(k)) => {
+                            self.spoiled.insert((false, k));
+                        }
+                        _ => {}
+                    }
                     if self.cx.top_lets.contains(n.as_str()) && self.bound(n.as_str()).is_none() {
                         self.write(format!("assigns the program's variable `{}`", n), *line);
                     }
@@ -10642,6 +11322,7 @@ impl<'a, 'c> GetWalk<'a, 'c> {
             if let Expr::Ident(n, _) = a {
                 match self.bound(n.as_str()) {
                     Some(Bound::Held(k)) => self.read_held(k),
+                    Some(Bound::Alias(k)) => self.o.calls.extend(self.alias(k)),
                     Some(_) => {}
                     None if self.cx.fns.contains_key(n.as_str()) => self.o.calls.push(n.to_string()),
                     None => {}
@@ -10652,6 +11333,7 @@ impl<'a, 'c> GetWalk<'a, 'c> {
         match callee {
             Expr::Ident(n, _) => match self.bound(n.as_str()) {
                 Some(Bound::Held(k)) => self.read_held(k),
+                Some(Bound::Alias(k)) => self.o.calls.extend(self.alias(k)),
                 Some(_) => {}
                 None if self.cx.fns.contains_key(n.as_str()) => self.o.calls.push(n.to_string()),
                 None => match n.as_str() {
@@ -10675,12 +11357,32 @@ impl<'a, 'c> GetWalk<'a, 'c> {
                             f if f.starts_with("db.") => self.db(name, first, f, line),
                             "http.post" | "http.put" | "http.patch" | "http.delete" | "image.convert" | "notification.send" => self.write(format!("`{}`", full), line),
                             "http.request" => {
-                                if let Some(Expr::Lit(Lit::Str(method))) = first {
+                                if let Some(Expr::Lit(Lit::Str(method))) = first.map(|f| self.text_of(f)) {
                                     if !["GET", "HEAD", "OPTIONS"].iter().any(|g| method.eq_ignore_ascii_case(g)) {
-                                        self.write(format!("`http.request(\"{}\", ...)`", method), line);
+                                        let shown = format!("`http.request(\"{}\", ...)`", method);
+                                        self.write(shown, line);
                                     }
                                 }
                             }
+                            // A stream sent with a method that writes, or a body, which makes it a
+                            // POST; a packet; a message to a channel's pages, as the prefetch guard
+                            // reads them (FEEDBACK75.md, Q-1084 and Q-1062; branch feedback75).
+                            "http.stream" => {
+                                let opts = if piped.is_some() { args.get(1) } else { args.get(2) };
+                                if let Some(Expr::Map(es)) = opts {
+                                    let method = es.iter().find(|(k, _)| k == "method").map(|(_, v)| self.text_of(v));
+                                    let shown = match method {
+                                        Some(Expr::Lit(Lit::Str(m))) if !["GET", "HEAD", "OPTIONS"].iter().any(|g| m.eq_ignore_ascii_case(g)) => Some(format!("`http.stream` with `method: \"{}\"`", m)),
+                                        Some(Expr::Lit(Lit::Nil)) | None if es.iter().any(|(k, v)| k == "body" && !matches!(v, Expr::Lit(Lit::Nil))) => Some("`http.stream` with a `body`".to_string()),
+                                        // A GET, or a method the text does not make certain.
+                                        _ => None,
+                                    };
+                                    if let Some(shown) = shown {
+                                        self.write(shown, line);
+                                    }
+                                }
+                            }
+                            "udp.send" | "udp.reply" | "channel.send" | "channel.broadcast" => self.write(format!("`{}`", full), line),
                             _ => {}
                         }
                     }
@@ -10755,6 +11457,10 @@ impl<'a, 'c> GetWalk<'a, 'c> {
     /// that only reads is no write; one built as it runs is `db.exec`'s, which writes; `db.query`
     /// and `db.one` write only where their written SQL surely does. `sql\`...\`` is its text.
     fn db(&mut self, name: &str, first: Option<&Expr>, shown: &str, line: u32) {
+        // SQL a `let` holds is read as written there, for what may only read (FEEDBACK75.md,
+        // Q-1084; branch feedback75); `db.exec` writes whatever its SQL a `let` holds says, and is
+        // said as 0.8.8 said it.
+        let first = if matches!(name, "query" | "one") { first.map(|e| self.text_of(e)) } else { first };
         let sql = first.and_then(|e| match e {
             Expr::Call(f, args, _) if args.len() == 1 && matches!(&**f, Expr::Ident(n, _) if n == "sql" && self.bound("sql").is_none() && !self.cx.fns.contains_key("sql")) => sql_written(&args[0]),
             e => sql_written(e),
@@ -11584,26 +12290,141 @@ fn other_language(name: &str) -> Option<&'static str> {
 /// `pirnt`), case aside: at most 2 edits, fewer than `name` has letters. Ties go to the same
 /// first letter, then the alphabet, so the answer is the same every run (FEEDBACK45.md, Q-517;
 /// branch feedback40-43).
+///
+/// A name past 64 letters is said none, and a candidate whose length is more than 2 from the
+/// name's is no nearer than 3: 20 unknown names of 1,000 letters, each compared letter by letter
+/// with 1,000 such names, took 31 s (FEEDBACK75.md, Q-1053 and Q-1120, found in review; branch
+/// feedback75). The distance is counted no further than 2 (`osa_within`).
 fn closest<'a>(name: &str, cands: impl Iterator<Item = &'a str>) -> Option<String> {
+    closest_counted(name, cands, &mut 0)
+}
+
+/// Names' lower-case letters, kept by `closest_within` for the names not all ASCII.
+type Lowered = HashMap<String, Box<[char]>, crate::value::BuildFx>;
+
+/// `closest`, adding to `cost` what it measures (`osa_band`), for a name of at most 64 letters.
+fn closest_counted<'a>(name: &str, cands: impl Iterator<Item = &'a str>, cost: &mut u64) -> Option<String> {
+    closest_within(name, cands, cost, 64, &mut Lowered::default())
+}
+
+/// `closest_counted`, for names of at most `most_len` letters. The bound each candidate is measured
+/// to is the best distance found so far, and a candidate's common start and end are not measured
+/// (FEEDBACK75.md, Q-1120, found in review; branch feedback75).
+/// `lowered` keeps the candidates' lower-case letters that are not all ASCII, from one call to the
+/// next.
+fn closest_within<'a>(name: &str, cands: impl Iterator<Item = &'a str>, cost: &mut u64, most_len: usize, lowered: &mut Lowered) -> Option<String> {
+    let count = name.chars().count();
+    if count > most_len {
+        return None;
+    }
     let lower = name.to_lowercase();
-    let first = lower.chars().next();
+    let lower_chars: Vec<char> = lower.chars().collect();
+    let first = lower_chars.first().copied();
+    let ascii = name.is_ascii();
     let mut best: Option<(usize, bool, String)> = None;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut chars: Vec<char> = Vec::new();
     for c in cands {
-        let lc = c.to_lowercase();
-        if lc == lower {
+        let bound = best.as_ref().map_or(2, |b| b.0);
+        let d = if c.is_ascii() {
+            // ASCII keeps its length in lower case: lengths more than the bound apart are read
+            // first, and no lower-case copy is kept.
+            if c.len().abs_diff(lower_chars.len()) > bound || (ascii && c.eq_ignore_ascii_case(name)) {
+                continue;
+            }
+            if ascii {
+                buf.clear();
+                buf.extend(c.bytes().map(|x| x.to_ascii_lowercase()));
+                osa_band(lower.as_bytes(), &buf, bound, cost)
+            } else {
+                chars.clear();
+                chars.extend(c.chars().map(|x| x.to_ascii_lowercase()));
+                osa_band(&lower_chars, &chars, bound, cost)
+            }
+        } else {
+            // Lower case may lengthen a letter (`İ`): a length 4 apart is the cheap test, the
+            // lower case's the sure one.
+            if c.len() + bound < lower_chars.len() {
+                continue;
+            }
+            if lowered.get(c).is_none() {
+                lowered.insert(c.to_string(), c.chars().flat_map(char::to_lowercase).collect());
+            }
+            let Some(lc) = lowered.get(c) else { continue };
+            // A name not all ASCII costs twice as long to measure: counted so.
+            *cost += 4;
+            if **lc == *lower_chars || lc.len().abs_diff(lower_chars.len()) > bound {
+                continue;
+            }
+            osa_band(&lower_chars, lc, bound, cost)
+        };
+        if d > bound || d >= count {
             continue;
         }
-        let d = osa_distance(&lower, &lc);
-        if d > 2 || d >= name.chars().count() {
-            continue;
-        }
-        let other_first = lc.chars().next() != first;
+        let other_first = c.chars().flat_map(char::to_lowercase).next() != first;
         let key = (d, other_first, c.to_string());
         if best.as_ref().map_or(true, |b| key < *b) {
             best = Some(key);
         }
     }
     best.map(|(_, _, c)| c)
+}
+
+/// `osa_distance`, counted no further than `most`: more is `most + 1`. The common start and end of
+/// the two are passed over, as they change no distance; then only the cells at most `most` from the
+/// diagonal are filled, and it stops at a row all past `most`. What it measured is added to `cost`
+/// (FEEDBACK75.md, Q-1120, found in review; branch feedback75).
+fn osa_band<C: PartialEq>(a: &[C], b: &[C], most: usize, cost: &mut u64) -> usize {
+    let start = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let (a, b) = (&a[start..], &b[start..]);
+    let end = a.iter().rev().zip(b.iter().rev()).take_while(|(x, y)| x == y).count();
+    let (a, b) = (&a[..a.len() - end], &b[..b.len() - end]);
+    *cost += 4 + (start + end) as u64 / 4;
+    if a.len().abs_diff(b.len()) > most {
+        return most + 1;
+    }
+    let far = most + 1;
+    let (n, m) = (a.len(), b.len());
+    let w = m + 1;
+    let mut small = [0usize; 3 * 72];
+    let mut large = Vec::new();
+    let rows: &mut [usize] = if 3 * w <= small.len() {
+        &mut small[..3 * w]
+    } else {
+        large.resize(3 * w, 0);
+        &mut large
+    };
+    // Row i is at ((i % 3) * w): the one before it and the one before that are the other two. Each
+    // row's band is filled with the cells either side of it, all another row reads of it.
+    for j in 0..=m.min(most + 2) {
+        rows[j] = j.min(far);
+    }
+    for i in 1..=n {
+        let (cur, prev, before) = ((i % 3) * w, ((i - 1) % 3) * w, ((i + 1) % 3) * w);
+        let (lo, hi) = (i.saturating_sub(most).max(1), (i + most).min(m));
+        rows[cur] = i.min(far);
+        if lo > 1 {
+            rows[cur + lo - 1] = far;
+        }
+        if hi < m {
+            rows[cur + hi + 1] = far;
+        }
+        let mut least = rows[cur];
+        for j in lo..=hi {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut v = (rows[prev + j] + 1).min(rows[cur + j - 1] + 1).min(rows[prev + j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                v = v.min(rows[before + j - 2] + 1);
+            }
+            rows[cur + j] = v.min(far);
+            least = least.min(rows[cur + j]);
+        }
+        *cost += (hi + 1 - lo.min(hi + 1)) as u64;
+        if least > most {
+            return far;
+        }
+    }
+    rows[(n % 3) * w + m].min(far)
 }
 
 /// Levenshtein distance where two letters swapped are one edit (optimal string alignment).
@@ -11666,6 +12487,392 @@ fn builtin_changes(n: &str) -> bool {
         // the request, which a call may be for.
         || n == "watch"
         || n == "unwrap"
+}
+
+/// What `gives_sql_safe` keeps of a function from one reading to the next: whether it assigns, and
+/// if it does, its graph of who reads what (FEEDBACK75.md, Q-1085, found in review; branch
+/// feedback75).
+enum GraphSlot<'e> {
+    Unread,
+    NoAssign,
+    Graph(Box<SafeGraph<'e>>),
+}
+
+/// A function's `let`s of one name and its assignments, in the order written (lambdas' and inner
+/// blocks' too), each with what it is given; for each name, the ones whose value reads it, the
+/// innermost only: a `let` whose value is a block of further `let`s reads what its block gives
+/// back, not what they read (FEEDBACK75.md, Q-1085, found in review; branch feedback75).
+struct SafeGraph<'e> {
+    defs: Vec<(&'static str, &'e Expr, bool)>,
+    readers: HashMap<&'static str, Vec<u32>, crate::value::BuildFx>,
+    last_let: HashMap<&'static str, u32, crate::value::BuildFx>,
+    assigned: HashSet<&'static str, crate::value::BuildFx>,
+}
+
+/// Whether `e` assigns a variable, in the blocks it runs (a lambda's too), read without its
+/// values' insides: a list of 300,000 is not walked for it.
+fn assigns_any(e: &Expr) -> bool {
+    fn stmts(ss: &[Stmt], depth: u32) -> bool {
+        ss.iter().any(|st| match st {
+            Stmt::Assign(..) => true,
+            Stmt::Let(_, v, _) | Stmt::Expr(v) | Stmt::Return(Some(v), _) => expr(v, depth),
+            _ => false,
+        })
+    }
+    fn expr(e: &Expr, depth: u32) -> bool {
+        let go = |ss: &[Stmt]| if depth % 8 == 7 { crate::stack::maybe_grow(256 << 10, 4 << 20, || stmts(ss, depth + 1)) } else { stmts(ss, depth + 1) };
+        match e {
+            Expr::Block(ss) => go(ss),
+            Expr::If(_, a, b) => std::iter::once(&**a).chain(b.as_deref()).any(|x| matches!(x, Expr::Block(ss) if go(ss))),
+            Expr::For(_, _, b, _) | Expr::While(_, b, _) => matches!(&**b, Expr::Block(ss) if go(ss)),
+            Expr::Match(_, arms, _) => arms.iter().any(|a| matches!(&a.body, Expr::Block(ss) if go(ss))),
+            Expr::Lambda(d) => matches!(&d.body, Expr::Block(ss) if go(ss)),
+            _ => false,
+        }
+    }
+    expr(e, 0)
+}
+
+/// `body`'s `SafeGraph`, in one walk of it; a confined check's clock read every 4,096th part.
+fn safe_graph(body: &Expr) -> SafeGraph<'_> {
+    let mut g = SafeGraph { defs: Vec::new(), readers: HashMap::default(), last_let: HashMap::default(), assigned: HashSet::default() };
+    let mut seen = 0u32;
+    graph_expr(&mut g, body, None, 0, &mut seen);
+    for (i, (n, _, assign)) in g.defs.iter().enumerate() {
+        if *assign {
+            g.assigned.insert(n);
+        } else {
+            g.last_let.insert(n, i as u32);
+        }
+    }
+    g
+}
+
+fn graph_expr<'e>(g: &mut SafeGraph<'e>, e: &'e Expr, at: Option<u32>, depth: u32, seen: &mut u32) {
+    *seen = seen.wrapping_add(1);
+    if *seen % 4096 == 0 && DEADLINE.with(|d| d.get()).is_some_and(|d| std::time::Instant::now() >= d) {
+        OVER_BUDGET.with(|o| o.set(true));
+    }
+    if *seen % 4096 == 0 && OVER_BUDGET.with(|o| o.get()) {
+        return;
+    }
+    if depth % 8 == 7 {
+        return crate::stack::maybe_grow(256 << 10, 4 << 20, || graph_here(g, e, at, depth, seen));
+    }
+    graph_here(g, e, at, depth, seen)
+}
+
+fn graph_here<'e>(g: &mut SafeGraph<'e>, e: &'e Expr, at: Option<u32>, depth: u32, seen: &mut u32) {
+    let d = depth + 1;
+    match e {
+        Expr::Ident(n, _) => {
+            if let Some(at) = at {
+                let r = g.readers.entry(n.as_str()).or_default();
+                if r.last() != Some(&at) {
+                    r.push(at);
+                }
+            }
+        }
+        Expr::Block(stmts) => {
+            for st in stmts {
+                match st {
+                    Stmt::Let(Pattern::Bind(n), v, _) | Stmt::Assign(n, _, v, _) => {
+                        let own = g.defs.len() as u32;
+                        g.defs.push((n.as_str(), v, matches!(st, Stmt::Assign(..))));
+                        graph_expr(g, v, Some(own), d, seen);
+                    }
+                    Stmt::Let(_, v, _) | Stmt::Expr(v) | Stmt::Return(Some(v), _) | Stmt::State(_, v, _) => graph_expr(g, v, at, d, seen),
+                    Stmt::SetField(o, _, _, v, _) => {
+                        graph_expr(g, o, at, d, seen);
+                        graph_expr(g, v, at, d, seen);
+                    }
+                    Stmt::Fn(f) => graph_expr(g, &f.body, None, d, seen),
+                    _ => {}
+                }
+            }
+        }
+        Expr::Lit(_) => {}
+        Expr::Template(parts) => {
+            for p in parts {
+                if let TPart::Expr(x) = p {
+                    graph_expr(g, x, at, d, seen);
+                }
+            }
+        }
+        Expr::List(xs) => xs.iter().for_each(|x| graph_expr(g, x, at, d, seen)),
+        Expr::Map(es) => es.iter().for_each(|(_, x)| graph_expr(g, x, at, d, seen)),
+        Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => graph_expr(g, x, at, d, seen),
+        Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) | Expr::Pipe(a, b, _) | Expr::Index(a, b, _) => {
+            graph_expr(g, a, at, d, seen);
+            graph_expr(g, b, at, d, seen);
+        }
+        Expr::Call(c, args, _) => {
+            graph_expr(g, c, at, d, seen);
+            args.iter().for_each(|x| graph_expr(g, x, at, d, seen));
+        }
+        Expr::If(c, a, b) => {
+            graph_expr(g, c, at, d, seen);
+            graph_expr(g, a, at, d, seen);
+            if let Some(b) = b {
+                graph_expr(g, b, at, d, seen);
+            }
+        }
+        Expr::Match(x, arms, _) => {
+            graph_expr(g, x, at, d, seen);
+            for a in arms {
+                if let Some(gd) = &a.guard {
+                    graph_expr(g, gd, at, d, seen);
+                }
+                graph_expr(g, &a.body, at, d, seen);
+            }
+        }
+        Expr::For(_, i, b, _) | Expr::While(i, b, _) => {
+            graph_expr(g, i, at, d, seen);
+            graph_expr(g, b, at, d, seen);
+        }
+        Expr::Lambda(f) => graph_expr(g, &f.body, at, d, seen),
+        Expr::Reply(x, b, _) => {
+            graph_expr(g, x, at, d, seen);
+            if let Some(b) = b {
+                graph_expr(g, b, at, d, seen);
+            }
+        }
+        // Markup's names, as `walk_expr` finds them: no `let` is written in it.
+        Expr::Html(..) => {
+            if let Some(at) = at {
+                walk_expr(e, &mut |x| {
+                    if let Expr::Ident(n, _) = x {
+                        let r = g.readers.entry(n.as_str()).or_default();
+                        if r.last() != Some(&at) {
+                            r.push(at);
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// The variables assigned something not SQL-safe, for `gives_sql_safe`: every name a `let` or an
+/// assignment gives is taken as safe text to begin with; one whose value (each assignment's, a
+/// `let`'s last) is not `ok` with the names still safe is not, and only what reads it is read again
+/// (`SafeGraph`). A chain of 20,000 assignments was read again whole for each, 24.7 s
+/// (FEEDBACK75.md, Q-1085, found in review; branch feedback75). A confined check's clock is read
+/// every 256th.
+fn unsafely_assigned(
+    g: &SafeGraph<'_>,
+    safe: &HashSet<String>,
+    ok: fn(&Expr, &HashSet<String>, &HashSet<String>, &HashSet<String>) -> bool,
+) -> HashSet<String> {
+    let none = HashSet::new();
+    let mut known: HashSet<String> = g.defs.iter().map(|(n, _, _)| n.to_string()).collect();
+    let mut unsafe_vars: HashSet<String> = HashSet::new();
+    let mut queue: std::collections::VecDeque<u32> = (0..g.defs.len() as u32).collect();
+    let mut queued = vec![true; g.defs.len()];
+    let mut taken = 0u32;
+    while let Some(i) = queue.pop_front() {
+        queued[i as usize] = false;
+        taken = taken.wrapping_add(1);
+        if taken % 256 == 0 && DEADLINE.with(|d| d.get()).is_some_and(|d| std::time::Instant::now() >= d) {
+            OVER_BUDGET.with(|o| o.set(true));
+            break;
+        }
+        let (n, v, assign) = g.defs[i as usize];
+        let counts = if assign { known.contains(n) } else { g.last_let.get(n) == Some(&i) && !g.assigned.contains(n) && known.contains(n) };
+        if !counts || ok(v, safe, &known, &none) {
+            continue;
+        }
+        known.remove(n);
+        if assign {
+            unsafe_vars.insert(n.to_string());
+        }
+        for &r in g.readers.get(n).into_iter().flatten() {
+            if !queued[r as usize] {
+                queued[r as usize] = true;
+                queue.push_back(r);
+            }
+        }
+    }
+    unsafe_vars
+}
+
+/// The program's functions that call each, by the name called: each read again when one it calls
+/// is found (`Worklist`; FEEDBACK75.md, Q-1053, found in review; branch feedback75).
+fn callers_by_name<'d>(defs: &[&'d FnDef]) -> HashMap<&'d str, Vec<usize>> {
+    let names: HashSet<&'d str> = defs.iter().map(|d| d.name.as_str()).collect();
+    let mut callers: HashMap<&'d str, Vec<usize>> = HashMap::new();
+    for (i, d) in defs.iter().enumerate() {
+        let mut called = Vec::new();
+        for code in fn_code(d) {
+            called_names(code, &mut called);
+        }
+        called.sort_unstable();
+        called.dedup();
+        for n in called {
+            if let Some(&name) = names.get(n.as_str()) {
+                callers.entry(name).or_default().push(i);
+            }
+        }
+    }
+    callers
+}
+
+/// The program's functions in an order that has each after the functions it calls (a cycle's in
+/// the order met), from `callers_by_name` (found in review).
+fn callees_first(defs: &[&FnDef], callers: &HashMap<&str, Vec<usize>>) -> Vec<usize> {
+    let mut calls: Vec<Vec<usize>> = vec![Vec::new(); defs.len()];
+    let mut by_name: HashMap<&str, usize> = HashMap::new();
+    for (i, d) in defs.iter().enumerate() {
+        by_name.entry(d.name.as_str()).or_insert(i);
+    }
+    for (name, cs) in callers {
+        if let Some(&callee) = by_name.get(name) {
+            for &c in cs {
+                calls[c].push(callee);
+            }
+        }
+    }
+    let mut order = Vec::with_capacity(defs.len());
+    let mut state = vec![0u8; defs.len()];
+    for start in 0..defs.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+        state[start] = 1;
+        while let Some(top) = stack.last_mut() {
+            let i = top.0;
+            if let Some(&c) = calls[i].get(top.1) {
+                top.1 += 1;
+                if state[c] == 0 {
+                    state[c] = 1;
+                    stack.push((c, 0));
+                }
+            } else {
+                state[i] = 2;
+                order.push(i);
+                stack.pop();
+            }
+        }
+    }
+    order
+}
+
+/// The functions still to read, each once at first and again when queued by `again`; ending at a
+/// confined check's time, read every 64th (FEEDBACK75.md, Q-1053, found in review; branch
+/// feedback75).
+/// First in, first out: a caller written before its 10,000 callees, read again each time one was
+/// found, waits in the queue once for all of them (found in review).
+struct Worklist {
+    todo: std::collections::VecDeque<usize>,
+    queued: Vec<bool>,
+    taken: u32,
+}
+
+impl Worklist {
+    fn new(order: &[usize]) -> Worklist {
+        Worklist { todo: order.iter().copied().collect(), queued: vec![true; order.len()], taken: 0 }
+    }
+
+    /// The next function to read; a confined check's clock is read for each (found in review).
+    fn next(&mut self) -> Option<usize> {
+        self.taken = self.taken.wrapping_add(1);
+        if DEADLINE.with(|d| d.get()).is_some_and(|d| std::time::Instant::now() >= d) {
+            OVER_BUDGET.with(|o| o.set(true));
+        }
+        if OVER_BUDGET.with(|o| o.get()) {
+            return None;
+        }
+        let i = self.todo.pop_front()?;
+        self.queued[i] = false;
+        Some(i)
+    }
+
+    fn again(&mut self, callers: Option<&Vec<usize>>) {
+        for &c in callers.into_iter().flatten() {
+            if !self.queued[c] {
+                self.queued[c] = true;
+                self.todo.push_back(c);
+            }
+        }
+    }
+}
+
+/// What a function gives back, as `Checker::gives_sql_built` reads it: its body, or its block's
+/// `return`s and last expression (FEEDBACK75.md, Q-1085; branch feedback75).
+fn fn_results(d: &FnDef) -> Vec<&Expr> {
+    // Each `return` in the blocks that run where the body does, not in a lambda's.
+    fn returns<'e>(stmts: &'e [Stmt], out: &mut Vec<&'e Expr>, depth: u32) {
+        let inner = |x: &'e Expr, out: &mut Vec<&'e Expr>| {
+            let go = |stmts: &'e [Stmt], out: &mut Vec<&'e Expr>| {
+                if depth % 8 == 7 {
+                    crate::stack::maybe_grow(256 << 10, 4 << 20, || returns(stmts, out, depth + 1))
+                } else {
+                    returns(stmts, out, depth + 1)
+                }
+            };
+            match x {
+                Expr::Block(s) => go(s, out),
+                Expr::If(_, a, b) => {
+                    for y in std::iter::once(&**a).chain(b.as_deref()) {
+                        if let Expr::Block(s) = y {
+                            go(s, out);
+                        }
+                    }
+                }
+                Expr::For(_, _, b, _) | Expr::While(_, b, _) => {
+                    if let Expr::Block(s) = &**b {
+                        go(s, out);
+                    }
+                }
+                Expr::Match(_, arms, _) => {
+                    for a in arms {
+                        if let Expr::Block(s) = &a.body {
+                            go(s, out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        };
+        for st in stmts {
+            match st {
+                Stmt::Return(Some(x), _) => out.push(x),
+                Stmt::Expr(x) | Stmt::Let(_, x, _) | Stmt::Assign(_, _, x, _) => inner(x, out),
+                _ => {}
+            }
+        }
+    }
+    match &d.body {
+        Expr::Block(stmts) => {
+            let mut out: Vec<&Expr> = Vec::new();
+            if let Some(Stmt::Expr(x)) = stmts.last() {
+                out.push(x);
+            }
+            returns(stmts, &mut out, 0);
+            out
+        }
+        e => vec![e],
+    }
+}
+
+/// Whether a function's result may be text built from values, by its form: not markup, a
+/// number, a text as written or a map (FEEDBACK75.md, Q-1085; branch feedback75).
+fn may_build(e: &Expr) -> bool {
+    may_build_at(e, 0)
+}
+
+/// `may_build`, `depth` choices deep: the stack grown every 8th, as `Returns::deep` grows it.
+fn may_build_at(e: &Expr, depth: u32) -> bool {
+    let inner = |x: &Expr| if depth % 8 == 7 { crate::stack::maybe_grow(256 << 10, 4 << 20, || may_build_at(x, depth + 1)) } else { may_build_at(x, depth + 1) };
+    match e {
+        Expr::Template(parts) => parts.iter().any(|p| matches!(p, TPart::Expr(_))),
+        Expr::Binary(BinOp::Add, ..) | Expr::Call(..) | Expr::Pipe(..) | Expr::Ident(..) | Expr::Field(..) | Expr::Index(..) => true,
+        Expr::If(_, a, b) => inner(a) || b.as_deref().is_some_and(inner),
+        Expr::Match(_, arms, _) => arms.iter().any(|a| inner(&a.body)),
+        Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(x) | Stmt::Return(Some(x), _)) if inner(x)),
+        _ => false,
+    }
 }
 
 fn assigned_in(e: &Expr, out: &mut HashSet<String>) {
@@ -11796,22 +13003,22 @@ fn names_in_text(src: &str) -> Vec<String> {
 /// arguments), text as written, a call of a function in `safe`, or a
 /// variable bound to one of those in the same block; or choices and joins
 /// of them.
-fn gives_sql_safe(body: &Expr, safe: &HashSet<String>) -> bool {
-    fn ok(e: &Expr, safe: &HashSet<String>, vars: &HashSet<String>) -> bool {
+fn gives_sql_safe<'e>(body: &'e Expr, safe: &HashSet<String>, graph: &mut GraphSlot<'e>) -> bool {
+    fn ok(e: &Expr, safe: &HashSet<String>, vars: &HashSet<String>, assigned: &HashSet<String>) -> bool {
         match e {
             Expr::Lit(Lit::Str(_)) => true,
             Expr::Ident(n, _) => vars.contains(n.as_str()),
             Expr::Call(f, _, _) => matches!(&**f, Expr::Ident(n, _) if n == "sql_name" || n == "sql_param" || safe.contains(n.as_str()))
                 || matches!(&**f, Expr::Field(o, n, _) if n == "sql_name" && matches!(&**o, Expr::Ident(m, _) if m == "db")),
-            Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(x) if ok(x, safe, vars))),
-            Expr::Binary(BinOp::Add, a, b, _) => ok(a, safe, vars) && ok(b, safe, vars),
-            Expr::If(_, a, b) => ok(a, safe, vars) && b.as_deref().map_or(false, |b| ok(b, safe, vars)),
-            Expr::Match(_, arms, _) => !arms.is_empty() && arms.iter().all(|a| ok(&a.body, safe, vars)),
+            Expr::Template(parts) => parts.iter().all(|p| matches!(p, TPart::Lit(_)) || matches!(p, TPart::Expr(x) if ok(x, safe, vars, assigned))),
+            Expr::Binary(BinOp::Add, a, b, _) => ok(a, safe, vars, assigned) && ok(b, safe, vars, assigned),
+            Expr::If(_, a, b) => ok(a, safe, vars, assigned) && b.as_deref().map_or(false, |b| ok(b, safe, vars, assigned)),
+            Expr::Match(_, arms, _) => !arms.is_empty() && arms.iter().all(|a| ok(&a.body, safe, vars, assigned)),
             Expr::Block(stmts) => {
-                let vars = block_vars(stmts, safe, vars);
+                let vars = block_vars(stmts, safe, vars, assigned);
                 match stmts.last() {
-                    Some(Stmt::Expr(x)) => ok(x, safe, &vars),
-                    Some(Stmt::Return(Some(x), _)) => ok(x, safe, &vars),
+                    Some(Stmt::Expr(x)) => ok(x, safe, &vars, assigned),
+                    Some(Stmt::Return(Some(x), _)) => ok(x, safe, &vars, assigned),
                     _ => false,
                 }
             }
@@ -11819,11 +13026,11 @@ fn gives_sql_safe(body: &Expr, safe: &HashSet<String>) -> bool {
         }
     }
     // The variables a block binds to safe text, up to its end.
-    fn block_vars(stmts: &[Stmt], safe: &HashSet<String>, outer: &HashSet<String>) -> HashSet<String> {
+    fn block_vars(stmts: &[Stmt], safe: &HashSet<String>, outer: &HashSet<String>, assigned: &HashSet<String>) -> HashSet<String> {
         let mut vars = outer.clone();
         for st in stmts {
             if let Stmt::Let(Pattern::Bind(n), x, _) = st {
-                if ok(x, safe, &vars) {
+                if ok(x, safe, &vars, assigned) && !assigned.contains(n.as_str()) {
                     vars.insert(n.to_string());
                 } else {
                     vars.remove(n.as_str());
@@ -11832,6 +13039,21 @@ fn gives_sql_safe(body: &Expr, safe: &HashSet<String>) -> bool {
         }
         vars
     }
+    // A variable assigned anywhere in the body something not SQL-safe holds nothing known:
+    // `let s = "select ..."` then `s += n` gave back built SQL as safe, and its callers' queries
+    // were not warned of (FEEDBACK75.md, Q-1085, found in review; branch feedback75). What is
+    // assigned is read with the variables bound safe text, and those assigned, taken as safe until
+    // one is found not to be (`c = c + " desc"` keeps `c` safe).
+    // The graph of who reads what is made once for each function, and only for one that assigns
+    // (found in review).
+    if matches!(graph, GraphSlot::Unread) {
+        *graph = if assigns_any(body) { GraphSlot::Graph(Box::new(safe_graph(body))) } else { GraphSlot::NoAssign };
+    }
+    let unsafe_vars = match graph {
+        GraphSlot::Graph(g) => unsafely_assigned(g, safe, ok),
+        _ => HashSet::new(),
+    };
+    let assigned = &unsafe_vars;
     // Every `return`, wherever it is (in an `if`, a loop, after `??`), with
     // what its own block bound before it.
     let mut returns_ok = true;
@@ -11841,19 +13063,19 @@ fn gives_sql_safe(body: &Expr, safe: &HashSet<String>) -> bool {
             for st in stmts {
                 match st {
                     Stmt::Let(Pattern::Bind(n), v, _) => {
-                        if ok(v, safe, &vars) {
+                        if ok(v, safe, &vars, assigned) && !assigned.contains(n.as_str()) {
                             vars.insert(n.to_string());
                         } else {
                             vars.remove(n.as_str());
                         }
                     }
-                    Stmt::Return(Some(r), _) if !ok(r, safe, &vars) => returns_ok = false,
+                    Stmt::Return(Some(r), _) if !ok(r, safe, &vars, assigned) => returns_ok = false,
                     _ => {}
                 }
             }
         }
     });
-    returns_ok && ok(body, safe, &HashSet::new())
+    returns_ok && ok(body, safe, &HashSet::new(), assigned)
 }
 
 /// Elements before which the HTML parser ends an open `<p>` ("close a p

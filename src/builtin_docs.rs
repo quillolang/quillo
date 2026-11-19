@@ -109,7 +109,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("write_file", "path, v", "Writes `v` as text, making folders and replacing the file; null, or an error value."),
     ("delete_file", "path", "Removes a file, or a folder and what is in it; nothing there is no error."),
     ("check_program", "path, files", "What `quillo check` says of a program, as maps; `files` gives text in place of what is on disk."),
-    ("run_script", "source, vars", "Runs users' code in a sandbox that sees `vars`; its last value, or an error value."),
+    ("run_script", "source, vars, options", "Runs users' code in a sandbox that sees `vars`, for 100 ms unless `options.timeout` says; its last value, or an error value."),
     ("allow_cross_site", "path", "Lets routes under `path` take form posts from other sites' pages, otherwise refused."),
     ("site_headers", "path, headers", "At the top: headers for every answer (under `path`) that sets none of its own; null takes one of Quillo's away."),
     ("ready", "name, f", "Adds a check to `/_quillo/ready`: `name` is ready while `f` gives `true`."),

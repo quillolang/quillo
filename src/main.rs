@@ -1911,6 +1911,12 @@ fn with_policy(main: &Path, extra: &[PathBuf], say: bool) -> Result<(), i32> {
             if !p.build {
                 quillo::native::NO_BUILD.store(true, std::sync::atomic::Ordering::Relaxed);
             }
+            // Each policy file is the program's own, served by no name, a hard link's included:
+            // known by its identity, as the settings are (FEEDBACK75.md, Q-1088, found in review;
+            // branch feedback75).
+            for f in &p.files {
+                quillo::builtins::protect_named(f, quillo::builtins::OWN_POLICY);
+            }
             quillo::policy::set(p);
             Ok(())
         }

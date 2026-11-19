@@ -23,6 +23,12 @@ const SAFE: &[&str] = &[
 /// Steps (calls and loop rounds) a script may take.
 pub const SCRIPT_STEPS: u64 = 20_000;
 
+/// How long a script may take, in milliseconds, unless `run_script`'s `timeout` says, and the
+/// most that may say: a step can read up to 1 MB, so steps alone let a 143-byte script hold its
+/// instance for 13 s (FEEDBACK75.md, Q-1055; branch feedback75).
+pub const SCRIPT_MS: u64 = 100;
+const MOST_SCRIPT_MS: u64 = 60_000;
+
 /// The most a value a script makes may hold, in bytes, roughly: a string's
 /// bytes, and eight for each number, item or entry, through nested lists
 /// and maps. Each 1 KB made also costs a step.
@@ -65,6 +71,84 @@ pub fn too_big(v: &Value) -> Result<usize, &'static str> {
         }
     }
     Ok(n)
+}
+
+/// What a builtin or an operator reads of `v`, in bytes, counted as `too_big` counts what a script
+/// makes and no further than `most` (FEEDBACK75.md, Q-1055; branch feedback75). Numbers and text
+/// cost no list to count with.
+pub fn read_size(v: &Value, most: usize) -> usize {
+    match v {
+        Value::Str(s) | Value::Html(s) => return s.len(),
+        Value::List(_) | Value::Map(_) | Value::Err(..) => {}
+        _ => return 8,
+    }
+    let mut n = 0usize;
+    let mut todo = vec![v];
+    while let Some(v) = todo.pop() {
+        match v {
+            Value::Str(s) | Value::Html(s) => n = n.saturating_add(s.len()),
+            Value::List(l) => {
+                n = n.saturating_add(l.len().saturating_mul(8));
+                todo.extend(l.iter().filter(|x| matches!(x, Value::Str(_) | Value::Html(_) | Value::List(_) | Value::Map(_) | Value::Err(..))));
+            }
+            Value::Map(m) => {
+                for (k, x) in m.iter() {
+                    n = n.saturating_add(8 + k.len());
+                    if matches!(x, Value::Str(_) | Value::Html(_) | Value::List(_) | Value::Map(_) | Value::Err(..)) {
+                        todo.push(x);
+                    }
+                }
+            }
+            Value::Err(x, _, _) => todo.push(x),
+            _ => n = n.saturating_add(8),
+        }
+        if n >= most {
+            break;
+        }
+    }
+    n
+}
+
+/// Whether builtin `name`'s first argument is paid for otherwise than as read: looked into without
+/// reading it through (a list's or a map's length, an entry, an end, a type), or copied into what
+/// it gives back, which is paid for as made (`push`, `set`, `merge`, `remove`, `sort`, `reverse`,
+/// the cases of a text): `out = push(out, x)` paid twice for `out`, and a loop 0.8.8 ran stopped
+/// (FEEDBACK75.md, Q-1055, found in review; branch feedback75). A text's length is counted through
+/// it, so `len` of a text reads it.
+pub fn looks_into(name: &str, args: &[Value]) -> bool {
+    match name {
+        "get" | "has" | "first" | "last" | "type_of" | "is_err" | "unwrap" | "err" | "filled" => true,
+        "push" | "set" | "merge" | "remove" | "sort" | "reverse" | "upper" | "lower" => true,
+        "len" | "count" => !matches!(args.first(), Some(Value::Str(_))) && args.len() == 1,
+        _ => false,
+    }
+}
+
+/// `run_script`'s third argument, `{ timeout }`: milliseconds (`250`) or text (`"250ms"`,
+/// `"2s"`), from 1 ms to 60 s; 100 ms when not given (FEEDBACK75.md, Q-1055; branch feedback75).
+pub fn timeout_of(opts: Option<&Map>) -> Result<u64, String> {
+    let Some(m) = opts else { return Ok(SCRIPT_MS) };
+    if let Some(k) = m.keys().find(|k| k.as_ref() != "timeout") {
+        return Err(format!("`run_script`: unknown option `{}` (the option is timeout)", k));
+    }
+    let wrong = |v: &Value| format!("`run_script`: `timeout` is milliseconds from 1 to {}, as 250, \"250ms\" or \"2s\", got {}", MOST_SCRIPT_MS, v.repr());
+    let ms = match m.get("timeout") {
+        None | Some(Value::Nil) => return Ok(SCRIPT_MS),
+        Some(Value::Int(n)) => Some(*n as f64),
+        Some(Value::Str(t)) => {
+            let t = t.trim();
+            let (num, scale) = match t.strip_suffix("ms") {
+                Some(n) => (n, 1.0),
+                None => (t.strip_suffix('s').unwrap_or("x"), 1000.0),
+            };
+            num.trim().parse::<f64>().ok().filter(|n| n.is_finite()).map(|n| n * scale)
+        }
+        _ => None,
+    };
+    match ms {
+        Some(ms) if (1.0..=MOST_SCRIPT_MS as f64).contains(&ms) => Ok(ms.round() as u64),
+        _ => Err(wrong(m.get("timeout").unwrap_or(&Value::Nil))),
+    }
 }
 
 /// Whether builtin `name` would make a value over the limit from `args`,
@@ -140,20 +224,51 @@ fn forbidden(e: &Expr) -> Option<&'static str> {
 /// the script, as no `??` takes it (FEEDBACK71.md, Q-977, found in review: `run_script(...) ??
 /// "caught"` caught it; branch security).
 pub fn run_script(it: &mut Interp, src: &str, vars: Option<&Map>) -> Result<Value, Ctrl> {
+    run_script_for(it, src, vars, SCRIPT_MS)
+}
+
+/// `run_script`, stopped after `ms` milliseconds (FEEDBACK75.md, Q-1055; branch feedback75).
+pub fn run_script_for(it: &mut Interp, src: &str, vars: Option<&Map>, ms: u64) -> Result<Value, Ctrl> {
+    // Its clock starts as it is read: a source near `--max-body` takes its time to parse.
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     // Names are kept for good, and this source may be a visitor's: its own are its own
     // (src/sym.rs), and messages say them as it wrote them.
     let (parsed, names) = crate::sym::Sym::in_script(|| crate::parser::Parser::new(src).parse_program());
     let out = match parsed {
-        Ok(stmts) => run_parsed(it, &stmts, &names, vars)?,
+        Ok(stmts) => run_parsed(it, &stmts, &names, vars, (until, ms))?,
         Err(e) => bad(&format!("line {}: {}", e.line, e.msg)),
     };
-    if names.is_empty() {
-        return Ok(out);
-    }
+    // Each name a message quotes, cut at 100 characters: an unknown name of 1 MB was said whole,
+    // into the log with each request (FEEDBACK75.md, Q-1076, found in review; branch feedback75).
+    // Quillo's own messages, not an error value the script made itself.
     Ok(match &out {
-        Value::Err(e, _, _) if matches!(&**e, Value::Str(_)) => bad(&said_as_written(&e.display(), &names)),
+        Value::Err(e, own, _) if matches!(&**e, Value::Str(_)) && (!names.is_empty() || (!own && e.display().len() > 100)) => {
+            let msg = e.display();
+            let msg = if names.is_empty() { msg } else { said_as_written(&msg, &names) };
+            if !own && msg.len() > 100 {
+                bad(&quoted_cut(&msg))
+            } else if names.is_empty() {
+                out
+            } else {
+                bad(&msg)
+            }
+        }
         _ => out,
     })
+}
+
+/// `msg` with each part in backticks cut at 100 characters, as `interp::said_name` cuts a name.
+fn quoted_cut(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len().min(4096));
+    let mut quoted = false;
+    for (i, part) in msg.split('`').enumerate() {
+        if i > 0 {
+            out.push('`');
+        }
+        out.push_str(if quoted { crate::interp::said_name(part) } else { part.into() }.as_ref());
+        quoted = !quoted;
+    }
+    out
 }
 
 /// `msg` with a script's own names as it wrote them: a message quotes a name in backticks,
@@ -179,7 +294,7 @@ fn said_as_written(msg: &str, names: &std::collections::HashMap<String, Sym>) ->
     out
 }
 
-fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap<String, Sym>, vars: Option<&Map>) -> Result<Value, Ctrl> {
+fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap<String, Sym>, vars: Option<&Map>, clock: (std::time::Instant, u64)) -> Result<Value, Ctrl> {
     // Its world: the safe builtins, then its variables. Quillo's own, not what the program's
     // globals have by those names: a program's `fn upper` was the script's `upper`, run with the
     // program's effects (FEEDBACK51.md, Q-648; branch feedback51-fixes).
@@ -210,7 +325,13 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
     let saved = std::mem::replace(&mut it.fuel, SCRIPT_STEPS);
     let saved_allowed = std::mem::replace(&mut it.allowed, 0);
     let saved_restrictor = it.restrictor.take();
-    let saved_script = it.script.replace((root.clone(), saved_allowed));
+    // A script a helper of another's runs ends by the outer one's time too (FEEDBACK75.md,
+    // Q-1055; branch feedback75).
+    let clock = match &it.script {
+        Some((_, _, until, ms)) if *until < clock.0 => (*until, *ms),
+        _ => clock,
+    };
+    let saved_script = it.script.replace((root.clone(), saved_allowed, clock.0, clock.1));
     let mut stopped = None;
     // Room on the stack for code nested as deeply as the parser allows.
     let out = crate::stack::for_nesting(crate::parser::MAX_NESTING, || {
