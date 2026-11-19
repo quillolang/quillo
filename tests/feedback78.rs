@@ -271,3 +271,43 @@ route GET /n = str(db.one("select n from p where k = 'a'")?.n)
     assert_eq!(call(port, "GET", "/n", wait), (200, (11 * (AT_ONCE + 1)).to_string()));
     stops(&mut g, "parallel");
 }
+
+// Q-1170: a transaction waiting for one of MySQL's connections waits without a thread, as
+// PostgreSQL's does. With `pool_max=1` and `--workers 2` (3 threads), ten transactions that each
+// hold the connection for 300 ms: those waiting for it took the threads, and a request needing one
+// for a millisecond waited behind them for seconds; now it is answered at once.
+#[test]
+fn a_transaction_waiting_for_a_mysql_connection_holds_no_thread() {
+    let Some(my) = support::mariadb("f78-checkout") else {
+        eprintln!("skipped: no MariaDB");
+        return;
+    };
+    let url = format!("{}?pool_min=1&pool_max=1", my.url("f78_checkout"));
+    let src = format!(
+        r#"db.open("{}")
+
+route POST /slow/:i = db.transaction(() => {{
+    let r = db.one("select ? as i", i)?
+    sleep(300)
+    str(r.i)
+}})
+
+route GET /quick {{
+    sleep(1)
+    "quick"
+}}
+"#,
+        url
+    );
+    let dir = support::temp_dir("f78-checkout");
+    let (mut g, port) = start(&dir, &src, &["--workers", "2"]);
+    let slow: Vec<_> = (0..10).map(|i| std::thread::spawn(move || call(port, "POST", &format!("/slow/{}", i), Duration::from_secs(30)))).collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let t = Instant::now();
+    assert_eq!(call(port, "GET", "/quick", Duration::from_secs(20)), (200, "quick".to_string()));
+    assert!(t.elapsed() < Duration::from_secs(1), "a request needing a thread waited {:?} behind transactions waiting for a connection", t.elapsed());
+    for (i, s) in slow.into_iter().enumerate() {
+        assert_eq!(s.join().unwrap(), (200, i.to_string()));
+    }
+    stops(&mut g, "MySQL checkout");
+}

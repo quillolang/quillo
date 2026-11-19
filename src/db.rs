@@ -1167,6 +1167,15 @@ fn tenant_target_or_none(it: &mut Interp, dbs: &Arc<TenantDbs>, name: &str) -> R
 /// that hold the connections, so waiting there could stop them all.
 pub(crate) fn checkout_for_tx(it: &mut Interp, b: &Arc<Backend>) -> Result<Pinned, String> {
     let Backend::Postgres(pool) = &**b else {
+        // MySQL's too, for as long as PostgreSQL's: it waited on one of those threads, with no
+        // limit (FEEDBACK78.md, Q-1170; branch feedback75). In place outside a request, and in a
+        // SQLite transaction, as before.
+        #[cfg(feature = "mysql")]
+        if let Backend::Mysql(p) = &**b {
+            if let Some(r) = crate::httpd::await_elsewhere(Box::pin(p.checkout_later())) {
+                return r.and_then(|c| c).map(Pinned::My);
+            }
+        }
         let b = b.clone();
         return it.unlocked(move || b.checkout());
     };

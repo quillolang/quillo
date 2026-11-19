@@ -211,6 +211,26 @@ impl Pool {
         run(pool.get_conn()).map(|c| Conn(Some(c), None, false, self.asked.clone(), false)).map_err(|e| e.to_string())
     }
 
+    /// `checkout`, as a future a request waits on without a thread, for at most
+    /// `pg::CHECKOUT_WAIT`, as PostgreSQL's does (`db::checkout_for_tx`). Waited for on one of the
+    /// server's waiting threads, with no limit, the transactions waiting for one of the pool's 100
+    /// connections took the threads that requests and the transactions holding them needed
+    /// (FEEDBACK78.md, Q-1170; branch feedback75).
+    pub fn checkout_later(&self) -> impl std::future::Future<Output = Result<Conn, String>> + Send + 'static {
+        let pool = self.pool.clone().expect("open");
+        let asked = self.asked.clone();
+        async move {
+            match tokio::time::timeout(crate::pg::CHECKOUT_WAIT, pool.get_conn()).await {
+                Ok(Ok(c)) => Ok(Conn(Some(c), None, false, asked, false)),
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(_) => Err(format!(
+                    "no MySQL connection free after {} s: all the pool's are in use (`?pool_max=N` in the URL allows more)",
+                    crate::pg::CHECKOUT_WAIT.as_secs()
+                )),
+            }
+        }
+    }
+
     /// Whether one of these names is a function of the database's own (which may write, so a
     /// replica is not asked), as far as known: None when a name was never looked up. MySQL's
     /// own functions are not in `information_schema.routines` (FEEDBACK55.md, Q-750; found in
