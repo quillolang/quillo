@@ -1155,8 +1155,32 @@ mod webtransport {
         connect_at(r, "127.0.0.1").await
     }
 
-    /// A session to the server's WebTransport at `host` (`127.0.0.1`, `[::1]`).
+    /// A session to the server's WebTransport at `host` (`127.0.0.1`, `[::1]`), asked again only
+    /// when wtransport's own driver dropped the attempt before Quillo was asked: wtransport 0.7.2
+    /// reads a page's SETTINGS frame inside a `select!` it rebuilds whenever another stream comes,
+    /// so a frame split across packets is read again from its middle and the server closes the
+    /// connection at the HTTP/3 level (0x105, 0x107) or never answers, on 0.8.8 as on this branch
+    /// (FEEDBACK75.md, Q-1124; branch feedback75). At most five tries; any other error, refusal or
+    /// session is returned as it is.
     pub async fn connect_at(r: &Run, host: &str) -> Result<Connection, String> {
+        let mut last = String::new();
+        for _ in 0..5 {
+            match tokio::time::timeout(Duration::from_secs(10), connect_once(r, host)).await {
+                Ok(Err(e)) if dropped_by_wtransport(&e) => last = e,
+                Ok(answer) => return answer,
+                Err(_) => last = "no answer within 10 s".to_string(),
+            }
+        }
+        Err(last)
+    }
+
+    /// Whether the server closed a connection at the HTTP/3 level (0x100 to 0x10f), as
+    /// wtransport's driver does on the race `connect_at` asks again for (Q-1124).
+    fn dropped_by_wtransport(e: &str) -> bool {
+        e.strip_prefix("connection closed by peer: ").and_then(|c| c.split_whitespace().next()).and_then(|c| c.parse::<u64>().ok()).is_some_and(|c| (0x100..0x110).contains(&c))
+    }
+
+    async fn connect_once(r: &Run, host: &str) -> Result<Connection, String> {
         let t = r.ticket("", "");
         let port = t["port"].as_u64().expect("no port");
         let hex = t["hash"].as_str().expect("no hash");
