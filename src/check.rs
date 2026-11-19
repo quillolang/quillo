@@ -3236,6 +3236,11 @@ impl Checker {
             self.out.symbols.push(Symbol { name: name.clone(), kind: SymbolKind::Variable, file: file.to_string(), line, detail });
             self.globals.insert(name, Var { t: T::of(ANY), sig: None, file, line, kind: Kind::Global, used: true, ready: true });
         }
+        // The types that name themselves with nothing between (`type Ab = Ab | int`): a value of
+        // one could be anything, so each is an error, found once over the definitions; the
+        // program's walk carries no chain to find one as it runs (FEEDBACK75.md, Q-1080, found in
+        // review; branch feedback75).
+        let looped = RECORDS.with(|r| crate::record::self_naming(&r.borrow()));
         // Everything top-level is known up front; it becomes usable from
         // top-level code once the program has run its definition.
         for it in &order {
@@ -3278,6 +3283,18 @@ impl Checker {
                     );
                 }
                 Stmt::Type(td) => {
+                    if looped.contains(&td.name) {
+                        // Through a `?`, a list or a record in the way, as `list<Opt>?` says
+                        // nothing a list does not (FEEDBACK75.md, Q-1080, found in review; branch
+                        // feedback75).
+                        let n = &td.name;
+                        let way = if RECORDS.with(|r| crate::record::self_naming_optional(&r.borrow(), n)) {
+                            format!("put a record or a list in the way (`type {} = {{ next: {}? }}`)", n, n)
+                        } else {
+                            format!("put a record, a list or a map shape in the way (`type {} = list<{}> | int`)", n, n)
+                        };
+                        self.diag_at(it.file.clone(), td.line, Severity::Error, format!("type {} names itself with nothing between: {}", n, way));
+                    }
                     self.globals.insert(
                         td.name.clone(),
                         Var {

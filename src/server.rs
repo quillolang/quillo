@@ -2109,7 +2109,9 @@ impl Interp {
         let hdr = |n: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(n)).map(|(_, v)| v.as_str());
         let live = hdr("x-quillo-live").is_some();
         if !live {
-            let res = self.call_closure(&c, args.into_iter().map(Some).collect(), 0);
+            // Its arguments made above, not checked again (FEEDBACK75.md, Q-1080, found in review;
+            // branch feedback75).
+            let res = self.call_made(&c, args, 0);
             self.current_request = None;
             return match res {
                 Ok(v) | Err(Ctrl::Return(v)) => match for_visitor(v) {
@@ -2148,7 +2150,7 @@ impl Interp {
                 self.own_seqs.clear();
                 let cookies = self.set_cookies.len();
                 self.in_run = true;
-                let res = self.call_closure(&c, args.into_iter().map(Some).collect(), 0);
+                let res = self.call_made(&c, args, 0);
                 self.in_run = false;
                 let mut topics: Vec<String> = self.reads.take().unwrap_or_default().into_iter().collect();
                 // Every change since the run began its own (it marked what it

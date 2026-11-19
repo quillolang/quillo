@@ -3377,9 +3377,12 @@ fn b2_review2_a_page_without_components_tells_the_worker_the_session() {
     stage_reached(stages.port, 1, &page);
     drop(s);
     let public = serde_json::json!({ "quillo::V": ["/"] });
+    // The sign-out off the site no longer goes unseen: the worker reads `quillo_tag` after the
+    // redirect, and hears of its change, and drops the session's pages at once, before the server
+    // stops (`still`) (changed with FEEDBACK75.md, Q-1082; branch feedback75).
     assert_eq!(
         page.join().unwrap(),
-        serde_json::json!({ "controlled": true, "mine": "Mine ana", "signed": { "quillo::V": ["/"], "quillo::V:S": ["/mine"] }, "cookie": "-", "down": true, "still": { "quillo::V": ["/"], "quillo::V:S": ["/mine"] }, "home": "Home", "after": public })
+        serde_json::json!({ "controlled": true, "mine": "Mine ana", "signed": { "quillo::V": ["/"], "quillo::V:S": ["/mine"] }, "cookie": "-", "down": true, "still": public, "home": "Home", "after": public })
     );
 }
 
@@ -3666,7 +3669,10 @@ fn b3_where_the_marks_go_and_whether_the_gate_runs() {
         r,
         serde_json::json!({
             "at": { "empty_comment": 5, "dash_comment": 6, "bang_end": 11, "unclosed": 0, "four_dashes": 7, "bom_doctype": 27, "pi": 21, "nbsp": 0, "past_4kb": 0, "doctype_unclosed": 0 },
-            "runs": { "none": true, "self": false, "hashed": true, "inline": true, "inline_nonce": false, "default_only": false, "style_only": true, "sandbox": false, "sandbox_same_origin": false, "sandbox_scripts": true, "two": false },
+            // A sandbox with scripts but not `allow-same-origin` stops the gate too: its page's origin
+            // is opaque, where the gate's `document.cookie` throws (changed with FEEDBACK75.md,
+            // Q-1078; branch feedback75).
+            "runs": { "none": true, "self": false, "hashed": true, "inline": true, "inline_nonce": false, "default_only": false, "style_only": true, "sandbox": false, "sandbox_same_origin": false, "sandbox_scripts": false, "two": false },
         })
     );
 }

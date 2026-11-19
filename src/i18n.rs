@@ -400,8 +400,10 @@ fn translate(it: &mut Interp, args: Vec<Value>, line: u32, html: bool) -> R {
     it.note_locale();
     let Some(l) = it.locale() else { return fail(line, "`t` needs `translations` first") };
     let i18n = it.site.i18n.clone().expect("a locale means translations");
-    let text = match i18n.entry(&l, &key) {
-        Some(Value::Str(s)) => s.to_string(),
+    // `table`: the text is the table's own, which `attr_spans` may keep its reading of.
+    let mut table = true;
+    let text: Arc<str> = match i18n.entry(&l, &key) {
+        Some(Value::Str(s)) => s.clone(),
         Some(Value::Map(forms)) => {
             // A count read from a form or a query is text, and an amount is a decimal: each is
             // taken at its number, a decimal's written digits counting as CLDR counts them
@@ -415,15 +417,47 @@ fn translate(it: &mut Interp, args: Vec<Value>, line: u32, html: bool) -> R {
                 Some(o) => plural_of(&l, &o),
                 None => "other",
             };
-            forms.get(cat).or_else(|| forms.get("other")).map(|v| v.display().to_string()).unwrap_or_default()
+            match forms.get(cat).or_else(|| forms.get("other")) {
+                Some(Value::Str(s)) => s.clone(),
+                Some(v) => {
+                    table = false;
+                    Arc::from(v.display().as_ref())
+                }
+                None => Arc::from(""),
+            }
         }
-        _ => key.to_string(),
+        // A key missing from every locale shows as itself: in the HTML form (`raw(t(...))`) as
+        // text, escaped, not as the translation's trusted markup. A key built from the request
+        // (`` raw(t(`flash.${msg}`)) ``) put `<script>` into the page (FEEDBACK75.md, Q-1059;
+        // branch feedback75).
+        // It has no tag, so nothing of it is read or kept (`attr_spans`): a key from a form filled
+        // the reading's cache, 4 MB keys taking 1.5 GB (FEEDBACK75.md, Q-1083's review; branch
+        // feedback75).
+        _ if html => return Ok(Value::html(interpolate(&crate::interp::escape(&key), escaped_vars(vars).as_ref()))),
+        _ => key,
     };
     if html {
-        let escaped = vars.map(|m| m.iter().map(|(k, v)| (k.clone(), Value::str(crate::interp::escape(&v.display())))).collect::<Map>());
-        return Ok(Value::html(interpolate(&text, escaped.as_ref())));
+        // An attribute of the translation's markup that takes a URL and holds a value
+        // (`<a href="{site}">`, `href="{scheme}:{rest}"`) is `about:blank#blocked` where what is
+        // written there makes a `javascript:` or `vbscript:` one, as markup makes it: the HTML
+        // form took a visitor's `javascript:` link as it was. Only there: the same value as text
+        // (`<i>{title}</i>`, "JavaScript: The Good Parts") is shown as written. An attribute
+        // written without quotes that holds a value is quoted, so that the value cannot end it
+        // (`href={site}` with "x onfocus=alert(1)") (FEEDBACK75.md, Q-1083 and its reviews;
+        // branch feedback75).
+        if let (Some(vars), true) = (&vars, table) {
+            if let Some(spans) = attr_spans(&text) {
+                return Ok(Value::html(interpolate_html(&text, vars, &spans)));
+            }
+        }
+        return Ok(Value::html(interpolate(&text, escaped_vars(vars).as_ref())));
     }
     Ok(Value::str(interpolate(&text, vars.as_deref())))
+}
+
+/// The values for the HTML form, each escaped.
+fn escaped_vars(vars: Option<Arc<Map>>) -> Option<Map> {
+    vars.map(|m| m.iter().map(|(k, v)| (k.clone(), Value::str(crate::interp::escape(&v.display())))).collect::<Map>())
 }
 
 /// The script a language is written in, in a region, where it has more than one (CLDR's
@@ -483,6 +517,270 @@ pub fn categories(locale: &str) -> Vec<&'static str> {
     }
     seen.sort_by_key(|c| PLURALS.iter().position(|p| p == c));
     seen
+}
+
+/// An attribute value of a translation's markup that holds a placeholder and needs care where
+/// values are put in: one that takes a URL (`kind` `URL`, `SRCSET`, `PING`), or one written
+/// without quotes (`quoted` false). `start..end`: the value, without its quotes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub quoted: bool,
+    pub kind: u8,
+}
+
+/// `Span::kind`s: not a URL; a URL (`interp::URL_ATTRS`); `srcset`'s list; `ping`'s list.
+pub const OTHER: u8 = 0;
+pub const URL: u8 = 1;
+pub const SRCSET: u8 = 2;
+pub const PING: u8 = 3;
+
+thread_local! {
+    /// `attr_spans` of each text of the translation table, by its address (the text kept, so
+    /// that its address is no other's), and how many bytes of text that is: up to `SPANS_BYTES`.
+    static SPANS: std::cell::RefCell<(HashMap<usize, (Arc<str>, Arc<[Span]>)>, usize)> = std::cell::RefCell::new((HashMap::new(), 0));
+}
+
+const SPANS_BYTES: usize = 4 << 20;
+
+/// The attribute values to take care of in `text`, a text of the translation table (see `Span`),
+/// none if none: read once for each text, and only for one with an attribute (`=`) and a
+/// placeholder (`{`) in it.
+pub fn attr_spans(text: &Arc<str>) -> Option<Arc<[Span]>> {
+    if !text.contains('=') || !text.contains('{') {
+        return None;
+    }
+    let at = text.as_ptr() as usize;
+    let found = match SPANS.with(|c| c.borrow().0.get(&at).map(|(_, s)| s.clone())) {
+        Some(s) => s,
+        None => {
+            let found: Arc<[Span]> = Arc::from(find_attr_spans(text));
+            SPANS.with(|c| {
+                let mut c = c.borrow_mut();
+                if c.1 + text.len() > SPANS_BYTES {
+                    *c = (HashMap::new(), 0);
+                }
+                if text.len() <= SPANS_BYTES {
+                    c.1 += text.len();
+                    c.0.insert(at, (text.clone(), found.clone()));
+                }
+            });
+            found
+        }
+    };
+    (!found.is_empty()).then_some(found)
+}
+
+/// The bytes of text `attr_spans` keeps on this thread: for tests.
+#[doc(hidden)]
+pub fn attr_spans_kept() -> usize {
+    SPANS.with(|c| c.borrow().1)
+}
+
+/// The end of the placeholder at `i` (its `{`), as `interpolate` reads one: a name of letters,
+/// digits and `_`, then `}`.
+fn placeholder_end(b: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+        j += 1;
+    }
+    (j > i + 1 && b.get(j) == Some(&b'}')).then_some(j + 1)
+}
+
+/// `attr_spans`, read from the text as the browser reads its tags: a start tag's name ends at
+/// white space, `/` or `>`; attributes are split by white space and `/`; values quoted either way
+/// or not at all; comments skipped.
+pub fn find_attr_spans(text: &str) -> Vec<Span> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        if b[i..].starts_with(b"<!--") {
+            i = text[i + 4..].find("-->").map_or(b.len(), |e| i + 4 + e + 3);
+            continue;
+        }
+        if !b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
+            i += 1;
+            continue;
+        }
+        while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'>' && b[i] != b'/' {
+            i += 1;
+        }
+        loop {
+            while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b'/') {
+                i += 1;
+            }
+            if i >= b.len() || b[i] == b'>' {
+                i += 1;
+                break;
+            }
+            let name_at = i;
+            while i < b.len() && !b[i].is_ascii_whitespace() && !matches!(b[i], b'=' | b'>' | b'/') {
+                i += 1;
+            }
+            let name = &text[name_at..i];
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            if b.get(i) != Some(&b'=') {
+                continue;
+            }
+            i += 1;
+            while i < b.len() && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            let quote = match b.get(i) {
+                Some(&q @ (b'"' | b'\'')) => {
+                    i += 1;
+                    Some(q)
+                }
+                _ => None,
+            };
+            let kind = if name.eq_ignore_ascii_case("srcset") {
+                SRCSET
+            } else if name.eq_ignore_ascii_case("ping") {
+                PING
+            } else if crate::interp::url_attr(name) {
+                URL
+            } else {
+                OTHER
+            };
+            let (start, mut holds) = (i, false);
+            while i < b.len() {
+                let c = b[i];
+                if Some(c) == quote || (quote.is_none() && (c.is_ascii_whitespace() || c == b'>')) {
+                    break;
+                }
+                if c == b'{' {
+                    if let Some(end) = placeholder_end(b, i) {
+                        holds = true;
+                        i = end;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            if holds && (kind != OTHER || quote.is_none()) {
+                out.push(Span { start, end: i, quoted: quote.is_some(), kind });
+            }
+            if quote.is_some() && i < b.len() {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `text` with its placeholders put in, each value escaped (`raw` false), or as the browser
+/// reads the attribute value it is in (`raw` true: values as they are, character references of
+/// the text decoded), for `runs_script`.
+fn put_in(text: &str, vars: &Map, raw: bool, out: &mut String) {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'{' => {
+                if let Some(end) = placeholder_end(b, i) {
+                    if let Some(v) = vars.get(&text[i + 1..end - 1]) {
+                        let d = v.display();
+                        if raw {
+                            out.push_str(&d);
+                        } else {
+                            crate::interp::escape_into(&d, out);
+                        }
+                        i = end;
+                        continue;
+                    }
+                }
+                out.push('{');
+                i += 1;
+            }
+            b'&' => {
+                match char_ref(&text[i..]).filter(|_| raw) {
+                    Some((c, len)) => {
+                        out.push(c);
+                        i += len;
+                    }
+                    None => {
+                        out.push('&');
+                        i += 1;
+                    }
+                }
+            }
+            _ => {
+                let next = text[i..].find(['{', '&']).map_or(b.len(), |n| i + n);
+                out.push_str(&text[i..next]);
+                i = next;
+            }
+        }
+    }
+}
+
+/// The character a character reference at the start of `t` stands for, and its length: decimal
+/// and hexadecimal ones (their `;` optional, as the browser reads them), and the named ones a URL's
+/// start may be written with.
+fn char_ref(t: &str) -> Option<(char, usize)> {
+    let b = t.as_bytes();
+    if b.get(1) == Some(&b'#') {
+        let hex = matches!(b.get(2), Some(b'x' | b'X'));
+        let from = if hex { 3 } else { 2 };
+        let digits = b[from..].iter().take_while(|c| if hex { c.is_ascii_hexdigit() } else { c.is_ascii_digit() }).count();
+        if digits == 0 || digits > 8 {
+            return None;
+        }
+        let n = u32::from_str_radix(&t[from..from + digits], if hex { 16 } else { 10 }).ok()?;
+        let len = from + digits + (b.get(from + digits) == Some(&b';')) as usize;
+        return Some((char::from_u32(n).unwrap_or('\u{FFFD}'), len));
+    }
+    for (name, c) in [("&Tab;", '\t'), ("&NewLine;", '\n'), ("&colon;", ':'), ("&amp;", '&'), ("&lt;", '<'), ("&gt;", '>'), ("&quot;", '"'), ("&apos;", '\''), ("&nbsp;", '\u{a0}')] {
+        if b.len() >= name.len() && b[..name.len()].eq_ignore_ascii_case(name.as_bytes()) {
+            return Some((c, name.len()));
+        }
+    }
+    None
+}
+
+/// Whether what an attribute value of `kind` says, its values put in, runs script when followed:
+/// a `javascript:` or `vbscript:` URL as markup reads one (`interp::script_url`); in `srcset`,
+/// any of its images' URLs; in `ping`, any of its URLs.
+fn runs_script(text: &str, vars: &Map, kind: u8) -> bool {
+    let mut value = String::with_capacity(text.len() + 16);
+    put_in(text, vars, true, &mut value);
+    match kind {
+        SRCSET => value.split(',').any(|c| crate::interp::script_url(c.trim_start_matches(|c: char| c.is_ascii_whitespace()).split(|c: char| c.is_ascii_whitespace()).next().unwrap_or(""))),
+        PING => value.split(|c: char| c.is_ascii_whitespace()).any(crate::interp::script_url),
+        _ => crate::interp::script_url(&value),
+    }
+}
+
+/// `interpolate` for the HTML form: each value escaped; an attribute value in `spans` that takes
+/// a URL and would run script, `interp::BLOCKED_URL`; one written without quotes, quoted.
+fn interpolate_html(text: &str, vars: &Map, spans: &[Span]) -> String {
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut pos = 0;
+    for sp in spans {
+        put_in(&text[pos..sp.start], vars, false, &mut out);
+        let value = &text[sp.start..sp.end];
+        if !sp.quoted {
+            out.push('"');
+        }
+        if sp.kind != OTHER && runs_script(value, vars, sp.kind) {
+            out.push_str(crate::interp::BLOCKED_URL);
+        } else {
+            put_in(value, vars, false, &mut out);
+        }
+        if !sp.quoted {
+            out.push('"');
+        }
+        pos = sp.end;
+    }
+    put_in(&text[pos..], vars, false, &mut out);
+    out
 }
 
 /// `{name}` replaced by the value's text; other braces are left alone.

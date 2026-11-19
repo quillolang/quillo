@@ -961,8 +961,13 @@ pub fn age_jwks(url: &str, by: Duration) {
 /// (FEEDBACK51.md, Q-665; branch feedback51-fixes). A client's own token has the client as
 /// `sub` (RFC 9068 §2.2, Okta), or is one of Auth0's client-credentials tokens, a Keycloak
 /// service account's, or an Entra ID app's.
+/// Okta names the client in `cid`, with the user's login in `sub` and no `client_id` or `azp`:
+/// the name fell back to `sub`, which equals itself, so every Okta user's token for the audience
+/// was a service's own, named by the login. `cid` names the client too, after `client_id` and
+/// `azp`, and so does Entra ID's v1 `appid` (FEEDBACK75.md, Q-1079 and its review; branch
+/// feedback75).
 pub fn jwt_caller(claims: &serde_json::Value) -> Result<Value, String> {
-    let name = ["client_id", "azp", "sub"].iter().find_map(|k| claims[*k].as_str()).unwrap_or("").to_string();
+    let name = ["client_id", "azp", "cid", "appid", "sub"].iter().find_map(|k| claims[*k].as_str()).unwrap_or("").to_string();
     let own = match claims["sub"].as_str() {
         None => true,
         Some(sub) => {

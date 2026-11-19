@@ -991,7 +991,9 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
     svc.request_id = rid;
     let err = |msg: String| Outcome::Refused(500, msg);
     let Some(carried) = carry_in(it, &mut svc, name, it.in_tool || call.starts_with(UNSEEN_CALL)) else { return Outcome::Stopped };
-    let r = svc.call_closure(&c, args.into_iter().map(Some).collect(), line);
+    // Its arguments made by `take_args`, not checked again (FEEDBACK75.md, Q-1080, found in
+    // review; branch feedback75).
+    let r = svc.call_made(&c, args, line);
     let label = format!("{}.{}", name, f);
     match (carry_back(it, &mut svc, carried, name, &label), r) {
         // Stopped to ask, or at a question refused there, said in its log as a builtin's error is.
@@ -2178,7 +2180,9 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: V
     let unseen = !carried && header("x-quillo-call").is_some_and(|c| c.starts_with(UNSEEN_CALL));
     let was_in = it.in_tool;
     it.in_tool |= unseen;
-    let (result, back) = with_asking(it, asking, |it| it.call_closure(&c, args.into_iter().map(Some).collect(), 0));
+    // Its arguments made by `take_args`, not checked again (FEEDBACK75.md, Q-1080, found in
+    // review; branch feedback75).
+    let (result, back) = with_asking(it, asking, |it| it.call_made(&c, args, 0));
     it.in_tool = was_in;
     it.deadline = None;
     let published = it.published.take().unwrap_or_default();

@@ -813,6 +813,11 @@ impl<'a> Reader<'a> {
             if name == "into" && any(k + 1, &["temp", "temporary"]) {
                 return true;
             }
+            // `update pg_settings set setting = ...` is `set`, for the session, as PostgreSQL
+            // defines it (FEEDBACK75.md, Q-1060; branch feedback75).
+            if name == "pg_settings" && self.updated(k, from) {
+                return true;
+            }
             if called && matches!(name.as_str(), "pg_advisory_lock" | "pg_advisory_lock_shared" | "pg_try_advisory_lock" | "pg_try_advisory_lock_shared") {
                 return true;
             }
@@ -825,6 +830,19 @@ impl<'a> Reader<'a> {
             }
         }
         false
+    }
+
+    /// Whether the table named at token `k` is the one an `update` changes: `update t`, `update
+    /// only t`, `update pg_catalog.t`; never before `from`, the statement's start.
+    fn updated(&self, k: usize, from: usize) -> bool {
+        let mut j = k;
+        if j >= from + 2 && self.kind(j - 1) == Some(Kind::Dot) && self.name(j - 2).as_deref() == Some("pg_catalog") {
+            j -= 2;
+        }
+        if j > from && self.is_word(j - 1, "only") {
+            j -= 1;
+        }
+        j > from && self.is_word(j - 1, "update")
     }
 
     /// Whether a string's text, read as PostgreSQL statements, changes the session.
@@ -1269,6 +1287,17 @@ fn writes_when_called(name: &str) -> bool {
     NAMES.contains(&name) || STARTS.iter().any(|p| name.starts_with(p))
 }
 
+/// PostgreSQL's own functions that run SQL from text (`query_to_xml('select ...', ...)`,
+/// `ts_stat('select ...')`, `ts_rewrite(q, 'select ...')`), a cursor's (`cursor_to_xml`), or read
+/// tables and views by name (`table_to_xml`, `schema_to_xml`, `database_to_xml`): a view's or the
+/// text's `set_config(..., false)` changed the session that every request shares (FEEDBACK75.md,
+/// Q-1060 and its review; branch feedback75).
+fn runs_sql(name: &str) -> bool {
+    const NAMES: &[&str] = &["ts_stat", "ts_rewrite"];
+    const STARTS: &[&str] = &["query_to_xml", "cursor_to_xml", "table_to_xml", "schema_to_xml", "database_to_xml"];
+    NAMES.contains(&name) || STARTS.iter().any(|p| name.starts_with(p))
+}
+
 /// `U&"..."`'s text decoded: `\XXXX`, `\+XXXXXX` and `\\`.
 fn unicode_escapes(t: &str) -> String {
     let mut out = String::with_capacity(t.len());
@@ -1356,6 +1385,10 @@ impl Scan {
                     // MySQL's names in any case are one.
                     let name = if pg { r.name(k) } else { r.name(k).map(|n| n.to_lowercase()) };
                     if let Some(n) = name {
+                        // PostgreSQL's own functions that run SQL given as text or read tables and
+                        // views by name: what they run is not read here, so they run isolated, as
+                        // a `do` block does (FEEDBACK75.md, Q-1060; branch feedback75).
+                        unseen |= pg && runs_sql(&n);
                         if !(r.toks[k].kind == Kind::Word && NOT_CALLS.contains(&n.as_str())) && !calls.iter().any(|c| **c == *n) {
                             calls.push(n.into_boxed_str());
                         }

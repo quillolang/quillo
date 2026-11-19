@@ -21,7 +21,7 @@
 //   answer, or the page's runtime, names another, and a session dropped is never kept again.
 // - Every other request goes to the network as if there were no worker.
 const BASE = @BASE@, V = @V@, PAGES = @PAGES@, OFFLINE = @OFFLINE@, GATE = @GATE@, GATE_HASH = @GATE_HASH@;
-const MINE = "quillo:" + BASE + ":", NAME = MINE + V, AWAY = NAME + ":", GONE = MINE + "gone";
+const MINE = "quillo:" + BASE + ":", NAME = MINE + V, AWAY = NAME + ":", GONE = MINE + "gone", TAG = "quillo_tag";
 const STATE = location.origin + BASE + "/_quillo/sw-state", DROPPED = location.origin + BASE + "/_quillo/sw-dropped";
 const NAMED = BASE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/_quillo/[brsti]/[0-9a-f]+\\.(?:js|css|png)";
 const ONE = new RegExp("^" + NAMED + "$"), ALL = new RegExp(NAMED, "g");
@@ -39,8 +39,21 @@ self.addEventListener("install", (e) => {
 self.addEventListener("activate", (e) => e.waitUntil((async () => {
   if (await isReady()) await dropOld();
   if (self.registration.navigationPreload) await self.registration.navigationPreload.enable();
+  // The worker follows `quillo_tag` itself where the browser tells it of changes (the Cookie Store
+  // API's, in Chromium): a sign-out it never saw (one that redirects to another site) left the
+  // person's kept pages in Cache Storage, readable on the device, until a page of the site was
+  // opened online (FEEDBACK75.md, Q-1082; branch feedback75).
+  if (self.registration.cookies) await self.registration.cookies.subscribe([{ name: TAG, url: self.registration.scope }]).catch(() => {});
   await self.clients.claim();
 })()));
+
+// `quillo_tag` set or taken away: the session the browser holds now, "-" for none, as the page's
+// runtime says it (FEEDBACK75.md, Q-1082; branch feedback75).
+self.addEventListener("cookiechange", (e) => {
+  const mine = (l) => (l || []).find((c) => c.name === TAG);
+  const set = mine(e.changed);
+  if (set || mine(e.deleted)) e.waitUntil(current(set ? set.value : "-", true));
+});
 
 self.addEventListener("fetch", (e) => {
   const r = e.request, u = new URL(r.url);
@@ -51,9 +64,18 @@ self.addEventListener("fetch", (e) => {
   }
   if (r.mode !== "navigate") return;
   // A form sent by a navigation is only read for the session it leaves, as a sign-out answered
-  // with a page says so there.
-  e.respondWith(r.method === "GET" ? page(e) : fetch(r).then((res) => (e.waitUntil(seen(null, null, res.headers.get("x-quillo-session"), null)), res)));
+  // with a page says so there; one answered with a redirect, by the cookie.
+  e.respondWith(r.method === "GET" ? page(e) : fetch(r).then((res) => (e.waitUntil(seen(null, null, res.headers.get("x-quillo-session"), null)), redirected(e, res), res)));
 });
+
+// A redirect answers a navigation opaquely: the worker cannot read the session it leaves, and the
+// page it leads to may be another site's. Where the worker can read cookies (the Cookie Store
+// API), `quillo_tag` says the session the browser holds after it (FEEDBACK75.md, Q-1082; branch
+// feedback75).
+function redirected(e, res) {
+  if (res.type !== "opaqueredirect" || !self.cookieStore) return;
+  e.waitUntil(self.cookieStore.get(TAG).then((c) => current(c ? c.value : "-", true)).catch(() => {}));
+}
 
 // The page's runtime says which session the browser holds; the gate, a session to drop.
 self.addEventListener("message", (e) => {
@@ -71,6 +93,7 @@ async function page(e) {
   } catch (_) {
     return (await kept(r.url)) || offline();
   }
+  redirected(e, res);
   // A prefetch, which Quillo refuses with a 503 when it would change something: that says nothing
   // of the page.
   if (/prefetch/i.test(r.headers.get("sec-purpose") || "") || res.headers.get("x-quillo-prefetch") === "refused") return res;
@@ -230,6 +253,9 @@ function start(html) {
 // Whether the gate can run under a kept page's policy: no `sandbox` that refuses scripts, and
 // where scripts are decided, inline ones let in or the gate's hash named. A page that cannot run
 // it would show without it (its own sheet may undo `hidden`), so it is not given back.
+// A `sandbox` without `allow-same-origin` gives the page an opaque origin, where the gate's
+// `document.cookie` throws: the gate stopped there, and the page showed, its scripts run, to the
+// next person on the device (FEEDBACK75.md, Q-1078; branch feedback75).
 function gated(h) {
   const policy = h.get("content-security-policy");
   if (!policy) return true;
@@ -237,7 +263,7 @@ function gated(h) {
     const ds = p.split(";").map((d) => d.trim().split(/\s+/)).filter((d) => d[0]);
     const named = (n) => ds.find((d) => d[0].toLowerCase() === n);
     const sandbox = named("sandbox");
-    if (sandbox && !sandbox.slice(1).some((t) => t.toLowerCase() === "allow-scripts")) return false;
+    if (sandbox && !["allow-scripts", "allow-same-origin"].every((w) => sandbox.slice(1).some((t) => t.toLowerCase() === w))) return false;
     const src = named("script-src-elem") || named("script-src") || named("default-src");
     if (!src) return true;
     const t = src.slice(1), low = t.map((x) => x.toLowerCase());

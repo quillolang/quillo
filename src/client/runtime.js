@@ -2967,10 +2967,12 @@ const pluralCount = (c, shown) => {
   return null;
 };
 B.locale = meta(() => { const d = i18n(); return d ? d.locale : null; }, "locale", null);
-const translate = (k, vars, esc) => {
+// `html`: for raw(t(...)), the values escaped and a key missing from every locale as escaped text
+// (FEEDBACK75.md, Q-1059; branch feedback75), as on the server.
+const translate = (k, vars, html) => {
   S(k, "t"); vars = M(vars, "t", 2);
   const d = i18n();
-  let e = d && hasOwn(d.t, k) ? d.t[k] : k, shown = null;
+  let table = !!d && hasOwn(d.t, k), e = table ? d.t[k] : html ? escText(k) : k, shown = null;
   if (e && typeof e === "object") {
     // A number's text, made once: for its form and for `{count}`.
     const n = vars.count;
@@ -2979,11 +2981,129 @@ const translate = (k, vars, esc) => {
     const cat = c === null ? "other" : c.i === 0 && !c.ib && c.v === 0 && hasOwn(e, "zero") ? "zero" : plural(d.locale, c);
     e = hasOwn(e, cat) ? e[cat] : (e.other ?? "");
   }
-  return String(e).replace(/\{(\w+)\}/g, (m, name) => hasOwn(vars, name) ? esc(name === "count" && shown !== null ? shown : display(vars[name])) : m);
+  table = table && typeof e === "string";
+  const text = String(e), val = (name) => name === "count" && shown !== null ? shown : display(vars[name]);
+  if (!html) return text.replace(PLACEHOLDER, (m, name) => hasOwn(vars, name) ? val(name) : m);
+  // The values put in, escaped (`raw` false), or as the browser reads the attribute value they are
+  // in (values as they are, character references of the text decoded).
+  const putIn = (t, raw) => {
+    if (!raw) return t.replace(PLACEHOLDER, (m, name) => hasOwn(vars, name) ? escText(val(name)) : m);
+    let out = "", i = 0;
+    while (i < t.length) {
+      if (t[i] === "{") {
+        const end = placeholderEnd(t, i);
+        if (end >= 0 && hasOwn(vars, t.slice(i + 1, end - 1))) { out += val(t.slice(i + 1, end - 1)); i = end; continue; }
+        out += "{"; i++;
+      } else if (t[i] === "&") {
+        const r = charRef(t, i);
+        if (r) { out += r[0]; i += r[1]; } else { out += "&"; i++; }
+      } else {
+        let next = i + 1;
+        while (next < t.length && t[next] !== "{" && t[next] !== "&") next++;
+        out += t.slice(i, next); i = next;
+      }
+    }
+    return out;
+  };
+  // An attribute of the translation's markup that takes a URL and holds a value is
+  // about:blank#blocked where what is written there makes a javascript: or vbscript: URL, as in
+  // markup; one written without quotes that holds a value is quoted (FEEDBACK75.md, Q-1083 and
+  // its reviews; branch feedback75).
+  const spans = table ? attrSpans(text) : null;
+  if (!spans) return putIn(text, false);
+  let out = "", pos = 0;
+  for (const sp of spans) {
+    out += putIn(text.slice(pos, sp.start), false);
+    const value = text.slice(sp.start, sp.end), q = sp.quoted ? "" : '"';
+    out += q + (sp.kind !== 0 && runsScript(putIn(value, true), sp.kind) ? "about:blank#blocked" : putIn(value, false)) + q;
+    pos = sp.end;
+  }
+  return out + putIn(text.slice(pos), false);
 };
-B.t = meta((k, vars) => translate(k, vars, (s) => s), "t", null);
+const PLACEHOLDER = /\{(\w+)\}/g;
+// The end of the placeholder at `i`, -1 if none, as the server reads one.
+function placeholderEnd(t, i) {
+  let j = i + 1;
+  while (j < t.length && /[A-Za-z0-9_]/.test(t[j])) j++;
+  return j > i + 1 && t[j] === "}" ? j + 1 : -1;
+}
+// The character a character reference at `i` stands for, and its length, as on the server.
+const NAMED_REFS = [["&tab;", "\t"], ["&newline;", "\n"], ["&colon;", ":"], ["&amp;", "&"], ["&lt;", "<"], ["&gt;", ">"], ["&quot;", '"'], ["&apos;", "'"], ["&nbsp;", "\u00a0"]];
+function charRef(t, i) {
+  if (t[i + 1] !== "#") {
+    for (const [name, c] of NAMED_REFS) if (t.slice(i, i + name.length).toLowerCase() === name) return [c, name.length];
+    return null;
+  }
+  const hex = t[i + 2] === "x" || t[i + 2] === "X", from = i + (hex ? 3 : 2);
+  let j = from;
+  while (j < t.length && (hex ? /[0-9a-fA-F]/ : /[0-9]/).test(t[j])) j++;
+  if (j === from || j - from > 8) return null;
+  const n = parseInt(t.slice(from, j), hex ? 16 : 10);
+  return [n <= 0x10ffff && (n < 0xd800 || n > 0xdfff) ? String.fromCodePoint(n) : "\ufffd", j - i + (t[j] === ";" ? 1 : 0)];
+}
+// Whether an attribute value of `kind` (1 a URL, 2 srcset, 3 ping) runs script, as on the server.
+function runsScript(v, kind) {
+  if (kind === 2) return v.split(",").some((c) => scriptURL(c.replace(/^[\t\n\f\r ]+/, "").split(/[\t\n\f\r ]/)[0]));
+  if (kind === 3) return v.split(/[\t\n\f\r ]/).some(scriptURL);
+  return scriptURL(v);
+}
+// The attribute values of a translation's text to take care of, as the server reads them
+// (i18n.rs, `Span`): [{ start, end, quoted, kind }], null if none. Read once for each text, up to
+// 4 MB of text kept.
+const attrSpansKept = new Map();
+let attrSpansBytes = 0;
+function attrSpans(t) {
+  if (!t.includes("=") || !t.includes("{")) return null;
+  let s = attrSpansKept.get(t);
+  if (s === undefined) {
+    s = findAttrSpans(t);
+    if (attrSpansBytes + t.length > 4194304) { attrSpansKept.clear(); attrSpansBytes = 0; }
+    if (t.length <= 4194304) { attrSpansKept.set(t, s); attrSpansBytes += t.length; }
+  }
+  return s;
+}
+// As `find_attr_spans`: a start tag's name ends at white space, / or >; attributes split by white
+// space and /; values quoted either way or not at all; comments skipped.
+function findAttrSpans(t) {
+  const out = [], n = t.length, ws = (c) => c === " " || c === "\t" || c === "\n" || c === "\f" || c === "\r";
+  let i = 0;
+  while (i < n) {
+    if (t[i] !== "<") { i++; continue; }
+    if (t.startsWith("<!--", i)) { const e = t.indexOf("-->", i + 4); i = e < 0 ? n : e + 3; continue; }
+    if (!/[A-Za-z]/.test(t[i + 1] || "")) { i++; continue; }
+    while (i < n && !ws(t[i]) && t[i] !== ">" && t[i] !== "/") i++;
+    for (;;) {
+      while (i < n && (ws(t[i]) || t[i] === "/")) i++;
+      if (i >= n || t[i] === ">") { i++; break; }
+      const at = i;
+      while (i < n && !ws(t[i]) && t[i] !== "=" && t[i] !== ">" && t[i] !== "/") i++;
+      const name = t.slice(at, i).toLowerCase();
+      while (i < n && ws(t[i])) i++;
+      if (t[i] !== "=") continue;
+      i++;
+      while (i < n && ws(t[i])) i++;
+      const q = t[i] === '"' || t[i] === "'" ? t[i++] : null;
+      const kind = name === "srcset" ? 2 : name === "ping" ? 3 : URL_ATTRS.includes(name) ? 1 : 0;
+      const start = i;
+      let holds = false;
+      while (i < n) {
+        const c = t[i];
+        if (c === q || (q === null && (ws(c) || c === ">"))) break;
+        if (c === "{") {
+          const e = placeholderEnd(t, i);
+          if (e >= 0) { holds = true; i = e; continue; }
+        }
+        i++;
+      }
+      if (holds && (kind !== 0 || q === null)) out.push({ start, end: i, quoted: q !== null, kind });
+      if (q !== null && i < n) i++;
+    }
+  }
+  return out.length ? out : null;
+}
+B.t = meta((k, vars) => translate(k, vars, false), "t", null);
 // raw(t(key, vars)): the translation's markup, with the values put in escaped.
-B.t_html = (k, vars) => rawHtml(translate(k, vars, B.escape));
+B.t_html = (k, vars) => rawHtml(translate(k, vars, true));
 B.url = meta(() => currentUrl(), "url", null);
 B.css = meta((s) => S(s, "css"), "css", null);
 // And `&` as `\26 `, as on the server, for a sheet in <svg> or <math> (FEEDBACK55.md, Q-707; branch feedback55).

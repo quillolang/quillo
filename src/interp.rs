@@ -205,6 +205,11 @@ pub enum Mode {
     Strict,
     Lenient,
     Request,
+    /// A request's `json` field: strict as `Strict` is, and a record in it made by the request's
+    /// walk (`record::make`, held to its limit), where `Strict` alone is the program's own `match`,
+    /// made as 0.8.8 made it (`record::make_program`) (FEEDBACK75.md, Q-1080's review; branch
+    /// feedback75).
+    Json,
 }
 
 pub struct Interp {
@@ -364,6 +369,13 @@ pub struct Interp {
     /// browser, where `http.*` calls are made (see src/fetch.rs). A
     /// `server fn` it calls runs on the server, and clears it.
     pub(crate) in_component: bool,
+    /// The next call's arguments were made from a request to its parameters' types
+    /// (`server::take_args`, the request's full walk): that call's `bind_args` takes this and does
+    /// not check them again, 0.8.8's walk of a deep valid union being exponential. Its defaults
+    /// are checked as ever. Set just before the call and cleared after it, so a call that binds
+    /// nothing leaves no other call unchecked (FEEDBACK75.md, Q-1080, found in review; branch
+    /// feedback75).
+    pub(crate) args_made: bool,
     /// While a `live` loader runs: the topics (tables, globals) it reads.
     pub reads: Option<std::collections::HashSet<String>>,
     /// The code read the request (its session, cookies, headers): what it
@@ -2408,6 +2420,7 @@ impl Interp {
             marked: (0, 0),
             state_again: None,
             in_component: false,
+            args_made: false,
             pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
             read_request: false,
@@ -2541,6 +2554,7 @@ impl Interp {
             marked: (0, 0),
             state_again: None,
             in_component: false,
+            args_made: false,
             pg_tx: std::sync::Mutex::new(Vec::new()),
             reads: None,
             read_request: false,
@@ -5204,6 +5218,19 @@ impl Interp {
         self.call_closure_with(c, args, n, line)
     }
 
+    /// `call_closure` for a request's door, with the arguments `server::take_args` made: they are
+    /// not checked again (see `args_made`), and the mark goes with the call however it ends
+    /// (FEEDBACK75.md, Q-1080, found in review; branch feedback75).
+    pub(crate) fn call_made(&mut self, c: &Closure, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+        self.args_made = true;
+        // Cleared however the call ends, a panic before its `bind_args` too, which would have left
+        // the mark for this Interp's next call: a guard cannot hold `self` across the call, so the
+        // unwind is caught, the mark cleared and the panic sent on, as `service::with_asking` does.
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.call_closure(c, args.into_iter().map(Some).collect(), line)));
+        self.args_made = false;
+        r.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+
     /// `call_closure` with every argument given: no list of them to make again.
     fn call_closure_given(&mut self, c: &Closure, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
         self.within_limit(line)?;
@@ -5588,6 +5615,12 @@ impl Interp {
     /// defaults), checked against their types.
     fn bind_args(&mut self, c: &Closure, def: &FnDef, args: impl IntoIterator<Item = Option<Value>>, line: u32) -> Result<Env, Ctrl> {
         let scope = Scope::child(&c.env);
+        // Arguments a request's door made to their types already (see `args_made`; FEEDBACK75.md,
+        // Q-1080, found in review; branch feedback75).
+        let made = self.args_made;
+        if made {
+            self.args_made = false;
+        }
         if def.server {
             let was = self.read_request;
             if let Some(req) = self.request_value() {
@@ -5607,14 +5640,14 @@ impl Interp {
         }
         let mut it = args.into_iter();
         for p in &def.params {
-            let v = match it.next().flatten() {
-                Some(v) => v,
+            let (v, given) = match it.next().flatten() {
+                Some(v) => (v, true),
                 None => match &p.default {
-                    Some(d) => self.eval(d, &scope)?,
+                    Some(d) => (self.eval(d, &scope)?, false),
                     None => return fail(line, format!("missing argument `{}` in call to `{}`", p.name, def.name)),
                 },
             };
-            if let Some(ty) = &p.ty {
+            if let (Some(ty), false) = (&p.ty, made && given) {
                 if let Err(why) = crate::record::fits(&self.types, ty, &v, false) {
                     return fail(
                         line,
@@ -5937,7 +5970,7 @@ impl Interp {
         for f in fields {
             let name = if place.is_empty() { f.path.join(".") } else { format!("{}.{}", place, f.path.join(".")) };
             let sub = match mode {
-                Mode::Request if f.path[0] == "json" => Mode::Strict,
+                Mode::Request if f.path[0] == "json" => Mode::Json,
                 Mode::Request => Mode::Lenient,
                 m => m,
             };
@@ -6058,10 +6091,13 @@ impl Interp {
                     None
                 }
             }
-            // A record: the value made as `User(v)` makes it.
+            // A record: the value made as `User(v)` makes it. A request's (a route's `json`, `form`
+            // and query fields) by the request's walk, held to its limit; the program's own `match`
+            // as 0.8.8 made it, where a value the program built 600 deep was refused and a match in
+            // a loop took time in its square (FEEDBACK75.md, Q-1080's review; branch feedback75).
             Pattern::Type(t) if self.types.contains_key(t) => {
                 let ty = Ty { names: vec![t.clone()], optional: false, elem: None, fields: None };
-                crate::record::make(self, &ty, v, lenient)?.ok()
+                if mode == Mode::Strict { crate::record::make_program(self, &ty, v, lenient)? } else { crate::record::make(self, &ty, v, lenient)? }.ok()
             }
             // A decimal from an int, numeric text or a JSON number, in
             // any pattern: what it is given is converted.
@@ -6137,7 +6173,7 @@ impl Interp {
                 }
                 for f in fields {
                     let sub_mode = match mode {
-                        Mode::Request if f.path[0] == "json" => Mode::Strict,
+                        Mode::Request if f.path[0] == "json" => Mode::Json,
                         Mode::Request => Mode::Lenient,
                         m => m,
                     };
