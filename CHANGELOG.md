@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.8 (2026-11-19)
 
 Found by the tests written for 0.8.7's coverage (Q-1100 to Q-1117).
 
