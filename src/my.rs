@@ -84,6 +84,13 @@ fn opts_of(url: &str) -> Result<Opts, String> {
     // counted those it changed, so an update to the value a row had was 0, and "update, else
     // insert" inserted a second row (FEEDBACK55.md, Q-739; branch feedback55).
     b = b.client_found_rows(found_rows || opts.client_found_rows());
+    // The driver closed every connection handed back past ten idle ones (its idle time to live
+    // is 0 by default), so 8 requests at once opened hundreds of connections in 5 s and 64 at
+    // once ran out of ports: idle connections now stay a minute, unless the URL says otherwise
+    // (FEEDBACK78.md, Q-1169; branch feedback75).
+    if !rest.iter().any(|p| p.starts_with("inactive_connection_ttl=")) {
+        b = b.pool_opts(opts.pool_opts().clone().with_inactive_connection_ttl(std::time::Duration::from_secs(60)));
+    }
     let opts: Opts = b.into();
     let remote = opts.socket().is_none() && !crate::pg::local_host(opts.ip_or_hostname());
     if !require.unwrap_or(remote || ca.is_some()) {
@@ -658,6 +665,25 @@ mod tests {
         assert!(ssl("mysql://u@db.example.com/app?ssl_cert=/c.pem&ssl_key=/k.pem").client_identity().is_some());
         assert!(opts_of("mysql://u@db.example.com/app?ssl_cert=/c.pem").is_err());
         assert!(opts_of("mysql://u@db.example.com/app?verify_ca=no").is_err());
+    }
+
+    // Idle connections stay a minute unless the URL says otherwise, so a busy pool keeps them
+    // (FEEDBACK78.md, Q-1169; branch feedback75).
+    #[test]
+    fn idle_connections_stay_a_minute_unless_the_url_says() {
+        let ttl = |url: &str| opts_of(url).unwrap().pool_opts().inactive_connection_ttl().as_secs();
+        assert_eq!(ttl("mysql://root@127.0.0.1/app"), 60);
+        assert_eq!(ttl("mariadb://root@127.0.0.1/app"), 60);
+        assert_eq!(ttl("mysql://root@127.0.0.1/app?inactive_connection_ttl=5"), 5);
+        assert_eq!(ttl("mysql://root@127.0.0.1/app?inactive_connection_ttl=0"), 0);
+        // With TLS settings the pool's settings are kept, and the driver's other pool settings too.
+        assert_eq!(ttl("mysql://root@db.example.com/app?ssl_server_name=db.example.com"), 60);
+        assert!(opts_of("mysql://root@db.example.com/app").unwrap().ssl_opts().is_some());
+        let o = opts_of("mysql://root@127.0.0.1/app?pool_min=2&pool_max=7").unwrap();
+        assert_eq!((o.pool_opts().constraints().min(), o.pool_opts().constraints().max()), (2, 7));
+        assert_eq!(o.pool_opts().inactive_connection_ttl().as_secs(), 60);
+        // An edge: a bad value is the driver's error, as before.
+        assert!(opts_of("mysql://root@127.0.0.1/app?inactive_connection_ttl=soon").is_err());
     }
 
     // FEEDBACK55.md, Q-739, Q-740, Q-756.
