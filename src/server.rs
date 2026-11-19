@@ -902,7 +902,12 @@ impl Interp {
                 // As a component's `data-s` is: JSON, read by the runtime's `islandJSON`.
                 let json = crate::interp::island_json(&crate::server::for_visitor(Value::map(m))).to_string();
                 let text = serde_json::Value::String(json).to_string();
-                tags.push_str(&format!("<script>{}.g={}</script>", crate::client::HANDOFF_JS, text.replace("</", "<\\/").replace("<!--", "<\\!--")));
+                // No `<` and no `&` in it, as in the i18n script and a component's JSON: read as
+                // an SVG script (a page whose raw markup left an <svg> open), `<img` would be an
+                // element and `&quot;` a quote that ends the string; `<` and `&` are the
+                // same characters to JavaScript wherever it is read (coverage of 0.8.7, Q-1116;
+                // branch coverage-087).
+                tags.push_str(&format!("<script>{}.g={}</script>", crate::client::HANDOFF_JS, text.replace('<', "\\u003c").replace('&', "\\u0026")));
             }
             // Components translate in the browser too: the page carries its
             // locale's text, read when the (deferred) bundle runs.

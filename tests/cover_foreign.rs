@@ -18,6 +18,9 @@ const CODE: &str = r#"<![CDATA[<b>x<\/b>&quot;]]]]><![CDATA[>]]>"#;
 const HTML: &str = r#"<b>x<\/b>&quot;]]>"#;
 /// `Q` written by the program in raw markup (no `</` turned into `<\/`), then put in a section.
 const RAW_CODE: &str = "<![CDATA[<b>x</b>&quot;]]]]><![CDATA[>]]>";
+/// What a page that lost the parser's place ends with, before Quillo's scripts: an element that
+/// takes the browser back to HTML (see `what_quillo_writes_after_a_page_that_lost_its_place_is_read_as_html`).
+const BACK: &str = "<span></span>";
 
 fn enc(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
@@ -616,8 +619,8 @@ fn a_self_closed_html_element_stays_open_as_the_browser_keeps_it() {
             // One of no special kind, `<x-y/>`: `</foreignObject>` goes down to the integration
             // point, which Chrome passes over and parse5 closes, so the script after is written as
             // safe in both (changed with round 7's review of Q-1116: it was HTML's).
-            ("/unknown", format!("<svg><foreignObject><x-y/></foreignObject><script>{RAW_CODE}</script></svg>")),
-            ("/unicode", format!("<svg><foreignObject><x-é/></foreignObject><script>{RAW_CODE}</script></svg>")),
+            ("/unknown", format!("<svg><foreignObject><x-y/></foreignObject><script>{RAW_CODE}</script></svg>{BACK}")),
+            ("/unicode", format!("<svg><foreignObject><x-é/></foreignObject><script>{RAW_CODE}</script></svg>{BACK}")),
             // Void elements: no end tag, so `</foreignObject>` ends the integration point.
             ("/br", format!("<svg><foreignObject><br/></foreignObject><script>{RAW_CODE}</script></svg>")),
             ("/br-upper", format!("<svg><foreignObject><BR/></foreignObject><script>{RAW_CODE}</script></svg>")),
@@ -633,9 +636,9 @@ fn a_self_closed_html_element_stays_open_as_the_browser_keeps_it() {
             ("/svg-bare", format!("<svg><foreignObject><svg hidden/><script>{Q}</script></foreignObject></svg>")),
             ("/math-closed", format!("<svg><foreignObject><math/><script>{Q}</script></foreignObject></svg>")),
             // No flag: the `<svg>` is open, and the script in it is SVG's.
-            ("/svg-unquoted", format!("<svg><foreignObject><svg width=10/><script>{RAW_CODE}</script></foreignObject></svg>")),
-            ("/svg-unicode", format!("<svg><foreignObject><svg aria-label=✓/><script>{RAW_CODE}</script></foreignObject></svg>")),
-            ("/svg-spaced-slash", format!("<svg><foreignObject><svg / ><script>{RAW_CODE}</script></foreignObject></svg>")),
+            ("/svg-unquoted", format!("<svg><foreignObject><svg width=10/><script>{RAW_CODE}</script></foreignObject></svg>{BACK}")),
+            ("/svg-unicode", format!("<svg><foreignObject><svg aria-label=✓/><script>{RAW_CODE}</script></foreignObject></svg>{BACK}")),
+            ("/svg-spaced-slash", format!("<svg><foreignObject><svg / ><script>{RAW_CODE}</script></foreignObject></svg>{BACK}")),
             // An SVG `<script/>` holds no text: the `<foreignObject>` after it is read, and its
             // script is HTML's. An HTML `<script/>`'s text runs to `</script>`, as before.
             ("/svg-script", format!("<svg><script/><foreignObject><script>{Q}</script></foreignObject></svg>")),
@@ -754,9 +757,9 @@ fn comments_and_cdata_sections_are_passed_over_as_the_browser_passes_them() {
         &mut it,
         &[
             // A comment that ends at once, or at `--!>`: the `<svg>` after it is open.
-            ("/comment-empty", fo(&format!("<!--><svg><script>{CODE}</script>"))),
-            ("/comment-dash", fo(&format!("<!---><svg><script>{CODE}</script>"))),
-            ("/comment-bang", fo(&format!("<!-- x --!><svg><script>{CODE}</script>"))),
+            ("/comment-empty", fo(&format!("<!--><svg><script>{CODE}</script>")) + BACK),
+            ("/comment-dash", fo(&format!("<!---><svg><script>{CODE}</script>")) + BACK),
+            ("/comment-bang", fo(&format!("<!-- x --!><svg><script>{CODE}</script>")) + BACK),
             // `--` alone, or before `->`, ends nothing: the `<svg>` is in the comment.
             ("/comment-dashes", fo(&format!("<!-- a -- <svg> b --><script>{HTML}</script>"))),
             ("/comment-closed", fo(&format!("<!-- <svg> ---><script>{HTML}</script>"))),
@@ -776,10 +779,10 @@ fn comments_and_cdata_sections_are_passed_over_as_the_browser_passes_them() {
             // read, the script written as HTML's, and Chrome and parse5 read it as SVG's). Left
             // open, it is ended with `]]>`, which ends either.
             ("/cdata-svg", format!("<svg><![CDATA[><foreignObject>]]><script>{RAW_CODE}</script></svg>")),
-            ("/cdata-point", fo(&format!("<![CDATA[><svg>]]><script>{RAW_CODE}</script>"))),
+            ("/cdata-point", fo(&format!("<![CDATA[><svg>]]><script>{RAW_CODE}</script>")) + BACK),
             ("/cdata-div", fo(&format!("<div><![CDATA[><svg>]]><script>{RAW_CODE}</script></svg></div>"))),
             ("/cdata-open", fo(&format!("<![CDATA[ x]]><script>{HTML}</script>"))),
-            ("/cdata-unsure", fo(&format!("<svg><p></p><![CDATA[><svg><script>{RAW_CODE}</script>]]>"))),
+            ("/cdata-unsure", fo(&format!("<svg><p></p><![CDATA[><svg><script>{RAW_CODE}</script>]]>")) + BACK),
         ],
     );
 }
@@ -836,43 +839,45 @@ fn the_inputs_a_review_found_against_parse5_are_read_as_the_browser_reads_them()
     let mut it = app(REVIEWED);
     let fo = |inner: &str| format!("<svg><foreignObject>{inner}</foreignObject></svg>");
     let mut cases: Vec<(String, String)> = vec![
-        ("/cdata-mi".into(), format!("<math><mi><![CDATA[><svg>]]><script>{RAW_CODE}</script></mi></math>")),
-        ("/cdata-desc".into(), format!("<svg><desc><![CDATA[><math>]]><script>{RAW_CODE}</script></desc></svg>")),
-        ("/cdata-ann".into(), format!("<math><annotation-xml encoding=\"text/html\"><![CDATA[><svg>]]><script>{RAW_CODE}</script></annotation-xml></math>")),
-        ("/cdata-renderer".into(), fo(&format!("<![CDATA[><svg>]]><script>{CODE}</script>"))),
+        ("/cdata-mi".into(), format!("<math><mi><![CDATA[><svg>]]><script>{RAW_CODE}</script></mi></math>{BACK}")),
+        ("/cdata-desc".into(), format!("<svg><desc><![CDATA[><math>]]><script>{RAW_CODE}</script></desc></svg>{BACK}")),
+        ("/cdata-ann".into(), format!("<math><annotation-xml encoding=\"text/html\"><![CDATA[><svg>]]><script>{RAW_CODE}</script></annotation-xml></math>{BACK}")),
+        ("/cdata-renderer".into(), fo(&format!("<![CDATA[><svg>]]><script>{CODE}</script>")) + BACK),
         // No markup between the two ends: either way the same, and the script is HTML's.
         ("/cdata-text".into(), fo(&format!("<![CDATA[>x]]><script>{HTML}</script>"))),
         ("/ann-ref".into(), format!("<math><annotation-xml encoding='text&#47;html'><script>{RAW_CODE}</script></annotation-xml></math>")),
-        ("/ann-ref-cdata".into(), format!("<math><annotation-xml encoding='text&#47;html'><x><![CDATA[ > </x></annotation-xml><script>{RAW_CODE}</script> ]]></math>")),
+        ("/ann-ref-cdata".into(), format!("<math><annotation-xml encoding='text&#47;html'><x><![CDATA[ > </x></annotation-xml><script>{RAW_CODE}</script> ]]></math>{BACK}")),
         ("/ann-plain".into(), format!("<math><annotation-xml encoding='text/html'><script>{Q}</script></annotation-xml></math>")),
         // Written by the renderer, `&` is `&amp;`: the browser reads `text&#47;html` as it is,
         // no HTML encoding, and the section is right.
         ("/ann-renderer?e=text%26%2347%3Bhtml".into(), format!("<math><annotation-xml encoding=\"text&amp;#47;html\"><script>{CODE}</script></annotation-xml></math>")),
-        ("/endtag-other".into(), format!("<svg><foreignObject><svg></x><script>{RAW_CODE}</script></svg>")),
-        ("/endtag-outer".into(), fo(&format!("</foreignObject><script>{CODE}</script>"))),
+        ("/endtag-other".into(), format!("<svg><foreignObject><svg></x><script>{RAW_CODE}</script></svg>{BACK}")),
+        ("/endtag-outer".into(), fo(&format!("</foreignObject><script>{CODE}</script>")) + BACK),
         // Down to the integration point, which parse5 closes and Chrome passes over: safe in both
         // (changed with round 7's review: it was HTML's).
-        ("/endtag-walk".into(), format!("<svg><foreignObject><x-y></foreignObject><script>{RAW_CODE}</script></svg>")),
-        ("/endtag-rule".into(), format!("<svg><foreignObject><div><span></div><script>{RAW_CODE}</script></foreignObject></svg>")),
-        ("/scriptx".into(), fo(&format!("<svg><script><![CDATA[</scriptx>]]></script><script>{RAW_CODE}</script>"))),
-        ("/escaped".into(), fo(&format!("<script><!--<script></script><script>{RAW_CODE}</script>"))),
+        ("/endtag-walk".into(), format!("<svg><foreignObject><x-y></foreignObject><script>{RAW_CODE}</script></svg>{BACK}")),
+        ("/endtag-rule".into(), format!("<svg><foreignObject><div><span></div><script>{RAW_CODE}</script></foreignObject></svg>{BACK}")),
+        ("/scriptx".into(), fo(&format!("<svg><script><![CDATA[</scriptx>]]></script><script>{RAW_CODE}</script>")) + BACK),
+        ("/escaped".into(), fo(&format!("<script><!--<script></script><script>{RAW_CODE}</script>")) + BACK),
         ("/input-open".into(), format!("<svg><input><foreignObject><script>{HTML}</script></foreignObject></svg>")),
         ("/end-open".into(), format!("<svg></><foreignObject><script>{HTML}</script></foreignObject></svg>")),
-        ("/end-x-open".into(), format!("<svg></x><foreignObject><script>{CODE}</script></foreignObject></svg>")),
+        ("/end-x-open".into(), format!("<svg></x><foreignObject><script>{CODE}</script></foreignObject></svg>{BACK}")),
         ("/quote-open".into(), format!("<svg><g a=\"x\"><foreignObject><script>{CODE}</script></foreignObject></svg>")),
         ("/single-open".into(), format!("<svg><g a='x'><foreignObject><script>{CODE}</script></foreignObject></svg>")),
         ("/textarea-open".into(), fo(&format!("<textarea></textarea><script>{HTML}</script>"))),
         ("/script-tag-open".into(), format!("<svg><script></script><foreignObject><script>{HTML}</script></foreignObject></svg>")),
     ];
     // Leaving nothing open, or after which the parser is not followed: the script after
-    // `</foreignObject>` is SVG's, in a section, with the slash or without.
+    // `</foreignObject>` is SVG's, in a section, with the slash or without; the ones not followed
+    // (from `<td>` on) lose the place, and the page ends going back to HTML.
     for t in [
         "param", "keygen", "image", "basefont", "bgsound", "frame", "head", "html", "body", "col", "td", "th", "tr", "tbody", "thead", "tfoot", "caption",
         "colgroup", "table", "select", "template", "frameset",
     ] {
         for slash in ["", "/"] {
             let tag = format!("<{t}{slash}>");
-            cases.push((format!("/tag?t={}", enc(&tag)), format!("<svg><foreignObject>{tag}</foreignObject><script>{RAW_CODE}</script></svg>")));
+            let back = if ["param", "keygen", "image", "basefont", "bgsound", "frame", "head", "html", "body", "col"].contains(&t) { "" } else { BACK };
+            cases.push((format!("/tag?t={}", enc(&tag)), format!("<svg><foreignObject>{tag}</foreignObject><script>{RAW_CODE}</script></svg>{back}")));
         }
     }
     // Open, as the browser keeps them: in a special one (`<div/>`) `</foreignObject>` ends nothing
@@ -880,7 +885,7 @@ fn the_inputs_a_review_found_against_parse5_are_read_as_the_browser_reads_them()
     // passes over and parse5 closes: the safe form (changed with round 7's review: HTML's).
     cases.push((format!("/tag?t={}", enc("<div/>")), format!("<svg><foreignObject><div/></foreignObject><script>{Q}</script></svg>")));
     for tag in ["<span/>", "<x-y/>", "<b/>"] {
-        cases.push((format!("/tag?t={}", enc(tag)), format!("<svg><foreignObject>{tag}</foreignObject><script>{RAW_CODE}</script></svg>")));
+        cases.push((format!("/tag?t={}", enc(tag)), format!("<svg><foreignObject>{tag}</foreignObject><script>{RAW_CODE}</script></svg>{BACK}")));
     }
     let cases: Vec<(&str, String)> = cases.iter().map(|(p, w)| (p.as_str(), w.clone())).collect();
     pages(&mut it, &cases);
@@ -944,24 +949,26 @@ fn the_second_reviews_inputs_are_read_as_the_browser_reads_them() {
         "<p>one</p><p>two</p>",
         "<li>a</li><li>b</li>",
     ] {
-        cases.push((format!("/tag?t={}", enc(t)), format!("<svg><foreignObject>{t}</foreignObject><script>{RAW_CODE}</script></svg>")));
+        // Not followed: the place is lost, and the page ends going back to HTML.
+        let back = if ["<p>one</p><p>two</p>", "<li>a</li><li>b</li>"].contains(&t) { "" } else { BACK };
+        cases.push((format!("/tag?t={}", enc(t)), format!("<svg><foreignObject>{t}</foreignObject><script>{RAW_CODE}</script></svg>{back}")));
     }
     cases.extend([
-        ("/form-outer".to_string(), format!("<form><svg><foreignObject><form></foreignObject><script>{RAW_CODE}</script></foreignObject></svg></form>")),
+        ("/form-outer".to_string(), format!("<form><svg><foreignObject><form></foreignObject><script>{RAW_CODE}</script></foreignObject></svg></form>{BACK}")),
         ("/cdata-end".into(), "<svg><svg><script><![CDATA[ var s = \"</script><img src=x onerror=1>\"; ]]></script></svg></svg>".into()),
         ("/cdata-end-fo".into(), "<svg><foreignObject><svg><script><![CDATA[ x=\"</script><img src=x onerror=1>\" ]]></script></svg></foreignObject></svg>".into()),
         // A comment in it ends nothing, and is put in a section, as markup in an SVG script is.
         ("/comment-end".into(), "<svg><script><![CDATA[<!-- </script><img src=x onerror=1> -->]]></script></svg>".into()),
         ("/attr-end".into(), "<svg><script><![CDATA[<g a='</script><img src=x onerror=1>'></g>]]></script></svg>".into()),
-        ("/cdata-end-unsure".into(), "<svg><foreignObject><svg><p></p><script><![CDATA[ \"<\\/script><img src=x onerror=1>\" ]]></script></foreignObject></svg>".into()),
+        ("/cdata-end-unsure".into(), format!("<svg><foreignObject><svg><p></p><script><![CDATA[ \"<\\/script><img src=x onerror=1>\" ]]></script></foreignObject></svg>{BACK}")),
         ("/style-cdata".into(), "<svg><style><![CDATA[ a{} </style><img src=x onerror=1> ]]></style></svg>".into()),
         ("/lt-text".into(), format!("<svg><foreignObject>&lt;hello<script>{HTML}</script></foreignObject></svg>")),
         ("/lt-tag".into(), format!("<svg><foreignObject>x &lt;<b>bold</b><script>{HTML}</script></foreignObject></svg>")),
         // Split over values: each value's markup ended where it stops (new in round 4; a decision
         // for the user), the second value's then text.
         ("/split-comment".into(), format!("<svg><!----><text>hidden</text>--><script>{CODE}</script></svg>")),
-        ("/split-attr?u=%2Fx".into(), "<svg><a href=''>/x'>link</a></svg>".into()),
-        ("/split-script?d=1".into(), "<svg><script>var d = </script>1;</script></svg>".into()),
+        ("/split-attr?u=%2Fx".into(), format!("<svg><a href=''>/x'>link</a></svg>{BACK}")),
+        ("/split-script?d=1".into(), format!("<svg><script>var d = </script>1;</script></svg>{BACK}")),
         ("/complete".into(), "<svg><g a='1'><!-- c --><text>t</text></g><style>a{}</style><script><![CDATA[ x < 1 ]]></script></svg>".into()),
     ]);
     let cases: Vec<(&str, String)> = cases.iter().map(|(p, w)| (p.as_str(), w.clone())).collect();
@@ -1001,8 +1008,8 @@ fn a_place_lost_in_a_page_stays_lost_to_its_end() {
     pages(
         &mut it,
         &[
-            ("/reopen", format!("<svg><g></svg><svg><svg></g></svg><script>{CODE}</script>")),
-            ("/reopen-later", format!("<svg><g></svg><svg><svg></g></svg><p>after</p><div><script>{CODE}</script></div>")),
+            ("/reopen", format!("<svg><g></svg><svg><svg></g></svg><script>{CODE}</script>{BACK}")),
+            ("/reopen-later", format!("<svg><g></svg><svg><svg></g></svg><p>after</p><div><script>{CODE}</script></div>{BACK}")),
         ],
     );
 }
@@ -1153,17 +1160,17 @@ route GET /open-comment = <html><body><svg>{raw("<script><!-- var s = \"</script
 fn the_third_reviews_inputs_are_safe_in_both_readings() {
     let mut it = app(THIRD);
     let mut cases: Vec<(String, String)> = vec![
-        ("/open-svg".into(), format!("<svg><svg></svg><script>{CODE}</script>")),
-        ("/open-math".into(), format!("<math><math></math><script>{CODE}</script>")),
-        ("/open-g-svg".into(), format!("<svg><g><svg></svg><script>{CODE}</script>")),
-        ("/open-fo".into(), format!("<svg><foreignObject><svg></foreignObject></svg><script>{CODE}</script>")),
-        ("/open-svg-fo".into(), format!("<svg><svg><foreignObject></svg><script>{CODE}</script>")),
+        ("/open-svg".into(), format!("<svg><svg></svg><script>{CODE}</script>{BACK}")),
+        ("/open-math".into(), format!("<math><math></math><script>{CODE}</script>{BACK}")),
+        ("/open-g-svg".into(), format!("<svg><g><svg></svg><script>{CODE}</script>{BACK}")),
+        ("/open-fo".into(), format!("<svg><foreignObject><svg></foreignObject></svg><script>{CODE}</script>{BACK}")),
+        ("/open-svg-fo".into(), format!("<svg><svg><foreignObject></svg><script>{CODE}</script>{BACK}")),
         ("/open-g".into(), format!("<svg><g></svg><script>{HTML}</script>")),
-        ("/cached".into(), format!("<svg></svg><svg><svg></svg><script>{CODE}</script>")),
+        ("/cached".into(), format!("<svg></svg><svg><svg></svg><script>{CODE}</script>{BACK}")),
         ("/cached-fine".into(), format!("<svg><g></g></svg><script>{HTML}</script>")),
-        ("/mi-span".into(), format!("<math><mi><span></mi><script>{RAW_CODE}</script></math>")),
-        ("/mo-span".into(), format!("<math><mo><span/></mo><script>{RAW_CODE}</script></math>")),
-        ("/mo-b".into(), format!("<math><mo><b>x</mo><noembed><script>{RAW_CODE}</script></math>")),
+        ("/mi-span".into(), format!("<math><mi><span></mi><script>{RAW_CODE}</script></math>{BACK}")),
+        ("/mo-span".into(), format!("<math><mo><span/></mo><script>{RAW_CODE}</script></math>{BACK}")),
+        ("/mo-b".into(), format!("<math><mo><b>x</mo><noembed><script>{RAW_CODE}</script></math>{BACK}")),
         // `<div>` is special: `</mi>` stops at it, in both readings; the script is HTML's.
         ("/mi-div".into(), format!("<math><mi><div></mi><script>{Q}</script></math>")),
         ("/open-cdata".into(), "<svg><script><![CDATA[ var s = \"<\\/script><img src=x onerror=1>\";]]></script></svg>".into()),
@@ -1172,8 +1179,124 @@ fn the_third_reviews_inputs_are_safe_in_both_readings() {
     for t in ["<li>a<li>b</li>", "<p>a<p>b</p>", "<dd>a<dt>b</dt>", "<h1>a<h2>b</h2>", "<li>a</li><li>b</li>", "<p>a</p><p>b</p>"] {
         // The run after: its `<p>` ends SVG where the browser takes it (in the `<foreignObject>`),
         // and the `</g>` after closes the SVG `<g>` outside it: the script is SVG's, in a section.
-        cases.push((format!("/run?t={}", enc(t)), format!("<svg><g><foreignObject>{t}<svg><g><p></p></g><script>{RAW_CODE}</script></svg>")));
+        cases.push((format!("/run?t={}", enc(t)), format!("<svg><g><foreignObject>{t}<svg><g><p></p></g><script>{RAW_CODE}</script></svg>{BACK}")));
     }
     let cases: Vec<(&str, String)> = cases.iter().map(|(p, w)| (p.as_str(), w.clone())).collect();
     pages(&mut it, &cases);
+}
+
+// ---- what Quillo writes after a page that lost the parser's place ---------------------------------
+
+const AFTER: &str = r##"state banner = "<img src=x onerror=3>"
+server fn slow() = "done"
+component Later(x: str) {
+    state b = defer(slow())
+    <g>{raw("<script>" + x + "</script>")}<text>{b}</text></g>
+}
+component Shown() {
+    <text>{banner}</text>
+}
+route GET /def-lost ? { q: str = "" } = <html><body><svg>{raw("</svg><svg><svg>")}</svg><Later x={q}/></body></html>
+route GET /def-frag ? { q: str = "" } = <svg>{raw("<svg>")}<Later x={q}/></svg>
+route GET /def-svg ? { q: str = "" } = <html><body><svg><Later x={q}/></svg></body></html>
+route GET /def-open ? { q: str = "" } = <html><body><svg>{raw("<g>")}<Later x={q}/></svg></body></html>
+route GET /def-html ? { q: str = "" } = <html><body><Later x={q}/></body></html>
+route GET /state-lost = <html><body><svg>{raw("<svg>")}</svg><svg><Shown/></svg></body></html>
+route GET /state-frag = <svg>{raw("<svg>")}<Shown/></svg>
+route GET /state-fine = <svg><Shown/></svg>
+view Mark() = <circle r="1"/>
+view Layout(children) = <html><body><main>{children}</main></body></html>
+route GET /mark-lost = <html><body><svg>{raw("<svg>")}</svg><svg><Mark/><Mark/></svg></body></html>
+route GET /mark = <html><body><svg><Mark/></svg></body></html>
+route GET /laid-lost = <Layout><svg>{raw("<svg>")}<Mark/></svg><p>{banner}</p></Layout>
+route GET /laid = <Layout><svg><Mark/></svg></Layout>
+"##;
+
+/// A whole response, for `path` with `q` set to `Q`: the page, then what Quillo adds after it.
+fn whole(it: &mut Interp, path: &str) -> String {
+    let url = format!("{}?q={}", path, enc(Q));
+    let r = it.handle(&HttpRequest { method: "GET".into(), url: url.clone(), headers: vec![("Host".into(), "localhost".into())], body: Vec::new(), remote: "127.0.0.1".into() });
+    assert_eq!(r.status, 200, "{}: {}", url, r.text());
+    r.text()
+}
+
+/// The deferred part's `<template>`, from its start tag to its end tag.
+fn template(page: &str) -> &str {
+    let from = page.find("<template data-qt=\"0\">").unwrap_or_else(|| panic!("no deferred part: {}", page));
+    let to = page[from..].find("</template>").map(|i| from + i + "</template>".len()).unwrap();
+    &page[from..to]
+}
+
+/// Where the first of Quillo's own scripts starts: the page states, or the loader.
+fn quillos(page: &str) -> usize {
+    ["<script>(()=>", "<script>(window[Symbol.for(\"quillo\")]"].iter().filter_map(|s| page.find(s)).min().unwrap_or_else(|| panic!("no script of Quillo's: {}", page))
+}
+
+/// After a page that lost the parser's place (raw markup that left an `<svg>` open), what Quillo
+/// writes after the page is read where the browser then is, in SVG: a deferred part's
+/// `<template>` would be an SVG element, and its component's script an SVG script, whose text is
+/// markup; the page states' script, holding the visitor's or the program's text as JSON, would be
+/// SVG's too, and an `<img onerror>` in it an element (in 0.8.7 both made the visitor's markup
+/// elements, parse5 8.0.1 standing in for the browser). The part is now rendered where the place
+/// is lost (its script in a section, as safe in both readings), and the page ends with an empty
+/// `<span>` before its `</body>`, or at its end where it has none, which ends SVG and MathML where
+/// the browser is, so that all Quillo writes after it is read as HTML (src/interp.rs
+/// `render_deferred`, `page_back_to_html`; FEEDBACK71.md Q-969, coverage of 0.8.7, Q-1116; branch
+/// coverage-087). The `<span>` goes at the end of the page's outermost literal only: not in a view
+/// rendered where the place was lost, which the view cache keeps for the next page (`/mark` after
+/// `/mark-lost`), and before the `</body>` of a layout around the page (`/laid-lost`).
+#[test]
+fn what_quillo_writes_after_a_page_that_lost_its_place_is_read_as_html() {
+    let mut it = app(AFTER);
+    let island = |done: &str| format!("data-c=\"Later\" data-p=\"{{&quot;x&quot;:&quot;&lt;b&gt;x&lt;/b&gt;&amp;quot;]]&gt;&quot;}}\" data-s=\"{{&quot;b&quot;:{done}}}\"");
+    for round in 1..=2 {
+        let p = whole(&mut it, "/def-lost");
+        let at = quillos(&p);
+        assert!(p[..at].ends_with(&format!("<svg></svg><svg><svg></svg><quillo-island style=\"display:contents\" {} data-qd=\"0\"><g><script>{RAW_CODE}</script><text></text></g></quillo-island><span></span>", island("null"))), "/def-lost (round {}): {}", round, p);
+        assert_eq!(template(&p), format!("<template data-qt=\"0\"><quillo-island style=\"display:contents\" {}><g><script>{RAW_CODE}</script><text>done</text></g></quillo-island></template>", island("&quot;done&quot;")), "/def-lost (round {})", round);
+        assert_eq!(p.matches("<span></span>").count(), 1, "/def-lost (round {}): {}", round, p);
+
+        let p = whole(&mut it, "/def-frag");
+        let at = quillos(&p);
+        assert_eq!(&p[..at], format!("<svg><svg><g data-qi {} data-qd=\"0\"><script>{RAW_CODE}</script><text></text></g></svg><span></span>", island("null")), "/def-frag (round {})", round);
+        assert_eq!(template(&p), format!("<template data-qt=\"0\"><g data-qi {}><script>{RAW_CODE}</script><text>done</text></g></template>", island("&quot;done&quot;")), "/def-frag (round {})", round);
+
+        // Pages that keep the place: no `<span>`, and the part as before, HTML's in its template.
+        for (path, before, part) in [
+            ("/def-svg", format!("<svg><g data-qi {} data-qd=\"0\"><script>{RAW_CODE}</script><text></text></g></svg>", island("null")), format!("<g data-qi {}><script>{Q}</script><text>done</text></g>", island("&quot;done&quot;"))),
+            ("/def-open", format!("<svg><g><g data-qi {} data-qd=\"0\"><script>{RAW_CODE}</script><text></text></g></svg>", island("null")), format!("<g data-qi {}><script>{Q}</script><text>done</text></g>", island("&quot;done&quot;"))),
+            ("/def-html", format!("<quillo-island style=\"display:contents\" {} data-qd=\"0\"><g><script>{Q}</script><text></text></g></quillo-island>", island("null")), format!("<quillo-island style=\"display:contents\" {}><g><script>{Q}</script><text>done</text></g></quillo-island>", island("&quot;done&quot;"))),
+        ] {
+            let p = whole(&mut it, path);
+            let at = quillos(&p);
+            assert!(p[..at].ends_with(&before), "{} (round {}): {}", path, round, p);
+            assert_eq!(template(&p), format!("<template data-qt=\"0\">{part}</template>"), "{} (round {})", path, round);
+            assert!(!p.contains("<span></span>"), "{} (round {}): {}", path, round, p);
+        }
+
+        let shown = "<text data-qi data-c=\"Shown\" data-p=\"{}\" data-s=\"{}\" data-e>&lt;img src=x onerror=3&gt;</text>";
+        for (path, page) in [
+            ("/state-lost", format!("<!doctype html><html><body><svg><svg></svg><svg>{shown}</svg><span></span>")),
+            ("/state-frag", format!("<svg><svg>{shown}</svg><span></span>")),
+            ("/state-fine", format!("<svg>{shown}</svg>")),
+        ] {
+            let p = whole(&mut it, path);
+            let at = quillos(&p);
+            assert_eq!(&p[..at], page, "{} (round {})", path, round);
+            // The page states' script comes after the page (and the prefetcher's), the span first.
+            // (A page with no component has none.) Its `<` is `\u003c`, so it is safe without the
+            // span too (src/server.rs; the same change).
+            assert!(p[at..].contains("<script>(window[Symbol.for(\"quillo\")]||(window[Symbol.for(\"quillo\")]={})).g=\"{\\\"banner\\\":\\\"\\u003cimg src=x onerror=3>\\\"}\"</script>"), "{} (round {}): {}", path, round, p);
+        }
+
+        let mark = "<circle r=\"1\"></circle>";
+        let (lost, after) = (whole(&mut it, "/mark-lost"), whole(&mut it, "/mark"));
+        assert_eq!(lost, format!("<!doctype html><html><body><svg><svg></svg><svg>{mark}{mark}</svg><span></span></body></html>"), "/mark-lost (round {})", round);
+        assert_eq!(after, format!("<!doctype html><html><body><svg>{mark}</svg></body></html>"), "/mark after /mark-lost (round {})", round);
+        let lost = whole(&mut it, "/laid-lost");
+        assert_eq!(lost, format!("<!doctype html><html><body><main><svg><svg>{mark}</svg><p>&lt;img src=x onerror=3&gt;</p></main><span></span></body></html>"), "/laid-lost (round {})", round);
+        assert_eq!(whole(&mut it, "/laid"), format!("<!doctype html><html><body><main><svg>{mark}</svg></main></body></html>"), "/laid (round {})", round);
+    }
+    let (hits, _) = it.view_cache_stats();
+    assert!(hits > 0, "the view cache kept none of the views");
 }

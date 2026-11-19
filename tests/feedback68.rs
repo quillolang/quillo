@@ -80,6 +80,31 @@ fn the_page_carries_its_states_and_a_program_with_none_nothing() {
     assert!(!page.contains(".g=") && !page.contains("\" data-e"), "{}", page);
 }
 
+// The page's states carry no `<` and no `&`, which an SVG reading of the script (a page whose raw
+// markup left an <svg> open) would take for a tag or a character reference, and read back as
+// they were written (coverage of 0.8.7, Q-1116; branch coverage-087).
+#[test]
+fn the_page_states_script_holds_no_lt_or_amp_and_reads_back_the_same() {
+    let note = "<img src=x onerror=1> &quot;\"; & &amp; </script><!-- \u{2028}é";
+    let src = format!("state note = {}\ncomponent C() = <p id=\"p\">{{note}}</p>\nroute GET / = <html><body><div><C/></div></body></html>\n", serde_json::Value::String(note.to_string()));
+    let d = dir("carried-amp", &src);
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let page = get(s.port, "/");
+    let at = page.find(".g=").unwrap_or_else(|| panic!("{}", page)) + 3;
+    let text = &page[at..at + page[at..].find("</script>").unwrap()];
+    assert!(!text.contains('<') && !text.contains('&'), "{}", text);
+    // A JavaScript string literal that is JSON: its value is the states' JSON.
+    let json: String = serde_json::from_str(text).unwrap_or_else(|e| panic!("{}: {}", e, text));
+    let states: serde_json::Value = serde_json::from_str(&json).unwrap_or_else(|e| panic!("{}: {}", e, json));
+    assert_eq!(states["note"], serde_json::Value::String(note.to_string()), "{}", json);
+    // A state with neither keeps its text as it was.
+    drop(s);
+    let d = dir("carried-plain", "state note = \"plain text 1\"\ncomponent C() = <p id=\"p\">{note}</p>\nroute GET / = <html><body><div><C/></div></body></html>\n");
+    let s = support::serve(&d.join("main.qwe"), &[]);
+    let page = get(s.port, "/");
+    assert!(page.contains("plain text 1\\\""), "{}", page);
+}
+
 fn chrome() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("QUILLO_CHROME") {
         return Some(PathBuf::from(p));

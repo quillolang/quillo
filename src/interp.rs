@@ -119,6 +119,7 @@ impl Interp {
         // it keeps it lost to its end (`foreign::LOST`), and the worker's next page is another
         // document (coverage of 0.8.7, Q-1116; branch coverage-087).
         self.ns = crate::foreign::At::default();
+        self.literals = 0;
         if self.page_states.is_empty() {
             return;
         }
@@ -322,6 +323,10 @@ pub struct Interp {
     /// the parser reads as markup there. Not `in_svg`, which is where a component stands
     /// (FEEDBACK71.md, Q-969; branch security).
     ns: crate::foreign::At,
+    /// How many HTML literals are being rendered, one in another: none around the page's own, at
+    /// whose end a page that lost the parser's place goes back to HTML (`page_back_to_html`;
+    /// coverage of 0.8.7, Q-1116; branch coverage-087).
+    literals: u32,
     /// Components marked by comments so far (see `island_wrap`), and those of them that run by
     /// themselves: what an island around them says (FEEDBACK61.md, Q-892; branch feedback61).
     marked: (usize, usize),
@@ -1588,6 +1593,21 @@ fn class_words(v: &Value, out: &mut Held) {
     }
 }
 
+/// A page whose markup lost the parser's place (raw markup that left an `<svg>` or `<math>` open,
+/// which the renderer's own end tags do not close): an empty `<span>` before its `</body>`, else
+/// at its end (a page with no `<body>`), a tag that ends SVG and MathML wherever the browser then
+/// is (it pops their elements to the nearest HTML element or integration point), so that what
+/// Quillo writes there after the page (its deferred parts' templates, the page states and the
+/// translations, the loader, the worker's and the player's scripts) is read as HTML, as it is
+/// written. Where the browser is in HTML already it is an empty inline element, which shows
+/// nothing (coverage of 0.8.7, Q-1116; branch coverage-087).
+#[cold]
+#[inline(never)]
+fn page_back_to_html(out: &mut Held) {
+    let at = out.rfind("</body>").or_else(|| out.rfind("</html>")).unwrap_or(out.len());
+    out.insert_str(at, "<span></span>");
+}
+
 /// Whether `v`, written in a page, writes markup: html, or a list holding some (`render_value`);
 /// anything else is written escaped.
 fn holds_markup(v: &Value) -> bool {
@@ -2339,6 +2359,7 @@ impl Interp {
             island_scopes_at: Vec::new(),
             in_svg: false,
             ns: Default::default(),
+            literals: 0,
             marked: (0, 0),
             state_again: None,
             in_component: false,
@@ -2471,6 +2492,7 @@ impl Interp {
             island_scopes_at: Vec::new(),
             in_svg: false,
             ns: Default::default(),
+            literals: 0,
             marked: (0, 0),
             state_again: None,
             in_component: false,
@@ -6078,7 +6100,17 @@ impl Interp {
         // makes, and is not made past it (FEEDBACK71.md, Q-977, found in review: a list of 200
         // long texts made a 1.26 GB page under a 1 MB limit; branch security).
         let mut out = Held::with_capacity(el.facts.last_len.load(Relaxed));
-        self.render_el_into(el, env, &mut out)?;
+        self.literals += 1;
+        let r = self.render_el_into(el, env, &mut out);
+        self.literals -= 1;
+        r?;
+        // The page's place lost (see `page_back_to_html`): at the end of the outermost literal
+        // outside a component, the page with its layout, `<html>` or not, as the place stays lost
+        // to the request's end; never in a value made inside it, which may be written anywhere
+        // in the page, or kept (coverage of 0.8.7, Q-1116; branch coverage-087).
+        if self.ns == crate::foreign::LOST && self.literals == 0 && !self.in_component {
+            page_back_to_html(&mut out);
+        }
         let out = out.into_text().map_err(|o| o.at(el.line))?;
         el.facts.last_len.store(out.len(), Relaxed);
         Ok(out)
@@ -7318,8 +7350,12 @@ impl Interp {
         // Where it stands, in an `<svg>` or not (see `in_svg`).
         let outer = std::mem::replace(&mut self.in_svg, d.svg);
         // Its part is read in a `<template>`, as HTML, wherever it then goes (FEEDBACK71.md,
-        // Q-969; branch security).
-        let outer_ns = std::mem::take(&mut self.ns);
+        // Q-969; branch security); but after a page that lost the parser's place (raw markup that
+        // left an `<svg>` open), the template may be read inside that `<svg>`, an SVG element
+        // whose scripts are SVG's: the part is written as it is safe in both (coverage of 0.8.7,
+        // Q-1116; branch coverage-087).
+        let outer_ns = self.ns;
+        self.ns = if outer_ns == crate::foreign::At::default() { outer_ns } else { crate::foreign::LOST };
         let marked = self.marked;
         let r = crate::value::js_numbers(true, || self.render_call_into(&d.c, d.args.clone(), d.line, &mut body));
         self.in_component = was;
