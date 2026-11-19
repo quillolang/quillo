@@ -279,7 +279,7 @@ pub fn call_given(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>, line: 
             it.restrictor = who;
         }
         match made {
-            Ok(Ok(made)) => it.call_closure(&c, made, line),
+            Ok(Ok(made)) => call_made(it, &c, made, line),
             Ok(Err(why)) => {
                 refused = Some(why);
                 Ok(Value::Nil)
@@ -297,6 +297,18 @@ pub fn call_given(it: &mut Interp, tool: &Tool, args: Vec<Option<Value>>, line: 
         Some(why) => Err(why),
         None => Ok(answer),
     })
+}
+
+/// `Interp::call_made` for a tool's arguments, each given or left for its default: those
+/// `made_args` made by the request's walk are not checked again by the program's, 0.8.8's, which
+/// is exponential on a deep valid union (a `Tt` 22 levels deep took seconds over the door, where
+/// an RPC call took a millisecond); defaults are checked as ever, and the mark goes with the call
+/// however it ends (FEEDBACK75.md, Q-1080's MCP part; branch feedback75).
+fn call_made(it: &mut Interp, c: &crate::value::Closure, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
+    it.args_made = true;
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.call_closure(c, args, line)));
+    it.args_made = false;
+    r.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 /// Runs `body` in a read-only transaction on the program's database, so the database refuses
