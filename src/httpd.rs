@@ -692,7 +692,8 @@ type Job = Box<dyn FnOnce() + Send>;
 /// What a paused request waits for: blocking work for a pool thread, or a
 /// future for the async runtime (the shared Postgres connections).
 enum Wait {
-    Run(Job),
+    /// A job for a pool thread; true for a transaction's statement (`wait_elsewhere_in_transaction`).
+    Run(Job, bool),
     Spawn(std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>),
     /// Functions to run as coroutines of their own (`parallel`); the
     /// request carries on when all of them have ended.
@@ -828,6 +829,19 @@ thread_local! {
 /// thread while the server answers other requests, and gives back its
 /// result. Elsewhere gives `f` back, for the caller to run.
 pub fn wait_elsewhere<T: Send, F: FnOnce() -> T + Send>(f: F) -> Result<T, F> {
+    wait_elsewhere_as(f, false)
+}
+
+/// `wait_elsewhere`, for a statement on a connection that a transaction of this request holds
+/// (`Interp::unlocked_in_transaction`): it goes before the other jobs waiting, and gets a thread
+/// even when all `max` are taken, perhaps by requests waiting on the locks it holds
+/// (FEEDBACK78.md, Q-1168; branch feedback75).
+pub fn wait_elsewhere_in_transaction<T: Send, F: FnOnce() -> T + Send>(f: F) -> Result<T, F> {
+    wait_elsewhere_as(f, true)
+}
+
+#[inline(always)]
+fn wait_elsewhere_as<T: Send, F: FnOnce() -> T + Send>(f: F, tx: bool) -> Result<T, F> {
     let y = YIELDER.with(|c| c.get());
     // Not while a SQLite transaction is open on this thread (FEEDBACK44.md, Q-579).
     if y == 0 || held() {
@@ -846,7 +860,7 @@ pub fn wait_elsewhere<T: Send, F: FnOnce() -> T + Send>(f: F) -> Result<T, F> {
     // SAFETY: the coroutine stays paused until the job has run, so what the
     // job borrows lives long enough.
     let job: Job = unsafe { std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, Job>(job) };
-    yielder.suspend(Wait::Run(job));
+    yielder.suspend(Wait::Run(job, tx));
     YIELDER.with(|c| c.set(y));
     match out.take().expect("the job ran") {
         Ok(v) => Ok(v),
@@ -923,14 +937,15 @@ pub fn await_elsewhere<T: Send + 'static>(
 
 /// Threads that do the waiting for paused requests.
 struct Pool {
-    jobs: Mutex<VecDeque<(usize, Job)>>,
+    /// The jobs waiting, and the threads `claim` counts, changed under this lock (FEEDBACK78.md,
+    /// Q-1168; branch feedback75).
+    queue: Mutex<Queue>,
     /// Jobs waiting, readable without the lock.
     queued: AtomicUsize,
     ready: Condvar,
-    /// Idle threads asleep, and idle threads still looking for work.
-    idle: AtomicUsize,
+    /// Threads looking for work before they sleep (at most two spin): counted up as they start
+    /// looking, outside the lock, and down under it, as they take a job or go to sleep.
     spinning: AtomicUsize,
-    threads: AtomicUsize,
     max: usize,
     done: Mutex<Vec<usize>>,
     waker: Arc<Waker>,
@@ -940,67 +955,146 @@ struct Pool {
     out: AtomicUsize,
 }
 
+/// The jobs waiting for a pool thread, and the threads (see `Pool::claim`).
+#[derive(Default)]
+struct Queue {
+    /// Each with whether it is a transaction's statement (`wait_elsewhere_in_transaction`).
+    jobs: VecDeque<(usize, Job, bool)>,
+    /// Transactions' statements among them: while there are, a thread may start past `max`.
+    tx: usize,
+    /// Threads asleep on `ready`, and those of them woken and not yet up.
+    idle: usize,
+    woken: usize,
+    /// Threads started and not yet looking.
+    starting: usize,
+    threads: usize,
+}
+
+/// What `claim` asked for, done once the lock is let go.
+enum Wake {
+    Nothing,
+    Notify,
+    Start,
+}
+
 impl Pool {
-    fn submit(self: &Arc<Self>, id: usize, job: Job) {
+    fn submit(self: &Arc<Self>, id: usize, job: Job, tx: bool) {
         self.out.fetch_add(1, SeqCst);
-        lock(&self.jobs).push_back((id, job));
-        self.queued.fetch_add(1, SeqCst);
-        // A thread looking for work takes it without being woken (waking a
-        // sleeping thread costs the loop more than many requests).
-        if self.spinning.load(SeqCst) > 0 {
-            return;
-        }
-        if self.idle.load(SeqCst) > 0 {
-            self.ready.notify_one();
-        } else if self.threads.fetch_add(1, SeqCst) < self.max {
-            let pool = self.clone();
-            let started = std::thread::Builder::new().name("quillo-wait".into()).spawn(move || {
-                pool.work()
-            });
-            if let Err(e) = started {
-                let left = self.threads.fetch_sub(1, SeqCst) - 1;
-                // Said once (FEEDBACK41.md, Q-480; branch feedback40-43). With no thread at all,
-                // tried again a little later, a few times: another process may have ended. Not
-                // run here: the loop would wait with it, and every connection with the loop.
-                static SAID: AtomicBool = AtomicBool::new(false);
-                if !SAID.swap(true, SeqCst) {
-                    eprintln!("quillo: cannot start a thread for waiting work ({}; the account's process limit?); requests wait for the {} threads there are", e, left);
-                }
-                // Tried again at most once a second, so the loop does not wait each time.
-                static TRIED: AtomicU64 = AtomicU64::new(0);
-                let now = clock();
-                if left == 0 && now.saturating_sub(TRIED.swap(now, SeqCst)) >= 1000 {
-                    for wait in [5, 20, 75] {
-                        std::thread::sleep(Duration::from_millis(wait));
-                        if self.threads.fetch_add(1, SeqCst) >= self.max {
-                            self.threads.fetch_sub(1, SeqCst);
-                            break;
-                        }
-                        let pool = self.clone();
-                        if std::thread::Builder::new().name("quillo-wait".into()).spawn(move || pool.work()).is_ok() {
-                            break;
-                        }
-                        self.threads.fetch_sub(1, SeqCst);
-                    }
-                }
+        let wake = {
+            let mut q = lock(&self.queue);
+            // A transaction's statement goes first: it holds locks and a connection that the
+            // requests queued behind it may be waiting for (FEEDBACK78.md, Q-1168; branch
+            // feedback75).
+            if tx {
+                q.tx += 1;
+                q.jobs.push_front((id, job, tx));
+            } else {
+                q.jobs.push_back((id, job, tx));
             }
-        } else {
-            self.threads.fetch_sub(1, SeqCst);
+            self.queued.fetch_add(1, SeqCst);
+            self.claim(&mut q)
+        };
+        self.wake(wake);
+    }
+
+    /// Under the lock: a thread more when jobs are waiting and none is coming for them (none
+    /// looking, woken and not yet up, or started). A thread that takes a job asks again for those
+    /// left, so they go to threads one after another, and a thread looking takes one without
+    /// being woken, which costs the loop more than many requests. Before, a submit woke none
+    /// while a thread was looking, and a thread took one job and left the rest: of three jobs
+    /// submitted together the third waited for a thread to come back, and when the two taken were
+    /// statements waiting on a row lock that the third's transaction held, none came back, while
+    /// the other threads slept; PostgreSQL waited for good, MySQL for 50 s (FEEDBACK78.md, Q-1168;
+    /// branch feedback75).
+    fn claim(&self, q: &mut Queue) -> Wake {
+        if q.jobs.is_empty() || self.spinning.load(SeqCst) + q.woken + q.starting > 0 {
+            return Wake::Nothing;
+        }
+        if q.idle > q.woken {
+            q.woken += 1;
+            return Wake::Notify;
+        }
+        // Past `max` for a transaction's statement: every thread may be waiting on the locks it
+        // holds, as MySQL's 100 connections let 65 requests do. As many more as transactions hold
+        // connections (each runs one statement at a time): they take only transactions'
+        // statements, and end once none is left (`may_take`; Q-1168).
+        if q.threads < self.max || q.tx > 0 {
+            q.threads += 1;
+            q.starting += 1;
+            return Wake::Start;
+        }
+        Wake::Nothing
+    }
+
+    fn wake(self: &Arc<Self>, w: Wake) {
+        match w {
+            Wake::Nothing => {}
+            Wake::Notify => self.ready.notify_one(),
+            Wake::Start => self.start(),
         }
     }
 
-    /// A job, looking for one a little while before sleeping (at most two
-    /// threads look at once).
-    fn next(&self) -> (usize, Job) {
+    /// A thread more, as `claim` counted.
+    fn start(self: &Arc<Self>) {
+        let pool = self.clone();
+        let Err(e) = std::thread::Builder::new().name("quillo-wait".into()).spawn(move || pool.work()) else { return };
+        let left = {
+            let mut q = lock(&self.queue);
+            q.threads -= 1;
+            q.starting -= 1;
+            q.threads
+        };
+        // Said once (FEEDBACK41.md, Q-480; branch feedback40-43). With no thread at all, tried
+        // again a little later, a few times: another process may have ended. Not run here: the
+        // loop would wait with it, and every connection with the loop.
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, SeqCst) {
+            eprintln!("quillo: cannot start a thread for waiting work ({}; the account's process limit?); requests wait for the {} threads there are", e, left);
+        }
+        // Tried again at most once a second, so the loop does not wait each time.
+        static TRIED: AtomicU64 = AtomicU64::new(0);
+        let now = clock();
+        if left == 0 && now.saturating_sub(TRIED.swap(now, SeqCst)) >= 1000 {
+            for wait in [5, 20, 75] {
+                std::thread::sleep(Duration::from_millis(wait));
+                {
+                    let mut q = lock(&self.queue);
+                    if q.threads >= self.max && q.tx == 0 {
+                        break;
+                    }
+                    q.threads += 1;
+                    q.starting += 1;
+                }
+                let pool = self.clone();
+                if std::thread::Builder::new().name("quillo-wait".into()).spawn(move || pool.work()).is_ok() {
+                    break;
+                }
+                let mut q = lock(&self.queue);
+                q.threads -= 1;
+                q.starting -= 1;
+            }
+        }
+    }
+
+    /// A job, looking for one a little while before sleeping (at most two threads look at
+    /// once); `fresh` for a thread's first. None: a thread started past `max` has nothing left
+    /// to do.
+    fn next(self: &Arc<Self>, fresh: bool) -> Option<(usize, Job)> {
+        // No longer starting, before it is counted looking: in between it is neither, which may
+        // wake one more thread, never one fewer.
+        if fresh {
+            lock(&self.queue).starting -= 1;
+        }
         if self.spinning.fetch_add(1, SeqCst) < 2 {
             let start = Instant::now();
             let mut i = 0u32;
             loop {
                 if self.queued.load(SeqCst) > 0 {
-                    if let Some(j) = lock(&self.jobs).pop_front() {
-                        self.queued.fetch_sub(1, SeqCst);
+                    let mut q = lock(&self.queue);
+                    if self.may_take(&q) {
+                        let (id, job, tx) = q.jobs.pop_front().expect("a job");
                         self.spinning.fetch_sub(1, SeqCst);
-                        return j;
+                        return Some(self.taken(q, id, job, tx));
                     }
                 }
                 i += 1;
@@ -1014,24 +1108,63 @@ impl Pool {
                 }
             }
         }
-        let mut q = lock(&self.jobs);
-        // Counted as idle before it stops spinning, so a job submitted in
+        let mut q = lock(&self.queue);
+        // Counted as idle before it stops looking, so a job submitted in
         // between is either seen here or wakes it.
-        self.idle.fetch_add(1, SeqCst);
+        q.idle += 1;
         self.spinning.fetch_sub(1, SeqCst);
         loop {
-            if let Some(j) = q.pop_front() {
-                self.queued.fetch_sub(1, SeqCst);
-                self.idle.fetch_sub(1, SeqCst);
-                return j;
+            if self.may_take(&q) {
+                let (id, job, tx) = q.jobs.pop_front().expect("a job");
+                q.idle -= 1;
+                return Some(self.taken(q, id, job, tx));
+            }
+            // Past `max`, a thread ends once no transaction's statement is left for it: the other
+            // jobs wait for a thread within `max`, and one is asked for them.
+            if q.threads > self.max {
+                q.threads -= 1;
+                q.idle -= 1;
+                let w = self.claim(&mut q);
+                drop(q);
+                self.wake(w);
+                return None;
             }
             q = self.ready.wait(q).unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Up: no longer coming. A wake no one asked for counts one down too, which only
+            // wakes another sooner.
+            q.woken = q.woken.saturating_sub(1);
         }
     }
 
-    fn work(&self) {
-        loop {
-            let (id, job) = self.next();
+    /// Whether a thread may take the job first in the queue: past `max`, only a transaction's
+    /// statement (they are all first). The threads past `max` are then no more than the
+    /// transactions' statements waiting, one for each connection a transaction holds; taking
+    /// other jobs, which may wait as long (a MySQL connection, `http`), they had grown with
+    /// every request waiting (Q-1168).
+    fn may_take(&self, q: &Queue) -> bool {
+        match q.jobs.front() {
+            Some(&(_, _, tx)) => tx || q.threads <= self.max,
+            None => false,
+        }
+    }
+
+    /// A job taken, the lock still held: counted out, and one more thread asked for those left
+    /// (`claim`).
+    fn taken(self: &Arc<Self>, mut q: MutexGuard<'_, Queue>, id: usize, job: Job, tx: bool) -> (usize, Job) {
+        self.queued.fetch_sub(1, SeqCst);
+        if tx {
+            q.tx -= 1;
+        }
+        let w = self.claim(&mut q);
+        drop(q);
+        self.wake(w);
+        (id, job)
+    }
+
+    fn work(self: Arc<Self>) {
+        let mut fresh = true;
+        while let Some((id, job)) = self.next(fresh) {
+            fresh = false;
             job();
             self.finish(id);
         }
@@ -1156,12 +1289,10 @@ fn run_loop(
     let waker = inbox.waker.clone();
     lock(&LOOPS).push(waker.clone());
     let pool = Arc::new(Pool {
-        jobs: Mutex::new(VecDeque::new()),
+        queue: Mutex::new(Queue::default()),
         queued: AtomicUsize::new(0),
         ready: Condvar::new(),
-        idle: AtomicUsize::new(0),
         spinning: AtomicUsize::new(0),
-        threads: AtomicUsize::new(0),
         max: max_waiting.max(1),
         done: Mutex::new(Vec::new()),
         waker,
@@ -1725,7 +1856,7 @@ impl Loop {
         r.limit = crate::stack::switch(outer);
         YIELDER.with(|c| c.set(0));
         match res {
-            Ok(CoroutineResult::Yield(Wait::Run(job))) => self.pool.submit(id, job),
+            Ok(CoroutineResult::Yield(Wait::Run(job, tx))) => self.pool.submit(id, job, tx),
             Ok(CoroutineResult::Yield(Wait::Spawn(fut))) => {
                 self.pool.out.fetch_add(1, SeqCst);
                 let done = Finish(self.pool.clone(), id);

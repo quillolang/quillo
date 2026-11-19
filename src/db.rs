@@ -1212,7 +1212,9 @@ pub(crate) fn pooled_run<T: Send>(
     let boom = fault();
     match pinned {
         Some(c) => {
-            let (c, r) = it.unlocked(move || {
+            // The transaction's own: before other waits, past the threads' limit (FEEDBACK78.md,
+            // Q-1168; branch feedback75).
+            let (c, r) = it.unlocked_in_transaction(move || {
                 let mut c = Taken { b: pool, conn: Some(c) };
                 faulted(boom);
                 let r = f(c.conn());
@@ -1274,7 +1276,8 @@ impl Drop for Taken<'_> {
 /// and closes it (FEEDBACK56.md, found in review; branch feedback56).
 fn close_after(it: &mut Interp, mut c: Taken<'_>, sqls: Vec<String>) {
     let boom = fault();
-    it.unlocked(move || {
+    // A transaction's connection, whose rollback lets its locks go (FEEDBACK78.md, Q-1168).
+    it.unlocked_in_transaction(move || {
         faulted(boom);
         for sql in &sqls {
             let _ = c.conn().batch(sql);

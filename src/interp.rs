@@ -2774,6 +2774,20 @@ impl Interp {
     /// Runs `f` without holding the interpreter lock, so other requests can
     /// run while this one waits. `f` must not touch Quillo values.
     pub fn unlocked<T: Send>(&mut self, f: impl FnOnce() -> T + Send) -> T {
+        self.unlocked_as(f, false)
+    }
+
+    /// `unlocked`, for a statement on a connection that a transaction of this request holds, with
+    /// its locks: in a request it goes before the other waits and gets a thread when all are
+    /// taken, perhaps by requests waiting on those locks. Queued behind them, its statement or its
+    /// commit waited for good: 50 to 100 requests at once on one row stopped every database route
+    /// on PostgreSQL, and MySQL's for 50 s (FEEDBACK78.md, Q-1168; branch feedback75).
+    pub(crate) fn unlocked_in_transaction<T: Send>(&mut self, f: impl FnOnce() -> T + Send) -> T {
+        self.unlocked_as(f, true)
+    }
+
+    #[inline(always)]
+    fn unlocked_as<T: Send>(&mut self, f: impl FnOnce() -> T + Send, tx: bool) -> T {
         // Inside a SQLite transaction, another request would run its SQL in
         // this one's transaction: committed or rolled back with it, and
         // seeing what it has not committed. So the wait holds everyone up.
@@ -2784,7 +2798,8 @@ impl Interp {
         }
         // A request in the server is a coroutine: it pauses, `f` runs on
         // another thread, and the server answers other requests meanwhile.
-        let f = match crate::httpd::wait_elsewhere(f) {
+        let waited = if tx { crate::httpd::wait_elsewhere_in_transaction(f) } else { crate::httpd::wait_elsewhere(f) };
+        let f = match waited {
             Ok(v) => return v,
             Err(f) => f,
         };
