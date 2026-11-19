@@ -423,9 +423,14 @@ fn error_message(id: Option<&J>, f: Fault) -> J {
 
 /// A message as the door reads one, as deep as every reader of JSON takes it
 /// (`value::json_value`): an object, else the error to answer with. `one` says how many a
-/// message carries: JSON-RPC's batches left MCP in 2025-06-18.
-fn message_of(text: &[u8], one: &str) -> Result<Map<String, J>, J> {
-    match crate::value::json_value(text) {
+/// message carries: JSON-RPC's batches left MCP in 2025-06-18. One that came over HTTP
+/// (`visitor`) and is over 1 KiB is read as a page's JSON is, within the values and the memory a
+/// visitor's JSON has (`value::json_from_page`): 10 MB of JSON read by `json_value` made about
+/// 750 MB whatever `--max-memory` said. Stdio's messages come from the program's own client, read
+/// as before (FEEDBACK75.md, Q-1052's MCP part; branch feedback75).
+fn message_of(text: &[u8], one: &str, visitor: bool) -> Result<Map<String, J>, J> {
+    let read = if visitor && text.len() > 1024 { crate::value::json_from_page(text) } else { crate::value::json_value(text) };
+    match read {
         Ok(J::Object(m)) => Ok(m),
         Ok(J::Array(_)) => Err(error_message(None, fault(INVALID_REQUEST, format!("Invalid request: {}, not a batch", one)))),
         Ok(_) => Err(error_message(None, fault(INVALID_REQUEST, "Invalid request: a message is a JSON object"))),
@@ -529,7 +534,7 @@ impl Door {
     /// The answer to one message, as it came: None for a notification and for a client's
     /// response, which are never answered.
     pub fn answer(&self, it: &mut Interp, text: &[u8]) -> Option<J> {
-        match message_of(text, "one message a line") {
+        match message_of(text, "one message a line", false) {
             // On stdio a call has a `request` too, as the guide's `request.mcp` and a `server fn`'s
             // middleware (`request | auth.required | ...`) read one: who the client says it is, and
             // no headers, cookies or query, so that a stage looking for a header finds none and
@@ -2598,7 +2603,7 @@ fn answer_http(it: &mut Interp, door: &Door, req: &crate::server::HttpRequest) -
         Ok(c) => c,
         Err(refused) => return refused,
     };
-    let msg = match message_of(&req.body, "one message a request") {
+    let msg = match message_of(&req.body, "one message a request", true) {
         Ok(m) => m,
         Err(refused) => return json_answer(400, refused),
     };
