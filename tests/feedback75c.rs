@@ -330,26 +330,33 @@ fn a_map_of_many_fields_is_checked_at_once() {
 }
 
 /// Each function read once and again only when one it calls is found: a chain of 30,000 helpers
-/// built SQL, or made it with `sql_name`, took 19.6 s and 23 s; each is checked at once, through
-/// `check_program` too, and says what it did (FEEDBACK75.md, Q-1053, found in review; branch
-/// feedback75).
+/// built SQL, or made it with `sql_name`, took 19.6 s and 23 s, the whole program read again for
+/// each helper found. A chain four times as long now takes about four times as long, plain and
+/// confined (`grows_linearly`, where the old reading took sixteen), and each says what it did; a
+/// confined check of the shorter passes within its own 2 s in a release build (FEEDBACK75.md,
+/// Q-1053, found in review; branch feedback75).
 #[test]
 fn a_chain_of_helpers_is_read_once() {
-    let n = if cfg!(debug_assertions) { 6_000 } else { 30_000 };
-    let built: Vec<String> = std::iter::once("fn f0(x) { return \"select '\" + x + \"'\" }".to_string()).chain((1..n).map(|i| format!("fn f{}(x) {{ return f{}(x) }}", i, i - 1))).collect();
-    let built = format!("db.open(\":memory:\")\n{}\nroute GET /a = db.query(f{}(request.query.x))\nroute GET /b = db.query(f{}(\"users\"))\n", built.join("\n"), n - 1, n - 1);
-    let named: Vec<String> = std::iter::once("fn s0(c) = sql_name(c)".to_string()).chain((1..n).map(|i| format!("fn s{}(c) = s{}(c)", i, i - 1))).collect();
-    let named = format!("db.open(\":memory:\")\n{}\nroute GET /a = db.query(\"select * from t order by \" + s{}(request.query.c))\n", named.join("\n"), n - 1);
+    let built = |n: usize| {
+        let fns: Vec<String> = std::iter::once("fn f0(x) { return \"select '\" + x + \"'\" }".to_string()).chain((1..n).map(|i| format!("fn f{}(x) {{ return f{}(x) }}", i, i - 1))).collect();
+        format!("db.open(\":memory:\")\n{}\nroute GET /a = db.query(f{}(request.query.x))\nroute GET /b = db.query(f{}(\"users\"))\n", fns.join("\n"), n - 1, n - 1)
+    };
+    let named = |n: usize| {
+        let fns: Vec<String> = std::iter::once("fn s0(c) = sql_name(c)".to_string()).chain((1..n).map(|i| format!("fn s{}(c) = s{}(c)", i, i - 1))).collect();
+        format!("db.open(\":memory:\")\n{}\nroute GET /a = db.query(\"select * from t order by \" + s{}(request.query.c))\n", fns.join("\n"), n - 1)
+    };
     let d = dir("chain");
     let _gone = Gone(d.clone());
     for confined in [false, true] {
-        let (said, took) = check_in(&d, &built, confined);
+        let said = grows_linearly(&d, &format!("built confined {}", confined), &built(2_000), &built(8_000), confined);
         assert_eq!(said.len(), 1, "{:?}", said);
         assert!(said[0].starts_with("warning: `db.query` with SQL built from values"), "{:?}", said);
-        assert!(took < Duration::from_secs(slow() as u64), "{:?}", took);
-        let (said, took) = check_in(&d, &named, confined);
+        let said = grows_linearly(&d, &format!("named confined {}", confined), &named(2_000), &named(8_000), confined);
         assert_eq!(said, Vec::<String>::new());
-        assert!(took < Duration::from_secs(slow() as u64), "{:?}", took);
+    }
+    if !cfg!(debug_assertions) {
+        assert_eq!(check_in(&d, &built(2_000), true).0.len(), 1);
+        assert_eq!(check_in(&d, &named(2_000), true).0, Vec::<String>::new());
     }
 }
 
@@ -394,6 +401,47 @@ fn nm(p: &str, mut i: usize) -> String {
             return out;
         }
     }
+}
+
+/// The CPU time this thread has run, where the system says it, else the time since the first call.
+/// A check runs on the thread that asks for it, so the time it took to run is told apart from the
+/// time it waited for a core: on a machine busy with other tests, a long check was stopped more
+/// often than a short one, and its wall time grew more (found in CI).
+fn thread_cpu() -> Duration {
+    #[cfg(unix)]
+    {
+        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: `ts` is a valid timespec for the call to write into.
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } == 0 {
+            return Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32);
+        }
+    }
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
+/// Asserts that checking `big`, four times `small` in each of its sizes, takes less than eight times
+/// as long as `small` (plus 20 ms for what a check costs whatever its size): what grows as the
+/// program does takes about four times, what grows as its square sixteen. Each is timed by the CPU
+/// time it ran (`thread_cpu`), the least of three checks taken in turn; a confined check is given
+/// ten minutes, so its own clock never ends one on a slow machine. The ratio, not a time, tells the
+/// two apart on any machine, a debug or coverage build included (found in CI; FEEDBACK75.md, Q-1085;
+/// branch feedback75).
+fn grows_linearly(d: &Path, name: &str, small: &str, big: &str, confined: bool) -> Vec<String> {
+    let time = Some(Duration::from_secs(600));
+    let (mut least_small, mut least_big) = (Duration::MAX, Duration::MAX);
+    let mut said = Vec::new();
+    for _ in 0..3 {
+        let t = thread_cpu();
+        check_timed(d, small, confined, time);
+        least_small = least_small.min(thread_cpu() - t);
+        let t = thread_cpu();
+        let (s, _) = check_timed(d, big, confined, time);
+        least_big = least_big.min(thread_cpu() - t);
+        said = s;
+    }
+    assert!(least_big < least_small * 8 + Duration::from_millis(20), "{}: {:?} for the program four times as large, {:?} for the small one", name, least_big, least_small);
+    said
 }
 
 /// `quillo run` of a program that checks `file` in `d` with `check_program`, under a heap of 256 MiB
@@ -487,63 +535,81 @@ fn nested_branches_are_not_copied() {
     }
 }
 
-/// A caller written before its 10,000 helpers (`sql_name`, built SQL, or written after them) is
-/// read once more when they are found, not once for each: it took 1.2 to 1.7 s, and a confined
-/// check said "too complex"; with a list of 30,000 built texts in it, 5 s and 1.9 GB. Each passes
-/// `check_program` at once, under a heap of 256 MiB (FEEDBACK75.md, Q-1085, found in review; branch
-/// feedback75).
+/// A caller written before its helpers (`sql_name`, built SQL, or written after them) is read once
+/// more when they are found, not once for each: with 10,000 it took 1.2 to 1.7 s, and a confined
+/// check said "too complex"; with a list of 30,000 built texts in it, 5 s and 1.9 GB. Four times
+/// the helpers now take about four times as long, plain and confined, where they took sixteen
+/// (`grows_linearly`); a confined check of 1,000 passes within its own 2 s in a release build; and
+/// 4,000 with a list of 15,000 built texts pass `check_program` under a heap of 256 MiB, where the
+/// old reading kept a copy of the list for each helper found, about 380 MB (FEEDBACK75.md, Q-1085,
+/// found in review; branch feedback75).
 #[test]
 fn a_caller_before_its_helpers_is_read_once() {
-    let n = 10_000;
-    let calls: Vec<String> = (0..n).map(|i| format!("  {}(x)", nm("t", i))).collect();
-    let helpers = |body: &str| (0..n).map(|i| format!("fn {}(x) {{ return {} }}", nm("t", i), body)).collect::<Vec<_>>();
-    let caller = |extra: &str| format!("fn f(x) {{\n{}\n{}  return x\n}}", calls.join("\n"), extra);
-    let fan_s = format!("{}\n{}\nprint(f(\"a\"))\n", caller(""), helpers("sql_name(x)").join("\n"));
-    let fan_b = format!("{}\n{}\nprint(f(\"a\"))\n", caller(""), helpers("\"s\" + x").join("\n"));
-    let fan_l = format!("{}\n{}\nprint(f(\"a\"))\n", helpers("sql_name(x)").join("\n"), caller(""));
-    let list = format!("  let p = [{}]\n", vec!["\"s\" + x"; 30_000].join(","));
-    let fan_p = format!("{}\n{}\nprint(f(\"a\"))\n", caller(&list), helpers("\"s\" + x").join("\n"));
+    let fan = |n: usize, shape: &str, list: usize| {
+        let calls: Vec<String> = (0..n).map(|i| format!("  {}(x)", nm("t", i))).collect();
+        let body = if shape == "s" || shape == "l" { "sql_name(x)" } else { "\"s\" + x" };
+        let helpers: Vec<String> = (0..n).map(|i| format!("fn {}(x) {{ return {} }}", nm("t", i), body)).collect();
+        let extra = if list > 0 { format!("  let p = [{}]\n", vec!["\"s\" + x"; list].join(",")) } else { String::new() };
+        let caller = format!("fn f(x) {{\n{}\n{}  return x\n}}", calls.join("\n"), extra);
+        if shape == "l" {
+            format!("{}\n{}\nprint(f(\"a\"))\n", helpers.join("\n"), caller)
+        } else {
+            format!("{}\n{}\nprint(f(\"a\"))\n", caller, helpers.join("\n"))
+        }
+    };
     let d = dir("fan");
     let _gone = Gone(d.clone());
-    for (name, src) in [("fan_s", &fan_s), ("fan_b", &fan_b), ("fan_l", &fan_l)] {
-        let (said, took) = check_in(&d, src, true);
-        assert!(!said.iter().any(|l| l.contains("too complex")), "{}: {:?}", name, said.first());
-        assert!(took < Duration::from_secs(slow() as u64), "{}: {:?}", name, took);
-        let (_, took) = check_in(&d, src, false);
-        assert!(took < Duration::from_secs(slow() as u64), "{}: {:?}", name, took);
+    for shape in ["s", "b", "l"] {
+        for confined in [false, true] {
+            let said = grows_linearly(&d, &format!("fan_{} confined {}", shape, confined), &fan(1_000, shape, 0), &fan(4_000, shape, 0), confined);
+            assert!(!said.iter().any(|l| l.contains("too complex")), "fan_{}: {:?}", shape, said.first());
+        }
+        if !cfg!(debug_assertions) {
+            let (said, _) = check_in(&d, &fan(1_000, shape, 0), true);
+            assert!(!said.iter().any(|l| l.contains("too complex")), "fan_{} within 2 s: {:?}", shape, said.first());
+        }
     }
-    std::fs::write(d.join("fan_p.qwe"), &fan_p).unwrap();
-    let t = Instant::now();
-    let (ended, out) = checked_in_256_mib(&d, "fan_p.qwe", 30 * slow() as u64);
+    std::fs::write(d.join("fan_p.qwe"), fan(4_000, "b", 15_000)).unwrap();
+    let (ended, out) = checked_in_256_mib(&d, "fan_p.qwe", 60 * slow() as u64);
     assert!(ended && out.starts_with("diags: "), "{}", out);
-    assert!(t.elapsed() < Duration::from_secs(2 * slow() as u64), "{:?}", t.elapsed());
 }
 
-/// A function that assigns, calls a chain of 100 helpers written after it (the last `sql_name`), and
-/// holds 100 `let`s each the block of the next around a list of 300,000: its graph of who reads
-/// what is made once, each name given to its innermost `let`, and the helpers are read before it,
-/// so it is not read again a round for each; it took 54 s, and `check_program` 8.3 s before "too
-/// complex". And a list of 250,000 with a chain of 300 helpers that build SQL, 0.97 s: each name
-/// in the list is read once (FEEDBACK75.md, Q-1085, found in review; branch feedback75).
+/// A function that assigns, calls a chain of helpers written after it (the last `sql_name`), and
+/// holds `let`s each the block of the next around a long list: its graph of who reads what is made
+/// once, each name given to its innermost `let`, and the helpers are read before it, so it is not
+/// read again a round for each. With 100 helpers, 100 `let`s and 300,000 items it took 54 s, and
+/// `check_program` 8.3 s before "too complex": the old reading grew as the product of the three
+/// (the helpers many enough here that even a reading that grew as their number times the list's
+/// shows past what grows as the program does). And a
+/// list with a chain of helpers that build SQL, 250,000 items and 300 helpers, 0.97 s: each name in
+/// the list is read once, where the list was read again for each helper, as the square (the helpers
+/// many enough here that the square shows past what grows as the program does). Four times
+/// each size now takes about four times as long, plain and confined (`grows_linearly`), and a
+/// confined check of the smaller passes within its own 2 s in a release build (FEEDBACK75.md,
+/// Q-1085, found in review; branch feedback75).
 #[test]
 fn a_function_is_read_once_through_a_chain_of_helpers() {
     let chain = |n: usize, last: &str| (0..n).map(|i| if i + 1 == n { format!("fn t{}(c) {{ return {} }}", i, last) } else { format!("fn t{}(c) {{ return t{}(c) }}", i, i + 1) }).collect::<Vec<_>>().join("\n");
     let calls = |n: usize, v: &str| (0..n).map(|i| format!("  t{}({})", i, v)).collect::<Vec<_>>().join("\n");
-    let mut nest = format!("[{}]", vec!["q"; 300_000].join(","));
-    for i in 0..100 {
-        nest = format!("{{ let a{} = {}\n a{} }}", i, nest, i);
-    }
-    let rounds = format!("fn f(q) {{\n  s = q\n{}\n  let top = {}\n  return 1\n}}\n{}\n", calls(100, "q"), nest, chain(100, "sql_name(c)"));
-    let list = format!("fn f(x) {{\n{}\n  let p = [{}]\n  return x\n}}\n{}\n", calls(300, "x"), vec!["x"; 250_000].join(","), chain(300, "\"s\" + c"));
+    let rounds = |n: usize, depth: usize, items: usize| {
+        let mut nest = format!("[{}]", vec!["q"; items].join(","));
+        for i in 0..depth {
+            nest = format!("{{ let a{} = {}\n a{} }}", i, nest, i);
+        }
+        format!("fn f(q) {{\n  s = q\n{}\n  let top = {}\n  return 1\n}}\n{}\n", calls(n, "q"), nest, chain(n, "sql_name(c)"))
+    };
+    let list = |n: usize, items: usize| format!("fn f(x) {{\n{}\n  let p = [{}]\n  return x\n}}\n{}\n", calls(n, "x"), vec!["x"; items].join(","), chain(n, "\"s\" + c"));
     let d = dir("rounds");
     let _gone = Gone(d.clone());
-    for (name, src) in [("rounds", &rounds), ("list", &list)] {
-        let (said, took) = check_in(&d, src, false);
-        assert!(!said.iter().any(|l| l.contains("too complex")), "{}", name);
-        assert!(took < Duration::from_secs(slow() as u64), "{}: {:?}", name, took);
-        let (said, took) = check_in(&d, src, true);
-        assert!(!said.iter().any(|l| l.contains("too complex")) || cfg!(debug_assertions), "{}", name);
-        assert!(took < Duration::from_millis(1_000 * slow() as u64), "{}: {:?}", name, took);
+    for (name, small, big) in [("rounds", rounds(80, 10, 30_000), rounds(320, 40, 120_000)), ("list", list(120, 25_000), list(480, 100_000))] {
+        for confined in [false, true] {
+            let said = grows_linearly(&d, &format!("{} confined {}", name, confined), &small, &big, confined);
+            assert!(!said.iter().any(|l| l.contains("too complex")), "{}", name);
+        }
+        if !cfg!(debug_assertions) {
+            let (said, _) = check_in(&d, &small, true);
+            assert!(!said.iter().any(|l| l.contains("too complex")), "{} within 2 s", name);
+        }
     }
 }
 

@@ -38,12 +38,16 @@ run_script("secret()", {})"#);
 
 #[test]
 fn scripts_stop_after_their_budget() {
-    let e = run(r#"run_script("let f = (g, n) => g(g, n + 1)\nf(f, 0)", {})"#);
+    // Given a minute, so that the steps stop these two scripts first: since FEEDBACK75.md, Q-1055
+    // (branch feedback75), a script also stops after 100 ms by default, the user's choice, and on a
+    // slow machine that clock could stop a long script before its 20,000 steps run out. The clock
+    // itself is tested in tests/feedback75c.rs.
+    let e = run(r#"run_script("let f = (g, n) => g(g, n + 1)\nf(f, 0)", {}, { timeout: "60s" })"#);
     assert!(e.contains("too many steps") || e.contains("too much recursion"), "{}", e);
     assert_eq!(run(r#"run_script("for x in items => x * 2", { items: [1, 2, 3] })"#), "[2, 4, 6]");
     let big = r#"let big = reduce(split("0123456789", ""), [], (acc, a) => acc + split("0123456789012345678901234567890123456789", ""))
 let bigger = reduce(split("012345678901234567890123456789012345678901234567890123456789", ""), [], (acc, a) => acc + big)
-run_script("for x in items => x", { items: bigger })"#;
+run_script("for x in items => x", { items: bigger }, { timeout: "60s" })"#;
     let e = run(big);
     assert!(e.contains("too many steps"), "{}", e);
     // The budget is the script's: the program runs on, unlimited, after it.
