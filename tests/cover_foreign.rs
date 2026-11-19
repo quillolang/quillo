@@ -1254,7 +1254,10 @@ fn what_quillo_writes_after_a_page_that_lost_its_place_is_read_as_html() {
         let at = quillos(&p);
         assert!(p[..at].ends_with(&format!("<svg></svg><svg><svg></svg><quillo-island style=\"display:contents\" {} data-qd=\"0\"><g><script>{RAW_CODE}</script><text></text></g></quillo-island><span></span>", island("null"))), "/def-lost (round {}): {}", round, p);
         assert_eq!(template(&p), format!("<template data-qt=\"0\"><quillo-island style=\"display:contents\" {}><g><script>{RAW_CODE}</script><text>done</text></g></quillo-island></template>", island("&quot;done&quot;")), "/def-lost (round {})", round);
-        assert_eq!(p.matches("<span></span>").count(), 1, "/def-lost (round {}): {}", round, p);
+        // One after the page, one after its part, which is rendered where the place is lost
+        // (changed with round 9: a part there is followed by one).
+        assert_eq!(p.matches("<span></span>").count(), 2, "/def-lost (round {}): {}", round, p);
+        assert!(p.contains("swap(\"0\")</script><span></span>"), "/def-lost (round {}): {}", round, p);
 
         let p = whole(&mut it, "/def-frag");
         let at = quillos(&p);
@@ -1299,4 +1302,75 @@ fn what_quillo_writes_after_a_page_that_lost_its_place_is_read_as_html() {
     }
     let (hits, _) = it.view_cache_stats();
     assert!(hits > 0, "the view cache kept none of the views");
+}
+
+// ---- a deferred part that loses the place, and the parts after it --------------------------------
+
+const PARTS: &str = r##"server fn slow() = "done"
+component Open(x: str) {
+    state b = defer(slow())
+    <svg>{raw(b == "done" ? x : "")}<text>{b}</text></svg>
+}
+component Later(x: str) {
+    state b = defer(slow())
+    <g>{raw("<script>" + x + "</script>")}<text>{b}</text></g>
+}
+site_headers("/two-csp", { "content-security-policy": "default-src 'self'" })
+route GET /two ? { q: str = "" } = <html><body><Open x={"</template><svg><svg>"}/><Later x={q}/></body></html>
+route GET /two-csp ? { q: str = "" } = <html><body><Open x={"</template><svg><svg>"}/><Later x={q}/></body></html>
+route GET /three ? { q: str = "" } = <html><body><Later x={q}/><Open x={"</template><svg><svg>"}/><Later x={q}/></body></html>
+route GET /kept ? { q: str = "" } = <html><body><Open x={"<g></g>"}/><Later x={q}/></body></html>
+"##;
+
+/// The deferred parts, from the first `<template>` to the page's `</body>`.
+fn parts(page: &str) -> &str {
+    let from = page.find("<template data-qt=\"0\">").unwrap_or_else(|| panic!("no deferred part: {}", page));
+    let to = page.rfind("</body>").unwrap();
+    &page[from..to]
+}
+
+/// A deferred part whose own raw markup loses the place (a `</template>` in its `<svg>`, which
+/// ends its template in the browser, and an `<svg><svg>` after it, which stays open) left the next
+/// part's `<template>` to be read inside that `<svg>`, an SVG element, and its script as SVG's, the
+/// visitor's markup in it elements (in 0.8.7 too; parse5 8.0.1 standing in for the browser). The
+/// page's later parts are now written where the place is lost, as safe in both readings, and a
+/// part that ends there is followed by an empty `<span>`, after its swap line (the one-line form
+/// finds the template as the line's previous element), which takes the browser back to HTML, so
+/// that the next part's template and line are HTML's. A part before the one that loses the place
+/// is as it was; parts that keep it are as before (src/interp.rs `render_deferred`,
+/// `place_lost`; src/defer.rs `resolve`; FEEDBACK71.md Q-969, coverage of 0.8.7, Q-1116; branch
+/// coverage-087).
+#[test]
+fn a_deferred_part_that_loses_the_place_leaves_it_lost_for_the_parts_after() {
+    let mut it = app(PARTS);
+    let wrap = |c: &str, x: &str, inner: &str| format!("<quillo-island style=\"display:contents\" data-c=\"{c}\" data-p=\"{{&quot;x&quot;:&quot;{x}&quot;}}\" data-s=\"{{&quot;b&quot;:&quot;done&quot;}}\">{inner}</quillo-island>");
+    let q = "&lt;b&gt;x&lt;/b&gt;&amp;quot;]]&gt;";
+    let lost_open = wrap("Open", "&lt;/template&gt;&lt;svg&gt;&lt;svg&gt;", "<svg></template><svg><svg><text>done</text></svg>");
+    let later = |code: &str| wrap("Later", q, &format!("<g><script>{code}</script><text>done</text></g>"));
+    let part = |id: usize, island: &str, back: &str| format!("<template data-qt=\"{id}\">{island}</template><script>window[Symbol.for(\"quillo\")].swap(\"{id}\")</script>{back}");
+    for round in 1..=2 {
+        assert_eq!(parts(&whole(&mut it, "/two")), format!("{}{}", part(0, &lost_open, BACK), part(1, &later(RAW_CODE), BACK)), "/two (round {})", round);
+        assert_eq!(
+            parts(&whole(&mut it, "/three")),
+            format!("{}{}{}", part(0, &later(Q), ""), part(1, &lost_open, BACK), part(2, &later(RAW_CODE), BACK)),
+            "/three (round {})",
+            round
+        );
+        let kept = wrap("Open", "&lt;g&gt;&lt;/g&gt;", "<svg><g></g><text>done</text></svg>");
+        let p = whole(&mut it, "/kept");
+        assert_eq!(parts(&p), format!("{}{}", part(0, &kept, ""), part(1, &later(Q), "")), "/kept (round {})", round);
+        assert!(!p.contains(BACK), "/kept (round {}): {}", round, p);
+
+        // Under a policy that refuses inline scripts: each part swapped in by the one line, which
+        // finds its template as the element before it; the `<span>` after the line.
+        let p = whole(&mut it, "/two-csp");
+        let one = "<script>window[Symbol.for(\"quillo\")].swap(document.currentScript.previousElementSibling.getAttribute(\"data-qt\"))</script>";
+        let plain = |s: String| s.replace(" style=\"display:contents\"", "");
+        assert_eq!(
+            parts(&p),
+            format!("<template data-qt=\"0\">{}</template>{one}{BACK}<template data-qt=\"1\">{}</template>{one}{BACK}", plain(lost_open.clone()), plain(later(RAW_CODE))),
+            "/two-csp (round {})",
+            round
+        );
+    }
 }

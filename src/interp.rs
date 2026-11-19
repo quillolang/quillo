@@ -1605,8 +1605,11 @@ fn class_words(v: &Value, out: &mut Held) {
 #[inline(never)]
 fn page_back_to_html(out: &mut Held) {
     let at = out.rfind("</body>").or_else(|| out.rfind("</html>")).unwrap_or(out.len());
-    out.insert_str(at, "<span></span>");
+    out.insert_str(at, BACK_TO_HTML);
 }
+
+/// An empty element that ends SVG and MathML where the browser is (see `page_back_to_html`).
+pub(crate) const BACK_TO_HTML: &str = "<span></span>";
 
 /// Whether `v`, written in a page, writes markup: html, or a list holding some (`render_value`);
 /// anything else is written escaped.
@@ -7338,6 +7341,13 @@ impl Interp {
         false
     }
 
+    /// Whether the page's markup lost the parser's place (`foreign::LOST`), so far: after a
+    /// deferred part, whether that part ends with the browser in a place not known (src/defer.rs
+    /// `resolve`; coverage of 0.8.7, Q-1116; branch coverage-087).
+    pub(crate) fn place_lost(&self) -> bool {
+        self.ns == crate::foreign::LOST
+    }
+
     /// A waiting component rendered again (src/defer.rs; branch defer): the states it
     /// had as they were, its deferred ones worked out now.
     pub(crate) fn render_deferred(&mut self, d: &crate::defer::Deferred) -> Result<String, Ctrl> {
@@ -7362,7 +7372,13 @@ impl Interp {
         let (state, mut live) = self.islands.pop().unwrap_or_default();
         let _ = self.states_now(&state);
         self.in_svg = outer;
-        self.ns = outer_ns;
+        // A part whose own raw markup lost the place (a `</template>` in it ends its template in
+        // the browser, and an `<svg>` after it stays open) leaves it lost for the page's later
+        // parts, which are written as safe in both; `defer::resolve` puts the way back to HTML
+        // after it (coverage of 0.8.7, Q-1116; branch coverage-087).
+        if r.is_err() || self.ns != crate::foreign::LOST {
+            self.ns = outer_ns;
+        }
         self.state_preset = None;
         r?;
         let body = body.into_text().map_err(|o| o.at(d.line))?;

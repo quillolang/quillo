@@ -86,7 +86,15 @@ pub(crate) fn resolve(it: &mut crate::interp::Interp, d: &Deferred, page: (bool,
     // Under the route's `with`, as the rest of the page was (branch feedback40-43).
     match it.under_route(|it| it.render_deferred(d)) {
         Ok(html) => {
-            let made = if one_swap { part_one_swap(d.id, &html) } else { part(d.id, &html) };
+            let mut made = if one_swap { part_one_swap(d.id, &html) } else { part(d.id, &html) };
+            // A part rendered where the page's place is lost (its own raw markup lost it, or the
+            // page's did): an empty `<span>` after it, past its swap line (which `ONE_SWAP` finds
+            // as its template's next element), ends SVG and MathML where the browser is, so that
+            // the next part's template and line are read as HTML (coverage of 0.8.7, Q-1116;
+            // branch coverage-087).
+            if it.place_lost() {
+                made.push_str(crate::interp::BACK_TO_HTML);
+            }
             if !plain_islands {
                 return made;
             }
