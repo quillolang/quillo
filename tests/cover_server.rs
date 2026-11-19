@@ -458,7 +458,9 @@ fn a_server_out_of_descriptors_watches_files_by_looking() {
 /// and a page connecting after, when none is left again, is let in and kept.
 #[test]
 fn a_page_connecting_when_no_descriptor_is_left_is_hung_up_on() {
-    let d = folder("ws-fds", &[("app.qwe", "route GET / = \"hi\"\n")]);
+    // One channel use (changed with FEEDBACK75.md, Q-1052: tickets only for programs with channels or
+    // media; branch feedback75).
+    let d = folder("ws-fds", &[("app.qwe", "channel.on(\"c\", (m, p) => null)\nroute GET / = \"hi\"\n")]);
     let srv = run(&d, &["--no-wt"], Some(64));
     // A connection with a ticket, opened while there are descriptors.
     let opened = || {
@@ -542,7 +544,9 @@ route GET /peers = len(channel.peers("chat"))
 /// a channel: the request is answered, and the channel's thread does not try for long.
 #[test]
 fn a_page_joining_as_the_server_stops_does_not_hold_it_up() {
-    let src = "route GET /slow {\n    sleep(3000)\n    \"done\"\n}\nroute GET /ok = \"ok\"\n";
+    // One channel use (changed with FEEDBACK75.md, Q-1052: tickets only for programs with channels or
+    // media; branch feedback75).
+    let src = "channel.on(\"c\", (m, p) => null)\nroute GET /slow {\n    sleep(3000)\n    \"done\"\n}\nroute GET /ok = \"ok\"\n";
     let d = folder("join-stopping", &[("app.qwe", src)]);
     let mut srv = run(&d, &["--no-wt"], None);
     let mut p = page(&srv);

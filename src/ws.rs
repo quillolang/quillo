@@ -885,34 +885,191 @@ pub struct Reader<R> {
     max: usize,
     /// A message sent in parts: its kind and what has come of it.
     partial: Option<(u8, Vec<u8>)>,
+    /// What a message begun may hold, and for how long (see `Hold`): none for a reader that
+    /// blocks on a connection of its own, which a thread's limits hold.
+    hold: Option<&'static Hold>,
+    /// The bytes of the message being read counted in `hold`'s total and its client's share,
+    /// given back when it is whole, or when the reader goes (an error, the page gone, its task
+    /// stopped).
+    counted: usize,
+    /// When the message a hold counts began, and what of it has come since (see `Hold::by`): none
+    /// between messages, which a page may leave as long as it likes.
+    since: Option<std::time::Instant>,
+    got: usize,
+    /// The client (an address, or an IPv6 /64) the connection is from, whose share of the hold its
+    /// messages count in.
+    client: std::sync::Arc<str>,
 }
 
-/// What a `Reader` reads from: as many bytes as the buffer holds, or an error.
+/// A whole message in one frame of at most this much is not counted in a hold, nor given its
+/// deadline: it holds at most this much, a frame for a connection; one in parts or larger is, each
+/// part (Q-1073).
+pub const SMALL: usize = 4096;
+
+/// What the messages a page has begun and not finished may hold, over all the readers that share
+/// it, and how long one may take from its first frame to its last (a message of one small frame
+/// aside: see `SMALL`). A channel socket's reader waited
+/// for good for the rest of a message, and held what had come of it, up to 1 MiB a socket on 4,096
+/// sockets, outside `--max-memory`; and a frame's whole length was made before its first byte came
+/// (FEEDBACK75.md, Q-1073; branch feedback75).
+pub struct Hold {
+    /// How long a message may go without coming on: once begun, it has this long and as much more
+    /// as what has come of it at `rate` takes, so that a page that keeps sending is let go on, and
+    /// one that stops is let go of (see `by`).
+    pub within: std::time::Duration,
+    /// The bytes a second a message keeps its time with.
+    pub rate: usize,
+    /// The bytes of unfinished messages held now, by every reader of this kind.
+    pub held: &'static std::sync::atomic::AtomicUsize,
+    /// The most they may hold together: a frame that would pass it ends its connection.
+    pub most: fn() -> usize,
+    /// What each client holds now, of its share (see `share`): one address took the whole hold,
+    /// and every other page's message was cut (found in review of FEEDBACK75.md, Q-1073).
+    pub clients: &'static std::sync::Mutex<Option<std::collections::HashMap<std::sync::Arc<str>, usize>>>,
+    /// The least a client's share is: the largest message, so that one is never too large for it.
+    pub least_share: usize,
+}
+
+impl Hold {
+    /// What one client may hold of the hold: an eighth, and at least the largest message.
+    pub fn share(&self) -> usize {
+        ((self.most)() / 8).max(self.least_share)
+    }
+
+    /// `n` more bytes for a message begun from `client`: false, and nothing counted, past its share
+    /// or what all may hold.
+    pub fn take(&self, n: usize, client: &str) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut g = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let m = g.get_or_insert_with(Default::default);
+        let mine = m.get(client).copied().unwrap_or(0);
+        if mine + n > self.share() {
+            return false;
+        }
+        if self.held.fetch_add(n, Relaxed) + n > (self.most)() {
+            self.held.fetch_sub(n, Relaxed);
+            return false;
+        }
+        match m.get_mut(client) {
+            Some(c) => *c += n,
+            None => {
+                m.insert(std::sync::Arc::from(client), n);
+            }
+        }
+        true
+    }
+
+    /// `n` bytes `client` held given back.
+    pub fn give(&self, n: usize, client: &str) {
+        if n == 0 {
+            return;
+        }
+        self.held.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+        let mut g = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(m) = g.as_mut() {
+            if let Some(c) = m.get_mut(client) {
+                *c = c.saturating_sub(n);
+                if *c == 0 {
+                    m.remove(client);
+                }
+            }
+        }
+    }
+
+    /// When a message begun at `since`, of which `got` bytes have come, must have come on by:
+    /// `within`, and as long again as `got` takes at `rate`. An honest 1 MiB at 80 KB/s was cut at
+    /// 10 s; a trickle is still let go of (found in review of FEEDBACK75.md, Q-1073).
+    pub fn by(&self, since: std::time::Instant, got: usize) -> std::time::Instant {
+        since + self.within + std::time::Duration::from_micros((got as u64).saturating_mul(1_000_000) / self.rate.max(1) as u64)
+    }
+}
+
+/// What a counted frame's data is read in at a time, its room made as it comes: a frame that said
+/// 1 MiB and sent nothing held a piece of 64 KiB counted before any of it came (found in review of
+/// FEEDBACK75.md, Q-1073).
+pub const PIECE: usize = 8 << 10;
+
+/// What a `Reader` reads from: as many bytes as the buffer holds, or an error; with `fill_by`, by
+/// `by`, where the source can wait (else whenever it comes); with `some_by`, what has come, at
+/// least a byte.
 trait Source {
     fn fill(&mut self, buf: &mut [u8]) -> impl std::future::Future<Output = std::io::Result<()>>;
+    fn fill_by(&mut self, buf: &mut [u8], by: Option<std::time::Instant>) -> impl std::future::Future<Output = std::io::Result<()>>;
+    fn some_by(&mut self, buf: &mut [u8], by: Option<std::time::Instant>) -> impl std::future::Future<Output = std::io::Result<usize>>;
 }
 
-/// A connection read as it blocks: each read done when it is asked for.
+/// A connection read as it blocks: each read done when it is asked for, within the socket's own
+/// timeout.
 struct Reading<'a, R>(&'a mut R);
 
 impl<R: Read> Source for Reading<'_, R> {
     async fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         self.0.read_exact(buf)
     }
+
+    async fn fill_by(&mut self, buf: &mut [u8], _: Option<std::time::Instant>) -> std::io::Result<()> {
+        self.0.read_exact(buf)
+    }
+
+    async fn some_by(&mut self, buf: &mut [u8], _: Option<std::time::Instant>) -> std::io::Result<usize> {
+        match self.0.read(buf)? {
+            0 => Err(std::io::ErrorKind::UnexpectedEof.into()),
+            n => Ok(n),
+        }
+    }
 }
 
-/// A connection a task reads, waiting for what has not come.
+/// A connection a task reads, waiting for what has not come, until `by`.
 struct Waiting<'a, R>(&'a mut R);
+
+/// `read` by `by`: what has come already read with no timer made for it (a page's message is
+/// mostly read ahead whole); only a read that waits is given one.
+async fn by_when<T>(read: impl std::future::Future<Output = std::io::Result<T>>, by: Option<std::time::Instant>) -> std::io::Result<T> {
+    let mut read = std::pin::pin!(read);
+    let Some(t) = by else { return read.await };
+    if let std::task::Poll::Ready(r) = std::future::poll_fn(|cx| std::task::Poll::Ready(read.as_mut().poll(cx))).await {
+        return r;
+    }
+    match tokio::time::timeout_at(tokio::time::Instant::from_std(t), read).await {
+        Ok(r) => r,
+        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+    }
+}
 
 impl<R: tokio::io::AsyncRead + Unpin> Source for Waiting<'_, R> {
     async fn fill(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
         tokio::io::AsyncReadExt::read_exact(self.0, buf).await.map(|_| ())
     }
+
+    async fn fill_by(&mut self, buf: &mut [u8], by: Option<std::time::Instant>) -> std::io::Result<()> {
+        by_when(tokio::io::AsyncReadExt::read_exact(&mut *self.0, buf), by).await.map(|_| ())
+    }
+
+    async fn some_by(&mut self, buf: &mut [u8], by: Option<std::time::Instant>) -> std::io::Result<usize> {
+        match by_when(tokio::io::AsyncReadExt::read(&mut *self.0, buf), by).await? {
+            0 => Err(std::io::ErrorKind::UnexpectedEof.into()),
+            n => Ok(n),
+        }
+    }
 }
 
 impl<R> Reader<R> {
     pub fn new(r: R, max: usize) -> Reader<R> {
-        Reader { r, max, partial: None }
+        Reader { r, max, partial: None, hold: None, counted: 0, since: None, got: 0, client: std::sync::Arc::from("") }
+    }
+
+    /// A reader whose unfinished messages `hold` limits, counted in `client`'s share
+    /// (FEEDBACK75.md, Q-1073; branch feedback75).
+    pub fn holding(r: R, max: usize, hold: &'static Hold, client: &str) -> Reader<R> {
+        Reader { r, max, partial: None, hold: Some(hold), counted: 0, since: None, got: 0, client: std::sync::Arc::from(client) }
+    }
+}
+
+impl<R> Drop for Reader<R> {
+    fn drop(&mut self) {
+        if let Some(h) = self.hold {
+            h.give(std::mem::take(&mut self.counted), &self.client);
+        }
     }
 }
 
@@ -921,20 +1078,100 @@ impl<R: Read> Reader<R> {
     /// one a page may send, or a message is larger than `max`.
     pub fn next(&mut self) -> std::io::Result<Message> {
         // Each read blocks till it is done, so the reading is done when first asked.
-        now(read_message(Reading(&mut self.r), self.max, &mut self.partial))
+        let started = match self.since {
+            None => match now(read_message(Reading(&mut self.r), self.max, &mut self.partial, self.hold.is_some()))? {
+                Next::Got(m) => return Ok(m),
+                Next::Held(f) => f.0,
+            },
+            Some(_) => None,
+        };
+        let mut st = State { max: self.max, partial: &mut self.partial, hold: self.hold, counted: &mut self.counted, since: &mut self.since, got: &mut self.got, client: &self.client };
+        now(read_held(Reading(&mut self.r), &mut st, started))
     }
 }
 
 impl<R: tokio::io::AsyncRead + Unpin> Reader<R> {
     /// `next`, on a connection a task reads.
     pub async fn next_async(&mut self) -> std::io::Result<Message> {
-        read_message(Waiting(&mut self.r), self.max, &mut self.partial).await
+        match self.next_or_held().await? {
+            Next::Got(m) => Ok(m),
+            Next::Held(f) => Box::pin(self.held_async(f)).await,
+        }
+    }
+
+    /// `next_async` in two steps, for a reader with a hold: the next message, read as it always
+    /// was, or word that a message the hold counts has begun (or goes on), which `held_async`
+    /// reads. Each is its own future, so that the one made for every message carries nothing of
+    /// the other's: in one, every message cost 0.7% more instructions (measured; FEEDBACK75.md,
+    /// Q-1073; branch feedback75).
+    pub async fn next_or_held(&mut self) -> std::io::Result<Next> {
+        if self.since.is_some() {
+            return Ok(Next::Held(Started(None)));
+        }
+        read_message(Waiting(&mut self.r), self.max, &mut self.partial, self.hold.is_some()).await
+    }
+
+    /// The message `next_or_held` said has begun.
+    pub async fn held_async(&mut self, started: Started) -> std::io::Result<Message> {
+        let mut st = State { max: self.max, partial: &mut self.partial, hold: self.hold, counted: &mut self.counted, since: &mut self.since, got: &mut self.got, client: &self.client };
+        read_held(Waiting(&mut self.r), &mut st, started.0).await
     }
 }
 
-/// The next message from `r` (see `Reader`).
-async fn read_message(mut r: impl Source, max: usize, partial: &mut Option<(u8, Vec<u8>)>) -> std::io::Result<Message> {
-    let bad = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, why.to_string());
+/// What `read_message` read: a message, or word that a message a hold counts has begun.
+pub enum Next {
+    Got(Message),
+    Held(Started),
+}
+
+/// Where a message a hold counts is: the head of its frame read, or (none) between its frames.
+pub struct Started(Option<(bool, u8, usize)>);
+
+/// A `Reader`'s own, apart from its connection.
+struct State<'a> {
+    max: usize,
+    partial: &'a mut Option<(u8, Vec<u8>)>,
+    hold: Option<&'static Hold>,
+    counted: &'a mut usize,
+    since: &'a mut Option<std::time::Instant>,
+    got: &'a mut usize,
+    client: &'a str,
+}
+
+impl State<'_> {
+    /// `n` more bytes of the message being read, counted in the hold: an error past what it allows.
+    fn charge(&mut self, n: usize) -> std::io::Result<()> {
+        if let Some(h) = self.hold {
+            if !h.take(n, self.client) {
+                return Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, "the messages begun on every page hold all they may"));
+            }
+            *self.counted += n;
+        }
+        Ok(())
+    }
+
+    /// A message is whole, or ended: what it held is given back, and the next has no deadline
+    /// until its first frame comes.
+    fn done(&mut self) {
+        if let (Some(h), n @ 1..) = (self.hold, *self.counted) {
+            h.give(n, self.client);
+            *self.counted = 0;
+        }
+        *self.since = None;
+        *self.got = 0;
+    }
+
+    /// When what is being read must come by (see `Hold::by`).
+    fn by(&self) -> Option<std::time::Instant> {
+        Some(self.hold?.by((*self.since)?, *self.got))
+    }
+}
+
+/// The next message from `r` (see `Reader`), as it always was read, but a frame a hold counts
+/// (`held`: the reader has one), whose head it gives back for `read_held` to go on with, out of
+/// line: with a deadline and a count in reach of every read, every message cost 3% more
+/// instructions, counted or not (measured; FEEDBACK75.md, Q-1073; branch feedback75).
+async fn read_message(mut r: impl Source, max: usize, partial: &mut Option<(u8, Vec<u8>)>, held: bool) -> std::io::Result<Next> {
     loop {
         let mut head = [0u8; 2];
         r.fill(&mut head).await?;
@@ -969,6 +1206,9 @@ async fn read_message(mut r: impl Source, max: usize, partial: &mut Option<(u8, 
         if len.checked_add(so_far).map_or(true, |n| n > max as u64) {
             return Err(bad("message too large"));
         }
+        if held && counted(fin, opcode, len as usize) {
+            return Ok(Next::Held(Started(Some((fin, opcode, len as usize)))));
+        }
         let mut mask = [0u8; 4];
         r.fill(&mut mask).await?;
         let mut data = vec![0u8; len as usize];
@@ -977,15 +1217,15 @@ async fn read_message(mut r: impl Source, max: usize, partial: &mut Option<(u8, 
             *b ^= mask[i % 4];
         }
         match opcode {
-            0x8 => return Ok(Message::Close),
-            0x9 => return Ok(Message::Ping(data)),
-            0xA => return Ok(Message::Pong),
+            0x8 => return Ok(Next::Got(Message::Close)),
+            0x9 => return Ok(Next::Got(Message::Ping(data))),
+            0xA => return Ok(Next::Got(Message::Pong)),
             0x0 => {
                 let Some((_, sofar)) = partial.as_mut() else { return Err(bad("a continuation of nothing")) };
                 sofar.extend_from_slice(&data);
                 if fin {
                     let (kind, all) = partial.take().unwrap_or_default();
-                    return whole(kind, all);
+                    return whole(kind, all).map(Next::Got);
                 }
             }
             0x1 | 0x2 => {
@@ -993,12 +1233,154 @@ async fn read_message(mut r: impl Source, max: usize, partial: &mut Option<(u8, 
                     return Err(bad("a new message before the last one ended"));
                 }
                 if fin {
-                    return whole(opcode, data);
+                    return whole(opcode, data).map(Next::Got);
                 }
                 *partial = Some((opcode, data));
             }
             _ => return Err(bad("unknown opcode")),
         }
+    }
+}
+
+/// The rest of a message a hold counts, from the frame `started` (its head read) or from the next
+/// one: each read by the message's time (see `Hold::by`), its data made room for as it comes, each
+/// room counted in the hold and the client's share first, where a frame's whole length was made
+/// before any of it came and a message begun was waited for for good (FEEDBACK75.md, Q-1073; branch
+/// feedback75).
+async fn read_held<S: Source>(mut r: S, st: &mut State<'_>, mut started: Option<(bool, u8, usize)>) -> std::io::Result<Message> {
+    if st.since.is_none() {
+        *st.since = Some(std::time::Instant::now());
+        *st.got = 0;
+    }
+    loop {
+        let (fin, opcode, len) = match started.take() {
+            Some(f) => f,
+            None => {
+                let mut head = [0u8; 2];
+                r.fill_by(&mut head, st.by()).await?;
+                head_ok(head)?;
+                let len = match head[1] & 0x7f {
+                    126 => {
+                        let mut b = [0u8; 2];
+                        r.fill_by(&mut b, st.by()).await?;
+                        u16::from_be_bytes(b) as u64
+                    }
+                    127 => {
+                        let mut b = [0u8; 8];
+                        r.fill_by(&mut b, st.by()).await?;
+                        u64::from_be_bytes(b)
+                    }
+                    n => n as u64,
+                };
+                let (fin, opcode) = (head[0] & 0x80 != 0, head[0] & 0x0f);
+                (fin, opcode, len_ok(st, fin, opcode, len)?)
+            }
+        };
+        let mut mask = [0u8; 4];
+        r.fill_by(&mut mask, st.by()).await?;
+        let data = if counted(fin, opcode, len) {
+            // Room made as the bytes come, doubling, each growth counted before it is made.
+            let mut data: Vec<u8> = Vec::new();
+            let mut piece = [0u8; PIECE];
+            while data.len() < len {
+                let want = (len - data.len()).min(PIECE);
+                let n = r.some_by(&mut piece[..want], st.by()).await?;
+                if data.len() + n > data.capacity() {
+                    let to = (data.capacity() * 2).max(data.len() + n).min(len);
+                    st.charge(to - data.capacity())?;
+                    data.reserve_exact(to - data.len());
+                }
+                data.extend_from_slice(&piece[..n]);
+                *st.got += n;
+            }
+            data
+        } else {
+            let mut data = vec![0u8; len];
+            r.fill_by(&mut data, st.by()).await?;
+            data
+        };
+        if let Some(m) = took(st, fin, opcode, mask, data) {
+            return m;
+        }
+    }
+}
+
+fn bad(why: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, why.to_string())
+}
+
+/// A frame's first two bytes, as a page may send them.
+fn head_ok(head: [u8; 2]) -> std::io::Result<()> {
+    if head[0] & 0x70 != 0 {
+        return Err(bad("reserved bits set"));
+    }
+    if head[1] & 0x80 == 0 {
+        return Err(bad("a page's frames are masked"));
+    }
+    Ok(())
+}
+
+/// A frame's length, within what it and its message may be.
+fn len_ok(st: &State<'_>, fin: bool, opcode: u8, len: u64) -> std::io::Result<usize> {
+    // A control frame is short and whole (RFC 6455 5.5); a message's parts are counted
+    // without wrapping, where a length of u64::MAX after a first part wrapped to 0 and
+    // passed, and the allocation panicked the channel's thread (FEEDBACK49.md, Q-593;
+    // branch main).
+    if opcode & 0x8 != 0 && (len > 125 || !fin) {
+        return Err(bad("a control frame longer than 125 bytes, or in parts"));
+    }
+    let so_far = if opcode == 0x0 { st.partial.as_ref().map_or(0, |(_, d)| d.len()) as u64 } else { 0 };
+    if len.checked_add(so_far).map_or(true, |n| n > st.max as u64) {
+        return Err(bad("message too large"));
+    }
+    Ok(len as usize)
+}
+
+/// Whether a hold counts a frame: not a control frame's 125 bytes at most, nor a whole message of
+/// one small frame (see `SMALL`), which has no deadline either: what it holds at most is what a
+/// page that sends nothing holds.
+fn counted(fin: bool, opcode: u8, len: usize) -> bool {
+    opcode & 0x8 == 0 && !(fin && opcode != 0 && len <= SMALL)
+}
+
+/// A frame read whole, unmasked and taken: the message it ends (or a control frame, or why the
+/// reading ends), or none for a part of a message still to come.
+fn took(st: &mut State<'_>, fin: bool, opcode: u8, mask: [u8; 4], mut data: Vec<u8>) -> Option<std::io::Result<Message>> {
+    for (i, b) in data.iter_mut().enumerate() {
+        *b ^= mask[i % 4];
+    }
+    // A control frame between messages ends what it began; one between a message's parts
+    // leaves the message's deadline as it was.
+    if opcode & 0x8 != 0 && st.partial.is_none() {
+        st.done();
+    }
+    let partial = &mut *st.partial;
+    match opcode {
+        0x8 => Some(Ok(Message::Close)),
+        0x9 => Some(Ok(Message::Ping(data))),
+        0xA => Some(Ok(Message::Pong)),
+        0x0 => {
+            let Some((_, sofar)) = partial.as_mut() else { return Some(Err(bad("a continuation of nothing"))) };
+            sofar.extend_from_slice(&data);
+            if fin {
+                let (kind, all) = partial.take().unwrap_or_default();
+                st.done();
+                return Some(whole(kind, all));
+            }
+            None
+        }
+        0x1 | 0x2 => {
+            if partial.is_some() {
+                return Some(Err(bad("a new message before the last one ended")));
+            }
+            if fin {
+                st.done();
+                return Some(whole(opcode, data));
+            }
+            *partial = Some((opcode, data));
+            None
+        }
+        _ => Some(Err(bad("unknown opcode"))),
     }
 }
 

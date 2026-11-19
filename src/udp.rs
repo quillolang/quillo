@@ -68,27 +68,64 @@ struct Packet {
 /// A bound socket, and the packets it has received that the program has
 /// not had yet.
 /// What a port has received and the program has not had yet: the packets, their bytes, and
-/// the bytes from each sender.
+/// the packets and bytes from each sender.
 #[derive(Default)]
 struct Queue {
     packets: VecDeque<Packet>,
     bytes: usize,
-    from: HashMap<std::net::IpAddr, usize>,
+    from: HashMap<std::net::IpAddr, Share>,
+}
+
+/// Who a packet is from, for a queue's shares: its address, or for IPv6 its /64, which one host is
+/// commonly given whole, so that a sender rotating addresses within it is still one (found in
+/// review of FEEDBACK75.md, Q-1094). An IPv4 address in IPv6 is the IPv4 one.
+fn sender(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(a) => match a.to_ipv4_mapped() {
+            Some(v4) => std::net::IpAddr::V4(v4),
+            None => {
+                let s = a.segments();
+                std::net::IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+        v4 => v4,
+    }
+}
+
+/// What one sender has waiting in a queue: its bytes, and its packets too, where its bytes alone
+/// were counted, so that a sender of empty packets held none of a queue its packets filled
+/// (FEEDBACK75.md, Q-1094; branch feedback75). One entry for both, so a packet costs one look-up
+/// of its sender, as it did.
+#[derive(Default, Clone, Copy, Debug)]
+struct Share {
+    bytes: usize,
+    packets: usize,
+}
+
+/// A share compares as its bytes, what the map held before it held packets too.
+impl PartialEq<usize> for Share {
+    fn eq(&self, bytes: &usize) -> bool {
+        self.bytes == *bytes
+    }
 }
 
 impl Queue {
     fn push(&mut self, p: Packet) {
         self.bytes += p.data.len();
-        *self.from.entry(p.from.ip()).or_default() += p.data.len();
+        let mine = self.from.entry(sender(p.from.ip())).or_default();
+        mine.bytes += p.data.len();
+        mine.packets += 1;
         self.packets.push_back(p);
     }
 
     fn taken(&mut self, p: &Packet) {
         self.bytes -= p.data.len();
-        if let Some(n) = self.from.get_mut(&p.from.ip()) {
-            *n -= p.data.len();
-            if *n == 0 {
-                self.from.remove(&p.from.ip());
+        let who = sender(p.from.ip());
+        if let Some(n) = self.from.get_mut(&who) {
+            n.bytes -= p.data.len();
+            n.packets -= 1;
+            if n.packets == 0 {
+                self.from.remove(&who);
             }
         }
     }
@@ -102,14 +139,19 @@ impl Queue {
     /// A packet in, within `cap` packets and `bytes`: how many were dropped for it. A sender
     /// holding more than half of a full queue that others wait in has its new packet dropped,
     /// where dropping the oldest let one sender push out the rest (FEEDBACK49.md, Q-604;
-    /// branch main). Alone, its oldest go, as before.
+    /// branch main). Alone, its oldest go, as before. More than half of what fills it: of its
+    /// packets where they are at `cap`, of its bytes where they are at `bytes`. By bytes alone, a
+    /// sender of empty packets filled a queue's packets, pushed out the others' and was never held
+    /// back, and the others, holding all of its bytes, were (FEEDBACK75.md, Q-1094; branch
+    /// feedback75).
     fn admit(&mut self, p: Packet, cap: usize, bytes: usize) -> u64 {
         let n = p.data.len();
         let full = |q: &Queue| q.packets.len() >= cap || q.bytes + n > bytes;
         let mut dropped = 0;
         if full(self) {
-            let mine = self.from.get(&p.from.ip()).copied().unwrap_or(0);
-            if mine * 2 > self.bytes && self.from.len() > 1 {
+            let mine = self.from.get(&sender(p.from.ip())).copied().unwrap_or_default();
+            let hog = (self.packets.len() >= cap && mine.packets * 2 > self.packets.len()) || (self.bytes + n > bytes && mine.bytes * 2 > self.bytes);
+            if hog && self.from.len() > 1 {
                 return 1;
             }
             while full(self) && self.pop_front().is_some() {
@@ -698,6 +740,29 @@ mod tests {
         assert_eq!(q.admit(p("10.0.0.3:1", 0), 1000, 500), 0);
         assert_eq!(q.admit(p("10.0.0.3:1", 600), 1000, 500), 1);
         assert_eq!(q.packets.len(), 1);
+    }
+
+    /// Senders within one IPv6 /64 are one sender for a queue's shares, so rotating addresses does
+    /// not get round the rule; another /64, and an IPv4 address in IPv6, are others; IPv4 is by
+    /// address (FEEDBACK75.md, Q-1094's review; branch feedback75)
+    #[test]
+    fn senders_in_one_ipv6_64_are_one() {
+        let p = |from: &str| Packet { data: vec![], from: from.parse().unwrap(), at: 0 };
+        let mut q = Queue::default();
+        // Ten addresses of one /64 fill a queue of ten; one of another /64 still gets in, and the
+        // eleventh of the first /64 holding them all is held back.
+        for i in 0..10 {
+            assert_eq!(q.admit(p(&format!("[2001:db8:1:2::{:x}]:9", i + 1)), 10, 1 << 20), 0);
+        }
+        assert_eq!(q.from.len(), 1);
+        assert_eq!(q.admit(p("[2001:db8:1:3::1]:9"), 10, 1 << 20), 1);
+        assert_eq!(q.from.len(), 2);
+        assert_eq!(q.admit(p("[2001:db8:1:2::ff]:9"), 10, 1 << 20), 1);
+        assert_eq!(q.packets.len(), 10);
+        // IPv4 in IPv6 is that IPv4 address; IPv4 is by address.
+        assert_eq!(sender("::ffff:10.0.0.1".parse().unwrap()), "10.0.0.1".parse::<std::net::IpAddr>().unwrap());
+        assert_ne!(sender("10.0.0.1".parse().unwrap()), sender("10.0.0.2".parse().unwrap()));
+        assert_eq!(sender("2001:db8:1:2:aaaa::1".parse().unwrap()), sender("2001:db8:1:2:bbbb::2".parse().unwrap()));
     }
 
     #[test]

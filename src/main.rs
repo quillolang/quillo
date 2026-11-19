@@ -962,6 +962,9 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
                 o.base = Some(b.to_string());
+                // Behind a proxy that may serve other programs at the site's other paths: the
+                // session cookies keep their paths (FEEDBACK75.md, Q-1077; branch feedback75).
+                quillo::session::serving_under(b);
             }
             ("--no-wt", _) => {
                 quillo::wt::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);

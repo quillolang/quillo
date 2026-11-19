@@ -209,7 +209,10 @@ fn a_mounted_programs_session_cookie_is_its_own() {
     it.base = "/app".into();
     let r = get(&mut it, "/in");
     let set: Vec<&str> = r.headers.iter().filter(|(k, _)| k == "set-cookie").map(|(_, v)| v.as_str()).collect();
-    assert!(set.iter().any(|c| c.starts_with("quillo_session=") && c.contains("Path=/app;")), "{:?}", set);
+    // `__Host-` with the mount in its name and `Path=/`, which a sibling subdomain cannot plant,
+    // where it was `quillo_session` with `Path=/app` (changed with FEEDBACK75.md, Q-1077; branch
+    // feedback75).
+    assert!(set.iter().any(|c| c.starts_with("__Host-app.quillo_session=") && c.contains("; Path=/;")), "{:?}", set);
     assert!(set.iter().any(|c| c.starts_with("x=1; Path=/app;")), "{:?}", set);
 }
 
@@ -276,7 +279,9 @@ route GET /receive-bad = receive("/p")
 
 #[test]
 fn quillos_own_addresses_are_for_those_they_are_for() {
-    let mut it = app("route GET / = \"hi\"\n");
+    // One channel use (changed with FEEDBACK75.md, Q-1052: tickets only for programs with channels or
+    // media; branch feedback75).
+    let mut it = app("channel.on(\"c\", (m, p) => null)\nroute GET / = \"hi\"\n");
     let token = ("x-quillo-job", jobs::token());
     for path in ["job/x", "tick/x", "udp/1", "later", "channel/x"] {
         let url = format!("/_quillo/{}", path);

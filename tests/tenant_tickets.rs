@@ -22,7 +22,9 @@ fn tenant_in(r: &HttpResponse) -> serde_json::Value {
 #[test]
 fn a_ticket_names_the_tenant_of_the_page_that_asked() {
     let mut it = Interp::new(&std::env::temp_dir());
-    it.load_source("tenant_from(\"example.com\")\nroute GET / = \"ok\"\n", "app.qwe").unwrap();
+    // One channel use (changed with FEEDBACK75.md, Q-1052: tickets only for programs with channels or
+    // media; branch feedback75).
+    it.load_source("tenant_from(\"example.com\")\nchannel.on(\"c\", (m, p) => null)\nroute GET / = \"ok\"\n", "app.qwe").unwrap();
     assert_eq!(tenant_in(&ticket(&mut it, "acme.example.com")), "acme");
     assert_eq!(tenant_in(&ticket(&mut it, "example.com")), serde_json::Value::Null);
 }

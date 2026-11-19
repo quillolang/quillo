@@ -613,11 +613,20 @@ fn listen(host: &str, port: u16, track: Track) -> std::io::Result<()> {
     Ok(())
 }
 
+/// How long the sender a track takes RTP from may send nothing before another is taken in its
+/// place (see `receive`).
+const SENDER_IDLE: Duration = Duration::from_secs(2);
+
 fn receive(socket: UdpSocket, track: Arc<Mutex<Track>>) {
     let mut buf = vec![0u8; 65_536];
     let mut order = Reorder::default();
     let mut h264 = H264::new();
     let (mut packets, mut units) = (Vec::new(), Vec::new());
+    // The sender the track takes packets from, by its address and SSRC, and when it last sent one:
+    // the first, until it has sent nothing for `SENDER_IDLE`; meanwhile another's are dropped. Any
+    // sender that reached the port was taken, its frames between the camera's, to every page
+    // watching (FEEDBACK75.md, Q-1066; branch feedback75).
+    let mut sender: Option<(std::net::SocketAddr, [u8; 4], Instant)> = None;
     loop {
         if crate::httpd::stopping() {
             return;
@@ -629,9 +638,21 @@ fn receive(socket: UdpSocket, track: Arc<Mutex<Track>>) {
         }
         let now = Instant::now();
         match socket.recv_from(&mut buf) {
-            Ok((n, _)) => {
+            Ok((n, from)) => {
                 if let Some(p) = parse(&buf[..n]) {
-                    order.push(p, now, &mut packets);
+                    let ssrc = [buf[8], buf[9], buf[10], buf[11]];
+                    match &sender {
+                        Some((a, s, last)) if (*a != from || *s != ssrc) && now.duration_since(*last) < SENDER_IDLE => {}
+                        current => {
+                            // Another sender, after the last went quiet: its packets start afresh.
+                            if current.is_some_and(|(a, s, _)| a != from || s != ssrc) {
+                                order = Reorder::default();
+                                h264 = H264::new();
+                            }
+                            sender = Some((from, ssrc, now));
+                            order.push(p, now, &mut packets);
+                        }
+                    }
                 }
             }
             Err(_) => order.drain(now, &mut packets),
@@ -701,7 +722,10 @@ fn rtp(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(Value::Map(o)) = args.get(1) else {
         return fail(line, "`media.rtp` takes the ports second: { video: 5004, audio: 5006 }".to_string());
     };
-    let mut host = "0.0.0.0".to_string();
+    // This machine alone unless `host` says otherwise, as `quillo run` listens: every interface,
+    // where RTP has no sign-in, let anyone who reached the port put video into the stream
+    // (FEEDBACK75.md, Q-1066; branch feedback75).
+    let mut host = "127.0.0.1".to_string();
     let mut tracks = Vec::new();
     for (k, v) in o.iter() {
         match k.as_str() {
@@ -755,9 +779,10 @@ pub fn frame_stream(wire: &[u8]) -> Option<&str> {
 
 /// `media.on(name, { publish, watch, tenants })`: pages may send stream `name` (a name ending
 /// in `*`: every stream it starts), with `<quillo-media publish="name">`, and watch it.
-/// `publish(peer)` says which may send, as a channel's `join` does: the page joins the channel
-/// `media:<name>`, and only a page that did is taken frames from. `watch(peer)` says which may
-/// watch. Without one, no page may: anyone could watch a private call, and send into any
+/// `publish(peer, name)` says which may send, as a channel's `join` does: the page joins the channel
+/// `media:<name>`, and only a page that did is taken frames from. `watch(peer, name)` says which may
+/// watch. `name` is the stream asked for, which a rule for a name ending in `*` needs to tell one
+/// stream from another (FEEDBACK75.md, Q-1050; branch feedback75; see `wt::answer`). Without one, no page may: anyone could watch a private call, and send into any
 /// stream, an RTP camera too (FEEDBACK51.md, Q-642 and Q-643; branch feedback51-fixes). Each
 /// tenant has its own streams of a name, unless `tenants: "shared"`.
 fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {

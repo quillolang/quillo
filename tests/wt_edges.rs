@@ -693,9 +693,11 @@ fn a_services_channels_reach_the_apps_pages_when_it_runs_apart() {
     e.text("[\"j\",\"room\"]");
     assert_eq!(e.read(), Frame::Text("[\"j\",\"room\",false]".into()));
     eventually(5, "the app did not say so", || r.log().contains("channel room: service talk did not take what pages sent").then_some(()));
-    // Asked which channels are its, it does not answer: they are no one's.
+    // Asked which channels are its, it does not answer: a name no one claims is not joined while
+    // it may be that service's, where it was joined as no one's and the page heard the service's
+    // broadcasts once it came back (changed with FEEDBACK75.md, Q-1065; branch feedback75).
     e.text("[\"j\",\"asked-again\"]");
-    assert_eq!(e.read(), Frame::Text("[\"j\",\"asked-again\",true]".into()));
+    assert_eq!(e.read(), Frame::Text("[\"j\",\"asked-again\",false]".into()));
 }
 
 #[test]

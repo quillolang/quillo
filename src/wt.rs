@@ -36,7 +36,7 @@ use crate::interp::{fail, Ctrl, Interp};
 use crate::value::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 // Only the WebTransport server keeps its certificate's hash behind one (built without it on phones; branch mobile).
 #[cfg(feature = "realtime")]
@@ -86,6 +86,93 @@ const TICKET_SECS: u64 = 120;
 
 /// Messages dropped (queues full), for `--metrics`.
 pub static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// The most bytes of one page's messages that may wait for their channels' handlers, and of every
+/// page's together (or what `--max-memory` lets one value take, where that is less). Inboxes
+/// counted messages only, 10,000 of up to 1 MiB each, so one page on one socket could have the
+/// server hold gigabytes for a handler that waits on a database (FEEDBACK75.md, Q-1056; branch
+/// feedback75).
+const PAGE_WAITING: usize = 4 << 20;
+const ALL_WAITING: usize = 256 << 20;
+
+/// What waits in every inbox now, in all. Each page's share is its own counter (`Peer::waiting`),
+/// each client's one its pages share (`Peer::client_waiting`), and each channel's its inbox's
+/// (`Inbox::waiting`): one slow channel, or the pages of one address, took all the room, and every
+/// other channel's messages were dropped (found in review of FEEDBACK75.md, Q-1056). A client may
+/// have an eighth of all waiting, a channel a quarter (each at least a page's share). All of them
+/// atomics: no lock and nothing made for a message.
+static WAITING_ALL: AtomicUsize = AtomicUsize::new(0);
+
+/// Each client's counter of what its pages have waiting, found once as a page connects.
+static CLIENT_WAITING: Mutex<Option<HashMap<Arc<str>, std::sync::Weak<AtomicUsize>>>> = Mutex::new(None);
+
+/// The counter of `client`'s pages, made with its first.
+fn client_counter(client: &str) -> Arc<AtomicUsize> {
+    let mut g = lock(&CLIENT_WAITING);
+    let m = g.get_or_insert_with(Default::default);
+    if let Some(c) = m.get(client).and_then(|w| w.upgrade()) {
+        return c;
+    }
+    if m.len() >= 1024 {
+        m.retain(|_, w| w.strong_count() > 0);
+    }
+    let c = Arc::new(AtomicUsize::new(0));
+    m.insert(Arc::from(client), Arc::downgrade(&c));
+    c
+}
+
+/// Pages waiting for room in an inbox (see `wait_for_room`), told when some is given back.
+fn room() -> &'static tokio::sync::Notify {
+    static ROOM: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    ROOM.get_or_init(tokio::sync::Notify::new)
+}
+
+/// How many pages wait for room: none, and nothing is told.
+static ROOM_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Room was given back: the pages waiting for it try again.
+fn room_freed() {
+    if ROOM_WAITERS.load(Relaxed) > 0 {
+        room().notify_waiters();
+    }
+}
+
+/// What every inbox may hold together.
+fn all_waiting() -> usize {
+    match crate::httpd::memory_limit() {
+        0 => ALL_WAITING,
+        m => ALL_WAITING.min(m.min(usize::MAX as u64) as usize),
+    }
+}
+
+/// How long a message a page has begun sending may take to come whole, and what all the messages
+/// begun and not finished may hold, on every channel connection (WebSocket and WebTransport), or
+/// what `--max-memory` lets one value take where that is less, but never less than two of the
+/// largest: a page that sent most of a message and never its end held up to 1 MiB for good, on
+/// each of 4,096 sockets (FEEDBACK75.md, Q-1073 and Q-1074; branch feedback75).
+const MESSAGE_WITHIN: Duration = Duration::from_secs(10);
+const ALL_BEGUN: usize = 64 << 20;
+static BEGUN_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn all_begun() -> usize {
+    let floor = 2 * (MAX_MESSAGE + 64);
+    match crate::httpd::memory_limit() {
+        0 => ALL_BEGUN,
+        m => ALL_BEGUN.min(m.min(usize::MAX as u64) as usize).max(floor),
+    }
+}
+
+/// What each client holds of it (see `ws::Hold::share`).
+static BEGUN_CLIENTS: Mutex<Option<HashMap<Arc<str>, usize>>> = Mutex::new(None);
+
+/// The bytes a second a message begun keeps its time with, past `MESSAGE_WITHIN` (see
+/// `ws::Hold::by`): 16 KiB, so a page sending 1 MiB at 80 KB/s finishes, and one that stops is let
+/// go of within 10 s of what it sent last (found in review of FEEDBACK75.md, Q-1073).
+const MESSAGE_RATE: usize = 16 << 10;
+
+/// The hold of every channel connection's unfinished messages (see `ws::Hold`).
+static BEGUN: crate::ws::Hold =
+    crate::ws::Hold { within: MESSAGE_WITHIN, rate: MESSAGE_RATE, held: &BEGUN_BYTES, most: all_begun, clients: &BEGUN_CLIENTS, least_share: MAX_MESSAGE + 64 };
 
 pub fn install(m: &mut Map) {
     let fns: &[(&'static str, BuiltinFn)] = &[
@@ -229,6 +316,16 @@ pub struct Peer {
     cut: AtomicBool,
     /// The channels and streams it asked to join or watch (see `MAX_ASKED`).
     asked: Mutex<HashSet<String>>,
+    /// The mount point of the program whose page it is, as its ticket says: its session is that
+    /// program's, and no other's (FEEDBACK75.md, Q-1061; branch feedback75).
+    base: String,
+    /// The bytes of its messages waiting for their channels' handlers (see `PAGE_WAITING`).
+    waiting: AtomicUsize,
+    /// The client (an address, or an IPv6 /64) it connected from, whose share of the messages begun
+    /// its own count in (see `BEGUN`); empty for a page of this process (a phone's window).
+    client: Arc<str>,
+    /// What its client's pages have waiting (see `WAITING_ALL`).
+    client_waiting: Arc<AtomicUsize>,
 }
 
 /// A page, as a stream's viewer.
@@ -248,10 +345,6 @@ impl crate::media::Sink for Viewer {
 }
 
 impl Peer {
-    fn id_text(&self) -> String {
-        format!("{:012x}", self.id)
-    }
-
     /// Queues a message; false when the page is gone or not keeping up.
     fn put(&self, out: Out) -> bool {
         let reliable = matches!(out, Out::Text { reliable: true, .. } | Out::Close);
@@ -297,12 +390,27 @@ fn hub() -> &'static Hub {
 #[derive(Clone)]
 pub struct Ticket {
     session: String,
+    /// Where it is good: its tenant, and the mount point of the program that gave it out; none for
+    /// the program at the root with no tenant. A ticket carried its session into every mounted
+    /// program's channels (FEEDBACK75.md, Q-1061; branch feedback75).
+    tenant: Option<Place>,
+}
+
+/// A ticket's tenant and its program's mount point (see `Ticket::tenant`).
+#[derive(Clone, Default)]
+pub struct Place {
     tenant: Option<String>,
+    base: String,
 }
 
 /// A connection from a page: registered with the hub, with the queue of
 /// what goes to it.
 pub fn connect(t: Ticket, media_tx: Option<tokio::sync::mpsc::Sender<Arc<crate::media::Frame>>>) -> (Arc<Peer>, tokio::sync::mpsc::Receiver<Out>) {
+    connect_from(t, media_tx, "")
+}
+
+/// `connect`, for a page of `client` (see `Peer::client`).
+pub fn connect_from(t: Ticket, media_tx: Option<tokio::sync::mpsc::Sender<Arc<crate::media::Frame>>>, client: &str) -> (Arc<Peer>, tokio::sync::mpsc::Receiver<Out>) {
     let (tx, rx) = tokio::sync::mpsc::channel(PEER_QUEUE);
     let id = loop {
         let id = fastrand::u64(1..1 << 48);
@@ -310,7 +418,21 @@ pub fn connect(t: Ticket, media_tx: Option<tokio::sync::mpsc::Sender<Arc<crate::
             break id;
         }
     };
-    let p = Arc::new(Peer { id, session: t.session, tenant: t.tenant, tx, media_tx, rooms: Mutex::new(HashSet::new()), cut: AtomicBool::new(false), asked: Mutex::new(HashSet::new()) });
+    let Place { tenant, base } = t.tenant.unwrap_or_default();
+    let p = Arc::new(Peer {
+        id,
+        session: t.session,
+        tenant,
+        tx,
+        media_tx,
+        rooms: Mutex::new(HashSet::new()),
+        cut: AtomicBool::new(false),
+        asked: Mutex::new(HashSet::new()),
+        base,
+        waiting: AtomicUsize::new(0),
+        client: Arc::from(client),
+        client_waiting: client_counter(client),
+    });
     lock(&hub().peers).insert(id, p.clone());
     (p, rx)
 }
@@ -336,6 +458,11 @@ pub fn disconnect(p: &Arc<Peer>) {
         crate::media::drop_if_idle(&r);
     }
 }
+
+/// A page's message of at most this many bytes is read as JSON with no count: what it makes is at
+/// most about 80 KB, gone once it is read; the count cost a message of 40 bytes 6.7% more
+/// instructions (measured; FEEDBACK75.md, Q-1052; branch feedback75).
+const PLAIN_JSON: usize = 1024;
 
 /// Most channels pages may have asked of, each with an inbox and a thread: each name a page
 /// sent made one, whether the program has that channel or not, and none went (found in review
@@ -366,11 +493,32 @@ fn inbox_ok(p: &Peer, ch: &str) -> bool {
 /// leave, `["m", channel, value]` for the channel's handler; `["v", stream]`
 /// to watch a stream (see `media`), `["u", stream]` to stop.
 pub fn from_page(p: &Arc<Peer>, text: &str) {
-    // As deep as every reader takes (FEEDBACK55.md, Q-875's second review; branch feedback55).
-    let Ok(serde_json::Value::Array(a)) = crate::value::json_value(text.as_bytes()) else { return };
-    let (Some(kind), Some(ch)) = (a.first().and_then(|k| k.as_str()), a.get(1).and_then(|c| c.as_str())) else { return };
+    // A page that cannot wait for room (a datagram, a page of this process): its message past its
+    // shares is dropped and counted, and past the count the oldest message goes, as before.
+    take_from_page(p, text, false);
+}
+
+/// `from_page`, for a page whose reader can wait for room (a WebSocket, a WebTransport stream):
+/// its message past its shares waits, and the page with it (see `wait_for_room`). `window` is what
+/// its connection may still be sent and hold unread while it waits, outside what the server counts
+/// otherwise: none for a WebSocket (the system's buffers), a stream's window for WebTransport.
+pub async fn from_page_waiting(p: &Arc<Peer>, text: &str, window: usize) {
+    if let Some(pending) = take_from_page(p, text, true) {
+        wait_for_room(p, pending, window).await;
+    }
+}
+
+/// What a page sent, taken (see `from_page`): where the page `can_wait`, a message for which there
+/// is no room now given back.
+fn take_from_page(p: &Arc<Peer>, text: &str, can_wait: bool) -> Option<Pending> {
+    // As deep as every reader takes (FEEDBACK55.md, Q-875's second review; branch feedback55), and
+    // past `PLAIN_JSON` within what a page's JSON may make: one message of 1 MiB made 75 MB, outside
+    // `--max-memory` (FEEDBACK75.md, Q-1052; branch feedback75).
+    let read = if text.len() > PLAIN_JSON { crate::value::json_from_page(text.as_bytes()) } else { crate::value::json_value(text.as_bytes()) };
+    let Ok(serde_json::Value::Array(a)) = read else { return None };
+    let (Some(kind), Some(ch)) = (a.first().and_then(|k| k.as_str()), a.get(1).and_then(|c| c.as_str())) else { return None };
     if !name_ok(ch) {
-        return;
+        return None;
     }
     let key = room_key(ch, p.tenant.as_deref());
     match kind {
@@ -384,15 +532,16 @@ pub fn from_page(p: &Arc<Peer>, text: &str) {
                 let mut waiting = lock(join_waits());
                 if let Some(left) = waiting.get_mut(&(p.id, key.clone())) {
                     *left = false;
-                    return;
+                    return None;
                 }
                 // Let in meanwhile: `joined` moves a page from waiting to the room under this lock.
                 if lock(&p.rooms).contains(&key) {
-                    return;
+                    return None;
                 }
                 if !inbox_ok(p, ch) {
                     drop(waiting);
-                    return joined(ch, p, false);
+                    joined(ch, p, false);
+                    return None;
                 }
                 waiting.insert((p.id, key), false);
             }
@@ -416,10 +565,24 @@ pub fn from_page(p: &Arc<Peer>, text: &str) {
         // Only from a page the channel took.
         "m" if lock(&p.rooms).contains(&key) => {
             let v = a.get(2).cloned().unwrap_or(serde_json::Value::Null);
-            inbox(ch).push(Event { kind: 'm', peer: p.clone(), value: v.to_string() });
+            let i = inbox(ch);
+            let event = Event { kind: 'm', peer: p.clone(), value: v.to_string() };
+            if !can_wait {
+                i.push(event);
+                return None;
+            }
+            return match i.try_push(event) {
+                Ok(()) => None,
+                Err((_, Room::Never)) => {
+                    DROPPED.fetch_add(1, Relaxed);
+                    None
+                }
+                Err((event, _)) => Some(Pending { inbox: i, event }),
+            };
         }
         _ => {}
     }
+    None
 }
 
 /// A page its stream's `watch` let in starts watching it, its tenant's.
@@ -521,25 +684,37 @@ struct Inbox {
     delivering: AtomicBool,
     /// Let go, as no page used it (see `deliver_loop`): what comes goes to a new one.
     closed: AtomicBool,
+    /// The bytes of pages' messages in it (see `WAITING_ALL`).
+    waiting: AtomicUsize,
 }
 
 /// How long an inbox with nothing in it, and no page in its channel's rooms, is kept.
 const INBOX_IDLE: Duration = Duration::from_secs(30);
 
 impl Inbox {
+    /// Queues `e`: a join, a leave, or a message of a page that cannot wait for room (a datagram,
+    /// a page of this process), which past its shares is dropped and counted, as past the count.
     fn push(self: &Arc<Self>, e: Event) {
         let mut q = lock(&self.queue);
         if self.closed.load(Relaxed) {
             drop(q);
             return inbox(&self.name).push(e);
         }
+        if e.kind == 'm' && !matches!(charge(&e, self), Room::Taken) {
+            DROPPED.fetch_add(1, Relaxed);
+            return;
+        }
         if q.len() >= INBOX {
             // Joining and leaving are kept; a message is not.
             match q.iter().position(|e| e.kind == 'm') {
                 Some(i) => {
-                    q.remove(i);
+                    if let Some(old) = q.remove(i) {
+                        release(&old, self);
+                        room_freed();
+                    }
                 }
                 None if e.kind == 'm' => {
+                    release(&e, self);
                     DROPPED.fetch_add(1, Relaxed);
                     return;
                 }
@@ -551,6 +726,122 @@ impl Inbox {
         drop(q);
         self.arrived.notify_one();
     }
+
+    /// Queues a page's message if there is room for it, within its shares and the count: else gives
+    /// it back with why, for the page to wait (see `wait_for_room`).
+    fn try_push(self: &Arc<Self>, e: Event) -> Result<(), (Event, Room)> {
+        let mut q = lock(&self.queue);
+        if self.closed.load(Relaxed) {
+            drop(q);
+            return inbox(&self.name).try_push(e);
+        }
+        if q.len() >= INBOX {
+            return Err((e, Room::Full));
+        }
+        match charge(&e, self) {
+            Room::Taken => {}
+            no => return Err((e, no)),
+        }
+        q.push_back(e);
+        drop(q);
+        self.arrived.notify_one();
+        Ok(())
+    }
+}
+
+/// Whether a message had room.
+#[derive(Clone, Copy, PartialEq)]
+enum Room {
+    Taken,
+    /// Not now: its page, its client, its channel or all hold their shares.
+    Full,
+    /// Never: larger than a page's whole share.
+    Never,
+}
+
+/// A page's message is to wait for its channel's handler: its bytes counted, its page's, its
+/// client's, its channel's and everyone's, or nothing counted, past any of their shares (see
+/// `PAGE_WAITING` and `WAITING_ALL`; FEEDBACK75.md, Q-1056; branch feedback75).
+fn charge(e: &Event, i: &Inbox) -> Room {
+    let n = e.value.len();
+    let all = all_waiting();
+    let page = PAGE_WAITING.min(all);
+    let (client, channel) = ((all / 8).max(page), (all / 4).max(page));
+    if n > page {
+        return Room::Never;
+    }
+    let counters: [(&AtomicUsize, usize); 4] = [(&e.peer.waiting, page), (&e.peer.client_waiting, client), (&i.waiting, channel), (&WAITING_ALL, all)];
+    for (k, (c, most)) in counters.iter().enumerate() {
+        if c.fetch_add(n, Relaxed) + n > *most {
+            for (c, _) in &counters[..=k] {
+                c.fetch_sub(n, Relaxed);
+            }
+            return Room::Full;
+        }
+    }
+    Room::Taken
+}
+
+/// A message `charge` counted in inbox `i` no longer waits (handed to the program, or dropped); the
+/// pages waiting for room are told by `room_freed`.
+fn release(e: &Event, i: &Inbox) {
+    if e.kind != 'm' {
+        return;
+    }
+    let n = e.value.len();
+    for c in [&e.peer.waiting, &*e.peer.client_waiting, &i.waiting, &WAITING_ALL] {
+        c.fetch_sub(n, Relaxed);
+    }
+}
+
+/// A page's message for which there is no room now, and its inbox.
+pub struct Pending {
+    inbox: Arc<Inbox>,
+    event: Event,
+}
+
+/// The page waits for room for `pending`, read no further meanwhile, so that what it sends waits
+/// in its connection (TCP's window, QUIC's flow control), not in the server: where a message past
+/// its shares was dropped, a page bursting ahead of its handler lost some (found in review of
+/// FEEDBACK75.md, Q-1056). It holds the message in its client's share of the messages begun
+/// (`BEGUN`) while it waits, and the `window` its connection may still be sent unread: QUIC let a
+/// waiting WebTransport stream be sent its whole 1 MiB window, which quinn held outside every
+/// count, 60 waiting sessions 70 MB (found in review of FEEDBACK75.md, Q-1056). One that cannot be
+/// held there has its message dropped and counted, as a datagram is, and goes on: a message of its
+/// own, the rest of the stream in order. A page that goes stops waiting. Only the senders to a full
+/// channel, or a full client's pages, wait.
+pub async fn wait_for_room(p: &Arc<Peer>, mut pending: Pending, window: usize) {
+    struct Held<'a>(usize, &'a str);
+    impl Drop for Held<'_> {
+        fn drop(&mut self) {
+            BEGUN.give(self.0, self.1);
+            ROOM_WAITERS.fetch_sub(1, Relaxed);
+        }
+    }
+    let n = pending.event.value.len() + window;
+    if !BEGUN.take(n, &p.client) {
+        DROPPED.fetch_add(1, Relaxed);
+        return;
+    }
+    ROOM_WAITERS.fetch_add(1, Relaxed);
+    let _held = Held(n, &p.client);
+    loop {
+        let told = room().notified();
+        tokio::pin!(told);
+        told.as_mut().enable();
+        match pending.inbox.try_push(pending.event) {
+            Ok(()) => return,
+            Err((_, Room::Never)) => {
+                DROPPED.fetch_add(1, Relaxed);
+                return;
+            }
+            Err((e, _)) => pending.event = e,
+        }
+        if !lock(&hub().peers).contains_key(&p.id) {
+            return;
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), told).await;
+    }
 }
 
 fn inbox(ch: &str) -> Arc<Inbox> {
@@ -558,7 +849,7 @@ fn inbox(ch: &str) -> Arc<Inbox> {
     if let Some(i) = all.get(ch) {
         return i.clone();
     }
-    let i = Arc::new(Inbox { name: ch.to_string(), queue: Mutex::new(VecDeque::new()), arrived: Condvar::new(), delivering: AtomicBool::new(false), closed: AtomicBool::new(false) });
+    let i = Arc::new(Inbox { name: ch.to_string(), queue: Mutex::new(VecDeque::new()), arrived: Condvar::new(), delivering: AtomicBool::new(false), closed: AtomicBool::new(false), waiting: AtomicUsize::new(0) });
     all.insert(ch.to_string(), i.clone());
     if let Some(addr) = ADDR.get() {
         start_inbox(*addr, ch.to_string(), i.clone());
@@ -639,17 +930,25 @@ fn deliver_loop(addr: SocketAddr, ch: String, i: Arc<Inbox>) {
             }
             q.drain(..n).collect()
         };
-        let mut body = String::new();
+        // Each line written as it goes, where a JSON value was made of each event and then written:
+        // the batch's handing over cost what the base each line came to say added, and more
+        // (FEEDBACK75.md, Q-1061's review, measured; branch feedback75). The same lines: `k`, `p`,
+        // `s`, `t`, `v`, and `b`, whose page, where it is not the root program's (its session is
+        // that program's; Q-1061).
+        let mut body: Vec<u8> = Vec::with_capacity(batch.iter().map(|e| e.value.len() + e.peer.session.len() + 64).sum());
         for e in &batch {
-            let line = serde_json::json!({
-                "k": e.kind.to_string(),
-                "p": e.peer.id_text(),
-                "s": e.peer.session,
-                "t": e.peer.tenant,
-                "v": e.value,
-            });
-            body.push_str(&line.to_string());
-            body.push('\n');
+            use std::io::Write as _;
+            let _ = write!(body, "{{\"k\":\"{}\",\"p\":\"{:012x}\",\"s\":", e.kind, e.peer.id);
+            let _ = serde_json::to_writer(&mut body, &e.peer.session);
+            body.extend_from_slice(b",\"t\":");
+            let _ = serde_json::to_writer(&mut body, &e.peer.tenant);
+            if !e.peer.base.is_empty() {
+                body.extend_from_slice(b",\"b\":");
+                let _ = serde_json::to_writer(&mut body, &e.peer.base);
+            }
+            body.extend_from_slice(b",\"v\":");
+            let _ = serde_json::to_writer(&mut body, &e.value);
+            body.extend_from_slice(b"}\n");
         }
         let mut answer: Option<Vec<u8>> = None;
         for _ in 0..50 {
@@ -666,7 +965,7 @@ fn deliver_loop(addr: SocketAddr, ch: String, i: Arc<Inbox>) {
                     }
                 },
             };
-            match c.post_for(&path, body.as_bytes()) {
+            match c.post_for(&path, &body) {
                 Ok((c, _, out)) => {
                     conn = Some(c);
                     answer = Some(out);
@@ -690,6 +989,12 @@ fn deliver_loop(addr: SocketAddr, ch: String, i: Arc<Inbox>) {
                 let_watch(&e.peer, ch.strip_prefix("media:").unwrap_or(&ch));
             }
         }
+        // The batch is done with: its messages no longer wait, and pages waiting for room are told
+        // (Q-1056).
+        for e in &batch {
+            release(e, &i);
+        }
+        room_freed();
     }
 }
 
@@ -705,9 +1010,27 @@ pub fn set_split(names: Vec<String>) {
 /// What the services said their channels are (names, or starts ending `*`),
 /// and when they were asked: asked again, at most every two seconds, when a
 /// channel is no one's (a service started again, or reloaded).
-fn remote_channels() -> &'static Mutex<(Vec<(String, String)>, Option<std::time::Instant>)> {
-    static R: OnceLock<Mutex<(Vec<(String, String)>, Option<std::time::Instant>)>> = OnceLock::new();
+#[derive(Default)]
+struct Remote {
+    names: Vec<(String, String)>,
+    asked: Option<std::time::Instant>,
+    /// Some service did not answer when last asked (it was starting again, or down): the names
+    /// it said before are kept, and a channel no one claims is not joined meanwhile. A service
+    /// that did not answer lost its names, and for the next two seconds anyone joined its channels
+    /// as no one's, without its `join`, and stayed after it came back (FEEDBACK75.md, Q-1065;
+    /// branch feedback75).
+    missing: bool,
+}
+
+fn remote_channels() -> &'static Mutex<Remote> {
+    static R: OnceLock<Mutex<Remote>> = OnceLock::new();
     R.get_or_init(Default::default)
+}
+
+/// Whether a service of this app, in a process of its own, did not answer when last asked which
+/// channels are its (see `Remote::missing`).
+fn remote_missing() -> bool {
+    SPLIT.get().is_some_and(|s| !s.is_empty()) && lock(remote_channels()).missing
 }
 
 fn remote_for(it: &mut Interp, name: &str) -> Option<String> {
@@ -715,29 +1038,34 @@ fn remote_for(it: &mut Interp, name: &str) -> Option<String> {
     let matches = |n: &str| n == name || n.strip_suffix('*').is_some_and(|p| name.starts_with(p));
     {
         let r = lock(remote_channels());
-        if let Some((_, s)) = r.0.iter().find(|(n, _)| matches(n)) {
+        if let Some((_, s)) = r.names.iter().find(|(n, _)| matches(n)) {
             return Some(s.clone());
         }
-        if r.1.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+        if r.asked.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
             return None;
         }
     }
     let asks: Vec<(String, Option<String>)> = services.iter().map(|s| (s.clone(), crate::service::first_url_of(&it.shared, s))).collect();
-    let found = it.unlocked(move || {
-        let mut all = Vec::new();
+    let (found, silent) = it.unlocked(move || {
+        let (mut all, mut silent) = (Vec::new(), Vec::new());
         for (s, url) in asks {
-            let Some(u) = url else { continue };
-            if let Ok(b) = crate::service::signed_post(&u, "/_quillo/service-channels", &s, "_channels", b"[]") {
-                for n in serde_json::from_slice::<Vec<String>>(&b).unwrap_or_default() {
-                    all.push((n, s.clone()));
-                }
+            let answer = url.ok_or(()).and_then(|u| crate::service::signed_post(&u, "/_quillo/service-channels", &s, "_channels", b"[]").map_err(|_| ()));
+            match answer.and_then(|b| serde_json::from_slice::<Vec<String>>(&b).map_err(|_| ())) {
+                Ok(names) => all.extend(names.into_iter().map(|n| (n, s.clone()))),
+                Err(()) => silent.push(s),
             }
         }
-        all
+        (all, silent)
     });
     let mut r = lock(remote_channels());
-    *r = (found, Some(std::time::Instant::now()));
-    r.0.iter().find(|(n, _)| matches(n)).map(|(_, s)| s.clone())
+    // A service that answered says what its channels are now; one that did not keeps those it
+    // said before (Q-1065).
+    let kept: Vec<(String, String)> = r.names.iter().filter(|(_, s)| silent.contains(s)).cloned().collect();
+    r.names = found;
+    r.names.extend(kept);
+    r.asked = Some(std::time::Instant::now());
+    r.missing = !silent.is_empty();
+    r.names.iter().find(|(n, _)| matches(n)).map(|(_, s)| s.clone())
 }
 
 /// `POST /_quillo/service-channels`, in a service: the channels its
@@ -753,8 +1081,11 @@ pub fn names_here(it: &Interp) -> crate::server::HttpResponse {
 fn forward(it: &mut Interp, service: &str, name: &str, body: &[u8]) -> crate::server::HttpResponse {
     let text = String::from_utf8_lossy(body);
     let mut joins = 0;
+    // The service is this program's: a page of another program it mounts is sent with no session,
+    // as that program's session is no session here (FEEDBACK75.md, Q-1061; branch feedback75).
+    let mut sent = Vec::with_capacity(body.len());
     for line in text.lines() {
-        let Ok(e) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        let Ok(mut e) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         if e["k"] == "j" {
             joins += 1;
             if let Some(id) = e["p"].as_str().and_then(|p| u64::from_str_radix(p, 16).ok()) {
@@ -762,9 +1093,16 @@ fn forward(it: &mut Interp, service: &str, name: &str, body: &[u8]) -> crate::se
                 lock(joining()).insert((room_key(name, e["t"].as_str()), id), Vec::new());
             }
         }
+        if e["b"].as_str().unwrap_or("") != it.base {
+            e["s"] = serde_json::Value::from("{}");
+            sent.extend_from_slice(e.to_string().as_bytes());
+        } else {
+            sent.extend_from_slice(line.as_bytes());
+        }
+        sent.push(b'\n');
     }
     let url = crate::service::first_url_of(&it.shared, service);
-    let (to, ch, sent) = (service.to_string(), name.to_string(), body.to_vec());
+    let (to, ch) = (service.to_string(), name.to_string());
     let answer = it.unlocked(move || match url {
         Some(u) => crate::service::signed_post(&u, &format!("/_quillo/service-channel/{}", ch), &to, &format!("_channel:{}", ch), &sent),
         None => Err(format!("service {} has no address", to)),
@@ -824,28 +1162,59 @@ pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpRe
             return forward(it, &service, name, body);
         }
     }
+    // A channel no reachable program claims, while a service apart did not say which are its:
+    // not joined, as it may be that service's (FEEDBACK75.md, Q-1065; branch feedback75).
+    let unclaimed_ok = handler.is_some() || !remote_missing();
+    // In a service's process apart, what comes is what the app let through (see `forward`).
+    let from_app = crate::service::app_url().is_some();
+    // The stream's name (a channel's own), given to `join`, `publish` and `watch` second: a rule
+    // for `media.on("call:*")` was not told which stream a page asked for, and let a page allowed
+    // one call watch every call and send into anyone's (FEEDBACK75.md, Q-1050, the user's decision
+    // of 2026-11-18: `(peer, name) =>`; branch feedback75). A rule of one parameter is called as it was.
+    let asked = Value::str(name.strip_prefix("media:").unwrap_or(name));
     let mut verdicts: Vec<bool> = Vec::new();
+    // The handler of each program pages of the batch are of, worked out once a batch (see
+    // `own_handler`): once a line, it cost each message 5% more instructions (measured).
+    let mut owners: Vec<(String, Option<(Arc<Handler>, Option<Vec<usize>>)>)> = Vec::new();
     let text = String::from_utf8_lossy(body);
     for line in text.lines() {
         let Ok(e) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         let kind = e["k"].as_str().unwrap_or("");
-        let Some((h, sub)) = handler.as_ref() else {
+        let Some((found, found_sub)) = handler.as_ref() else {
             // A channel no `channel.on` names: pages may join it (to hear
             // the program's broadcasts), and what they send goes nowhere. Not a stream's,
             // `media:<name>`, which only a `media.on` lets pages send or watch (FEEDBACK51.md,
             // Q-643; branch feedback51-fixes).
             match kind {
-                "j" => verdicts.push(!name.starts_with("media:")),
+                "j" => verdicts.push(!name.starts_with("media:") && unclaimed_ok),
                 "w" => verdicts.push(false),
                 _ => {}
             }
             continue;
         };
-        let it: &mut Interp = match sub {
+        // The handler of the page's own program, or of a service it declares, which sees the
+        // page's session; else the one found, in another mounted program, which sees none: a
+        // ticket of one program carried its session into another's channels, and a session a
+        // visitor sets freely in the root passed a mount's `join` (FEEDBACK75.md, Q-1061; branch
+        // feedback75).
+        let base = e["b"].as_str().unwrap_or("");
+        let mine = match owners.iter().find(|(b, _)| b == base) {
+            Some((_, o)) => o.clone(),
+            None => {
+                let o = own_handler(it, name, base);
+                owners.push((base.to_string(), o.clone()));
+                o
+            }
+        };
+        let (h, sub, own) = match mine {
+            Some((h, sub)) => (h, sub, true),
+            None => (found.clone(), found_sub.clone(), from_app),
+        };
+        let it: &mut Interp = match &sub {
             Some(path) => mounted(&mut *it, path),
             None => &mut *it,
         };
-        let session = crate::value::json_value(e["s"].as_str().unwrap_or("{}").as_bytes()).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil);
+        let session = if own { crate::value::json_value(e["s"].as_str().unwrap_or("{}").as_bytes()).map(|j| Value::from_json(&j)).unwrap_or(Value::Nil) } else { Value::Nil };
         let session = if matches!(session, Value::Map(_)) { session } else { Value::map(Map::new()) };
         let mut peer = Map::new();
         peer.insert("id".into(), Value::str(e["p"].as_str().unwrap_or("")));
@@ -861,7 +1230,7 @@ pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpRe
                     if let Some(id) = e["p"].as_str().and_then(|p| u64::from_str_radix(p, 16).ok()) {
                         lock(joining()).insert((room_key(name, e["t"].as_str()), id), Vec::new());
                     }
-                    let r = it.call(f, args_for(f, vec![peer]), 0);
+                    let r = it.call(f, args_for(f, vec![peer, asked.clone()]), 0);
                     let yes = matches!(&r, Ok(v) | Err(Ctrl::Return(v)) if v.truthy());
                     verdicts.push(yes);
                     r.map(|_| Value::Nil)
@@ -875,7 +1244,7 @@ pub fn answer(it: &mut Interp, name: &str, body: &[u8]) -> crate::server::HttpRe
             // (FEEDBACK51.md, Q-642; branch feedback51-fixes).
             "w" => match &h.watch {
                 Some(f) => {
-                    let r = it.call(f, args_for(f, vec![peer]), 0);
+                    let r = it.call(f, args_for(f, vec![peer, asked.clone()]), 0);
                     verdicts.push(matches!(&r, Ok(v) | Err(Ctrl::Return(v)) if v.truthy()));
                     r.map(|_| Value::Nil)
                 }
@@ -928,6 +1297,37 @@ fn find(it: &Interp, name: &str) -> Option<(Arc<Handler>, Option<Vec<usize>>)> {
         if let Some((h, path)) = find(sub, name) {
             let mut p = vec![i];
             p.extend(path.unwrap_or_default());
+            return Some((h, Some(p)));
+        }
+    }
+    None
+}
+
+/// The handler of `name` in the program at mount point `base` (this one, or one it mounts), or in
+/// a service that program declares under a prefix, which is part of it as one apart is (Q-087):
+/// the programs a page of that program's session is good in (FEEDBACK75.md, Q-1061; branch
+/// feedback75). None when no such program has one, or no program is at `base`.
+fn own_handler(it: &Interp, name: &str, base: &str) -> Option<(Arc<Handler>, Option<Vec<usize>>)> {
+    let mut path = Vec::new();
+    let mut at = it;
+    while at.base != base {
+        let under = |m: &Interp| base.strip_prefix(m.base.as_str()).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+        let (i, sub) = at.mounts.iter().enumerate().find(|(_, (_, m))| !m.base.is_empty() && under(m)).map(|(i, (_, m))| (i, m))?;
+        path.push(i);
+        at = sub;
+    }
+    let matches = |h: &Handler| h.name == name || h.name.strip_suffix('*').is_some_and(|p| name.starts_with(p));
+    if let Some(h) = at.site.channels.iter().find(|h| matches(h)) {
+        return Some((h.clone(), (!path.is_empty()).then_some(path)));
+    }
+    for (i, (_, sub)) in at.mounts.iter().enumerate() {
+        if !sub.is_service || at.is_service {
+            continue;
+        }
+        if let Some((h, more)) = find(sub, name) {
+            let mut p = path.clone();
+            p.push(i);
+            p.extend(more.unwrap_or_default());
             return Some((h, Some(p)));
         }
     }
@@ -1148,11 +1548,19 @@ fn now() -> u64 {
 /// connect (a ticket, and where WebTransport listens, with the hash of its
 /// certificate when it has one of its own).
 pub fn ticket(it: &mut Interp) -> crate::server::HttpResponse {
+    // Only for a program whose pages can use channels: on every program, anyone could connect and
+    // send what the server reads, and start WebTransport's listener (FEEDBACK75.md, Q-1052; branch
+    // feedback75). Elsewhere it is a path the program does not have.
+    if !uses_channels(it) {
+        return crate::server::plain(404, "not found\n");
+    }
     let session = crate::session::current(it).to_json().to_string();
     let tenant = it.tenant().map(|t| t.to_string());
+    // The mount point of the program giving it out: its session is good there alone (FEEDBACK75.md,
+    // Q-1061; branch feedback75).
     let sealed = crate::session::seal(
         "quillo channel ticket",
-        &serde_json::json!({ "s": session, "t": tenant, "e": now() + TICKET_SECS }).to_string(),
+        &serde_json::json!({ "s": session, "t": tenant, "b": it.base, "e": now() + TICKET_SECS }).to_string(),
     );
     let mut out = serde_json::json!({ "ticket": sealed });
     if let Some((port, hash)) = endpoint() {
@@ -1170,7 +1578,71 @@ pub fn ticket(it: &mut Interp) -> crate::server::HttpResponse {
     r
 }
 
-/// The ticket in a connection's `?t=`, if it is good.
+/// Whether the program's pages may use channels or media, and so are given tickets: yes on any
+/// doubt, as a wrong no breaks a program that uses them and a wrong yes leaves things as they were
+/// in 0.8.8 (FEEDBACK75.md, Q-1052, the coordinator's call: fail open; branch feedback75). Yes for
+/// a `channel.on` or `media.on`; a program mounted, mounting another, or with services (here or
+/// apart); one that names `channel` or `media` anywhere (a channel only broadcast to, a component's
+/// `channel.open`, `<quillo-media>`, a script's text), calls the page's scripts (`js`), or takes in
+/// what is not a Quillo file (a plugin, a script for the page). Worked out once for each program
+/// loaded, from its statements and those of the files it uses.
+fn uses_channels(it: &Interp) -> bool {
+    if !it.site.channels.is_empty() || !it.base.is_empty() || !it.mounts.is_empty() || !it.remote_mounts.is_empty() || SPLIT.get().is_some_and(|s| !s.is_empty()) {
+        return true;
+    }
+    type Program = Arc<Vec<Arc<Vec<crate::ast::Stmt>>>>;
+    static SEEN: Mutex<Vec<(Program, bool)>> = Mutex::new(Vec::new());
+    if let Some((_, uses)) = lock(&SEEN).iter().find(|(p, _)| Arc::ptr_eq(p, &it.program)) {
+        return *uses;
+    }
+    let uses = may_name_channels(&it.program);
+    let mut seen = lock(&SEEN);
+    // The programs loaded last, each kept while it is here so that its place is not another's.
+    if seen.len() >= 8 {
+        seen.remove(0);
+    }
+    seen.push((it.program.clone(), uses));
+    uses
+}
+
+/// Whether statements may use channels (see `uses_channels`): a `use` of what is not a `.qwe`
+/// file, a `mount` or a `service`, or `channel`, `media` or a call of `js` in their written form,
+/// searched as it is made, a piece at a time, and stopped at the first.
+fn may_name_channels(program: &[Arc<Vec<crate::ast::Stmt>>]) -> bool {
+    use crate::ast::Stmt;
+    struct Search {
+        tail: Vec<u8>,
+        found: bool,
+    }
+    const NAMES: [&[u8]; 3] = [b"channel", b"media", b"Ident(\"js\""];
+    impl std::fmt::Write for Search {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.tail.extend_from_slice(s.as_bytes());
+            if NAMES.iter().any(|n| memchr::memmem::find(&self.tail, n).is_some()) {
+                self.found = true;
+                return Err(std::fmt::Error);
+            }
+            let keep = self.tail.len().min(16);
+            self.tail.drain(..self.tail.len() - keep);
+            Ok(())
+        }
+    }
+    let mut search = Search { tail: Vec::new(), found: false };
+    for stmts in program {
+        if stmts.iter().any(|s| matches!(s, Stmt::Use(path, ..) if !path.ends_with(".qwe")) || matches!(s, Stmt::Mount(..) | Stmt::Service(..))) {
+            return true;
+        }
+        // Formatting stops only where the search stops it: any other error, and it says yes.
+        if std::fmt::write(&mut search, format_args!("{:?}", stmts)).is_err() {
+            return true;
+        }
+    }
+    search.found
+}
+
+/// The ticket in a connection's `?t=`, if it is good, with the mount point of the program that
+/// gave it out (FEEDBACK75.md, Q-1061; branch feedback75). One made before tickets said it (by
+/// 0.8.8 or before, good for 120 s) is the root program's, as it was taken.
 pub fn ticket_of(query: &str) -> Option<Ticket> {
     let t = query.split('&').find_map(|kv| kv.strip_prefix("t="))?;
     let t = crate::server::percent_decode(t, false);
@@ -1178,7 +1650,8 @@ pub fn ticket_of(query: &str) -> Option<Ticket> {
     if j["e"].as_u64()? < now() {
         return None;
     }
-    Some(Ticket { session: j["s"].as_str()?.to_string(), tenant: j["t"].as_str().map(str::to_string) })
+    let place = Place { tenant: j["t"].as_str().map(str::to_string), base: j["b"].as_str().unwrap_or("").to_string() };
+    Some(Ticket { session: j["s"].as_str()?.to_string(), tenant: (place.tenant.is_some() || !place.base.is_empty()).then_some(place) })
 }
 
 // ---- WebTransport ----------------------------------------------------------------
@@ -1239,10 +1712,31 @@ mod quic {
             .map_err(|e| e.to_string())
     }
 
+    /// The server's QUIC limits: what a session may open and have sent before it is read. With
+    /// quinn's own (100 streams each way, 1.25 MB a stream, no limit a connection), one session
+    /// had the server hold about 110 MB of what it sent, read or not (measured on 0.8.8: 3 sessions
+    /// of 90 streams, 15 MB to 342 MB). A page opens HTTP/3's 3 streams, one per track it sends
+    /// (`MOST_TRACKS`), and its first stream both ways (FEEDBACK75.md, Q-1074; branch feedback75).
+    fn transport() -> wtransport::config::QuicTransportConfig {
+        let mut t = wtransport::config::QuicTransportConfig::default();
+        // A stream may have a whole frame (1 MiB) on its way, and the session four: with 256 KiB a
+        // stream, 1 MB frames at 30 a second came at 27, and a stream at 100 ms took 21 Mbit/s at
+        // most (found in review of FEEDBACK75.md, Q-1074). What a session holds unread is still
+        // the connection's window at most.
+        // Two streams both ways, what the protocol uses: HTTP/3's CONNECT and the page's first. With
+        // four, a session opened two more that nothing reads, each holding its window for good
+        // (found in review of FEEDBACK75.md, Q-1074).
+        t.max_concurrent_uni_streams((3 + MOST_TRACKS as u32 + 1).into())
+            .max_concurrent_bidi_streams(2u32.into())
+            .stream_receive_window(STREAM_WINDOW.into())
+            .receive_window((4u32 << 20).into());
+        t
+    }
+
     fn config(addr: SocketAddr, id: Identity) -> ServerConfig {
         ServerConfig::builder()
             .with_bind_address(addr)
-            .with_identity(id)
+            .with_custom_transport(id, transport())
             .keep_alive_interval(Some(Duration::from_secs(5)))
             .max_idle_timeout(Some(Duration::from_secs(20)))
             .map(|b| b.build())
@@ -1313,59 +1807,58 @@ mod quic {
             req.forbidden().await;
             return;
         };
+        // A place among the pages that wait, as a WebSocket takes, held for the session: a session
+        // took none, so one address could open as many as it liked (FEEDBACK75.md, Q-1074; branch
+        // feedback75).
+        let ip = req.remote_address().ip().to_string();
+        let Some(_place) = crate::server::Waiter::take(&ip) else {
+            req.too_many_requests().await;
+            return;
+        };
         let Ok(conn) = req.accept().await else { return };
         // The page's first stream carries what must arrive (joining, and
         // large or reliable messages), both ways.
         let Ok(Ok(opening)) = tokio::time::timeout(Duration::from_secs(10), conn.accept_bi()).await else { return };
         let (mut out, mut inn) = opening;
         let (media_tx, media_rx) = tokio::sync::mpsc::channel(240);
-        let (peer, mut rx) = connect(ticket, Some(media_tx));
+        let client = crate::statics::client_of(&ip);
+        let (peer, mut rx) = connect_from(ticket, Some(media_tx), &client);
         let frames = tokio::spawn(send_frames(conn.clone(), media_rx));
         let reader = {
             let peer = peer.clone();
             tokio::spawn(async move {
-                let mut len = [0u8; 4];
-                loop {
-                    if inn.read_exact(&mut len).await.is_err() {
-                        return;
-                    }
-                    let n = u32::from_be_bytes(len) as usize;
-                    if n > MAX_MESSAGE {
-                        return;
-                    }
-                    let mut buf = vec![0u8; n];
-                    if inn.read_exact(&mut buf).await.is_err() {
-                        return;
-                    }
+                while let Some(buf) = read_frame(&mut inn, &peer.client).await {
                     if let Ok(text) = std::str::from_utf8(&buf) {
-                        from_page(&peer, text);
+                        from_page_waiting(&peer, text, STREAM_WINDOW as usize).await;
                     }
                 }
             })
         };
         tokio::pin!(reader);
         // Frames the page sends (`<quillo-media publish>`): a stream of its
-        // own per track, each frame after its length.
+        // own per track, each frame after its length. At most `MOST_TRACKS` at once: a stream past
+        // them is let go as it comes, where each had a task holding up to 1 MiB (Q-1074).
         let sending = {
             let (conn, peer) = (conn.clone(), peer.clone());
             tokio::spawn(async move {
+                let open = Arc::new(AtomicUsize::new(0));
                 while let Ok(opening) = conn.accept_uni().await {
-                    let peer = peer.clone();
+                    if open.load(Relaxed) >= MOST_TRACKS {
+                        drop(opening);
+                        continue;
+                    }
+                    open.fetch_add(1, Relaxed);
+                    let (peer, open) = (peer.clone(), open.clone());
                     tokio::spawn(async move {
+                        struct Ends(Arc<AtomicUsize>);
+                        impl Drop for Ends {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, Relaxed);
+                            }
+                        }
+                        let _ends = Ends(open);
                         let mut inn = opening;
-                        let mut len = [0u8; 4];
-                        loop {
-                            if inn.read_exact(&mut len).await.is_err() {
-                                return;
-                            }
-                            let n = u32::from_be_bytes(len) as usize;
-                            if n > MAX_MESSAGE {
-                                return;
-                            }
-                            let mut buf = vec![0u8; n];
-                            if inn.read_exact(&mut buf).await.is_err() {
-                                return;
-                            }
+                        while let Some(buf) = read_frame(&mut inn, &peer.client).await {
                             frame_from_page(&peer, buf);
                         }
                     });
@@ -1403,6 +1896,60 @@ mod quic {
         frames.abort();
         sending.abort();
         conn.close(0u32.into(), b"");
+    }
+
+    /// The most a page's WebTransport stream may be sent before it is read (see `transport`, and
+    /// `wait_for_room`, which counts it for a page that waits).
+    pub const STREAM_WINDOW: u32 = 1 << 20;
+
+    /// The most streams a page's session sends frames on at once: a track each (video and sound
+    /// of a stream or two). With quinn's 100 a session, each read into a frame of up to 1 MiB with
+    /// no deadline, a session held about 100 MiB (FEEDBACK75.md, Q-1074; branch feedback75).
+    const MOST_TRACKS: usize = 8;
+
+    /// The next frame on a page's stream, after its length: none when the stream ends, the length
+    /// is past `MAX_MESSAGE`, the frame stops coming on (see `ws::Hold::by`), or all the messages
+    /// begun, or its client's, hold what `BEGUN` allows. A frame of `ws::SMALL` bytes or less is
+    /// read as it comes, with no clock or count, as a WebSocket's (Q-1073's review). A larger one
+    /// is made room for as it comes, each growth counted first, where its whole length was made
+    /// before any of it came (FEEDBACK75.md, Q-1074, as Q-1073 for a WebSocket; branch feedback75).
+    async fn read_frame(inn: &mut wtransport::RecvStream, client: &str) -> Option<Vec<u8>> {
+        struct Counted<'a>(usize, &'a str);
+        impl Drop for Counted<'_> {
+            fn drop(&mut self) {
+                BEGUN.give(self.0, self.1);
+            }
+        }
+        let mut len = [0u8; 4];
+        inn.read_exact(&mut len).await.ok()?;
+        let n = u32::from_be_bytes(len) as usize;
+        if n > MAX_MESSAGE {
+            return None;
+        }
+        if n <= crate::ws::SMALL {
+            let mut buf = vec![0u8; n];
+            inn.read_exact(&mut buf).await.ok()?;
+            return Some(buf);
+        }
+        let since = std::time::Instant::now();
+        let mut counted = Counted(0, client);
+        let mut buf: Vec<u8> = Vec::new();
+        let mut piece = vec![0u8; crate::ws::PIECE];
+        while buf.len() < n {
+            let want = (n - buf.len()).min(crate::ws::PIECE);
+            let by = tokio::time::Instant::from_std(BEGUN.by(since, buf.len()));
+            let got = tokio::time::timeout_at(by, inn.read(&mut piece[..want])).await.ok()?.ok()??;
+            if buf.len() + got > buf.capacity() {
+                let to = (buf.capacity() * 2).max(buf.len() + got).min(n);
+                if !BEGUN.take(to - buf.capacity(), client) {
+                    return None;
+                }
+                counted.0 += to - buf.capacity();
+                buf.reserve_exact(to - buf.len());
+            }
+            buf.extend_from_slice(&piece[..got]);
+        }
+        Some(buf)
     }
 
     /// A page's frames: each track on a stream of its own (opened with its
@@ -1468,9 +2015,9 @@ const PING_EVERY: Duration = Duration::from_secs(20);
 /// program sending a system call a message, and waking a task costs none, so the wait (a yield to
 /// the runtime, round and round) cost more than it saved, 4% more for a burst to three pages and
 /// 1.5% less without it than with threads (FEEDBACK66.md, Q-954; branch q954).
-pub async fn over_websocket(stream: tokio::net::TcpStream, ticket: Ticket) {
+pub async fn over_websocket(stream: tokio::net::TcpStream, ticket: Ticket, client: &str) {
     let (r, mut w) = stream.into_split();
-    let (peer, mut rx) = connect(ticket, None);
+    let (peer, mut rx) = connect_from(ticket, None, client);
     let reading = tokio::spawn(read_page(peer.clone(), r));
     let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_EVERY, PING_EVERY);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1546,10 +2093,19 @@ async fn read_page(peer: Arc<Peer>, r: tokio::net::tcp::OwnedReadHalf) {
         }
     }
     let _ends = Ends(peer.clone());
-    let mut reader = crate::ws::Reader::new(tokio::io::BufReader::with_capacity(READ_AHEAD, r), MAX_MESSAGE + 64);
+    // A message begun comes whole within `MESSAGE_WITHIN`, and what all those begun hold is held
+    // to `BEGUN` (FEEDBACK75.md, Q-1073; branch feedback75).
+    let mut reader = crate::ws::Reader::holding(tokio::io::BufReader::with_capacity(READ_AHEAD, r), MAX_MESSAGE + 64, &BEGUN, &peer.client);
     loop {
-        match reader.next_async().await {
-            Ok(crate::ws::Message::Text(t)) => from_page(&peer, &t),
+        // A message a hold counts is read by a future of its own, apart from every message's
+        // (FEEDBACK75.md, Q-1073; branch feedback75).
+        let next = match reader.next_or_held().await {
+            Ok(crate::ws::Next::Got(m)) => Ok(m),
+            Ok(crate::ws::Next::Held(f)) => Box::pin(reader.held_async(f)).await,
+            Err(e) => Err(e),
+        };
+        match next {
+            Ok(crate::ws::Message::Text(t)) => from_page_waiting(&peer, &t, 0).await,
             Ok(crate::ws::Message::Binary(b)) => frame_from_page(&peer, b),
             // RFC 6455 5.5.2 (FEEDBACK16.md, Q-132; branch feedback20-fixes).
             Ok(crate::ws::Message::Ping(data)) => {
@@ -1628,12 +2184,14 @@ mod tests {
     #[test]
     fn what_comes_to_an_inbox_let_go_goes_to_the_new_one() {
         let (p, _rx) = connect(Ticket { session: "{}".into(), tenant: None }, None);
-        let gone = Arc::new(Inbox { name: "unit-let-go".into(), queue: Mutex::new(VecDeque::new()), arrived: Condvar::new(), delivering: AtomicBool::new(false), closed: AtomicBool::new(true) });
+        // Each with its count of what waits in it (changed with FEEDBACK75.md, Q-1056's review:
+        // an inbox holds its channel's count; branch feedback75).
+        let gone = Arc::new(Inbox { name: "unit-let-go".into(), queue: Mutex::new(VecDeque::new()), arrived: Condvar::new(), delivering: AtomicBool::new(false), closed: AtomicBool::new(true), waiting: AtomicUsize::new(0) });
         // The one made in its place, as `inbox` makes it, with no thread taking what comes to it:
         // another test of this process serving a program (src/mobile.rs) gave each new inbox a
         // thread, which took the message before it was looked for (CI, found in the second review
         // of FEEDBACK55.md's slice 7; branch feedback55).
-        let new = Arc::new(Inbox { name: "unit-let-go".into(), queue: Mutex::new(VecDeque::new()), arrived: Condvar::new(), delivering: AtomicBool::new(true), closed: AtomicBool::new(false) });
+        let new = Arc::new(Inbox { name: "unit-let-go".into(), queue: Mutex::new(VecDeque::new()), arrived: Condvar::new(), delivering: AtomicBool::new(true), closed: AtomicBool::new(false), waiting: AtomicUsize::new(0) });
         lock(&hub().inboxes).insert("unit-let-go".into(), new.clone());
         gone.push(Event { kind: 'm', peer: p.clone(), value: "1".into() });
         assert!(lock(&gone.queue).is_empty());

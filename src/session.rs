@@ -21,8 +21,11 @@
 //! request's host cannot tell: behind a proxy, every request is to
 //! 127.0.0.1.) A `Secure` session cookie for the whole site is named
 //! `__Host-quillo_session`, which browsers only take from this very host,
-//! over HTTPS: a sibling subdomain (another tenant's) cannot plant one. Two
-//! session cookies that are both valid here are no session.
+//! over HTTPS: a sibling subdomain (another tenant's) cannot plant one. A
+//! program mounted under a path has its own, with the path in its name
+//! (`__Host-shop.quillo_session`); under `--base` it is `quillo_session`
+//! with the program's path. Two session cookies that are both valid here are
+//! no session.
 
 use crate::crypto::{b64url, hmac_sha256, unb64url};
 use crate::interp::{fail, Ctrl, Interp};
@@ -474,7 +477,7 @@ fn warn_if_dropped(it: &mut Interp, cookie: &str) {
              Serve the site over HTTPS (a proxy with TLS in front, named with --trust-proxy, sending x-forwarded-proto: https), or run with --plain-http on a network you trust",
             cookie,
             host,
-            if cookie == COOKIE || cookie == HOST_COOKIE { ": sessions will not stick there" } else { "" }
+            if is_session_cookie(cookie) { ": sessions will not stick there" } else { "" }
         );
     }
 }
@@ -500,7 +503,7 @@ pub(crate) fn take_back(it: &mut Interp, cookies: Vec<String>, session: Option<V
     let name = cookie_name(it);
     let mut set = false;
     for c in cookies {
-        set |= cookie_key(&c).0 == name;
+        set |= cookie_key(&c).0 == name.as_ref();
         queue(it, c);
     }
     if session.is_some() && (set || it.session.is_none()) {
@@ -569,14 +572,52 @@ fn delete_cookie(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::Nil)
 }
 
-/// The session cookie's name here: `__Host-` when the cookie is `Secure`
-/// and for the whole site, as browsers require of that prefix.
-fn cookie_name(it: &Interp) -> &'static str {
+/// The session cookie's name here: `__Host-` when the cookie is `Secure` and for the whole site,
+/// as browsers require of that prefix. A program mounted under a path in this process has the path
+/// in the name, `__Host-shop.quillo_session` for `/shop`, with `Path=/`, where it had
+/// `quillo_session` with `Path=/shop`, which a sibling subdomain could set with `Domain=` to its own
+/// valid session: the visitor signed in as the attacker, or with two sessions, none. Every path of
+/// the site is this process's, so `Path=/` sends it nowhere new (FEEDBACK75.md, Q-1077, the
+/// coordinator's decision of 2026-11-19: mounts only; branch feedback75). Under `--base` the site's
+/// other paths may be other programs' behind the same proxy: every program there keeps
+/// `quillo_session` with its own path, as over plain HTTP (`--watch`, a desktop app,
+/// `--plain-http`), where a cookie is not `Secure`.
+pub(crate) fn cookie_name(it: &Interp) -> std::borrow::Cow<'static, str> {
     if it.base.is_empty() && !PLAIN_HTTP.load(std::sync::atomic::Ordering::Relaxed) {
-        HOST_COOKIE
+        HOST_COOKIE.into()
+    } else if it.base.is_empty() || PLAIN_HTTP.load(std::sync::atomic::Ordering::Relaxed) || UNDER_BASE.get().is_some() {
+        COOKIE.into()
     } else {
-        COOKIE
+        format!("__Host-{}.{}", mount_in_name(&it.base), COOKIE).into()
     }
+}
+
+/// Set by `--base`: the site is served under a path behind a proxy (see `cookie_name`).
+static UNDER_BASE: OnceLock<String> = OnceLock::new();
+
+/// `--base`: this process serves the site under `base`, behind a proxy that may serve other
+/// programs at the site's other paths.
+pub fn serving_under(base: &str) {
+    let _ = UNDER_BASE.set(base.to_string());
+}
+
+/// A mount point as part of a cookie's name, one name for each: its `/`s as `.`, past the first,
+/// and a byte a name cannot hold, or a `.` of its own, as `%XX` (`/a/b`: `a.b`, `/a.b`: `a%2Eb`).
+fn mount_in_name(base: &str) -> String {
+    let mut out = String::with_capacity(base.len());
+    for b in base.strip_prefix('/').unwrap_or(base).bytes() {
+        match b {
+            b'/' => out.push('.'),
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Whether `name` is a session cookie's, here or in any program (see `cookie_name`).
+pub(crate) fn is_session_cookie(name: &str) -> bool {
+    name == COOKIE || name == HOST_COOKIE || name.strip_prefix("__Host-").is_some_and(|n| n.ends_with(".quillo_session"))
 }
 
 /// Every value the request has for the session cookie: a program mounted
@@ -591,7 +632,7 @@ pub(crate) fn cookies(it: &mut Interp) -> Vec<String> {
 /// Queues the session cookie (empty with age 0: removes it).
 pub(crate) fn send_cookie(it: &mut Interp, value: &str, age: Option<u64>, line: u32) -> Result<(), Ctrl> {
     let name = cookie_name(it);
-    let l = cookie_line(it, name, value, age, None, "set_session", line)?;
+    let l = cookie_line(it, &name, value, age, None, "set_session", line)?;
     queue(it, l);
     Ok(())
 }
@@ -904,7 +945,7 @@ pub(crate) fn cookie_opens(it: &mut Interp, req: &crate::server::HttpRequest) ->
         .filter(|(k, _)| k.eq_ignore_ascii_case("cookie"))
         .flat_map(|(_, v)| v.split(';'))
         .filter_map(crate::server::cookie_pair)
-        .filter(|(k, _)| *k == name)
+        .filter(|(k, _)| *k == name.as_ref())
         .map(|(_, v)| v)
         .collect();
     if values.is_empty() {

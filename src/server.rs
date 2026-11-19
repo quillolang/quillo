@@ -2606,11 +2606,13 @@ static WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 /// The places taken, by client.
 static WAITING: Mutex<Option<std::collections::HashMap<String, usize>>> = Mutex::new(None);
 
-/// A place among the `MAX_WAITERS`, given back when dropped.
-struct Waiter(String);
+/// A place among the `MAX_WAITERS`, given back when dropped. A WebTransport session takes one too,
+/// from the same count, where it had a count of its own: 256 and 256 a client (FEEDBACK75.md,
+/// Q-1074's review; branch feedback75).
+pub(crate) struct Waiter(String);
 
 impl Waiter {
-    fn take(ip: &str) -> Option<Waiter> {
+    pub(crate) fn take(ip: &str) -> Option<Waiter> {
         use std::sync::atomic::Ordering::SeqCst;
         let who = crate::statics::client_of(ip);
         let mut g = WAITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2933,6 +2935,9 @@ fn serve_channels(req: HttpRequest) -> Answer {
         Ok(p) => p,
         Err(refused) => return refused,
     };
+    // Whose share of what pages' messages hold its own count in (FEEDBACK75.md, Q-1073 and
+    // Q-1056's review; branch feedback75).
+    let client = crate::statics::client_of(&req.remote);
     Answer::Detach(Box::new(move |stream, mut before| {
         // With no runtime (none could be made), or a connection the runtime cannot take, the page
         // is hung up on, and connects again.
@@ -2951,7 +2956,7 @@ fn serve_channels(req: HttpRequest) -> Answer {
                 return;
             }
             drop(before);
-            crate::wt::over_websocket(stream, ticket).await;
+            crate::wt::over_websocket(stream, ticket, &client).await;
         });
     }))
 }

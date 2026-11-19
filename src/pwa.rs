@@ -1079,7 +1079,8 @@ pub fn mark(it: &mut Interp, req: &HttpRequest, offline_route: bool, session_cha
     for (k, v) in req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
         let _ = k;
         for (name, value) in v.split(';').filter_map(crate::server::cookie_pair) {
-            session_cookie |= name == crate::session::COOKIE || name == crate::session::HOST_COOKIE;
+            // A mounted program's own name too (FEEDBACK75.md, Q-1077; branch feedback75).
+            session_cookie |= crate::session::is_session_cookie(name);
             if name == crate::session::TAG_COOKIE && had.is_none() {
                 had = Some(value.to_string());
             }
