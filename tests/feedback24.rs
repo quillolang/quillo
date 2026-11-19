@@ -106,6 +106,85 @@ fn a_plain_form_sent_twice_runs_once_on_mariadb() {
     a_form_sent_twice_runs_once("form-mariadb", &m.url("form24"));
 }
 
+const FORMS_ELSEWHERE: &str = r#"
+db.open("shop.db")
+db.exec("create table if not exists paid (cents int)")
+
+component PayBox(label: str) = <form method="post" action="/pay" idempotent>
+    <input name="cents" value="500"/>
+    <button>{label}</button>
+</form>
+
+view PayView() = <form method="post" action="/pay" idempotent>
+    <input name="cents" value="500"/>
+</form>
+
+route GET /comp = <html><body><PayBox label="Pay"/></body></html>
+route GET /view = <html><body><PayView/></body></html>
+route GET /upload = <html><body>
+    <form method="post" action="/pay" enctype="multipart/form-data" idempotent>
+        <input name="cents" value="500"/>
+        <input type="file" name="doc"/>
+    </form>
+</body></html>
+
+route POST /pay = idempotent(() => {
+    sleep(300)
+    db.exec("insert into paid (cents) values (?)", request.form.cents)
+    redirect("/done")
+})
+
+route GET /done = "done"
+route GET /count = len(db.query("select cents from paid"))
+"#;
+
+/// The form's key with no script, where the form is not in the route's own literal: in a
+/// component, in a `view` (whose cache must not keep one key for every page), and sent as
+/// multipart with a file. Checked by hand with JavaScript off by quillo-app1-f1 on 0.8.7 and
+/// 0.8.8 (.git/wip/idempotent-no-js); pinned here (FEEDBACK24.md, Q-196).
+#[test]
+fn a_form_in_a_component_a_view_or_with_a_file_sent_twice_runs_once() {
+    let d = dir("form-elsewhere", &[("main.qwe", FORMS_ELSEWHERE)]);
+    let s = serve(&d.join("main.qwe"), &[]);
+    let port = s.port;
+    let mut paid = 0;
+    for path in ["/comp", "/view", "/upload"] {
+        let page = send(port, "GET", path, &[], "");
+        // The key is a field of the form itself, so a browser with no script sends it (the page
+        // may carry Quillo's own scripts, the prefetcher and an island's loader; the form needs
+        // neither).
+        let form = &page.body[page.body.find("<form").expect("a form")..];
+        let form = &form[..form.find("</form>").expect("its end")];
+        assert!(form.contains("name=\"_idempotency_key\"") && !page.body.contains(" idempotent"), "{}: {}", path, page.body);
+        let key = field(&page.body);
+        assert_ne!(key, field(&send(port, "GET", path, &[], "").body), "{}: each page has its own key", path);
+        let (ctype, body) = if path == "/upload" {
+            let b = "q24boundary";
+            (
+                format!("multipart/form-data; boundary={b}"),
+                format!(
+                    "--{b}\r\ncontent-disposition: form-data; name=\"_idempotency_key\"\r\n\r\n{key}\r\n--{b}\r\ncontent-disposition: form-data; name=\"cents\"\r\n\r\n500\r\n--{b}\r\ncontent-disposition: form-data; name=\"doc\"; filename=\"a.txt\"\r\ncontent-type: text/plain\r\n\r\nhello\r\n--{b}--\r\n"
+                ),
+            )
+        } else {
+            ("application/x-www-form-urlencoded".to_string(), format!("_idempotency_key={}&cents=500", key))
+        };
+        // Two clicks at once, then back and the same again: one payment.
+        let both: Vec<_> = (0..2)
+            .map(|_| {
+                let (c, b) = (ctype.clone(), body.clone());
+                std::thread::spawn(move || send(port, "POST", "/pay", &[("content-type", c.as_str()), ("sec-fetch-site", "same-origin")], &b))
+            })
+            .collect();
+        let answers: Vec<(u16, Option<String>)> = both.into_iter().map(|t| { let a = t.join().unwrap(); (a.status, a.header("location").map(String::from)) }).collect();
+        assert_eq!(answers, vec![(303, Some("/done".to_string())); 2], "{}", path);
+        let again = send(port, "POST", "/pay", &[("content-type", ctype.as_str()), ("sec-fetch-site", "same-origin")], &body);
+        assert_eq!((again.status, again.header("idempotent-replayed")), (303, Some("true")), "{}", path);
+        paid += 1;
+        assert_eq!(send(port, "GET", "/count", &[], "").body, paid.to_string(), "{}: the work ran once", path);
+    }
+}
+
 /// A key is for one page of one visitor: no cache may keep it.
 #[test]
 fn a_page_with_a_forms_key_is_never_kept() {
