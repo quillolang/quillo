@@ -539,8 +539,9 @@ routes offline /help {
   (the runtime, the bundles, the sheets), so that a page never opened opens offline with its
   components working. A page with a parameter is kept once it is opened. The worker asks for
   them one at a time as a prefetch, which Quillo answers changing nothing (see
-  [Prefetching](#prefetching)): a route that would write, set a cookie or call a service is
-  refused, and kept only once someone opens it; a redirect is skipped. A page Quillo is too
+  [Prefetching](#prefetching)): a route that would write, set a cookie, call a service, or
+  send a packet, a channel message or a request that writes, is refused, and kept only once
+  someone opens it; a redirect is skipped. A page Quillo is too
   busy to prefetch (others' requests are waiting, as a prefetch never goes before anyone) is
   asked again within the try, after 0.25, 0.5, 1 and 2 s, 5 s for the whole try. A page that
   did not come (no network, a `502` to `504`) is asked for again on later navigations, 10 s,
@@ -590,7 +591,10 @@ too, for that visitor's session alone:
   script first in its head, the gate, which shows it when the browser's `quillo_tag` names
   that session, and otherwise shows the offline page and drops that session's pages. The
   page's `content-security-policy` names the gate by its hash; a kept page whose policy
-  would stop it anyway (a `sandbox` without `allow-scripts`) is not given back at all.
+  would stop it anyway (a `sandbox` without `allow-scripts`), or keep it from reading the
+  cookie (a `sandbox` without `allow-same-origin`), is not given back at all *(since 0.8.9:
+  under `sandbox allow-scripts` the gate could not read the cookie, and the page showed to
+  the next person on the device)*.
 - **Any change to the session drops them**: a sign-out, a sign-in as another person, a
   sign-in in two steps, a cart written into the session. They are kept again, under the new
   name, as they are opened. The worker learns of it from the answer that changed the
@@ -598,9 +602,12 @@ too, for that visitor's session alone:
   page with components, and from the register script on offline pages without them.
 - **A session the server no longer takes** (past its time, or signed with a
   `QUILLO_SECRET` since changed) is no one, as a request with no session cookie at all is:
-  the next page drops every session's kept pages. A sign-out the worker could not see (a
-  redirect to another site) is caught so, at the next page of the site. A session dropped
-  is never kept again, even by an answer of its that comes late.
+  the next page drops every session's kept pages. A sign-out that redirects to another
+  site, whose answer the worker cannot read, drops the session's pages at once where the
+  browser gives a worker the Cookie Store API (Chromium's browsers): the worker follows
+  `quillo_tag` itself, and reads it after such a redirect *(since 0.8.9)*. Elsewhere it is
+  caught at the next page of the site. A session dropped is never kept again, even by an
+  answer of its that comes late.
 
 **Where there is no worker.** Under [`--watch`](#options-of-quillo-run) no page registers
 it, and `/_quillo/sw.js` is a worker that takes itself away with what Quillo's worker kept,
@@ -1178,8 +1185,19 @@ match v {
 - A type is named like `User` or `OrderLine` (a capital letter first, and small ones),
   which keeps it apart from constants such as `MAX` or `DAY`; `type ID = int` is
   refused. A record may name itself (`type Node = { value: int, kids: list<Node> = [] }`).
+  A type that names itself with nothing between is an error, as a value of it could be
+  anything (`` type Ab names itself with nothing between: put a record, a list or a map
+  shape in the way (`type Ab = list<Ab> | int`) `` for `type Ab = Ab | int`) *(since 0.8.9)*.
   `type`, like `service` and `mount`, is written at the top level. A field that is
   there but `null` counts as missing: its default fills it, or it is reported.
+- **How deep a record is checked.** A value from a request (a `server fn`'s arguments, a
+  route pattern's `json`, `form` and query records) is checked to its end, up to 512 levels,
+  each type named on the way counting as one, and refused past them (`... is nested more
+  than 512 deep`, a 400 for a `server fn`). A union of records (`type Tt = Aa | Bb`) is
+  tried once for each value, so a deep valid one is made in time in proportion to its size.
+  What the program builds itself (`Node(v)`, an annotation, a `match`) is checked 64 levels
+  deep, as before *(since 0.8.9: a request's value was checked 64 levels deep too, and what
+  was below went unchecked)*.
 - `date` is text that is a calendar date (`YYYY-MM-DD`, a real day): `type Leave = {
   start: date, end: date }` refuses `"2026-02-30"` and a date-time, in a record, an
   annotation (`fn next(d: date)`), a pattern (`match x { date => ... }`, a query's `?
@@ -3155,8 +3173,9 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   in the background keeps its connection and runs its loaders as a visible one does. A
   page on another site cannot open it (403).
 - A server keeps at most 4096 such connections open (live data, [`--watch`](#options-of-quillo-run) reloads,
-  channels over a WebSocket), and at most 256 for one client: an IPv4 address, or an
-  IPv6 /64 network. Channels over WebTransport are not counted. Past that, a page is
+  channels over a WebSocket or WebTransport), and at most 256 for one client: an IPv4
+  address, or an IPv6 /64 network *(since 0.8.9: channels over WebTransport were not
+  counted)*. Past that, a page is
   answered `503`, keeps what it shows, says so once in the console, and asks again when
   told. The server says so once in its log, and `quillo_live_refused_total` counts them.
 - **Behind a proxy, name it.** Every visitor is then the proxy's address, so without
@@ -3184,7 +3203,10 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   the visitor's other tabs, and nothing waits for it. Randomness made in SQL (`select
   hex(randomblob(8))`) is a read, so such a run is shared: make tokens with
   `crypto.token`. `nextval` or a writing function behind a view is not seen either: put
-  it in the query.
+  it in the query. The runs kept for sharing weigh 64 MB at most in all, each weighed at 41
+  bytes for each byte of its answer's JSON, the oldest let go first; a run heavier than that
+  alone (an answer past about 1.6 MB) is not kept *(since 0.8.9: they were kept by their
+  arguments, with no bound)*.
 - **What a thousand pages cost** depends on whether the loader is shared. A loader for
   everyone runs once a change however many pages show it. One that reads the viewer runs
   once for each page, on every change to what it read, so with many pages and a busy
@@ -3550,6 +3572,9 @@ client gets from a call:
 - An answer past what the door takes in (10 MiB of JSON, or 128 levels deep) is an `isError`
   saying so, never a cut or empty answer; a tool that crashes answers `internal error` and the
   door goes on serving.
+- A message over HTTP is read as a page's JSON is: under `--max-memory`, one whose values
+  would pass the limit is a parse error that says so *(since 0.8.9: it was read whole first)*.
+  A tool's arguments are checked against its parameters' types once, as a `server fn`'s are.
 
 A policy's `max_compute` and `max_body` hold `quillo mcp` as they hold `quillo run`. On
 Windows, `print` goes to stderr, but other writes to stdout (a `.qwer` plugin's own output) are
@@ -4178,7 +4203,11 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
   request's headers or cookies, there, in a function it calls, a component it shows, or its
   middleware). A request pattern reads them when any of its `|` alternatives takes the
   headers or cookies, or one under `as`, so `route GET /seen { query: { who: str } } |
-  { cookies: { who: str } } { ... }` that writes is warned of *(since 0.8.8: it was not)*. Make such a route a `POST`
+  { cookies: { who: str } } { ... }` that writes is warned of *(since 0.8.8: it was not)*.
+  A write is followed through `http.stream` with a `method` that writes or a `body`,
+  `http.request` whose method a `let` holds, `udp.send`, `udp.reply`, `channel.send` and
+  `channel.broadcast`, SQL a `let` holds, and a function a `let` holds (`let w = save_visit`,
+  then `w(session().user)`) *(since 0.8.9: these were not seen)*. Make such a route a `POST`
   (a form or a button), which Quillo refuses from other sites, or tag it where the write is
   meant, as for a confirm-your-address link, a sign-in callback or a presence ping. Three or
   more routes that warn through one write (a helper they all call, a group's middleware) are said
@@ -4652,17 +4681,26 @@ of the folder through a link is reported as an error (`path must stay inside the
 program's folder: data/x.qwe`), not read. It reads only Quillo's files, `.qwe` (and the
 signatures of `.qwer` and `.rs` files for a `use`), no path with a dot folder or file in
 it, and a link judged by where it leads, so `use .env` or `use .git/config` reads
-nothing; its messages never show a file's text. `delete_file(path)` removes a file or folder inside the
-program's folder, but not a folder that holds a database the program has open.
+nothing; its messages never show a file's text, a `.rs` file's line included *(since 0.8.9:
+one was quoted)*. Such code may also be written to be slow to check, so the check has a
+budget: a type is kept to 10,000 parts and 16 levels, what grows past them taken as unknown
+(which says less, never wrongly), and past 2 s, or about a million parts kept in all, the
+check gives one error in place of all else, `the code is too complex to check: its types
+grew past what a check keeps, or the check took too long` *(since 0.8.9: a 699-byte program
+whose types doubled on each line took the server's memory)*. `quillo check` itself keeps a
+type to 1,000,000 parts and 64 levels, and never gives that error. `delete_file(path)`
+removes a file or folder inside the program's folder, but not a folder that holds a database
+the program has open.
 
 ### Scripts from users
 
-`run_script(source, vars)` runs code a program's users write (a rule on a form's field,
-who may see a record) on the server, and gives its last expression's value, or an error
-value saying what went wrong:
+`run_script(source, vars, { timeout })` runs code a program's users write (a rule on a
+form's field, who may see a record) on the server, and gives its last expression's value, or
+an error value saying what went wrong:
 
 ```quillo
 run_script("value > 3 ? null : `at least 4, got ${value}`", { value: 5 })   // null
+run_script("total > 100", { total: 120 }, { timeout: "1s" })               // true, given a second
 ```
 
 - The script sees the values in `vars` and the builtins that only compute (`len`,
@@ -4677,7 +4715,22 @@ run_script("value > 3 ? null : `at least 4, got ${value}`", { value: 5 })   // n
 - It stops after 20,000 steps (calls and loop rounds). A value it makes may be up to
   1 MB (strings, and lists and maps counted with what they hold), and each KB it makes
   costs a step: doubling a string in a loop stops there, not when the memory runs out.
-- Like any code, it may nest at most 256 levels deep.
+  Each KB a builtin or a comparison reads costs a step too, so `unique`, `min` or `==` on a
+  list near 1 MB is many steps, not one; what a builtin only looks into (`len` of a list,
+  `get`, `has`, `first`, `last`) or copies into what it gives back (`push`, `set`, `merge`,
+  `sort`) is paid for as made, so `out = push(out, x)` pays for `out` once *(since 0.8.9: a
+  step was one call however much it read, and a 143-byte script held its instance for
+  13 s)*.
+- It stops after 100 ms, with the error value `the script took longer than its 100 ms`,
+  unless `timeout` gives another time: milliseconds (`250`) or text (`"250ms"`, `"2s"`), from
+  1 ms to 60 s. Another option, or a time out of range, is an error (`` `run_script`:
+  `timeout` is milliseconds from 1 to 60000, as 250, "250ms" or "2s", got 0 ``). A helper of
+  the program's that waits (a query) counts in that time, and a script run inside another
+  ends by the outer one's time *(since 0.8.9: it had no time limit)*. [`--max-compute`](#options-of-quillo-run)
+  still ends the whole request, script and all.
+- Like any code, it may nest at most 256 levels deep. A name in its error is cut at 100
+  characters (``int has no method `aaaa…` ``), and the method names it calls are not kept by
+  the server after it ends *(since 0.8.9: each was kept for good)*.
 
 ### Images
 
@@ -4824,9 +4877,13 @@ fn touch() {
   laptop), keep an id in the session and check it against the database.
 - The session cookie is `__Host-quillo_session` when it is `Secure` and for the whole
   site (as in production): browsers take a cookie with that prefix only from the very
-  host, over HTTPS, so a sibling subdomain (another tenant's site) cannot plant one.
-  Elsewhere ([`--watch`](#options-of-quillo-run), `quillo run main.qwe --watch` while working on a program; a
-  mounted program) it is `quillo_session`. A request with two
+  host, over HTTPS, so a sibling subdomain (another tenant's site) cannot plant one. A
+  program mounted under a path has one of its own, with the path in its name and `Path=/`:
+  `__Host-shop.quillo_session` for `mount /shop`, `__Host-a.b.quillo_session` for `/a/b`
+  *(since 0.8.9: `quillo_session` at `Path=/shop`, which a sibling subdomain could plant)*.
+  Elsewhere ([`--watch`](#options-of-quillo-run), `quillo run main.qwe --watch` while working on a program;
+  [`--plain-http`](#options-of-quillo-run); under [`--base`](#options-of-quillo-run), where the site's other paths may be
+  other programs') it is `quillo_session`, with the program's path. A request with two
   session cookies that are both valid here has no session: one of them was planted.
 - Set `QUILLO_SECRET` to a long random string (`crypto.token()` makes one) and use the
   same one on every server. Without it, a random key is made at start: sessions end
@@ -5100,7 +5157,9 @@ server's code:
   them. There is no log file or syslog option.
 - **Quillo's own addresses.** Under `/_quillo/` the server answers: `health`, `ready`
   and, with [`--metrics`](#options-of-quillo-run), `metrics`; `live` (the live-data WebSocket, or a long poll where
-  it cannot open); `wt` and `wt-ticket` (channels); `events`, `dev` and `src/...`
+  it cannot open); `wt` and `wt-ticket` (channels; `wt-ticket` is 404 for a program that
+  surely uses none: no `channel`, `media` or `js` in it, nothing mounted, no service and no
+  plugin *(since 0.8.9)*); `events`, `dev` and `src/...`
   (`--watch`); `quillo.js`, `media.js`, `b/<hash>.js`, `r/<hash>.js` and
   `s/<hash>.css` (what pages load); `rpc/<name>` (`server fn` calls) and `markdown`;
   `service/<name>` and `join` (services); `announce` ([`--register`](#options-of-quillo-run)); `describe`
@@ -5308,6 +5367,9 @@ has logged in or out.
 - **Prefetching changes nothing.** A route asked for ahead of a click may read (the
   database, files, other servers) but not write: `db.exec` or SQL that writes, assigning
   a global variable, cookies and sessions, files, `publish`, `notification.send`, `http.post` and the like,
+  `http.request` with a method other than `GET`, `HEAD` or `OPTIONS`, `http.stream` with one
+  or a `body`, `udp.send`, `udp.reply`, `channel.send`, `channel.broadcast` *(since 0.8.9:
+  these were sent, as the visitor)*,
   and calls to services stop it, and it is answered "not prefetched" (503, which the
   browser drops; the request log shows it as any 503, with no error line). The page is
   then made, as usual, when the link is followed. So pointing at a `GET` that does something (a
@@ -5486,7 +5548,10 @@ Each packet adds a line, `hall: 21.5 °C`, to every page open on `/`, without a 
 - Packets wait in a queue while the handler is busy (10,000 unless `queue` says
   otherwise, and 64 MiB at most). A full queue drops its oldest packet, as UDP would,
   except that a sender holding more than half of it while others wait has its new packet
-  dropped, so one sender cannot push out the rest *(since 0.7)*. A batch the server could
+  dropped, so one sender cannot push out the rest *(since 0.7)*. More than half is of the
+  queue's packets when it is full by count, and of its bytes when it is full by size, and a
+  sender is its address, or for IPv6 its /64 *(since 0.8.9: by bytes alone, so a sender of
+  empty packets filled the queue and was never held back)*. A batch the server could
   not take for five seconds is dropped with a line in the log; on a server started with
   [`--metrics`](#options-of-quillo-run) (`quillo run main.qwe --metrics`),
   `quillo_udp_received_total` and `quillo_udp_dropped_total` count them. Nothing slows
@@ -5561,9 +5626,13 @@ component Board() {
   as UDP packets do (see [UDP](#udp)): like a request, with waits holding up no one. An
   error in `f` is logged and the next message goes on. Each of `f`, `join` and `leave`
   is called with as many arguments as it declares.
-- `join(peer)` decides whether a page may join (anything but `null`, `false` or an error
+- `join(peer, name)` decides whether a page may join (anything but `null`, `false` or an error
   says yes): anyone who can open a page can ask, so a channel whose messages are not for
-  everyone has one (`(peer) => peer.session.user != null`). `leave(peer)` hears that a
+  everyone has one (`(peer) => peer.session.user != null`). `name` is the channel's, as a
+  media stream's rule is told its stream's (see [Media](#media)) *(since 0.8.9)*. The session
+  a page brings is its own program's: in a program that mounts others, a page of one sees its
+  session in that program's handlers only, and none in another's *(since 0.8.9: a session a
+  visitor set in one program was taken by another's `join`)*. `leave(peer)` hears that a
   page left, or closed (for each channel it was in; not when the server itself
   stops). A channel no `channel.on` names may be joined, to hear what the program
   broadcasts on it; what pages send on it goes nowhere. There is no list of who is
@@ -5580,7 +5649,10 @@ component Board() {
   (`channel.peers`) is its tenant's room's; with no tenant, the bare domain's, the room of
   no tenant. Code run for no one, a job, a tick or the top level, reaches every tenant's
   room, and `with_tenant(name, f)` one tenant's. `{ tenants: "shared" }` makes one room
-  for every tenant. Under `--split`, a service's channel is per tenant whatever it says.
+  for every tenant. Under `--split`, a service's channel is per tenant whatever it says,
+  and while a service does not answer (it is starting again, or down), a page cannot join a
+  channel no program claims, as it may be that service's *(since 0.8.9: it joined as no
+  one's, without the service's `join`, and stayed once the service was back)*.
   Pages may ask of 4,096 channel names in all; past that a page asking to join is told no.
 
   A chat for people who are signed in, with both sides:
@@ -5625,8 +5697,21 @@ component Board() {
   numbers; there is no binary message). Each page has room for 4096 messages on their
   way to it: when it is full, a plain message is dropped and counted, and a `reliable`
   one closes the connection, so the page comes back and joins again rather than miss
-  it. A channel keeps 10,000 messages from pages waiting for its handler; past that the
-  oldest goes. Nothing is kept for a page while it is away.
+  it. Nothing is kept for a page while it is away.
+- **Messages from pages wait for the handler** within bounds counted in bytes: 4 MiB a page,
+  an eighth of the total a client (an address, or an IPv6 /64), a quarter a channel, and
+  256 MiB in all, or [`--max-memory`](#concurrency-and-reloading) when it is smaller; and
+  10,000 messages a channel. A page past its share is held back, its socket not read until
+  there is room, so it loses nothing; a message sent as a datagram over WebTransport is
+  dropped instead (and with 10,000 waiting, the oldest goes) *(since 0.8.9: only the count
+  was kept, 10,000 messages of up to 1 MiB)*. A message over 1 KiB is read within
+  `--max-memory`.
+- **A message must keep coming.** One a page sends in parts, or over 4 KiB, is read in 8
+  KiB pieces, counted as they come against 64 MiB for all such messages at once (or
+  `--max-memory`, when smaller), an eighth of it for one client, and must be whole within
+  10 s, and a second more for each 16 KiB that came. Past either, the connection ends, and
+  the page connects again. A message of one frame of 4 KiB or less is read at once *(since
+  0.8.9: a message never finished held up to 1 MiB for good)*.
 - In the page, messages sent before the join is answered, or while the connection is
   down, wait (up to 256 a channel) and go once it is joined; sent on a channel that
   refused the page, they are dropped. `.send` gives `null`.
@@ -5655,7 +5740,11 @@ How messages travel:
   own, good for 13 days and replaced after 11, which browsers take by its hash (they
   take such certificates for two weeks at most); [`--tls-cert`](#options-of-quillo-run) and [`--tls-key`](#options-of-quillo-run), given
   together, give it a real one. A WebTransport connection is kept alive every 5 s and
-  dropped after 20 s of silence. Behind a proxy that passes HTTP only, open the UDP
+  dropped after 20 s of silence. A session counts among the connections a server keeps
+  open, as a WebSocket does (see [Live data](#live-data)), opens at most 8 streams of
+  media frames and 2 both ways, and may have 1 MiB a stream, and 4 MiB in all, on its way
+  before the server reads it *(since 0.8.9: it was not counted, and one session could hold
+  about 100 MiB)*. Behind a proxy that passes HTTP only, open the UDP
   port to the server itself, or pages use the WebSocket. [`--no-wt`](#options-of-quillo-run) turns WebTransport
   off, as does a build without the `realtime` feature. The browser's Network panel shows
   a WebTransport session open but none of its messages, so to watch a channel's messages
@@ -5698,13 +5787,18 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   codec: "h264" }` says so in full). The packets never reach Quillo code: the server puts
   them back in order (waiting 50 ms, or 256 packets, for a late one), makes frames of
   them (it reads single NAL units, STAP-A and FU-A), and passes each on to every page
-  watching, without decoding or encoding anything. Any sender that reaches the port is
-  taken (the payload type and SSRC are not checked), and there is no RTCP and no SRTP:
-  keep the ports to the network the camera is on. The server keeps at most 600 frames
+  watching, without decoding or encoding anything. The ports are on this machine alone,
+  `127.0.0.1`, unless `host` names another address (`host: "0.0.0.0"` for all of them, for a
+  camera elsewhere on the network) *(since 0.8.9: every address, unless `host` said)*. One
+  sender is taken at a time: the first, by its address and SSRC, until it has sent nothing
+  for 2 s, and another's packets are dropped meanwhile *(since 0.8.9: any sender's packets
+  went between the camera's)*. The payload type is not checked, and there is no RTCP and no
+  SRTP: keep the ports to the network the camera is on. The server keeps at most 600 frames
   since the last keyframe, and 32 MiB of them (256 MiB for all streams: past that a stream
   keeps none, and a page that starts watching it waits for its next keyframe).
-- **Who may watch** is `media.on(name, { watch })`'s `watch(peer)`, asked as a channel's
-  `join` is, with the page's session. A stream no `watch` names is watched by no page
+- **Who may watch** is `media.on(name, { watch })`'s `watch(peer, name)`, asked as a channel's
+  `join` is, with the page's session; `name` is the stream the page asks for, which a rule
+  for a name ending in `*` needs (below). A stream no `watch` names is watched by no page
   *(since 0.7: any page could watch any stream)*.
 - `<quillo-media stream="cam">` in any page plays the stream: the page loads a small
   script for it (4.5 KB compressed, `/_quillo/media.js`, put into any page that writes
@@ -5732,12 +5826,27 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   two seconds, and Opus at 64 kbit/s, what the relay passes on) and sends the frames on
   its channel connection; the server passes them on as it does RTP, decoding nothing.
   Sound needs Chromium's capture API (`MediaStreamTrackProcessor`): a browser without it
-  sends the picture alone. `publish(peer)` says which pages may, as a channel's `join`
+  sends the picture alone. `publish(peer, name)` says which pages may, as a channel's `join`
   does (with the page's `session()`); without it, no page may *(since 0.7: any page
-  could)*. A video call is a stream per person:
+  could)*.
+- **A rule for a name ending in `*` checks the name.** `publish` and `watch` are called as
+  `(peer, name)`, `name` being the stream asked for (`call:42:ana`); a rule written with one
+  parameter is called as before. A rule that does not read `name` lets a page it lets in for one
+  stream watch, or send into, every stream the name starts, and `quillo check` warns of it
+  (`` `media.on("call:*")`'s `publish` never reads which stream is asked for ... ``) *(since
+  0.8.9: the rules were not told the name, so the call below, written with `session().user
+  != null`, let anyone signed in watch every call and send video into anyone's)*. A video
+  call is a stream per person, `call:<room>:<person>`: a person sends only their own, and
+  watches only the rooms they are in:
 
   ```quillo
-  media.on("call:*", { publish: (peer) => session().user != null, watch: (peer) => session().user != null })
+  fn room_of(name: str) = split(name, ":")[1]
+  fn in_room(room) = db.one("select 1 as yes from members where room = ? and user = ?", room, session().user) != null
+
+  media.on("call:*", {
+      publish: (peer, name) => name == `call:${room_of(name)}:${session().user}` && in_room(room_of(name)),
+      watch: (peer, name) => in_room(room_of(name)),
+  })
 
   component Call(room: str, me: str, others: list) {
       <div>
@@ -5747,7 +5856,7 @@ ffmpeg -f avfoundation -framerate 30 -video_size 1280x720 -i "0:0" \
   }
   ```
 
-  `no-video` or `no-audio` leaves one out. Given a MediaStream as its `source` (a
+  On `<quillo-media publish>`, `no-video` or `no-audio` leaves one out. Given a MediaStream as its `source` (a
   canvas's, the screen's: `el.source = js("navigator.mediaDevices.getDisplayMedia")` in
   `@mount`), it sends that instead of the camera. Its `data-state` is `starting`,
   `sending`, `refused` (no camera, or `publish` said no), `ended` or `unsupported`, and
@@ -5882,8 +5991,11 @@ route GET /docs/*p = files("manual", p, { index: "home.htm", extensions: ["htm"]
 - The program's own files are known by their device and inode as well as by name: the
   `.env` and `.env.*` (a service's too), the [`--env-file`](#options-of-quillo-run) and
   [`--tls-key`](#options-of-quillo-run) (kept by the path given, so a key renewed through
-  a link, as certbot does, stays refused), the `.qwe`, `.qwer` and `.rs` files loaded, and
-  the databases open. So a hard link to one, or one saved anew, is refused too.
+  a link, as certbot does, stays refused), the `.qwe`, `.qwer` and `.rs` files loaded, the
+  policy files the program runs under (`quillo.policy`, and one [`--policy`](#the-policy)
+  names, by any name), and the databases open. So a hard link to one, or one saved anew, is
+  refused too. A file named `quillo.policy` is never served *(since 0.8.9: `quillo serve DIR`
+  served the folder's own, which names the secrets' variables, inner hosts and limits)*.
 - No SQLite database is served by `files()` or `quillo serve`, whatever its name:
   each is known by its content (the header, a `-wal`, `-shm` or `-journal` beside it), the
   program's, a tenant's, another program's, or one no one has open. `file("backup.db")`
@@ -6100,7 +6212,17 @@ view Header(user) = <header>
   wrote in them. In that form the values put in (`{name}`) are still escaped, on the
   server and in the browser: `raw(t("welcome", { name: user.name }))` keeps the
   translation's `<b>` and shows the name as text. (Only that form: `raw` of a variable
-  holding `t(...)`'s text makes all of it HTML.)
+  holding `t(...)`'s text makes all of it HTML.) A key no locale has shows as itself, and in
+  that form as text, escaped, so `` raw(t(`flash.${msg}`)) `` with a `msg` from the request
+  shows a visitor's `<script>` as text *(since 0.8.9: it was put into the page as HTML)*.
+  An attribute of the translation's markup that takes a URL (`href`, `src`, `action` and
+  the like) and holds a value, `"Visit <a href=\"{url}\">{name}</a>"`, is
+  `about:blank#blocked` where what is written there makes a `javascript:` or `vbscript:`
+  URL once the values are put in, as in markup; the same value as text (`<i>{title}</i>`,
+  "JavaScript: The Good Parts") shows as written. An attribute written without quotes that
+  holds a value (`<a href={url}>`) is quoted, so the value cannot end it *(since 0.8.9:
+  `raw(t("site", { url }))` took a visitor's `javascript:` link as it was)*. The browser
+  does the same.
 - `with_locale("de", () => ...)` runs code in another locale (an email in the
   recipient's language).
 - `translations({ en: {...}, fr: {...} })` takes the text directly instead of a folder.
@@ -6129,9 +6251,12 @@ The mounted program runs unchanged, with its own globals and its own database, a
 sees paths without the prefix (`url().path` is `/products`, not `/shop/products`).
 Its root-relative links and form actions (`href`, `src`, `action`), its redirects, its
 browser bundle, its `server fn` calls, live data and page changes are all moved under the
-prefix. Its cookies are set for the prefix (`Path=/shop`), its session cookie is
-`quillo_session` and is signed for that mount, so the two programs' sessions never pass
-for each other. Its file paths count from its own folder; the services it declares are
+prefix. Its cookies are set for the prefix (`Path=/shop`), its session cookie is its own,
+`__Host-shop.quillo_session` at `Path=/` (`quillo_session` at `Path=/shop` over plain HTTP
+and under `--base`; see [Cookies and sessions](#cookies-and-sessions)), and is signed for
+that mount, so the two programs' sessions never pass for each other, in their channels'
+handlers too *(since 0.8.9: `quillo_session` at `Path=/shop` whatever the scheme, and the
+other program's handlers took a page's session)*. Its file paths count from its own folder; the services it declares are
 shared with the program that mounts it. `/_quillo/health` and `/_quillo/metrics` are
 the process's, at the root only. `mount`, like `service`, is written at the top level.
 Changes to mounted files are picked up by [`--watch`](#options-of-quillo-run) (`quillo run main.qwe --watch`). See
@@ -6423,8 +6548,9 @@ When a service runs elsewhere, its calls are made to hold up:
   known, a `url` that does not lead to where the copy joined from), 401 (a bad or old
   signature, no nonce, the shared secret where the app has the service's key, another
   service's key), 403 (the app has neither `QUILLO_SERVICE_SECRET` nor keys, or
-  [`--no-join`](#options-of-quillo-run) and [`--allow-join`](#options-of-quillo-run) refuse it), 404 (no such service), 405 (not a POST) or
-  409 (a nonce sent before). Only copies call it, so a proxy in front of the app need not
+  [`--no-join`](#options-of-quillo-run) and [`--allow-join`](#options-of-quillo-run) refuse it), 404 (no such service), 405 (not a POST),
+  409 (a nonce sent before) or 413 (a body over 4 KB, refused before it is read *(since
+  0.8.9: it was read whole first)*). Only copies call it, so a proxy in front of the app need not
   pass it from outside.
 - **Made later.** `billing.later.invoice(name, 1200)` does not wait: the call is kept, its
   id is the result, and it is made in the background, tried every second, then a little
@@ -6539,7 +6665,14 @@ server fn refund(account: int, cents: int) for ["shop"] {
   service is not taken here; `exp` is required too, and `nbf`, `iss` and `aud` are
   checked, with a minute's leeway. A token that fails is a 401 that says why (`the
   bearer token: the token is not for billing (aud)`, `... has expired`, `... has no exp:
-  it would be good for ever`, `an unsigned token`).
+  it would be good for ever`, `an unsigned token`). The token must be the caller's own,
+  from the client credentials grant: the client is named by `client_id`, `azp`, `cid`
+  (Okta's) or `appid` (Entra ID v1's), else by `sub`, and a token whose `sub` is someone
+  else (a user who signed in through that client) is refused (`the token is one a user
+  signed in for (sub "ana@example.com"), not client "0oa1shop"'s own ...`), so a page that
+  forwards its visitor's token does not call as the client *(since 0.8.9: Okta's and Entra
+  ID v1's user tokens, which name the client in `cid` and `appid`, were taken as the
+  client's own, named by the user's login)*.
 - `client_cert: { header }`: the identity in the header a proxy that ended mutual TLS
   sets, as Envoy's `x-forwarded-client-cert` (`Subject="CN=shop,O=Acme";URI=spiffe://...`):
   the SPIFFE id whole, as Istio's policies name principals
@@ -6604,7 +6737,7 @@ function's call: `request.caller` is null, and `for` is not checked):
 - `request.caller`: `{ name, by }`, `by` being `"quillo"` (the shared secret; `name` as
   the caller signed it, or `""` where `accept_calls` names callers another way), `"key"`,
   `"jwt"` (with `scopes`, from `scope` or `scp`, and the token's `claims`; `name` its
-  `client_id`, `azp` or `sub`) or `"mtls"` (with `subject`, and `uri` for a SPIFFE id,
+  `client_id`, `azp`, `cid`, `appid` or `sub`) or `"mtls"` (with `subject`, and `uri` for a SPIFFE id,
   which is then its `name` too). What `check` gave, when it gave a map.
 - `request.user`: the claims of the visitor's token, when the caller forwarded its
   `authorization` and `accept_calls`'s `jwt` takes it; else null.
@@ -6638,9 +6771,10 @@ for the same.
 For a caller that is not a Quillo service (a gateway, a program in another language with
 an OAuth token), `accept_calls { jwt }` takes its token at `/_quillo/service/<fn>` with
 `x-quillo-to` and `x-quillo-call`. Or the service offers routes, a JSON API, checked as
-middleware with the catalog's `jwt.qwer` (2.0.0: `jwt_check(token, secret, { audience,
-issuer, require })`, `exp` required unless told otherwise, and `jwt_verify_jwks` for an
-identity provider's keys) or `oidc.qwer` (1.1.0: `oidc_client_credentials` fetches a
+middleware with the catalog's `jwt.qwer` (3.0.0: `jwt_check(token, secret, { audience,
+issuer, require, leeway })`, `exp` required unless told otherwise, a token with no `aud` or
+`iss` refused when an audience or an issuer is asked for, an option not known or of the
+wrong type an error, and `jwt_verify_jwks` for an identity provider's keys) or `oidc.qwer` (1.1.0: `oidc_client_credentials` fetches a
 token, `oidc_verify_access` checks one), and called with `http.*`. That gives up what
 `service` brings: `quillo check` of each call, contracts, retries run once, deadlines,
 `.later` and published topics.
@@ -7011,7 +7145,11 @@ stays the simpler choice when the next move depends on the answer.
   `oninput={(e) => { preview = str(markdown(e.value)) }}` and `<div>{raw(preview)}</div>`.
   `/_quillo/markdown` takes at most 1 MB of text (a larger one is answered 413, and
   `markdown` in the component gives an error value), and one that computes past
-  [`--max-compute`](#options-of-quillo-run) is a 500.
+  [`--max-compute`](#options-of-quillo-run) is a 500. Under
+  [`--max-memory`](#concurrency-and-reloading), what the text will take as it is made into
+  HTML (its marks, its tables' cells, its fenced code to highlight) is worked out from the
+  text first, and one that would pass the limit is a 500 before anything is made *(since
+  0.8.9: 1 MB of `[` made 180 MB under a limit of 8 MB)*.
   `markdown_page(text, { title, lang, html })` is the same as a whole page, for a route:
   a doctype, a `<head>` with its `<title>` (the option's, else the text's first level-one
   heading, `# Title` or a line underlined with `=`, as the text it shows, without its
@@ -7250,7 +7388,13 @@ Safety built in:
   `join([...])`) that reaches `db.query`, `db.one` or `db.exec`, or the same on a
   connection from `db.connect`, whether passed directly, piped (`` `...${x}` |
   db.query ``) or made first in a variable (`let q = ...`, `q += ...`); pass the values
-  as `?` parameters instead. Names cannot be parameters: put a table's or a column's
+  as `?` parameters instead. It follows such SQL through a function of the program's that
+  builds and returns it (`db.query(build(request.query.n))`, the function written before or
+  after), through `str`, `trim`, `lower`, `upper` and `replace`, through a map's field or a
+  list's item it was put in, `s = s + n` and a loop that builds an `IN (...)` list, and out
+  of a `return` inside an `if`; a map's other fields, a list's other items and a helper
+  given only safe text are not said *(since 0.8.9: SQL built in a helper or passed through
+  these was not seen)*. Names cannot be parameters: put a table's or a column's
   name in with `sql_name(name)` (or a list of them; quoted `"name"`, or `` `name` `` when
   the program's database is MySQL; `conn.sql_name(name)` quotes for the connection it is
   called on, `db.sql_name(name)` for the program's), and named parameters with
@@ -8282,7 +8426,8 @@ sends one on purpose. Back it up with `db.exec("vacuum into
   other requests never see its changes early.
 - **The session is the transaction's** *(since 0.7)*. A pooled connection goes from one
   request to another, so what a statement changes beyond its transaction would reach the
-  next visitor: `set` (without `local`), `set_config(..., false)`, a `create temp` table,
+  next visitor: `set` (without `local`), `set_config(..., false)`, `update pg_settings set
+  setting = ...` (which is `set`) *(since 0.8.9: it was not seen)*, a `create temp` table,
   `listen`, a session's advisory lock, a cursor `with hold`, `set session authorization`.
   Every transaction's connection (`db.transaction`, `db.atomic` and migrations alike) is
   reset as it ends, before it goes back (`set session authorization default`, `reset
@@ -8293,7 +8438,12 @@ sends one on purpose. Back it up with `db.exec("vacuum into
   case or quoting, unless its third argument is `true`; a `pg_temp` table; and a `begin`
   anywhere in a script. A `do` block, and a call of a function of the database's own
   (which may change the session where Quillo cannot read it), runs outside a transaction
-  on a connection of its own, reset after it. `prepare` is refused everywhere: pass values as
+  on a connection of its own, reset after it; so do PostgreSQL's functions that run SQL
+  given as text or read tables and views by name, `query_to_xml` and its kin
+  (`cursor_to_xml`, `table_to_xml`, `schema_to_xml`, `database_to_xml`), `ts_stat` and
+  `ts_rewrite` *(since 0.8.9: they ran on the shared connection)*. What a view, a rule or a
+  trigger changes of the session is not seen: keep session changes (`set_config(...,
+  false)`, `set`) out of the functions they call. `prepare` is refused everywhere: pass values as
   parameters (`?`), which Quillo prepares itself. Inside a SQLite transaction a PostgreSQL
   query takes a free connection at once or is an error, as waiting would hold every request. Row-level
   security's setting per request is therefore written inside the transaction, as local:
@@ -8361,7 +8511,10 @@ sends one on purpose. Back it up with `db.exec("vacuum into
 - Connections come from the driver's pool (10 to 100), and a query releases the
   interpreter lock while it waits, as with Postgres. `pool_size` is PostgreSQL's: in a
   MySQL URL it stops the database from opening; the driver's own `pool_min` and
-  `pool_max` set the pool. A transaction keeps one connection until it ends; nested
+  `pool_max` set the pool. An idle connection is kept a minute, and `inactive_connection_ttl`
+  (seconds) sets that *(since 0.8.9: the driver closed every connection handed back past ten
+  idle ones, so a busy program opened thousands a second and ran out of ports)*. A
+  transaction keeps one connection until it ends; nested
   ones are savepoints. A Unix socket is `?socket=/path`.
 - `db.migrate()` takes turns through a named lock (`get_lock`). A migration may change
   the schema, but such a statement commits at once in MySQL (outside the refusal above),
@@ -8798,7 +8951,8 @@ work, division by a written zero, return and error types, effects, view and comp
 component code that cannot run in a browser, route mistakes, and calls like `last(xs)`
 where a variable of yours named `last`, known not to be a function, hides the builtin.
 Also: a parameter, a record's field, or a local `fn` or `state` named twice; a pattern's
-type the program has not (`Usr`); a `let` or a `match` that cannot match what it is given
+type the program has not (`Usr`); a type that names itself with nothing between (`type Ab
+= Ab | int`, see [Records](#records)) *(since 0.8.9)*; a `let` or a `match` that cannot match what it is given
 (`let [a, b] = [1]`, `match x { }`); a lambda called with the wrong number of arguments,
 by its `let` name or given to `map`, `filter`, `reduce`, `sort_by` and the like; a list
 whose item is not what `list<T>` takes (`[1, "a"]` for `list<int>`); a field `request`
@@ -8850,8 +9004,18 @@ view `Card`; a name imported as a builtin's; a key written twice in a map
 before it is no second key); a function written in a route's answer, which cannot be
 JSON (`` this route's answer holds a function at `f` ``), the program's own or one the
 route's block makes (`fn helper() = 2`, `let f = (x) => x`; a call of it is a value); a job or tick named twice where
-both calls may run. Warnings never make
-it fail.
+both calls may run; a `GET` route that writes and reads who the visitor is (see `writes`
+under [Routes](#routes)); a `media.on` rule *(since 0.8.9)* for a name ending in `*` whose
+`publish` or `watch` never reads which stream is asked for (see [Media](#media)). Warnings
+never make it fail.
+
+A type grows as the code is read (a list of maps of lists, made again on each line), so
+the check keeps each to 1,000,000 parts and 64 levels, and takes what grows past them as
+unknown, which says less but never wrongly: a program whose types double on each line is
+checked at once, and a data table written out keeps its fields known *(since 0.8.9: such a
+program took the check's memory)*. A check of code from a program's users, by
+`check_program`, keeps tighter limits and a time (see [Checking code from a
+program](#checking-code-from-a-program)).
 
 [`quillo check --policy FILE`](#other-commands) (`quillo check main.qwe --policy host.toml`)
 checks the program as it would run under that policy (and
@@ -8955,11 +9119,19 @@ other request goes on. No `??` takes it, and it is said at the line that made th
   log.
 - Lists and maps are compared as they grow: `push`, `range`, `flatten`, spreads, `merge`,
   `set`, `group_by`, `json.parse`, a site's answer, a query's rows, a form's fields.
+- A visitor's JSON is read with each text, list and map counted at its size as it is made:
+  `request.json` and a form's JSON, a `server fn`'s arguments (the files and decimals in
+  them too), `/_quillo/markdown`'s text (and the HTML it will make, worked out first), and a
+  page's channel message over 1 KiB. So a small body that would make many empty lists stops
+  at the limit *(since 0.8.9: JSON was counted in values, at least 1,000,000 whatever the
+  limit, and a 3 KB body made 136 MB)*.
 - Bytes read stop at the limit (`read_file`, `http`, a site's call, a request's body), and
   their text (U+FFFD for each byte that is not UTF-8) is held to it too.
+- What pages' channel messages hold while they wait for a handler is at most 256 MiB, or the
+  limit when it is smaller (see [Channels](#channels)).
 - Not held to it: the sum of many values each under it (bounded by time, with
   `--max-compute`), copies no larger than what they copy (`slice`, `map`, `filter`, `sort`),
-  error messages, sessions and channels, and the PostgreSQL driver's own rows.
+  error messages, sessions, the values channels keep, and the PostgreSQL driver's own rows.
 
 Each instance and each `--split` service holds the same limit, and `--split` passes
 `--max-compute` on to its services too *(since 0.8.7: they ran without it)*.
@@ -9549,7 +9721,10 @@ Each file only narrows what the ones before it allow: a list is a condition ever
 must meet, so a later file cannot give back what an earlier one took away. A file that
 says something a policy does not say, or a word that is not an effect, stops the program
 with exit 2, naming the file and the line (`quillo.policy:2: `disk` is not an effect`).
-What one refuses names the file that refused it.
+What one refuses names the file that refused it. None of them is served: a file named
+`quillo.policy`, and each policy file the program runs under, by its name or a hard link's,
+is a miss for `files()` and `quillo serve` (see [Static files](#static-files)) *(since
+0.8.9)*.
 
 ```toml
 # /etc/quillo/policy.toml: what any program on this server may do

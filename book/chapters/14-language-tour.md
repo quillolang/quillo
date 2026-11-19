@@ -316,8 +316,19 @@ match v {
 - A type is named like `User` or `OrderLine` (a capital letter first, and small ones),
   which keeps it apart from constants such as `MAX` or `DAY`; `type ID = int` is
   refused. A record may name itself (`type Node = { value: int, kids: list<Node> = [] }`).
+  A type that names itself with nothing between is an error, as a value of it could be
+  anything (`` type Ab names itself with nothing between: put a record, a list or a map
+  shape in the way (`type Ab = list<Ab> | int`) `` for `type Ab = Ab | int`) *(since 0.8.9)*.
   `type`, like `service` and `mount`, is written at the top level. A field that is
   there but `null` counts as missing: its default fills it, or it is reported.
+- **How deep a record is checked.** A value from a request (a `server fn`'s arguments, a
+  route pattern's `json`, `form` and query records) is checked to its end, up to 512 levels,
+  each type named on the way counting as one, and refused past them (`... is nested more
+  than 512 deep`, a 400 for a `server fn`). A union of records (`type Tt = Aa | Bb`) is
+  tried once for each value, so a deep valid one is made in time in proportion to its size.
+  What the program builds itself (`Node(v)`, an annotation, a `match`) is checked 64 levels
+  deep, as before *(since 0.8.9: a request's value was checked 64 levels deep too, and what
+  was below went unchecked)*.
 - `date` is text that is a calendar date (`YYYY-MM-DD`, a real day): `type Leave = {
   start: date, end: date }` refuses `"2026-02-30"` and a date-time, in a record, an
   annotation (`fn next(d: date)`), a pattern (`match x { date => ... }`, a query's `?

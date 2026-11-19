@@ -1352,8 +1352,9 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   in the background keeps its connection and runs its loaders as a visible one does. A
   page on another site cannot open it (403).
 - A server keeps at most 4096 such connections open (live data, [`--watch`](#options-of-quillo-run) reloads,
-  channels over a WebSocket), and at most 256 for one client: an IPv4 address, or an
-  IPv6 /64 network. Channels over WebTransport are not counted. Past that, a page is
+  channels over a WebSocket or WebTransport), and at most 256 for one client: an IPv4
+  address, or an IPv6 /64 network *(since 0.8.9: channels over WebTransport were not
+  counted)*. Past that, a page is
   answered `503`, keeps what it shows, says so once in the console, and asks again when
   told. The server says so once in its log, and `quillo_live_refused_total` counts them.
 - **Behind a proxy, name it.** Every visitor is then the proxy's address, so without
@@ -1381,7 +1382,10 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   the visitor's other tabs, and nothing waits for it. Randomness made in SQL (`select
   hex(randomblob(8))`) is a read, so such a run is shared: make tokens with
   `crypto.token`. `nextval` or a writing function behind a view is not seen either: put
-  it in the query.
+  it in the query. The runs kept for sharing weigh 64 MB at most in all, each weighed at 41
+  bytes for each byte of its answer's JSON, the oldest let go first; a run heavier than that
+  alone (an answer past about 1.6 MB) is not kept *(since 0.8.9: they were kept by their
+  arguments, with no bound)*.
 - **What a thousand pages cost** depends on whether the loader is shared. A loader for
   everyone runs once a change however many pages show it. One that reads the viewer runs
   once for each page, on every change to what it read, so with many pages and a busy
@@ -1747,6 +1751,9 @@ client gets from a call:
 - An answer past what the door takes in (10 MiB of JSON, or 128 levels deep) is an `isError`
   saying so, never a cut or empty answer; a tool that crashes answers `internal error` and the
   door goes on serving.
+- A message over HTTP is read as a page's JSON is: under `--max-memory`, one whose values
+  would pass the limit is a parse error that says so *(since 0.8.9: it was read whole first)*.
+  A tool's arguments are checked against its parameters' types once, as a `server fn`'s are.
 
 A policy's `max_compute` and `max_body` hold `quillo mcp` as they hold `quillo run`. On
 Windows, `print` goes to stderr, but other writes to stdout (a `.qwer` plugin's own output) are

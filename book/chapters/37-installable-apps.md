@@ -175,8 +175,9 @@ routes offline /help {
   (the runtime, the bundles, the sheets), so that a page never opened opens offline with its
   components working. A page with a parameter is kept once it is opened. The worker asks for
   them one at a time as a prefetch, which Quillo answers changing nothing (see
-  [Prefetching](#routes-prefetching)): a route that would write, set a cookie or call a service is
-  refused, and kept only once someone opens it; a redirect is skipped. A page Quillo is too
+  [Prefetching](#routes-prefetching)): a route that would write, set a cookie, call a service, or
+  send a packet, a channel message or a request that writes, is refused, and kept only once
+  someone opens it; a redirect is skipped. A page Quillo is too
   busy to prefetch (others' requests are waiting, as a prefetch never goes before anyone) is
   asked again within the try, after 0.25, 0.5, 1 and 2 s, 5 s for the whole try. A page that
   did not come (no network, a `502` to `504`) is asked for again on later navigations, 10 s,
@@ -226,7 +227,10 @@ too, for that visitor's session alone:
   script first in its head, the gate, which shows it when the browser's `quillo_tag` names
   that session, and otherwise shows the offline page and drops that session's pages. The
   page's `content-security-policy` names the gate by its hash; a kept page whose policy
-  would stop it anyway (a `sandbox` without `allow-scripts`) is not given back at all.
+  would stop it anyway (a `sandbox` without `allow-scripts`), or keep it from reading the
+  cookie (a `sandbox` without `allow-same-origin`), is not given back at all *(since 0.8.9:
+  under `sandbox allow-scripts` the gate could not read the cookie, and the page showed to
+  the next person on the device)*.
 - **Any change to the session drops them**: a sign-out, a sign-in as another person, a
   sign-in in two steps, a cart written into the session. They are kept again, under the new
   name, as they are opened. The worker learns of it from the answer that changed the
@@ -234,9 +238,12 @@ too, for that visitor's session alone:
   page with components, and from the register script on offline pages without them.
 - **A session the server no longer takes** (past its time, or signed with a
   `QUILLO_SECRET` since changed) is no one, as a request with no session cookie at all is:
-  the next page drops every session's kept pages. A sign-out the worker could not see (a
-  redirect to another site) is caught so, at the next page of the site. A session dropped
-  is never kept again, even by an answer of its that comes late.
+  the next page drops every session's kept pages. A sign-out that redirects to another
+  site, whose answer the worker cannot read, drops the session's pages at once where the
+  browser gives a worker the Cookie Store API (Chromium's browsers): the worker follows
+  `quillo_tag` itself, and reads it after such a redirect *(since 0.8.9)*. Elsewhere it is
+  caught at the next page of the site. A session dropped is never kept again, even by an
+  answer of its that comes late.
 
 **Where there is no worker.** Under [`--watch`](#options-of-quillo-run) no page registers
 it, and `/_quillo/sw.js` is a worker that takes itself away with what Quillo's worker kept,

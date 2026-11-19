@@ -744,9 +744,13 @@ server that only says it is billing cannot answer for it.
 **Callers that are not Quillo services.** A gateway, or a service in another language,
 can sign Quillo's calls (the wire is above), send a token `jwt` takes, or call routes.
 For routes, check the token in a route's middleware with the catalog's `jwt.qwer`
-(2.0.0: `jwt_check` with `audience`, `issuer` and `require`, `exp` required, and
-`jwt_verify_jwks` for an identity provider's keys); `oidc.qwer` 1.1.0 adds
-`oidc_client_credentials`, to fetch a token for calling out, and `oidc_verify_access`.
+(3.0.0: `jwt_check` with `audience`, `issuer` and `require`, `exp` required, and
+`jwt_verify_jwks` for an identity provider's keys). A token with no `aud` or `iss` is
+refused when an audience or an issuer is asked for, and an option not known or of the
+wrong type is an error *(since jwt 3.0.0: such a token was taken, and an option given as
+null, an unset variable's, turned its check off)*. `oidc.qwer` 1.1.0 adds
+`oidc_client_credentials`, to fetch a token for calling out, and `oidc_verify_access`. See
+[Authentication](#jwt-jwks-and-paseto) for the checks.
 Routes give up what `service` brings (checked calls, contracts, retries run once,
 deadlines, `.later`), so prefer `accept_calls` where the caller can send a token.
 

@@ -119,6 +119,11 @@ pwa = ["# Installable apps, offline pages and notifications", "",
 while pwa[-1] == "":
     pwa.pop()
 add("37-installable-apps.md", "pwa", pwa, ("page", "introduction"))
+# The website's guide to signing people in (quillo-app1 FEEDBACK78), after the web chapters
+au = shift(site_guide("authentication"), -1)
+au = replace_once(au, "this page shows how, one protocol at a time", "this chapter shows how, one protocol at a time")
+au = replace_once(au, "for every plugin on this page:", "for every plugin in this chapter:")
+add("38-authentication.md", "authentication", au, ("guide", "authentication"))
 add("41-database.md", "database", replace_once(shift(site_guide("database"), -1),
     "This page goes through it", "This chapter goes through it"), ("guide", "database"))
 add("42-money.md", "money", replace_once(shift(site_guide("money"), -1),

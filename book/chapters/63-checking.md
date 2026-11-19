@@ -11,7 +11,8 @@ work, division by a written zero, return and error types, effects, view and comp
 component code that cannot run in a browser, route mistakes, and calls like `last(xs)`
 where a variable of yours named `last`, known not to be a function, hides the builtin.
 Also: a parameter, a record's field, or a local `fn` or `state` named twice; a pattern's
-type the program has not (`Usr`); a `let` or a `match` that cannot match what it is given
+type the program has not (`Usr`); a type that names itself with nothing between (`type Ab
+= Ab | int`, see [Records](#records)) *(since 0.8.9)*; a `let` or a `match` that cannot match what it is given
 (`let [a, b] = [1]`, `match x { }`); a lambda called with the wrong number of arguments,
 by its `let` name or given to `map`, `filter`, `reduce`, `sort_by` and the like; a list
 whose item is not what `list<T>` takes (`[1, "a"]` for `list<int>`); a field `request`
@@ -63,8 +64,18 @@ view `Card`; a name imported as a builtin's; a key written twice in a map
 before it is no second key); a function written in a route's answer, which cannot be
 JSON (`` this route's answer holds a function at `f` ``), the program's own or one the
 route's block makes (`fn helper() = 2`, `let f = (x) => x`; a call of it is a value); a job or tick named twice where
-both calls may run. Warnings never make
-it fail.
+both calls may run; a `GET` route that writes and reads who the visitor is (see `writes`
+under [Routes](#routes)); a `media.on` rule *(since 0.8.9)* for a name ending in `*` whose
+`publish` or `watch` never reads which stream is asked for (see [Media](#media)). Warnings
+never make it fail.
+
+A type grows as the code is read (a list of maps of lists, made again on each line), so
+the check keeps each to 1,000,000 parts and 64 levels, and takes what grows past them as
+unknown, which says less but never wrongly: a program whose types double on each line is
+checked at once, and a data table written out keeps its fields known *(since 0.8.9: such a
+program took the check's memory)*. A check of code from a program's users, by
+`check_program`, keeps tighter limits and a time (see [Checking code from a
+program](#checking-code-from-a-program)).
 
 [`quillo check --policy FILE`](#other-commands) (`quillo check main.qwe --policy host.toml`)
 checks the program as it would run under that policy (and

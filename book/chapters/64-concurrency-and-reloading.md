@@ -52,11 +52,19 @@ other request goes on. No `??` takes it, and it is said at the line that made th
   log.
 - Lists and maps are compared as they grow: `push`, `range`, `flatten`, spreads, `merge`,
   `set`, `group_by`, `json.parse`, a site's answer, a query's rows, a form's fields.
+- A visitor's JSON is read with each text, list and map counted at its size as it is made:
+  `request.json` and a form's JSON, a `server fn`'s arguments (the files and decimals in
+  them too), `/_quillo/markdown`'s text (and the HTML it will make, worked out first), and a
+  page's channel message over 1 KiB. So a small body that would make many empty lists stops
+  at the limit *(since 0.8.9: JSON was counted in values, at least 1,000,000 whatever the
+  limit, and a 3 KB body made 136 MB)*.
 - Bytes read stop at the limit (`read_file`, `http`, a site's call, a request's body), and
   their text (U+FFFD for each byte that is not UTF-8) is held to it too.
+- What pages' channel messages hold while they wait for a handler is at most 256 MiB, or the
+  limit when it is smaller (see [Channels](#channels)).
 - Not held to it: the sum of many values each under it (bounded by time, with
   `--max-compute`), copies no larger than what they copy (`slice`, `map`, `filter`, `sort`),
-  error messages, sessions and channels, and the PostgreSQL driver's own rows.
+  error messages, sessions, the values channels keep, and the PostgreSQL driver's own rows.
 
 Each instance and each `--split` service holds the same limit, and `--split` passes
 `--max-compute` on to its services too *(since 0.8.7: they ran without it)*.
@@ -646,7 +654,10 @@ Each file only narrows what the ones before it allow: a list is a condition ever
 must meet, so a later file cannot give back what an earlier one took away. A file that
 says something a policy does not say, or a word that is not an effect, stops the program
 with exit 2, naming the file and the line (`quillo.policy:2: `disk` is not an effect`).
-What one refuses names the file that refused it.
+What one refuses names the file that refused it. None of them is served: a file named
+`quillo.policy`, and each policy file the program runs under, by its name or a hard link's,
+is a miss for `files()` and `quillo serve` (see [Static files](#static-files)) *(since
+0.8.9)*.
 
 ```toml
 # /etc/quillo/policy.toml: what any program on this server may do

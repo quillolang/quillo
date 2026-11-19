@@ -1,5 +1,210 @@
 # Changelog
 
+## Unreleased (0.8.9)
+
+Found by the security audit of 0.8.7 (FEEDBACK75.md, Q-1050 to Q-1095, and Q-1120 found in
+review), and by the study of authentication (FEEDBACK78.md, Q-1169).
+
+### Security
+
+- **A wildcard media stream's rules are told which stream a page asks for.** With
+  `media.on("call:*", ...)`, a page let in for one stream could watch every stream under it and
+  send its own video into anyone's, the guide's video call included, as `publish` and `watch`
+  were called with the peer alone. They are called as `(peer, name)`, `name` being the stream
+  asked for (`call:42:ana`), and a channel's `join` is given the channel's name the same way;
+  a rule written with one parameter is called as before. `quillo check` warns of a `*` rule
+  whose `publish` or `watch` never reads the name, and the guide's call checks it (FEEDBACK75.md,
+  Q-1050, the user's choice).
+- **`media.rtp` listens on this machine unless told otherwise, and takes one sender at a
+  time.** It listened on every interface and took any sender's packets, so anyone who reached
+  the UDP port put their video between the camera's frames, for every viewer. `host` gives
+  another address (`"0.0.0.0"`: all of them, as before); the first sender, by its address and
+  SSRC, is taken until it has sent nothing for 2 s, and another's packets are dropped meanwhile
+  (FEEDBACK75.md, Q-1066).
+- **A visitor's JSON is read within `--max-memory`.** A `server fn`'s arguments, `request.json`,
+  a form's JSON, `/_quillo/markdown`'s text and a page's channel messages over 1 KiB are read
+  with each text, list and map counted at its real size as it is made, so a request whose
+  values pass the limit ends with the memory 500. One call of about 10 KB of gzip made about
+  1 GB before its arguments were checked; under any limit a 3 KB body made 136 MB, as JSON's
+  count of values had a floor of 1,000,000 and an empty list or map counted as one. With no
+  limit, and for JSON Quillo trusts (a split service's answers, replays of idempotent
+  requests, stored channel values), nothing changes. A message to the MCP door over HTTP of
+  more than 1 KiB is read the same way; stdio's are read as before (FEEDBACK75.md, Q-1052,
+  Q-1070).
+- **The markdown door reckons what it will make before it makes it**: `/_quillo/markdown`
+  made 160 to 220 MB from a 1.2 KB request (1 MB of `[`, gzipped), past `--max-memory`. What the
+  parser's tree, the highlighter and the HTML will take is worked out from the text, and past
+  the limit the request is the memory 500 before anything is parsed (FEEDBACK75.md, Q-1069).
+- **`/_quillo/join` refuses a body over 4 KB**, with 413, before reading it: its JSON was read
+  whole before the signature could be checked, and 1 KB of gzip made 100 MB (FEEDBACK75.md,
+  Q-1052).
+- **Live runs kept for sharing have a bound.** They were kept by their arguments' bytes, and
+  256 calls of about 10 KB kept 2.5 GB for good. A run is kept by a keyed digest of its call,
+  the runs kept weigh 64 MB at most, the oldest let go first, and a run heavier than that alone
+  is not kept (FEEDBACK75.md, Q-1057).
+- **`data-q-` words in a page cost nothing**: one comment of `data-q-XXXXXXXX` words made each
+  view of its page compute for seconds to minutes, past `--max-compute`. A page's marks are
+  looked up once among the program's own styles' (80,000 of them: 6.07 s to 2 ms)
+  (FEEDBACK75.md, Q-1054).
+- **What pages' messages hold while they wait for a handler is counted in bytes.** A channel
+  kept 10,000 messages from pages, up to 1 MiB each, so one visitor on one socket could make
+  the server hold gigabytes. Messages waiting take at most 4 MiB a page, an eighth of the total
+  a client, a quarter a channel, and 256 MiB in all, or `--max-memory` if smaller; a page past
+  its share waits, its socket unread, instead of losing messages; a message sent as a
+  WebTransport datagram is dropped past it, as one past a full queue was (FEEDBACK75.md,
+  Q-1056).
+- **A channel message begun must keep coming.** A socket that never finished a message held up
+  to 1 MiB for good, on 4,096 sockets, outside `--max-memory`. A message in parts, or over 4
+  KiB, is read in 8 KiB pieces counted as they come, against 64 MiB for all such messages (or
+  `--max-memory`, if smaller) and an eighth of it for one client, and must be whole within 10
+  s, and a second more for each 16 KiB that came; past either, the connection ends. A whole
+  message in one frame of 4 KiB or less is read as before (FEEDBACK75.md, Q-1073).
+- **WebTransport sessions are held as WebSockets are.** A session counts among the 4,096
+  connections the server keeps (256 a client), where it was not counted; it opens at most 8
+  streams of frames and 2 both ways; and it may have 1 MiB a stream, and 4 MiB in all, sent
+  before the server reads it. One session could hold about 100 MiB in unfinished frames
+  (FEEDBACK75.md, Q-1074).
+- **A program's session reaches its own channels only.** A page's channel ticket names the
+  program it came from, and another mounted program's handlers see no session for it: a
+  session a visitor could set freely in one program was taken by another's `join` and handlers
+  (FEEDBACK75.md, Q-1061).
+- **Under `--split`, a channel no program claims is not joined while a service is silent.**
+  While a service started again (a crash, a deploy), anyone could join its channels as no
+  one's, without its `join`, and kept hearing them once it was back (FEEDBACK75.md, Q-1065).
+- **A mounted program's session cookie has a name of its own**: `__Host-shop.quillo_session`
+  for `mount /shop`, at `Path=/`, where it was `quillo_session` at `Path=/shop`, which a sibling
+  subdomain could plant with a session of its own, so the visitor was signed in as the
+  attacker, or out. Under `--base`, and over plain HTTP (`--watch`, `--plain-http`, `quillo
+  app`), it is `quillo_session` with the program's path, as before (FEEDBACK75.md, Q-1077).
+- **UDP fairness counts packets too.** A sender of empty packets filled a port's queue, pushed
+  everyone else's out and was never held back, its bytes being few. A sender holding more than
+  half of a full queue's packets, or of its bytes, has its new packet dropped, and IPv6 senders
+  count by their /64 (FEEDBACK75.md, Q-1094).
+- **`check_program` stays within its budget.** A 699-byte program whose types doubled on each
+  line took the server's memory until it was killed. A confined check (`check_program`) keeps a
+  type to 10,000 parts and 16 levels, taking what grows past them as unknown, and past 2 s, or
+  about a million parts kept in all, gives one error, `the code is too complex to check`.
+  `quillo check` and `quillo run` take a type past 1,000,000 parts or 64 levels as unknown and
+  say what 0.8.8 said (FEEDBACK75.md, Q-1053). A confined check quotes no `.rs` file's text
+  (Q-1095).
+- **`run_script` no longer holds its instance.** A 143-byte script held an instance for 13 s,
+  as a step was one call however much it read. A builtin or a comparison costs a step for each
+  KB it reads, as each KB made did, and a script stops after 100 ms unless `run_script(source,
+  vars, { timeout })` says otherwise, from 1 ms to 60 s (FEEDBACK75.md, Q-1055, the user's
+  choice). A script's method names are no longer kept for good (each request leaked its
+  source's size), and a name in its errors is cut at 100 characters (Q-1076).
+- **A prefetch sends no packet and no message.** Pointing at a link (65 ms), or the offline
+  worker installing, ran a `GET`'s `udp.send`, `udp.reply`, `channel.send`,
+  `channel.broadcast`, `http.request` with a method that writes, or `http.stream` with one or a
+  `body`, as the visitor. Each is refused in a prefetch, as `http.post` was (FEEDBACK75.md,
+  Q-1062).
+- **`quillo.policy` is never served**: `quillo serve DIR` and `files(".", path)` served the
+  folder's policy file, which names the secrets' variables, inner hosts and limits. A
+  `quillo.policy`, and the policy file the program runs under by any name, a hard link to it
+  too, are kept back as `.env` is (FEEDBACK75.md, Q-1088).
+- **A translation key from the request is shown as text.** `raw(t(key))` wrote a key missing
+  from every locale as HTML, so `` raw(t(`flash.${msg}`)) `` put a visitor's `<script>` into the
+  page. Such a key is written escaped, on the server and in the browser (FEEDBACK75.md,
+  Q-1059).
+- **A URL put into a translation's markup is checked as markup's are.** `raw(t("site", {
+  url }))` wrote a `javascript:` link into `<a href="{url}">` as it was. An attribute that takes
+  a URL is `about:blank#blocked` where what is written there, once the values are put in and the
+  translation's own character references read, makes a `javascript:` or `vbscript:` URL; an
+  attribute written without quotes that holds a value is quoted, so the value cannot end it.
+  The same value as text (`<i>{title}</i>`) is shown as written; the browser does the same
+  (FEEDBACK75.md, Q-1083).
+- **A PostgreSQL session change by other words is caught.** `update pg_settings set setting =
+  ...` changed the shared connection's session for every later visitor; it is refused outside
+  a transaction, as `set` is. `query_to_xml` and its kin (`cursor_to_xml`, `table_to_xml`,
+  `schema_to_xml`, `database_to_xml`), `ts_stat` and `ts_rewrite`, which run SQL Quillo cannot
+  read, run on a connection of their own, reset after them, as a `do` block does. A view, a
+  rule or a trigger that changes the session is still not seen (FEEDBACK75.md, Q-1060).
+- **A user's own Okta or Entra ID token is not a service's.** `accept_calls { jwt }` named an
+  Okta token's caller by its `sub`, the user's login, which then matched itself, so every
+  user's token for the audience passed as a service's own. Okta's `cid` and Entra ID v1's
+  `appid` name the client, after `client_id` and `azp`, so such a token is a user's and is
+  refused (FEEDBACK75.md, Q-1079).
+- **A record from a request is checked to its end.** A recursive record was checked 64 levels
+  deep, and below that wrong types, values outside a set of strings and extra fields reached a
+  `server fn`'s parameters and route patterns. A request's value is checked to its end, up to
+  512 levels (each type named on the way counting one), and refused past them (`is nested more
+  than 512 deep`); a union is tried once for each value, so a deep valid one is made in linear
+  time, and a `server fn`'s arguments, and an MCP tool's, are checked once: a tool's call
+  with a valid tree 22 levels deep took 1.4 s, as the door checked its arguments a second time
+  in exponential time, and 62 levels would have held a worker for good. What the program builds
+  itself is checked as before. `quillo check` refuses a type that names itself with nothing
+  between (`type Ab = Ab | int`) (FEEDBACK75.md, Q-1080).
+- **An offline page's gate fails closed under a sandbox.** Under `content-security-policy:
+  sandbox allow-scripts` the gate could not read the session's cookie and stopped, and the page
+  showed, its scripts run, to the next person on the device. A kept page whose policy is a
+  `sandbox` without `allow-same-origin`, as without `allow-scripts`, is not given back
+  (FEEDBACK75.md, Q-1078).
+- **A sign-out that redirects to another site drops the kept pages.** They stayed in Cache
+  Storage, readable on the device, until a page of the site was opened online. Where the
+  browser gives a worker the Cookie Store API (Chromium's), Quillo's worker follows
+  `quillo_tag` itself, and reads it after a redirect, so the session's pages go at once
+  (FEEDBACK75.md, Q-1082).
+
+### Fixed
+
+- **MySQL and MariaDB keep their connections while the program is busy.** The driver closed
+  every connection handed back past ten idle ones, so 64 requests at once opened 31,563
+  connections in 5 s, left 16,506 sockets waiting to close and failed 14,082 of 93k requests.
+  Idle connections now stay a minute unless the URL gives `inactive_connection_ttl`; the same
+  load opens 169, with no failures (FEEDBACK78.md, Q-1169).
+- **`quillo check` and a `GET` that writes**: a write through `http.stream` with a writing
+  `method` or a `body`, `http.request` whose method a `let` holds, `udp.send`, `udp.reply`,
+  `channel.send` or `channel.broadcast`, SQL a `let` holds, and a function a `let` holds, are
+  warned of as `db.exec` was; their forms that write nothing are not (FEEDBACK75.md, Q-1084).
+- **`quillo check` and SQL built in a helper**: SQL built from values is warned of where a
+  function of the program's builds it (written before or after its caller), where it goes
+  through `str`, `trim`, `lower`, `upper` or `replace`, a map's field or a list's item, `s = s +
+  n` or a loop that builds an `IN` list, and where it is returned from inside an `if`. Only
+  what is built is said: a map's other field, a helper given only safe text, and `sql_name` are
+  not (FEEDBACK75.md, Q-1085).
+- **"Did you mean" at once**: a name is compared with others within a band, and the search
+  stops early, so 3,000 unknown names among 3,000 functions of 67 letters check in about a
+  second, where they took 82 s, with the same suggestions (FEEDBACK75.md, Q-1120, found in
+  review).
+
+### Changed
+
+What a program may notice:
+
+- **`media.on`'s `publish` and `watch`, and `channel.on`'s `join`, may take the name as a
+  second parameter**: `(peer, name) =>`. A rule for a name ending in `*` should check it: the
+  guide's video call does (Q-1050).
+- **`media.rtp` listens on 127.0.0.1**: a camera or an encoder on another machine needs `host`
+  (`media.rtp("cam", { video: 5004, host: "0.0.0.0" })`, best a private address), and a second
+  sender is taken only after the first has been quiet for 2 s (Q-1066).
+- **`run_script(source, vars, { timeout })`** stops after 100 ms unless `timeout` says (a number
+  of milliseconds, or `"250ms"`, `"2s"`; 1 ms to 60 s; another option, or one out of range, is
+  an error), with the error value `the script took longer than its 100 ms`. A script that
+  walks large values near 20,000 steps may stop sooner, each KB read costing a step (Q-1055).
+- **`check_program` past its caps** gives the one error `the code is too complex to check:
+  ...` in place of all else (Q-1053).
+- **A mounted program's session cookie is `__Host-<mount>.quillo_session`** over HTTPS without
+  `--base`, so a person signed in to a mounted program before the upgrade signs in again
+  (Q-1077).
+- **A request's value nested past 512 levels is refused**, and a type that names itself with
+  nothing between is an error (Q-1080).
+- **New `quillo check` warnings**: a `GET` route that writes in the ways above (Q-1084), SQL
+  built in a helper or through text functions (Q-1085), and a `*` media rule that never reads
+  the stream's name (Q-1050).
+- **A page that sends faster than a channel's handler takes its messages** is held back, its
+  socket left unread, rather than having the oldest messages dropped (Q-1056).
+- **`/_quillo/wt-ticket` is 404** for a program that surely uses no channel or media (none of
+  `channel`, `media` or `js` in it, nothing mounted, no service, no plugin), where anyone could
+  connect and send what the server reads (Q-1052).
+- **`quillo.policy` is a miss** for `files()` and `quillo serve`, as `.env` is (Q-1088).
+- **`update pg_settings` outside a transaction is refused** on PostgreSQL, and `query_to_xml`
+  and its kin run on a connection of their own (Q-1060).
+- **`raw(t(key))` of a key no locale has is escaped text**, and a URL attribute of a
+  translation's markup that a value makes a `javascript:` one is `about:blank#blocked`
+  (Q-1059, Q-1083).
+
+<!-- FEEDBACK75 slices D and B wave 2: to add -->
+
 ## 0.8.8 (2026-11-19)
 
 Found by the tests written for 0.8.7's coverage (Q-1100 to Q-1117).

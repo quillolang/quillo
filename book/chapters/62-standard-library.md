@@ -56,7 +56,11 @@
   `oninput={(e) => { preview = str(markdown(e.value)) }}` and `<div>{raw(preview)}</div>`.
   `/_quillo/markdown` takes at most 1 MB of text (a larger one is answered 413, and
   `markdown` in the component gives an error value), and one that computes past
-  [`--max-compute`](#options-of-quillo-run) is a 500.
+  [`--max-compute`](#options-of-quillo-run) is a 500. Under
+  [`--max-memory`](#concurrency-and-reloading), what the text will take as it is made into
+  HTML (its marks, its tables' cells, its fenced code to highlight) is worked out from the
+  text first, and one that would pass the limit is a 500 before anything is made *(since
+  0.8.9: 1 MB of `[` made 180 MB under a limit of 8 MB)*.
   `markdown_page(text, { title, lang, html })` is the same as a whole page, for a route:
   a doctype, a `<head>` with its `<title>` (the option's, else the text's first level-one
   heading, `# Title` or a line underlined with `=`, as the text it shows, without its
@@ -295,7 +299,13 @@ Safety built in:
   `join([...])`) that reaches `db.query`, `db.one` or `db.exec`, or the same on a
   connection from `db.connect`, whether passed directly, piped (`` `...${x}` |
   db.query ``) or made first in a variable (`let q = ...`, `q += ...`); pass the values
-  as `?` parameters instead. Names cannot be parameters: put a table's or a column's
+  as `?` parameters instead. It follows such SQL through a function of the program's that
+  builds and returns it (`db.query(build(request.query.n))`, the function written before or
+  after), through `str`, `trim`, `lower`, `upper` and `replace`, through a map's field or a
+  list's item it was put in, `s = s + n` and a loop that builds an `IN (...)` list, and out
+  of a `return` inside an `if`; a map's other fields, a list's other items and a helper
+  given only safe text are not said *(since 0.8.9: SQL built in a helper or passed through
+  these was not seen)*. Names cannot be parameters: put a table's or a column's
   name in with `sql_name(name)` (or a list of them; quoted `"name"`, or `` `name` `` when
   the program's database is MySQL; `conn.sql_name(name)` quotes for the connection it is
   called on, `db.sql_name(name)` for the program's), and named parameters with
@@ -1327,7 +1337,8 @@ sends one on purpose. Back it up with `db.exec("vacuum into
   other requests never see its changes early.
 - **The session is the transaction's** *(since 0.7)*. A pooled connection goes from one
   request to another, so what a statement changes beyond its transaction would reach the
-  next visitor: `set` (without `local`), `set_config(..., false)`, a `create temp` table,
+  next visitor: `set` (without `local`), `set_config(..., false)`, `update pg_settings set
+  setting = ...` (which is `set`) *(since 0.8.9: it was not seen)*, a `create temp` table,
   `listen`, a session's advisory lock, a cursor `with hold`, `set session authorization`.
   Every transaction's connection (`db.transaction`, `db.atomic` and migrations alike) is
   reset as it ends, before it goes back (`set session authorization default`, `reset
@@ -1338,7 +1349,12 @@ sends one on purpose. Back it up with `db.exec("vacuum into
   case or quoting, unless its third argument is `true`; a `pg_temp` table; and a `begin`
   anywhere in a script. A `do` block, and a call of a function of the database's own
   (which may change the session where Quillo cannot read it), runs outside a transaction
-  on a connection of its own, reset after it. `prepare` is refused everywhere: pass values as
+  on a connection of its own, reset after it; so do PostgreSQL's functions that run SQL
+  given as text or read tables and views by name, `query_to_xml` and its kin
+  (`cursor_to_xml`, `table_to_xml`, `schema_to_xml`, `database_to_xml`), `ts_stat` and
+  `ts_rewrite` *(since 0.8.9: they ran on the shared connection)*. What a view, a rule or a
+  trigger changes of the session is not seen: keep session changes (`set_config(...,
+  false)`, `set`) out of the functions they call. `prepare` is refused everywhere: pass values as
   parameters (`?`), which Quillo prepares itself. Inside a SQLite transaction a PostgreSQL
   query takes a free connection at once or is an error, as waiting would hold every request. Row-level
   security's setting per request is therefore written inside the transaction, as local:
@@ -1406,7 +1422,10 @@ sends one on purpose. Back it up with `db.exec("vacuum into
 - Connections come from the driver's pool (10 to 100), and a query releases the
   interpreter lock while it waits, as with Postgres. `pool_size` is PostgreSQL's: in a
   MySQL URL it stops the database from opening; the driver's own `pool_min` and
-  `pool_max` set the pool. A transaction keeps one connection until it ends; nested
+  `pool_max` set the pool. An idle connection is kept a minute, and `inactive_connection_ttl`
+  (seconds) sets that *(since 0.8.9: the driver closed every connection handed back past ten
+  idle ones, so a busy program opened thousands a second and ran out of ports)*. A
+  transaction keeps one connection until it ends; nested
   ones are savepoints. A Unix socket is `?socket=/path`.
 - `db.migrate()` takes turns through a named lock (`get_lock`). A migration may change
   the schema, but such a statement commits at once in MySQL (outside the refusal above),
