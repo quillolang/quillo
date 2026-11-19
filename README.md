@@ -314,30 +314,22 @@ for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; 
 
 ### Test coverage
 
-**Rust: 97.92% of lines** run under the tests (77,866 lines, 1,622 not run), **96.62% of
-regions** (187,400, 6,328 not run).
+**Rust: 98.25% of lines** run under the tests (78,506 lines, 1,376 not run), **97.00% of
+regions** (188,943, 5,676 not run).
 **Browser runtime (`src/client/runtime.js`): 99.89% of lines** (6,631 lines, 7 not run).
-Both were measured together on 2026-11-18 on 0.8.7's code (6e55af9) on macOS, from 4,045
-tests with Chrome, PostgreSQL and MariaDB included; none failed (two that failed under the
-load, feedback52_jit's call given up for the stack and a UDP test's order, passed run alone).
-Of the 6,751 lines of Rust added since 0.8.6's run, 344 did not run in this one, which is why
-the total fell from 98.34%: 116 are in `src/foreign.rs`, which works out whether the browser
-reads an element as HTML, SVG or MathML, in its cautious branches (a spread attribute, a loop or an
-assignment that carries a value, `<font>` and `annotation-xml`, a walk out of budget); 59 are
-`--max-memory`'s bounded JSON writers stopping at the limit in each kind of value, and text
-methods nothing calls yet; 41 are a page's rendering stopping at that limit (attributes,
-classes, islands, two large texts or lists joined); 38 are `notification`'s messages for a
-wrong call and a push service's failures; the rest are the GET-that-writes warning past three
-writes, IPv6 loopback peers, a session changed while the device's notifications cannot be
-turned off, and fallbacks (an interrupted read, an `unreachable!` arm). runtime.js's 7 lines
-are defensive guards. The Rust figures are the Lines and Regions columns of `cargo llvm-cov`'s total. A line counts as
+Both were measured together on 2026-11-19 on 0.8.8's code (f35bf2d) on macOS, from 4,121
+tests with Chrome, PostgreSQL and MariaDB included; none failed (three that failed under the
+load, a debugger test, a UDP test's order and closing a desktop app's window, which needs the
+screen unlocked, passed run alone). The total rose from 0.8.7's 97.92% with the tests written
+for the lines 0.8.7 added that no test ran (branch coverage-087), which also found the bugs
+0.8.8 fixes. runtime.js's 7 lines are defensive guards. The Rust figures are the Lines and Regions columns of `cargo llvm-cov`'s total. A line counts as
 run when any part of it ran, so `let x = f()?;` is run though `f` never failed; regions
 count each part, which is why they are lower (FEEDBACK49.md). The runtime's is V8's own
 coverage from headless Chrome and every Node a test starts, mapped back to runtime.js's
 lines. What Rust does not run is mostly operating system failures (a thread or a socket
 that cannot be made), other systems' branches (`src/platform.rs`, `src/desktop.rs`),
-`unreachable!` arms and timers; the files with the most are `src/value.rs` (138 lines),
-`src/foreign.rs` (119), `src/check.rs` (103) and `src/interp.rs` (103).
+`unreachable!` arms and timers; the files with the most are `src/value.rs` (130 lines),
+`src/check.rs` (92), `src/ws.rs` (79) and `src/interp.rs` (76).
 
 Rust must stay at **97.90% of lines or above** (the aim is 99%), and runtime.js at
 **99.50% or above** on every change, and every line a change
