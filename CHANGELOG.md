@@ -36,6 +36,18 @@ Found by the tests written for 0.8.7's coverage (Q-1100 to Q-1117).
   script over two `raw` values now sees it ended after the first, and the server log says
   so once for each line. `annotation-xml` with `encoding="text&#47;html"` is no longer taken
   for MathML (coverage of 0.8.7, Q-1116, Q-1117). Each worker's page starts at HTML.
+- **What Quillo writes after such a page is read as HTML.** Where raw markup left an `<svg>`
+  open, the browser read what came after the page inside it: a deferred part's `<template>`
+  became an SVG element and its script SVG's, as did the next part after one whose own raw
+  markup lost the place, and the page states' script made `<img` an element and `&quot;` a
+  quote that ends its string. Deferred parts on such a page are written in the form safe in
+  both readings; an empty `<span></span>`, which ends SVG and MathML, goes before the page's
+  `</body>` and after a part that lost the place; and the page states' script has its `<`
+  and `&` as `\u003c` and `\u0026`, as the translations' script has. Raw markup that leaves an
+  `<svg>` or `<math>` open, a start tag that closes an element by itself (a second `<li>`, a
+  `<p>` after a `<p>`), and `</mi>` or `</mo>` with an HTML element open inside now make
+  Quillo unsure where the browser is, and a view whose markup did so is not kept in the view
+  cache (coverage of 0.8.7, Q-1116).
 - **Pages with SVG render faster**: reading markup inside `<svg>` takes 39-49% less time,
   as tag names are matched at once where 0.8.7 compared them with a list of 44 on every
   tag. A page of 5,000 `<rect>`s answers in 0.90 ms where it took 1.04 ms, nested SVG in

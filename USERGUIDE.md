@@ -1700,8 +1700,12 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   ends the element it names and those open inside it, as the browser's parser does. Where
   Quillo cannot tell where the browser is (a `</div>` that names nothing open, one that walks
   past a `<p>`, `<li>`, `<a>`, `<form>` or the like, a `<table>`, a `<select>`, a
-  `<template>`), every later script on that page, after the page's own `</svg>` too, is
-  written in the form safe in both readings. A script inside `<svg>` ends where the browser
+  `<template>`, an `<svg>` or `<math>` left open, a second `<li>` or `<p>` that closes the
+  first), every later script on that page, after the page's own `</svg>` too, is written in
+  the form safe in both readings, the page's deferred parts' too, and an empty
+  `<span></span>`, which ends SVG and MathML wherever the browser is, goes before its
+  `</body>` (and after a deferred part that lost the place), so that what Quillo writes after
+  the page is read as HTML. A script inside `<svg>` ends where the browser
   ends it, after a CDATA section in it. Markup inside `<svg>` or `<math>` that stops partway
   (`raw("<!-- x")`, `raw("<a href='x")`, a `<script>` with no `</script>`, a last `<`) has
   its end written (`-->`, `'>`, `</script>`, `&lt;`), so the browser never reads on into the
