@@ -54,6 +54,13 @@ const SLOW: Duration = Duration::from_secs(30);
 /// A body that keeps coming slower than this, past its first `SLOW`, is given up on: a byte
 /// every 25 s held a connection for good (FEEDBACK51.md, Q-672; branch feedback51-fixes).
 const MIN_BODY_RATE: u64 = 1024;
+/// How long after a stop a request may go on arriving: past it, it is told 503 (see
+/// `refuse_arriving`; FEEDBACK75.md, Q-1091; branch feedback75). The time a head or a silent body
+/// has.
+const STOP_BODY: Duration = SLOW;
+/// The most a gzip body may decode to, as a multiple of what was sent (and 64 KB beside it): see
+/// `parse` (FEEDBACK75.md, Q-1090; branch feedback75).
+const GZIP_RATIO: usize = 100;
 /// How long a connection being closed may keep sending (see `linger`).
 const LINGER: Duration = Duration::from_secs(2);
 /// A request's stack: address space, used only as needed.
@@ -195,6 +202,21 @@ pub fn over_time() -> bool {
     let over = OWN_BUSY.with(|b| b.borrow().as_ref().is_some_and(|b| b.over.swap(false, SeqCst)));
     OVER_TIME.store(lock(&LOOPS_BUSY).iter().any(|b| b.over.load(SeqCst)), SeqCst);
     over
+}
+
+/// What the request running here may still compute before `--max-compute` ends it, by the
+/// watchdog's own clock (from when its loop last resumed it): None where nothing limits it, or
+/// this thread runs no request. For a builtin whose one call computes long, so that it stops in
+/// time and not at the request's next step after it (FEEDBACK75.md, Q-1075; branch feedback75).
+pub fn compute_left() -> Option<Duration> {
+    let limit = MAX_COMPUTE.load(std::sync::atomic::Ordering::Relaxed);
+    if limit == 0 {
+        return None;
+    }
+    OWN_BUSY.with(|b| {
+        let since = b.borrow().as_ref()?.since.load(SeqCst);
+        (since != 0).then(|| Duration::from_millis(limit.saturating_sub(clock().saturating_sub(since))))
+    })
 }
 
 /// `--max-memory`: the most bytes one value a request makes may take; 0 for no limit. A failed
@@ -1306,6 +1328,9 @@ impl Loop {
                     }
                 }
                 self.close_idle();
+                if self.now.duration_since(since) >= STOP_BODY {
+                    self.refuse_arriving();
+                }
                 if self.quiet() || drain().is_some_and(|d| self.now.duration_since(since) >= d) {
                     flush_log();
                     gil.release();
@@ -1325,6 +1350,33 @@ impl Loop {
                     self.close(i, c);
                 }
             }
+        }
+    }
+
+    /// Stopping, `STOP_BODY` after the stop: each request still arriving (its head or its body)
+    /// is told 503, with `Connection: close`, and its connection closed once that is written. The
+    /// stop waits, with no limit unless `--drain` sets one, for the requests being answered, which
+    /// it would cut off (the user's graceful stop, 2026-11-09); one that has not yet arrived has
+    /// had no work done, and a body trickled at a little over 1 KiB/s held a stop for as long as
+    /// it kept coming, 78 s seen and hours possible (FEEDBACK75.md, Q-1091; branch feedback75).
+    /// A connection with an answer still being written, or requests waiting their turn
+    /// (`pending`), keeps its place until they are written.
+    fn refuse_arriving(&mut self) {
+        for i in 0..self.slots.len() {
+            let Slot::Idle(c) = &self.slots[i] else { continue };
+            if c.receiving.is_none() || c.lingering || !c.pending.is_empty() || !c.output.is_empty() {
+                continue;
+            }
+            let Slot::Idle(mut c) = std::mem::replace(&mut self.slots[i], Slot::Free) else { continue };
+            if let Some(line) = c.body_of.take() {
+                log_refused(&line, 503, "the server is stopping, and the body had not come 30 s after");
+            }
+            write_response(&mut c.output, &crate::server::plain_response(503, "the server is stopping\n"), false, true);
+            if let Ok(true) = flush(&mut c) {
+                self.linger(i, c);
+                continue;
+            }
+            self.close(i, c);
         }
     }
 
@@ -2496,11 +2548,18 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
             "identity" | "" => {}
             "gzip" | "x-gzip" => {
                 use std::io::Read;
+                // No more than `GZIP_RATIO` times what was sent, and 64 KB: decoded only to
+                // `--max-body`, 10 KB on the wire carried 10 MB to the route, the JSON reader and
+                // every other limit after it, which saw only the decoded size, so each cost a byte
+                // there took a thousandth of a byte to send (FEEDBACK75.md, Q-1090; branch
+                // feedback75). Real uploads compress 3 to 20 times.
+                let most = max_body.min(body.len().saturating_mul(GZIP_RATIO).saturating_add(64 << 10));
                 let mut out = Vec::new();
-                let read = flate2::read::MultiGzDecoder::new(&body[..]).take(max_body as u64 + 1).read_to_end(&mut out);
+                let read = flate2::read::MultiGzDecoder::new(&body[..]).take(most as u64 + 1).read_to_end(&mut out);
                 match read {
                     Err(_) => return Parsed::Bad(400, "the body is not gzip, as its content-encoding says"),
                     Ok(_) if out.len() > max_body => return Parsed::Bad(413, "request body too large (once decompressed)"),
+                    Ok(_) if out.len() > most => return Parsed::Bad(413, "request body too large for what was sent (once decompressed, more than 100 times its size)"),
                     Ok(_) => body = out,
                 }
             }

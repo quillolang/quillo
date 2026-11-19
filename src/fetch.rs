@@ -288,10 +288,25 @@ pub fn public_ip(ip: IpAddr) -> bool {
             if s[0] == 0x2002 {
                 return public_v4(Ipv4Addr::new((s[1] >> 8) as u8, s[1] as u8, (s[2] >> 8) as u8, s[2] as u8));
             }
+            let embedded = || Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
+            // IPv4-translated, ::ffff:0:a.b.c.d (RFC 2765, 6145): a stateless translator (SIIT)
+            // takes it to the IPv4 address, loopback and the metadata service among them, which
+            // was taken for public (FEEDBACK75.md, Q-1093; branch feedback75).
+            if s[0..6] == [0, 0, 0, 0, 0xffff, 0] {
+                return public_v4(embedded());
+            }
+            // ISATAP, an interface of ::5efe:a.b.c.d (or ::200:5efe:, RFC 5214) under any prefix:
+            // sent inside IPv4 to the address it ends in (Q-1093).
+            if s[4] & 0xfdff == 0 && s[5] == 0x5efe && !public_v4(embedded()) {
+                return false;
+            }
             !(a.is_unspecified()
                 || a.is_loopback()
                 || a.is_multicast()
-                || s[0..6] == [0, 0, 0, 0, 0, 0] // IPv4-compatible, and the rest of ::/96
+                // IPv4-compatible, and the rest of 0::/8, which IANA keeps (none of it is anyone's
+                // address on the internet): ::/96 was refused, and ::ffff:0:0/96 beside it was not
+                // (Q-1093).
+                || s[0] < 0x0100
                 || (s[0] & 0xfe00) == 0xfc00 // unique local, fc00::/7
                 || (s[0] & 0xffc0) == 0xfe80 // link-local, fe80::/10
                 || (s[0] & 0xffc0) == 0xfec0 // site-local, fec0::/10
@@ -393,7 +408,13 @@ fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, Stri
     if let Some(left) = left {
         req = req.timeout(left);
     }
-    for (k, v) in headers {
+    // Those that say how the request is framed, or are the connection's own, are the client's to
+    // write, from the body it sends: a program's `content-length: 3` before a longer body made the
+    // upstream read the rest as a second request, and a route that passed on a visitor's headers
+    // let them send any request from the server's address. They are left out, as `fetch` leaves
+    // them out in a browser, where these calls run in a component (FEEDBACK75.md, Q-1089; branch
+    // feedback75).
+    for (k, v) in headers.iter().filter(|(k, _)| !framing_header(k)) {
         req = req.set(k, v);
     }
     if let Some((ctype, _)) = body {
@@ -411,6 +432,15 @@ fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, Stri
         Ok(r) | Err(ureq::Error::Status(_, r)) => Ok(r),
         Err(e) => Err(timed_out(o, url, e.to_string())),
     }
+}
+
+/// Whether a request header is one the client writes itself, never the program (see `call`): the
+/// body's framing and the connection's own headers. A program's `Host` is still sent, as before:
+/// programs reach a virtual host by its address with it, and it frames nothing (the user's
+/// decision, 2026-11-19).
+fn framing_header(name: &str) -> bool {
+    let name = name.trim();
+    ["content-length", "transfer-encoding", "connection", "keep-alive", "te", "trailer", "upgrade"].iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
 /// `call`, and its redirects, each followed here: a `307` or `308` with the same method and
@@ -507,6 +537,125 @@ impl From<String> for Unsent {
     }
 }
 
+/// What the answers being read whole take, every call's at once, past the first `READ_FREE` of
+/// each: at most `READING_MOST`, and a call whose answer would take more is an error value. Calls
+/// run off the interpreter lock, up to `--workers` at once, and each answer could take its limit
+/// (64 MiB): 64 answers of 200 KB of gzip asked for about 13 GB (FEEDBACK75.md, Q-1072; branch
+/// feedback75).
+static READING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const READING_MOST: u64 = 256 << 20;
+const READ_FREE: u64 = 1 << 20;
+/// The first piece an answer is read into; each next one as large as all before it.
+const READ_PIECE: u64 = 16 << 10;
+
+/// Why `read_whole` gave no body.
+enum Unread {
+    Io(std::io::Error),
+    /// The answer is longer than the most read.
+    Longer,
+    /// All the answers being read at once would take more than `READING_MOST`.
+    Busy,
+}
+
+/// What this call has taken from `READING`, given back when it is dropped.
+struct Reading(u64);
+
+impl Reading {
+    /// The call's answer takes `total` bytes: what that is past `READ_FREE` taken from what all
+    /// may take at once, or false when it does not fit.
+    fn hold(&mut self, total: u64) -> bool {
+        let want = total.saturating_sub(READ_FREE);
+        if want <= self.0 {
+            return true;
+        }
+        let more = want - self.0;
+        let mut now = READING.load(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            let Some(next) = now.checked_add(more).filter(|t| *t <= READING_MOST) else { return false };
+            match READING.compare_exchange_weak(now, next, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(seen) => now = seen,
+            }
+        }
+        self.0 = want;
+        true
+    }
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        READING.fetch_sub(self.0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// An answer's body, read to its end, or `Unread::Longer` past `most` bytes, never holding more
+/// than `most`: `read_to_end` of `most + 1` doubled its buffer, so reaching 64 MiB + 1 made one of
+/// 128 MiB and copied the old one into it, about 230 MB a call for 200 KB of gzip (FEEDBACK75.md,
+/// Q-1072; branch feedback75). Read 16 KiB at a time into pieces, each with room for as much as all
+/// before it (the first 16 KiB, the last to end at `most`), none ever grown or copied, and joined
+/// once the answer has ended: one past the limit is dropped holding at most the limit, and an
+/// ordinary one is one piece. A piece's room is only asked for, not written, until bytes come.
+/// What has arrived is held to `READING_MOST` with every other call's, and the join while it is
+/// made, the whole and the largest piece: room asked for ahead (an answer that stalled after
+/// 32 MiB held 64) tied up the budget, and every other call over 1 MiB was refused (found in
+/// review).
+fn read_whole(mut reader: impl Read, most: u64) -> Result<Vec<u8>, Unread> {
+    let most = usize::try_from(most).unwrap_or(usize::MAX);
+    let mut pieces: Vec<Vec<u8>> = Vec::new();
+    let mut total = 0usize;
+    let mut held = Reading(0);
+    let mut chunk = [0u8; READ_PIECE as usize];
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Unread::Io(e)),
+        };
+        if n > most - total {
+            return Err(Unread::Longer);
+        }
+        if !held.hold((total + n) as u64) {
+            return Err(Unread::Busy);
+        }
+        let mut rest = &chunk[..n];
+        while !rest.is_empty() {
+            let room = pieces.last().map_or(0, |p| p.capacity() - p.len());
+            if room == 0 {
+                let want = total.max(READ_PIECE as usize).min(most - total).max(rest.len());
+                let mut piece = Vec::new();
+                piece.try_reserve_exact(want).map_err(|_| Unread::Busy)?;
+                pieces.push(piece);
+                continue;
+            }
+            let k = room.min(rest.len());
+            if let Some(piece) = pieces.last_mut() {
+                piece.extend_from_slice(&rest[..k]);
+            }
+            rest = &rest[k..];
+            total += k;
+        }
+    }
+    if pieces.len() <= 1 {
+        return Ok(pieces.pop().unwrap_or_default());
+    }
+    let largest = pieces.iter().map(Vec::len).max().unwrap_or(0);
+    if !held.hold((total + largest) as u64) {
+        return Err(Unread::Busy);
+    }
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(total).map_err(|_| Unread::Busy)?;
+    for piece in pieces {
+        bytes.extend_from_slice(&piece);
+    }
+    Ok(bytes)
+}
+
+/// What a call is told when the answers being read at once are too many (`READING_MOST`).
+fn too_busy(url: &str) -> String {
+    format!("{}: the answers being read at once would take more than the {} MiB read at once; try again shortly, or read it with http.stream", url, READING_MOST >> 20)
+}
+
 /// `most`: the longest answer read, `MAX_BODY` or less where `--max-memory` leaves less (see
 /// `body_room`); past a limit of its, `Unsent::OverMemory`.
 fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>, most: u64) -> Result<Reply, Unsent> {
@@ -516,23 +665,31 @@ fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Op
     // Those set on the way first, so that the last answer's have the last word.
     passed.extend(last);
     let cookies = passed;
-    let mut bytes = Vec::new();
-    reader.take(most + 1).read_to_end(&mut bytes).map_err(|e| timed_out(o, &url, e.to_string()))?;
-    // Read no further than one value may be (FEEDBACK71.md, Q-977; branch security).
-    if bytes.len() as u64 > most && most < MAX_BODY {
-        return Err(Unsent::OverMemory);
-    }
-    // A longer one is an error, where it was cut at the limit and said nothing: cut JSON was
-    // `json: null` (FEEDBACK49.md, Q-599; branch main).
-    if bytes.len() as u64 > MAX_BODY {
-        // A site's call has no `http.stream` to read it with (FEEDBACK71.md, Q-973; branch
-        // security).
-        return Err(Unsent::Said(if o.same_origin { format!("{}: the answer is longer than {} MiB, the most a site's call reads", url, MAX_BODY >> 20) } else { too_long(&url) }));
-    }
+    // A site's call reads the same way, as it is made here (FEEDBACK75.md, Q-1072; branch
+    // feedback75).
+    let bytes = match read_whole(reader, most) {
+        Ok(b) => b,
+        Err(Unread::Io(e)) => return Err(Unsent::Said(timed_out(o, &url, e.to_string()))),
+        Err(Unread::Busy) => return Err(Unsent::Said(too_busy(&url))),
+        // Read no further than one value may be (FEEDBACK71.md, Q-977; branch security).
+        Err(Unread::Longer) if most < MAX_BODY => return Err(Unsent::OverMemory),
+        // A longer one is an error, where it was cut at the limit and said nothing: cut JSON was
+        // `json: null` (FEEDBACK49.md, Q-599; branch main). A site's call has no `http.stream` to
+        // read it with (FEEDBACK71.md, Q-973; branch security).
+        Err(Unread::Longer) => {
+            return Err(Unsent::Said(if o.same_origin { format!("{}: the answer is longer than {} MiB, the most a site's call reads", url, MAX_BODY >> 20) } else { too_long(&url) }));
+        }
+    };
     // Made text held too: what is not UTF-8 takes three bytes a byte as U+FFFD, and 1 MB of
     // 0xFF read to a 3 MB text under a 1 MB limit (FEEDBACK71.md, Q-977, found in review; branch
     // security).
-    let body = if most < MAX_BODY { crate::value::lossy_held(bytes).map_err(|_| Unsent::OverMemory)? } else { String::from_utf8_lossy(&bytes).into_owned() };
+    // Text that is UTF-8 is the buffer itself, not a copy of it (FEEDBACK75.md, Q-1072; branch
+    // feedback75).
+    let body = if most < MAX_BODY {
+        crate::value::lossy_held(bytes).map_err(|_| Unsent::OverMemory)?
+    } else {
+        String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    };
     Ok(Reply { status, headers, cookies, body })
 }
 
@@ -1151,16 +1308,16 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         // No further than one value may be, and made text held to it (FEEDBACK71.md, Q-977;
         // branch security).
         let most = body_room();
-        let read = it.unlocked(move || {
-            let mut b = Vec::new();
-            reader.take(most + 1).read_to_end(&mut b).map(|_| b)
-        });
+        // Into a buffer that never passes the limit, held with the others being read
+        // (FEEDBACK75.md, Q-1072; branch feedback75).
+        let read = it.unlocked(move || read_whole(reader, most));
         // Its error said, not dropped, and one too long refused (Q-599).
         let bytes = match read {
-            Ok(b) if b.len() as u64 > most && most < MAX_BODY => return Err(crate::httpd::OverMemory.at(line)),
-            Ok(b) if b.len() as u64 > MAX_BODY => return Ok(Value::err(Value::str(format!("http: {}", too_long(&url))))),
             Ok(b) => b,
-            Err(e) => return Ok(Value::err(Value::str(format!("http: {}: {}", url, e)))),
+            Err(Unread::Longer) if most < MAX_BODY => return Err(crate::httpd::OverMemory.at(line)),
+            Err(Unread::Longer) => return Ok(Value::err(Value::str(format!("http: {}", too_long(&url))))),
+            Err(Unread::Io(e)) => return Ok(Value::err(Value::str(format!("http: {}: {}", url, e)))),
+            Err(Unread::Busy) => return Ok(Value::err(Value::str(format!("http: {}", too_busy(&url))))),
         };
         m.insert("body".into(), Value::str(crate::value::lossy_held(bytes).map_err(|o| o.at(line))?));
         return Ok(Value::map(m));
@@ -1224,7 +1381,10 @@ mod tests {
     fn local_use_nat64_is_not_public() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         assert!(!public_ip(ip("64:ff9b:1::a00:1")) && !public_ip(ip("64:ff9b:1:ffff::808:808")));
-        assert!(public_ip(ip("64:ff9b::808:808")) && !public_ip(ip("64:ff9b::a00:1")) && public_ip(ip("64:ff9c::1")) && public_ip(ip("64:ff9b:2::1")));
+        assert!(public_ip(ip("64:ff9b::808:808")) && !public_ip(ip("64:ff9b::a00:1")));
+        // In 0::/8, which IANA keeps: none of it is anyone's address on the internet (changed with
+        // FEEDBACK75.md, Q-1093; branch feedback75).
+        assert!(!public_ip(ip("64:ff9c::1")) && !public_ip(ip("64:ff9b:2::1")));
     }
 
     // Every option is in a cached answer's key: another certificate, none, another CA, another

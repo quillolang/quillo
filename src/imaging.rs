@@ -56,11 +56,140 @@ fn format_name(f: ImageFormat) -> &'static str {
 fn reader(path: &Path) -> Result<ImageReader<std::io::BufReader<std::fs::File>>, String> {
     let mut r = ImageReader::open(path).map_err(|e| e.to_string())?.with_guessed_format().map_err(|e| e.to_string())?;
     match r.format() {
-        Some(ImageFormat::Jpeg | ImageFormat::Png | ImageFormat::WebP | ImageFormat::Gif) => {}
+        Some(ImageFormat::Png) => {
+            // Looked at through the reader's own file and buffer, then given back to it at the start.
+            let mut file = r.into_inner();
+            png_profiles_fit(&mut file)?;
+            r = ImageReader::with_format(file, ImageFormat::Png);
+        }
+        Some(ImageFormat::Jpeg | ImageFormat::WebP | ImageFormat::Gif) => {}
         _ => return Err("not a JPEG, PNG, WebP or GIF image".into()),
     }
     r.limits(limits());
     Ok(r)
+}
+
+/// Most bytes a PNG's colour profile (`iCCP`) may inflate to. Real ones are kilobytes, the
+/// largest (a monitor's measured tables) a megabyte or two.
+const MOST_PROFILE: u64 = 4 << 20;
+
+/// Most a deflate stream inflates to, a byte of it: a match of 258 bytes in two bits.
+const MOST_RATIO: u64 = 1032;
+
+/// A PNG's colour profiles, before its pixels, each no larger than `MOST_PROFILE` inflated, or an
+/// error. The png decoder inflates a profile while it reads the header, with the whole decode's
+/// budget (`MOST_BYTES`) as the profile's own: a 1×1 PNG of 146 KB whose profile is 150 MB of
+/// zeros took 264 MiB in `image.info`, and one of 0.5 MB 512 MiB, outside every image and memory
+/// limit; the process aborted where that much was refused (FEEDBACK75.md, Q-1051; branch
+/// feedback75). Each is inflated here into nothing, through a fixed buffer, no further than the
+/// limit: none is held. One too small to pass it however it inflates is not inflated at all.
+/// One that cannot be read and might pass it is refused too: what the decoder (fdeflate) would
+/// make of it is not known here.
+/// `file` is read from its start and left there: the chunks before the pixels are skipped within
+/// its buffer, with no new read or open, so a header costs what it did.
+fn png_profiles_fit(file: &mut std::io::BufReader<std::fs::File>) -> Result<(), String> {
+    use std::io::{Seek, SeekFrom};
+    let fit = profiles_from(file);
+    // Back to the start: within the buffer when every chunk was, else from the file.
+    let back = match fit {
+        Ok(Some(read)) => file.seek_relative(-read),
+        _ => file.seek(SeekFrom::Start(0)).map(|_| ()),
+    };
+    back.map_err(|e| e.to_string())?;
+    fit.map(|_| ())
+}
+
+/// `png_profiles_fit`'s walk, from the start of `file`: how far it read when it came to the pixels,
+/// None when the file ended first (the decoder's to say), or why it refuses the file.
+fn profiles_from(file: &mut std::io::BufReader<std::fs::File>) -> Result<Option<i64>, String> {
+    use std::io::Read;
+    // After the signature, which the format was told by: read, not skipped, so that the buffer
+    // starts at the file's start and the way back is within it.
+    let mut signature = [0u8; 8];
+    if file.read_exact(&mut signature).is_err() {
+        return Ok(None);
+    }
+    let mut read = 8i64;
+    loop {
+        let mut head = [0u8; 8];
+        if file.read_exact(&mut head).is_err() {
+            return Ok(None);
+        }
+        read += 8;
+        let len = u64::from(u32::from_be_bytes([head[0], head[1], head[2], head[3]]));
+        let mut skip = len + 4;
+        match &head[4..] {
+            b"IDAT" | b"IEND" => return Ok(Some(read)),
+            b"iCCP" => {
+                let mut data = (&mut *file).take(len);
+                // The profile's name and its zero, then the compression method, read as the decoder
+                // reads them: a name of 1 to 80 bytes, and 0 (deflate). One it refuses there it
+                // passes over without inflating, and so does this.
+                let mut name = 0u64;
+                let mut b = [0u8; 1];
+                let named = loop {
+                    if data.read_exact(&mut b).is_err() {
+                        break false;
+                    }
+                    if b[0] == 0 {
+                        break name > 0;
+                    }
+                    name += 1;
+                    if name > 80 {
+                        break false;
+                    }
+                };
+                let deflated = named && data.read_exact(&mut b).is_ok() && b[0] == 0;
+                // zlib's header, as the decoder checks it (deflate, a window it knows, no preset
+                // dictionary, its check bits): with any other it inflates nothing. Then the
+                // deflate data, read raw: a profile wrong only in its checksum, at the end, is
+                // still read as it was.
+                let mut z = [0u8; 2];
+                let zlib = deflated && data.read_exact(&mut z).is_ok() && z[0] & 0x0f == 8 && z[0] >> 4 <= 7 && z[1] & 0x20 == 0 && (u16::from(z[0]) << 8 | u16::from(z[1])) % 31 == 0;
+                if zlib && len.saturating_sub(name + 4).saturating_mul(MOST_RATIO) > MOST_PROFILE {
+                    let mut z = flate2::bufread::DeflateDecoder::new(&mut data);
+                    match std::io::copy(&mut (&mut z).take(MOST_PROFILE + 1), &mut std::io::sink()) {
+                        Ok(n) if n <= MOST_PROFILE => {}
+                        Ok(_) => return Err(format!("the PNG's colour profile (iCCP) is larger than the {} MiB read", MOST_PROFILE >> 20)),
+                        Err(e) => return Err(format!("the PNG's colour profile (iCCP) cannot be read: {}", e)),
+                    }
+                }
+                // What is left of the chunk, and its CRC.
+                skip = data.limit() + 4;
+            }
+            _ => {}
+        }
+        file.seek_relative(i64::try_from(skip).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        // The whole chunk, what was read of it and what was skipped.
+        read = read.saturating_add(i64::try_from(len + 4).map_err(|e| e.to_string())?);
+    }
+}
+
+/// Most image headers read at once (`image.info`, and `image.convert`'s look before its turn):
+/// each may take twice `MOST_PROFILE` for a profile as png inflates it, and 64 workers at once
+/// half a gigabyte (FEEDBACK75.md, Q-1051; branch feedback75).
+const MOST_HEADERS: usize = 8;
+
+/// `f` once fewer than `MOST_HEADERS` headers are being read.
+fn header_turn<T>(f: impl FnOnce() -> T) -> T {
+    use std::sync::{Condvar, Mutex};
+    static READING: Mutex<usize> = Mutex::new(0);
+    static FREED: Condvar = Condvar::new();
+    let mut n = READING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *n >= MOST_HEADERS {
+        n = FREED.wait(n).unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+    *n += 1;
+    drop(n);
+    struct Done;
+    impl Drop for Done {
+        fn drop(&mut self) {
+            *READING.lock().unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+            FREED.notify_one();
+        }
+    }
+    let _done = Done;
+    f()
 }
 
 /// Whether an orientation turns the image a quarter, so that its width is its height.
@@ -101,7 +230,9 @@ fn err_value(e: String) -> Value {
 /// Size and kind, from the file's header (the pixels are not decoded).
 fn info(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let path = path_arg(it, &args, 0, "image.info", line)?;
-    let found = it.unlocked(move || -> Result<(u32, u32, &'static str, bool), String> {
+    // Headers read a few at once: a profile may take megabytes as it is inflated (FEEDBACK75.md,
+    // Q-1051; branch feedback75).
+    let found = it.unlocked(move || header_turn(|| -> Result<(u32, u32, &'static str, bool), String> {
         let r = reader(&path)?;
         let format = format_name(r.format().unwrap_or(ImageFormat::Png));
         let mut d = r.into_decoder().map_err(|e| e.to_string())?;
@@ -113,7 +244,7 @@ fn info(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         // EXIF orientation that says to turn it (FEEDBACK55.md, Q-825; branch feedback55).
         let (w, h) = if turned(d.orientation().unwrap_or(Orientation::NoTransforms)) { (h, w) } else { (w, h) };
         Ok((w, h, format, d.color_type().has_alpha()))
-    });
+    }));
     Ok(match found {
         Ok((w, h, format, alpha)) => {
             let mut m = Map::new();
@@ -382,7 +513,9 @@ fn convert(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             args.get(1).map(|v| v.display()).unwrap_or_default()
         )));
     }
-    Ok(match it.unlocked(move || cost_of(&src, &job).and_then(|bytes| in_turn(bytes, || make(&src, &dest, job)))) {
+    // Its header read in turn with the others' (`header_turn`, FEEDBACK75.md, Q-1051; branch
+    // feedback75), then the conversion in its own.
+    Ok(match it.unlocked(move || header_turn(|| cost_of(&src, &job)).and_then(|bytes| in_turn(bytes, || make(&src, &dest, job)))) {
         Ok((w, h)) => {
             let mut m = Map::new();
             m.insert("width".into(), Value::Int(w as i64));

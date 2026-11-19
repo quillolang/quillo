@@ -1408,9 +1408,11 @@ fn s_median_high(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(back(values_at(&x, &[n / 2])[0], ints))
 }
 
-/// A hash for numbers' bits: a multiply, not SipHash (nothing here is an
-/// attacker's choice of keys that would matter: the worst is a slow mode).
-#[derive(Default)]
+/// A hash for numbers' bits, keyed for the process: MurmurHash3's finish of the bits and the key,
+/// as `unique_of` keys numbers. It was a multiply with no key, and its low 24 bits could be solved
+/// for: 160,000 crafted numbers in one list (and one text, which sends any length here) all fell
+/// in the same buckets, and `stats.mode` held an instance 3.5 s, past `--max-compute`
+/// (FEEDBACK75.md, Q-1092; branch feedback75).
 struct Bits(u64);
 
 impl std::hash::Hasher for Bits {
@@ -1419,19 +1421,41 @@ impl std::hash::Hasher for Bits {
     }
     fn write(&mut self, b: &[u8]) {
         for x in b {
-            self.0 = (self.0.rotate_left(5) ^ *x as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            self.write_u64(*x as u64);
         }
     }
     fn write_u64(&mut self, x: u64) {
-        self.0 = (x ^ (x >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (x >> 32);
+        let mut x = (self.0.rotate_left(23) ^ x).wrapping_add(0x9e37_79b9_7f4a_7c15);
+        x = (x ^ (x >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x = (x ^ (x >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        self.0 = x ^ (x >> 33);
     }
 }
 
-type Fast<K> = HashMap<K, usize, std::hash::BuildHasherDefault<Bits>>;
+/// `Bits` with the process's key, drawn once from the system's randomness.
+#[derive(Clone, Copy)]
+struct Keyed(u64);
+
+impl Keyed {
+    fn new() -> Keyed {
+        use std::hash::BuildHasher;
+        static KEY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        Keyed(*KEY.get_or_init(|| std::collections::hash_map::RandomState::new().hash_one(0u8)))
+    }
+}
+
+impl std::hash::BuildHasher for Keyed {
+    type Hasher = Bits;
+    fn build_hasher(&self) -> Bits {
+        Bits(self.0)
+    }
+}
+
+type Fast<K> = HashMap<K, usize, Keyed>;
 
 /// How often each value occurs, in the order first seen.
 fn tally(l: &[Value]) -> Vec<(usize, usize)> {
-    let mut nums: Fast<u64> = Fast::default();
+    let mut nums: Fast<u64> = Fast::with_hasher(Keyed::new());
     let mut others: HashMap<String, usize> = HashMap::new();
     let mut out: Vec<(usize, usize)> = Vec::new();
     for (i, v) in l.iter().enumerate() {

@@ -54,6 +54,8 @@ flate2 = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 # `re`: patterns that match as JavaScript's do (src/re.rs).
 regex = "1"
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "unicode", "hybrid", "nfa-pikevm", "nfa-backtrack", "dfa-onepass", "perf-literal"] }
+regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode"] }
 # 0.13: 0.12 was quadratic on mixed emphasis (`*a_*a_...`), a megabyte 17 s (FEEDBACK55.md,
 # Q-706; branch feedback55).
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }

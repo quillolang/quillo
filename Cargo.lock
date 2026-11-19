@@ -3122,6 +3122,8 @@ dependencies = [
  "pulldown-cmark",
  "rcgen",
  "regex",
+ "regex-automata",
+ "regex-syntax",
  "ring",
  "rusqlite",
  "rustls",

@@ -464,7 +464,9 @@ fn host_matches(pattern: &str, host: &str) -> bool {
 /// Loopback, private, link-local (the cloud's metadata at 169.254.169.254), unspecified,
 /// carrier-grade NAT, and IPv6's unique-local and link-local, with IPv4 in IPv6 judged as IPv4.
 pub fn private_ip(ip: IpAddr) -> bool {
-    // What `http`'s `public_only` refuses (NAT64, 6to4 and IPv4-compatible addresses too).
+    // What `http`'s `public_only` refuses (NAT64, 6to4 and IPv4-compatible addresses too, and
+    // IPv4-translated and ISATAP ones and the rest of 0::/8: FEEDBACK75.md, Q-1093; branch
+    // feedback75).
     if !crate::fetch::public_ip(ip) {
         return true;
     }

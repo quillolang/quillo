@@ -21,7 +21,9 @@
 use crate::interp::{fail, Ctrl, Interp};
 use crate::value::*;
 use regex::{Regex, RegexBuilder};
+use regex_automata::{hybrid, nfa::thompson, util::prefilter::Prefilter, Anchored, Input, MatchKind};
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -346,7 +348,7 @@ fn class(cs: &[char], i: usize) -> Result<(String, usize), String> {
 /// order they came in.
 #[derive(Default)]
 struct Kept {
-    map: HashMap<(String, String), (Regex, usize)>,
+    map: HashMap<(String, String), (Regex, usize, Room)>,
     order: std::collections::VecDeque<(String, String)>,
     bytes: usize,
 }
@@ -357,6 +359,39 @@ thread_local! {
 
 /// The pattern (argument 2) and flags (`flags_at`), compiled.
 fn regex_of(args: &[Value], flags_at: usize, f: &str, line: u32) -> Result<Regex, Ctrl> {
+    pattern(args, flags_at, f, line, 0, false).map(|pat| pat.r)
+}
+
+/// A pattern as the searches take it: compiled, and how long a text the crate may search for it
+/// (`Room`). Its text and flags, which its `Guard` is made from, are read again from the call's
+/// arguments where one is needed (`Key`), and not carried by each call (found in review: 130
+/// instructions a call). `r` is `unused()` until a call takes the crate's path (`Room::gate` shut
+/// until then).
+struct Pat {
+    r: Regex,
+    room: Room,
+}
+
+/// Where a call's pattern and flags are, for the guard.
+#[derive(Clone, Copy)]
+struct Key<'a> {
+    args: &'a [Value],
+    flags_at: usize,
+}
+
+impl Key<'_> {
+    fn strings(&self) -> (String, String) {
+        let text = |v: Option<&Value>| match v {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => String::new(),
+        };
+        (text(self.args.get(1)), text(self.args.get(self.flags_at)))
+    }
+}
+
+/// `regex_of`, with the rest of `Pat`: for a call on `len` bytes, asking for groups or not (`caps`),
+/// which a pattern not yet kept is compiled for (`nfa_first`).
+fn pattern(args: &[Value], flags_at: usize, f: &str, line: u32, len: usize, caps: bool) -> Result<Pat, Ctrl> {
     let p = match args.get(1) {
         Some(Value::Str(s)) => s.to_string(),
         other => return fail(line, format!("`{}` expects a str as argument 2, got {}", f, other.map_or("nothing", |v| v.type_name()))),
@@ -367,31 +402,98 @@ fn regex_of(args: &[Value], flags_at: usize, f: &str, line: u32) -> Result<Regex
         Some(other) => return fail(line, format!("`{}` expects a str as argument {}, got {}", f, flags_at + 1, other.type_name())),
     };
     let key = (p, flags);
-    if let Some(r) = CACHE.with(|c| c.borrow().map.get(&key).map(|(r, _)| r.clone())) {
-        return Ok(r);
+    if let Some(pat) = CACHE.with(|c| c.borrow().map.get(&key).map(|(r, _, room)| Pat { r: r.clone(), room: *room })) {
+        return Ok(pat);
+    }
+    compile_and_keep(key, f, line, len, caps)
+}
+
+/// `pattern` for one not kept yet: compiled for the first call (`nfa_first`), and kept.
+#[cold]
+#[inline(never)]
+fn compile_and_keep(key: (String, String), f: &str, line: u32, len: usize, caps: bool) -> Result<Pat, Ctrl> {
+    if len > NFA_FIRST {
+        if let Some(pat) = nfa_first(&key, len, caps) {
+            return Ok(pat);
+        }
     }
     let (r, step) = compile_stepped(&key.0, &key.1).or_else(|e| fail(line, format!("`{}`: {}", f, e)))?;
-    let counted = step * 2;
+    // From the size it compiled within, which no NFA of it passes (see `Room`).
+    let room = Room::of(step as u128 / STATE_BYTES, step as u128 / RANGE_BYTES, 2 * r.captures_len() as u128, false);
+    store(&key, &r, step * 2, room);
+    Ok(Pat { r, room })
+}
+
+/// From how long a text a pattern not yet kept is first compiled as the guard compiles it (its NFA,
+/// and its exact `Room`), and the crate's Regex only where that room holds the text: below it, the
+/// crate's first, as before. A pattern that only ever went by the guard was compiled for both, the
+/// UI kit's checker and a 600-word list on 1 MB 15 to 17% slower than 0.8.8 (found measuring).
+const NFA_FIRST: usize = 64 << 10;
+
+/// `pattern`'s first compile for a long text (`NFA_FIRST`), kept: the crate's Regex where the room
+/// holds the text, else the NFA alone for the guard, the Regex `unused()` until a call needs it
+/// (`guard_past_room`). None where it cannot be compiled so, which the crate's compile then says.
+fn nfa_first(key: &(String, String), len: usize, caps: bool) -> Option<Pat> {
+    let hir = regex_automata::util::syntax::parse(&full_pattern(&key.0, &key.1).ok()?).ok()?;
+    let nfa = thompson::Compiler::new().configure(guard_nfa(false)).build_from_hir(&hir).ok()?;
+    let room = room_of(&nfa);
+    if room.fits(len, caps) {
+        let (r, step) = compile_stepped(&key.0, &key.1).ok()?;
+        store(key, &r, step * 2, room);
+        return Some(Pat { r, room });
+    }
+    // Counted as the crate's would be (twice the step its program fits, forward and back).
+    let room = room.with_crate(false);
+    let r = unused();
+    store(key, &r, 2 * step_for(nfa.memory_usage()), room);
+    MADE.with(|m| *m.borrow_mut() = Some((key.clone(), Made { nfa })));
+    Some(Pat { r, room })
+}
+
+/// The least of `STEPS` that `bytes` of compiled program fit.
+fn step_for(bytes: usize) -> usize {
+    STEPS.iter().copied().find(|s| bytes <= *s).unwrap_or(MOST_COMPILED)
+}
+
+/// `key` kept in this thread's cache as `r`, counted at `counted`, with `room`, in place of what was
+/// kept for it; the oldest go first where it would not fit (see `CACHE_BYTES`).
+fn store(key: &(String, String), r: &Regex, counted: usize, room: Room) {
     CACHE.with(|c| {
         let mut c = c.borrow_mut();
+        if let Some((_, n, _)) = c.map.remove(key) {
+            c.bytes -= n;
+            c.order.retain(|k| k != key);
+        }
         while !c.order.is_empty() && (c.bytes + counted > CACHE_BYTES || c.map.len() >= CACHE_MOST) {
             let old = c.order.pop_front().expect("not empty");
-            if let Some((_, n)) = c.map.remove(&old) {
+            if let Some((_, n, _)) = c.map.remove(&old) {
                 c.bytes -= n;
             }
         }
         if counted <= CACHE_BYTES {
             c.bytes += counted;
             c.order.push_back(key.clone());
-            c.map.insert(key, (r.clone(), counted));
+            c.map.insert(key.clone(), (r.clone(), counted, room));
         }
     });
-    Ok(r)
+}
+
+thread_local! {
+    /// What a kept pattern holds in place of the crate's Regex until a call takes the crate's path:
+    /// never searched with, nor its names read, as its `Room`'s gate is shut until then.
+    static UNUSED: Regex = Regex::new("").expect("the empty pattern compiles");
+    /// The NFA `nfa_first` compiled for a pattern it kept for the guard alone, until the guard is
+    /// made of it in the same call (`exact_room`), out of `Pat`, which each call makes.
+    static MADE: RefCell<Option<((String, String), Made)>> = const { RefCell::new(None) };
+}
+
+fn unused() -> Regex {
+    UNUSED.with(Regex::clone)
 }
 
 /// Whether this thread's cache keeps `p` with `flags`, and what it is counted at (for tests).
 pub fn kept(p: &str, flags: &str) -> Option<usize> {
-    CACHE.with(|c| c.borrow().map.get(&(p.to_string(), flags.to_string())).map(|(_, n)| *n))
+    CACHE.with(|c| c.borrow().map.get(&(p.to_string(), flags.to_string())).map(|(_, n, _)| *n))
 }
 
 /// `compile` at each of `STEPS` in turn: the pattern, and the step it compiled within.
@@ -414,6 +516,15 @@ pub fn compile(p: &str, flags: &str) -> Result<Regex, String> {
 
 /// `compile`, the pattern held to `limit` bytes compiled: Err((true, ..)) when it is bigger.
 fn compile_within(p: &str, flags: &str, limit: usize) -> Result<Regex, (bool, String)> {
+    let full = full_pattern(p, flags)?;
+    RegexBuilder::new(&full).size_limit(limit).dfa_size_limit(DFA_CACHE).build().map_err(|e| match e {
+        regex::Error::CompiledTooBig(_) => (true, format!("the pattern is too big: it compiles to more than the size limit of {} MB a pattern has (a repeat inside a repeat, such as (?:\\w{{1000}}){{100}}, multiplies its size)", MOST_COMPILED >> 20)),
+        e => (false, format!("the pattern is too big: {}", e.to_string().lines().last().unwrap_or(""))),
+    })
+}
+
+/// The flags checked and the pattern written for the crates, the flags in front.
+fn full_pattern(p: &str, flags: &str) -> Result<String, (bool, String)> {
     for (k, f) in flags.char_indices() {
         if !matches!(f, 'i' | 'm' | 's') || flags[..k].contains(f) {
             return Err((false, format!("the flags are `i` (any case), `m` (^ and $ at each line) and `s` (. matches line breaks), each once; got \"{}\"", flags)));
@@ -428,11 +539,7 @@ fn compile_within(p: &str, flags: &str, limit: usize) -> Result<Regex, (bool, St
         pre.push_str("mR");
     }
     let body = translate(p, flags.contains('s')).map_err(|e| (false, e))?;
-    let full = if pre.is_empty() { body } else { format!("(?{}){}", pre, body) };
-    RegexBuilder::new(&full).size_limit(limit).dfa_size_limit(DFA_CACHE).build().map_err(|e| match e {
-        regex::Error::CompiledTooBig(_) => (true, format!("the pattern is too big: it compiles to more than the size limit of {} MB a pattern has (a repeat inside a repeat, such as (?:\\w{{1000}}){{100}}, multiplies its size)", MOST_COMPILED >> 20)),
-        e => (false, format!("the pattern is too big: {}", e.to_string().lines().last().unwrap_or(""))),
-    })
+    Ok(if pre.is_empty() { body } else { format!("(?{}){}", pre, body) })
 }
 
 /// A match: where it is in bytes, and its groups' (byte) spans.
@@ -450,6 +557,8 @@ enum Stop {
     Scans(Duration),
     /// `--max-memory`'s stop.
     Memory(crate::httpd::OverMemory),
+    /// A guarded search gave up (`Guard`).
+    GaveUp,
 }
 
 /// What the searches of a call over `len` bytes may take, of their thread's time computing, once
@@ -458,6 +567,1388 @@ enum Stop {
 /// (Q-976, found in review: wall-clock time, and 0.64 µs a byte, refused them there).
 fn scan_time(len: usize) -> Duration {
     Duration::from_millis(250) + Duration::from_nanos((len as u64).saturating_mul(4_000))
+}
+
+/// What one search by the crate costs a byte at its worst, the PikeVM following every state of the
+/// NFA, in picoseconds: each state (`STATE_PS`), each range a state's transitions are scanned
+/// through (`RANGE_PS`: a class of 64 ranges is scanned whole), and, where the groups are asked
+/// for, each slot each state carries (`SLOT_PS`: the PikeVM copies them all for every thread).
+/// Measured on the server, under load, as upper bounds with room: 4 ns a state (`[ab]*a[ab]{900}c`,
+/// 909 states, 0.74 s on 200 KB), 13 ns a state for 63 ranges each (0.81 s on 69 KB), 0.04 ns a
+/// state and slot (`(?:(a)|(a)|...)*` of 1,000, 3,007 states and 2,002 slots, 5.4 s on 21 KB), and
+/// no family of 25 adversarial ones, nor 1,600 fuzzed patterns, past 0.78 of the bound
+/// (FEEDBACK75.md, Q-1075, third review; branch feedback75).
+const STATE_PS: u128 = 6_000;
+const RANGE_PS: u128 = 250;
+const SLOT_PS: u128 = 80;
+
+/// How much slower a debug build's guard steps and backtracks: its clock (`Clock`) and its
+/// backtracker's cost (`TRACK_PS`) are both this many times longer, so that it decides as a
+/// release build does (found running the tests there).
+const SLOWER: u32 = if cfg!(debug_assertions) { 20 } else { 1 };
+
+/// What the bounded backtracker costs a state a byte of a match, at the most, in picoseconds (see
+/// `Guarding::track_long`): measured 0.055 to 0.38 ns, the most with 2,002 and 6,002 slots alike
+/// (`(?:(a)|...)*` of 1,000 and 3,000), with room (FEEDBACK75.md, Q-1075).
+const TRACK_PS: u128 = 1_000 * SLOWER as u128;
+
+/// What a guarded call may compute a byte of its text, past its tenth of a second (see `Clock`):
+/// 3.9 times the slowest real pattern measured, every pattern of the website, its plugins, the UI
+/// kit and the starter, the kit's translation checker and a 600-word alternation with `i`, on 10 MB
+/// of prose, JSON, log lines and mixed text (`[^ims]` on log lines, 38.5 ns a byte for the whole
+/// `re.replace`) (FEEDBACK75.md, Q-1075; branch feedback75). A debug build's (`SLOWER`) is longer.
+const GUARD_PER_BYTE: Duration = Duration::from_nanos(150 * SLOWER as u64);
+
+/// What one search by the crate may compute at its worst: Q-976's quarter of a second.
+const GUARD_BUDGET_PS: u128 = 250_000_000_000;
+
+/// What a state and a range take, at least, of the size an NFA is compiled within (regex-automata's
+/// builder counts each state at 32 bytes and each range of a state's transitions at 8): a pattern
+/// compiled within `step` has no more than `step / 32` states nor `step / 8` ranges.
+const STATE_BYTES: u128 = 32;
+const RANGE_BYTES: u128 = 8;
+
+/// How long a text the crate may search for a pattern, its worst (see `STATE_PS`) within
+/// `GUARD_BUDGET_PS`: `test` where no group is asked for (`re.test`), `caps` where they are, and
+/// what a byte costs with them, for the guard's own search of a match's groups. From the size the
+/// pattern compiled within until a text is longer than that allows (`exact` false), then from its
+/// NFA's own states, ranges and slots, counted once (`exact_room`). The crate guarantees no more
+/// than that for any pattern, whatever its shape; a search past it goes by the pattern's `Guard`.
+/// Each call compares its text's length with one of them: one `re.test` of `[ab]*a[ab]{900}c` on
+/// 200 KB held an instance 5 s, past `--max-compute`, and the shapes looked for before missed
+/// patterns written out, cases, escapes, groups and wide classes (FEEDBACK75.md, Q-1075; branch
+/// feedback75).
+#[derive(Clone, Copy)]
+struct Room {
+    /// What a call's length is compared with, the one compare a call makes (`holds`): one past the
+    /// room (`test`, `caps`) where the crate's Regex is compiled, nothing where it is not.
+    gate: (usize, usize),
+    /// What a byte costs at the crate's worst without groups and with them, which the room is.
+    test_ps: u64,
+    caps_ps: u64,
+    exact: bool,
+}
+
+impl Room {
+    fn of(states: u128, ranges: u128, slots: u128, exact: bool) -> Room {
+        let test_ps = STATE_PS.saturating_mul(states).saturating_add(RANGE_PS.saturating_mul(ranges)).max(1);
+        let caps_ps = test_ps.saturating_add(SLOT_PS.saturating_mul(states).saturating_mul(slots));
+        let ps = |ps: u128| u64::try_from(ps).unwrap_or(u64::MAX);
+        Room { gate: (0, 0), test_ps: ps(test_ps), caps_ps: ps(caps_ps), exact }.with_crate(true)
+    }
+
+    /// No room at all, for a pattern its NFA cannot be compiled of again.
+    fn none() -> Room {
+        Room { gate: (0, 0), test_ps: u64::MAX, caps_ps: u64::MAX, exact: true }.with_crate(true)
+    }
+
+    /// How long a text the crate may search, without groups and with them.
+    fn test(&self) -> usize {
+        usize::try_from(GUARD_BUDGET_PS / u128::from(self.test_ps.max(1))).unwrap_or(usize::MAX)
+    }
+
+    fn caps(&self) -> usize {
+        usize::try_from(GUARD_BUDGET_PS / u128::from(self.caps_ps.max(1))).unwrap_or(usize::MAX)
+    }
+
+    /// Whether the crate's Regex is compiled (see `nfa_first`): the gate is open, at 1 at least.
+    fn compiled(&self) -> bool {
+        self.gate.0 != 0
+    }
+
+    /// It, the crate's Regex compiled or not.
+    fn with_crate(self, compiled: bool) -> Room {
+        let gate = if compiled { (self.test().saturating_add(1), self.caps().saturating_add(1)) } else { (0, 0) };
+        Room { gate, ..self }
+    }
+
+    /// Whether a call on `len` bytes goes to the crate at once: within the room, and compiled.
+    #[inline]
+    fn holds(&self, len: usize, caps: bool) -> bool {
+        len < if caps { self.gate.1 } else { self.gate.0 }
+    }
+
+    /// Whether a text of `len` bytes is within it, compiled or not.
+    fn fits(&self, len: usize, caps: bool) -> bool {
+        len <= if caps { self.caps() } else { self.test() }
+    }
+}
+
+/// `pat`'s room from its NFA as the crate compiles it, its states, the ranges of their transitions
+/// and its slots: counted the first time a text is too long for its room from size, and kept with
+/// the pattern; none at all where it cannot be compiled again.
+/// Also the NFA, which the guard is made from where the room is too small: compiled once for both, where twice made the UI kit's translation checker on 1 MB slower than
+/// 0.8.8 (found measuring: 6 ms of 11).
+fn exact_room(pat: &mut Pat, key: &(String, String)) -> (Room, Option<Made>) {
+    if pat.room.exact {
+        let made = MADE.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.as_ref().is_some_and(|(k, _)| k == key) {
+                m.take().map(|(_, made)| made)
+            } else {
+                None
+            }
+        });
+        return (pat.room, made);
+    }
+    let made = full_pattern(&key.0, &key.1)
+        .ok()
+        .and_then(|full| regex_automata::util::syntax::parse(&full).ok())
+        .and_then(|hir| thompson::Compiler::new().configure(guard_nfa(false)).build_from_hir(&hir).ok().map(|nfa| Made { nfa }));
+    let room = made.as_ref().map_or_else(Room::none, |m| room_of(&m.nfa)).with_crate(pat.room.compiled());
+    pat.room = room;
+    CACHE.with(|c| {
+        if let Some(e) = c.borrow_mut().map.get_mut(key) {
+            e.2 = room;
+        }
+    });
+    (room, made)
+}
+
+/// `nfa`'s room, from its states, the ranges of their transitions and its slots (see `Room`).
+fn room_of(nfa: &thompson::NFA) -> Room {
+    let ranges: u128 = nfa
+        .states()
+        .iter()
+        .map(|st| match st {
+            thompson::State::Sparse(t) => t.transitions.len() as u128,
+            thompson::State::ByteRange { .. } | thompson::State::Dense(_) => 1,
+            _ => 0,
+        })
+        .sum();
+    Room::of(nfa.states().len() as u128, ranges, nfa.group_info().slot_len() as u128, true)
+}
+
+/// A pattern's NFA forward, as `guard_nfa(false)` compiles it.
+struct Made {
+    nfa: thompson::NFA,
+}
+
+/// How a guard's NFAs are compiled, forward or back (back without groups, which it never finds).
+fn guard_nfa(reverse: bool) -> thompson::Config {
+    let c = thompson::Config::new().nfa_size_limit(Some(MOST_COMPILED)).reverse(reverse);
+    if reverse {
+        c.which_captures(thompson::WhichCaptures::None)
+    } else {
+        c
+    }
+}
+
+/// A pattern's search whose work is held to a time (FEEDBACK75.md, Q-1075; branch feedback75):
+/// regex-automata's lazy DFA, forward to where a match ends and back to where it starts, stepped
+/// here (`forward`, `backward`) as the crate steps it, with the prefilter the crate uses, and a look
+/// at the time every 4,096 bytes and every 16 states it has to make or look up: past what the call
+/// may compute (`Clock`), the error value. The crate's own rule for giving up (three clearings of
+/// its cache with under 10 bytes read a state) let a text that made a state every 21 bytes run a
+/// 4-branch `(?:x*[ab]){900}` pattern 6.5 s on 1 MB; a rule of the NFA's states a state refused the
+/// UI kit's translation checker on 1 MB of text with many braces (found in reviews). A match's
+/// groups are found within the match alone, by the bounded backtracker where it fits, as the
+/// crate does, else the PikeVM, held to the same budget as the crate's own searches. What only a
+/// match needs is made when one first does (the DFA back, the one-pass DFA), and a pattern every
+/// match of which ends where the text ends (`x$`) is searched back from there, as the crate does:
+/// made and stepped through first, the UI kit's checker, the 600-word list, and `(ch|sh|x)$` on
+/// 1 MB with no match took up to 19% longer than 0.8.8 (found measuring).
+struct Guard {
+    forward: hybrid::dfa::DFA,
+    /// The pattern as the crates take it, which the DFA back is compiled from.
+    full: String,
+    /// Where the pattern is its literals and nothing else (`\d`, `[;{}]`, `cat|dog`): the
+    /// prefilter that finds them, the crate's whole search there (`Guarding::find_literal`).
+    literal: Option<Prefilter>,
+    /// Whether each match ends where the text ends, and none must start where it starts (the
+    /// crate's "reverse anchored" search).
+    end_anchored: bool,
+    reverse: std::cell::OnceCell<Option<hybrid::dfa::DFA>>,
+    /// Where the pattern has a literal inside that every match holds, and no fast one in front:
+    /// the crate's "reverse inner" search (`Guarding::find_inner`).
+    inner: Option<Inner>,
+    groups: thompson::pikevm::PikeVM,
+    /// For a match short enough for it, as the crate does: quicker than the PikeVM there.
+    track: Option<thompson::backtrack::BoundedBacktracker>,
+    /// Where the pattern is one-pass, as the crate does: a match's groups in time linear in it,
+    /// however long, where the PikeVM's bound refused `^([^:]*)(?::([^:]*))?$` on a 2 MB line
+    /// that 0.8.8 read in 5 ms (found measuring).
+    onepass: std::cell::OnceCell<Option<regex_automata::dfa::onepass::DFA>>,
+}
+
+impl Guard {
+    /// The DFA back from where a match ends, made the first time one is needed; None where it
+    /// cannot be (the call then gives up).
+    fn reverse(&self) -> Option<&hybrid::dfa::DFA> {
+        self.reverse
+            .get_or_init(|| {
+                let hir = regex_automata::util::syntax::parse(&self.full).ok()?;
+                let rev = thompson::Compiler::new().configure(guard_nfa(true)).build_from_hir(&hir).ok()?;
+                let dfa = hybrid::dfa::Config::new().cache_capacity(GUARD_CACHE).skip_cache_capacity_check(true);
+                hybrid::dfa::Builder::new().configure(dfa.prefilter(None).specialize_start_states(false).match_kind(MatchKind::All)).build_from_nfa(rev).ok()
+            })
+            .as_ref()
+    }
+
+    /// The one-pass DFA, made the first time a match's groups are looked for; only for groups,
+    /// which a pattern without any never looks for.
+    fn onepass(&self) -> Option<&regex_automata::dfa::onepass::DFA> {
+        self.onepass
+            .get_or_init(|| {
+                let nfa = self.groups.get_nfa();
+                if nfa.group_info().group_len(regex_automata::PatternID::ZERO) > 1 {
+                    regex_automata::dfa::onepass::DFA::new_from_nfa(nfa.clone()).ok()
+                } else {
+                    None
+                }
+            })
+            .as_ref()
+    }
+}
+
+/// What each lazy DFA of a guarded call may keep: twice the crate's, as states of large patterns
+/// are large (at least what one state needs, whatever this says).
+const GUARD_CACHE: usize = 2 << 20;
+
+/// `p` with `flags` as a `Guard`, from what `exact_room` made where it is given, or None where it
+/// cannot be made.
+fn build_guard(p: &str, flags: &str, made: Option<Made>) -> Option<Guard> {
+    // Parsed again (a small part of compiling).
+    let full = full_pattern(p, flags).ok()?;
+    let hir = regex_automata::util::syntax::parse(&full).ok()?;
+    let fwd = match made {
+        Some(Made { nfa }) => nfa,
+        None => thompson::Compiler::new().configure(guard_nfa(false)).build_from_hir(&hir).ok()?,
+    };
+    let props = hir.properties();
+    let start_anchored = props.look_set_prefix().contains(regex_syntax::hir::Look::Start);
+    let dfa = hybrid::dfa::Config::new().cache_capacity(GUARD_CACHE).skip_cache_capacity_check(true);
+    // The crate's prefixes and its prefilter of them (regex-automata's `util::prefilter::prefixes`
+    // and `Prefilter::from_hir_prefix`), none where every match starts at the start, as the crate
+    // has none there.
+    let prefixes = (!start_anchored).then(|| {
+        let mut extractor = regex_syntax::hir::literal::Extractor::new();
+        extractor.kind(regex_syntax::hir::literal::ExtractKind::Prefix);
+        let mut seq = regex_syntax::hir::literal::Seq::empty();
+        seq.union(&mut extractor.extract(&hir));
+        seq.optimize_for_prefix_by_preference();
+        seq
+    });
+    let prefilter = prefixes.as_ref().and_then(|seq| seq.literals()).and_then(|lits| Prefilter::new(MatchKind::LeftmostFirst, lits));
+    let fast_prefix = prefilter.as_ref().is_some_and(Prefilter::is_fast);
+    // Where those prefixes are exact, and the pattern has no group of its own nor look-around, the
+    // crate's search is that prefilter alone (its "Pre" strategy, `Pre::from_prefixes`).
+    let literal = prefilter.clone().filter(|_| prefixes.as_ref().is_some_and(|seq| seq.is_exact()) && props.explicit_captures_len() == 0 && props.look_set().is_empty());
+    let forward = hybrid::dfa::Builder::new().configure(dfa.prefilter(prefilter)).build_from_nfa(fwd.clone()).ok()?;
+    // As the crate chooses: back from the end where every match ends there, else from a literal
+    // inside where there is no fast one in front, else forward.
+    let end_anchored = props.look_set_suffix().contains(regex_syntax::hir::Look::End) && !start_anchored;
+    let inner = if literal.is_some() || end_anchored || start_anchored || fast_prefix { None } else { inner_search(&hir) };
+    let track = thompson::backtrack::BoundedBacktracker::new_from_nfa(fwd.clone()).ok();
+    let groups = thompson::pikevm::PikeVM::new_from_nfa(fwd).ok()?;
+    Some(Guard { forward, full, literal, end_anchored, reverse: std::cell::OnceCell::new(), inner, groups, track, onepass: std::cell::OnceCell::new() })
+}
+
+/// The crate's "reverse inner" search for a pattern: the literal inside it, found by a prefilter,
+/// and the part in front of it, compiled back, which the search reads back from the literal to
+/// where the match starts (FEEDBACK75.md, Q-1075; branch feedback75). Without it, the guard read
+/// every byte of a text the crate skipped to each `@` in: `[^@\s]+@[^@\s]+\.[^@\s]+` on 990 KB
+/// 22% slower than 0.8.8 (found measuring).
+struct Inner {
+    pre: Prefilter,
+    rev: hybrid::dfa::DFA,
+}
+
+/// `hir`'s `Inner`, where the crate would search it so: a literal inside a top-level concatenation
+/// that a fast prefilter finds, and a part in front of it that no earlier match can come from
+/// (`inner::has_no_earlier_match`).
+fn inner_search(hir: &regex_syntax::hir::Hir) -> Option<Inner> {
+    let found = inner::extract(hir)?;
+    if !inner::has_no_earlier_match(&found.prefix, &found.literals) {
+        return None;
+    }
+    let nfa = thompson::Compiler::new().configure(guard_nfa(true)).build_from_hir(&found.prefix).ok()?;
+    let dfa = hybrid::dfa::Config::new().cache_capacity(GUARD_CACHE).skip_cache_capacity_check(true).prefilter(None).specialize_start_states(false).match_kind(MatchKind::All);
+    let rev = hybrid::dfa::Builder::new().configure(dfa).build_from_nfa(nfa).ok()?;
+    Some(Inner { pre: found.pre, rev })
+}
+
+/// regex-automata 0.4.18's own choice of an inner literal (`src/meta/reverse_inner.rs`) and its
+/// proofs that the first match found from one is the match its engines report
+/// (`src/meta/prefix.rs`), as they are there (MIT or Apache-2.0): private to the crate, and the
+/// guard must choose as it does to answer as it does.
+mod inner {
+    use regex_automata::util::prefilter::Prefilter;
+    use regex_automata::MatchKind;
+    use regex_syntax::hir::{
+        self,
+        literal::{self, Literal},
+        Class, Hir, HirKind,
+    };
+
+    pub(super) struct Found {
+        pub(super) prefix: Hir,
+        pub(super) pre: Prefilter,
+        pub(super) literals: Vec<Literal>,
+    }
+
+    /// `InnerPrefilter::new` for one pattern.
+    pub(super) fn extract(hir: &Hir) -> Option<Found> {
+        let mut concat = top_concat(hir)?;
+        for i in 1..concat.len() {
+            let Some((pre, lits)) = prefilter_with_literals(&concat[i]) else { continue };
+            if !pre.is_fast() {
+                continue;
+            }
+            let concat_suffix = Hir::concat(concat.split_off(i));
+            let concat_prefix = Hir::concat(concat);
+            let (pre, literals) = match prefilter_with_literals(&concat_suffix) {
+                Some((pre2, lits2)) if pre2.is_fast() => (pre2, lits2),
+                _ => (pre, lits),
+            };
+            return Some(Found { prefix: concat_prefix, pre, literals });
+        }
+        None
+    }
+
+    fn prefilter_with_literals(hir: &Hir) -> Option<(Prefilter, Vec<Literal>)> {
+        let mut extractor = literal::Extractor::new();
+        extractor.kind(literal::ExtractKind::Prefix);
+        let mut prefixes = extractor.extract(hir);
+        prefixes.make_inexact();
+        prefixes.optimize_for_prefix_by_preference();
+        let lits = prefixes.literals()?;
+        let pre = Prefilter::new(MatchKind::LeftmostFirst, lits)?;
+        Some((pre, lits.to_vec()))
+    }
+
+    fn top_concat(mut hir: &Hir) -> Option<Vec<Hir>> {
+        loop {
+            hir = match hir.kind() {
+                HirKind::Empty | HirKind::Literal(_) | HirKind::Class(_) | HirKind::Look(_) | HirKind::Repetition(_) | HirKind::Alternation(_) => return None,
+                HirKind::Capture(hir::Capture { ref sub, .. }) => sub,
+                HirKind::Concat(ref subs) => {
+                    let concat = Hir::concat(subs.iter().map(flatten).collect());
+                    return match concat.into_kind() {
+                        HirKind::Concat(xs) => Some(xs),
+                        _ => None,
+                    };
+                }
+            };
+        }
+    }
+
+    fn flatten(hir: &Hir) -> Hir {
+        match hir.kind() {
+            HirKind::Empty => Hir::empty(),
+            HirKind::Literal(hir::Literal(ref x)) => Hir::literal(x.clone()),
+            HirKind::Class(ref x) => Hir::class(x.clone()),
+            HirKind::Look(ref x) => Hir::look(*x),
+            HirKind::Repetition(ref x) => Hir::repetition(x.with(flatten(&x.sub))),
+            HirKind::Capture(hir::Capture { ref sub, .. }) => flatten(sub),
+            HirKind::Alternation(ref xs) => Hir::alternation(xs.iter().map(flatten).collect()),
+            HirKind::Concat(ref xs) => Hir::concat(xs.iter().map(flatten).collect()),
+        }
+    }
+
+    /// Whether the first literal confirmed is the match the crate's engines report.
+    pub(super) fn has_no_earlier_match(concat_prefix: &Hir, literals: &[Literal]) -> bool {
+        if literals.is_empty() || literals.iter().any(|lit| lit.is_empty()) {
+            return false;
+        }
+        if literals.len() == 1 && !hir_can_contain_literal(concat_prefix, literals[0].as_bytes()) {
+            return true;
+        }
+        hir_has_fixed_length(concat_prefix) || has_disjoint_class_separator(concat_prefix, literals)
+    }
+
+    fn hir_can_contain_literal(hir: &Hir, lit: &[u8]) -> bool {
+        lit.is_empty() || lit.iter().all(|&byte| hir_can_consume_byte(hir, byte))
+    }
+
+    fn hir_has_fixed_length(hir: &Hir) -> bool {
+        let props = hir.properties();
+        props.minimum_len().and_then(|min| props.maximum_len().map(|max| min == max)).unwrap_or(false)
+    }
+
+    fn has_disjoint_class_separator(prefix: &Hir, literals: &[Literal]) -> bool {
+        let hirs = match uncapture(prefix).kind() {
+            HirKind::Concat(hirs) if hirs.len() >= 2 => hirs,
+            _ => return false,
+        };
+        let Some(first) = hirs.iter().position(|hir| !hir_matches_empty_only(hir)) else { return false };
+        let last = hirs.iter().rposition(|hir| !hir_matches_empty_only(hir)).expect("one is");
+        has_disjoint_class_separator_at(hirs, last, literals) || (first != last && has_disjoint_class_separator_at(hirs, first, literals))
+    }
+
+    fn has_disjoint_class_separator_at(hirs: &[Hir], separator: usize, literals: &[Literal]) -> bool {
+        let Some(separator_class) = required_class(&hirs[separator]) else { return false };
+        class_is_disjoint_from_literals(separator_class, literals) && hirs.iter().enumerate().all(|(i, hir)| i == separator || hir_is_disjoint_from_class(hir, separator_class))
+    }
+
+    fn hir_matches_empty_only(hir: &Hir) -> bool {
+        hir.properties().maximum_len() == Some(0)
+    }
+
+    fn required_class(hir: &Hir) -> Option<&Class> {
+        match uncapture(hir).kind() {
+            HirKind::Class(cls) => Some(cls),
+            HirKind::Repetition(rep) if rep.min > 0 => match uncapture(&rep.sub).kind() {
+                HirKind::Class(cls) => Some(cls),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn hir_is_disjoint_from_class(hir: &Hir, separator: &Class) -> bool {
+        match hir.kind() {
+            HirKind::Empty | HirKind::Look(_) => true,
+            HirKind::Literal(lit) => class_is_disjoint_from_literal(separator, &lit.0),
+            HirKind::Class(cls) => classes_are_disjoint(cls, separator),
+            HirKind::Repetition(rep) => hir_is_disjoint_from_class(&rep.sub, separator),
+            HirKind::Capture(capture) => hir_is_disjoint_from_class(&capture.sub, separator),
+            HirKind::Concat(hirs) | HirKind::Alternation(hirs) => hirs.iter().all(|hir| hir_is_disjoint_from_class(hir, separator)),
+        }
+    }
+
+    fn uncapture(mut hir: &Hir) -> &Hir {
+        while let HirKind::Capture(capture) = hir.kind() {
+            hir = &capture.sub;
+        }
+        hir
+    }
+
+    fn classes_are_disjoint(left: &Class, right: &Class) -> bool {
+        match (left, right) {
+            (Class::Bytes(left), Class::Bytes(right)) => {
+                let (mut intersection, other) = if left.ranges().len() <= right.ranges().len() { (left.clone(), right) } else { (right.clone(), left) };
+                intersection.intersect(other);
+                intersection.ranges().is_empty()
+            }
+            (Class::Unicode(left), Class::Unicode(right)) => {
+                let (mut intersection, other) = if left.ranges().len() <= right.ranges().len() { (left.clone(), right) } else { (right.clone(), left) };
+                intersection.intersect(other);
+                intersection.ranges().is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    fn class_is_disjoint_from_literals(cls: &Class, literals: &[Literal]) -> bool {
+        literals.iter().all(|lit| class_is_disjoint_from_literal(cls, lit.as_bytes()))
+    }
+
+    fn class_is_disjoint_from_literal(cls: &Class, lit: &[u8]) -> bool {
+        match cls {
+            Class::Bytes(cls) => lit.iter().all(|&byte| !byte_class_contains(cls, byte)),
+            Class::Unicode(cls) => core::str::from_utf8(lit).is_ok_and(|lit| lit.chars().all(|ch| !unicode_class_contains(cls, ch))),
+        }
+    }
+
+    fn hir_can_consume_byte(hir: &Hir, byte: u8) -> bool {
+        match hir.kind() {
+            HirKind::Empty | HirKind::Look(_) => false,
+            HirKind::Literal(lit) => lit.0.contains(&byte),
+            HirKind::Class(Class::Bytes(cls)) => byte_class_contains(cls, byte),
+            HirKind::Class(Class::Unicode(cls)) => byte > 0x7F || unicode_class_contains(cls, char::from(byte)),
+            HirKind::Repetition(rep) => hir_can_consume_byte(&rep.sub, byte),
+            HirKind::Capture(capture) => hir_can_consume_byte(&capture.sub, byte),
+            HirKind::Concat(hirs) | HirKind::Alternation(hirs) => hirs.iter().any(|hir| hir_can_consume_byte(hir, byte)),
+        }
+    }
+
+    fn byte_class_contains(cls: &hir::ClassBytes, byte: u8) -> bool {
+        cls.ranges().iter().any(|range| range.start() <= byte && byte <= range.end())
+    }
+
+    fn unicode_class_contains(cls: &hir::ClassUnicode, ch: char) -> bool {
+        cls.ranges().iter().any(|range| range.start() <= ch && ch <= range.end())
+    }
+}
+
+/// A thread's guards, kept as its compiled patterns are (each counted as its pattern is), at most
+/// `GUARDS_MOST`; None for a pattern none could be made of.
+#[derive(Default)]
+struct Guards {
+    map: HashMap<(String, String), (Option<Rc<Guard>>, usize)>,
+    order: std::collections::VecDeque<(String, String)>,
+    bytes: usize,
+}
+
+const GUARDS_MOST: usize = 64;
+
+thread_local! {
+    static GUARDS: RefCell<Guards> = RefCell::new(Guards::default());
+}
+
+/// The pattern's `Guard`, made the first time a search needs it; None where it cannot be made,
+/// and the search is then made by the crate, as before.
+fn guard_of(key: (String, String), made: Option<Made>) -> Option<Rc<Guard>> {
+    if let Some(g) = GUARDS.with(|c| c.borrow().map.get(&key).map(|(g, _)| g.clone())) {
+        return g;
+    }
+    let g = build_guard(&key.0, &key.1, made).map(Rc::new);
+    // Counted as its pattern is in the cache, as most as anything kept there where it is not.
+    let counted = CACHE.with(|c| c.borrow().map.get(&key).map_or(CACHE_BYTES, |(_, n, _)| *n));
+    GUARDS.with(|c| {
+        let mut c = c.borrow_mut();
+        while !c.order.is_empty() && (c.bytes + counted > CACHE_BYTES || c.map.len() >= GUARDS_MOST) {
+            let old = c.order.pop_front().expect("not empty");
+            if let Some((_, n)) = c.map.remove(&old) {
+                c.bytes -= n;
+            }
+        }
+        if counted <= CACHE_BYTES {
+            c.bytes += counted;
+            c.order.push_back(key.clone());
+            c.map.insert(key, (g.clone(), counted));
+        }
+    });
+    g
+}
+
+/// The guard for a call of `pat` over `len` bytes (`caps`: one that asks for groups), with what a
+/// byte of a match's groups costs, where the crate's worst would not fit (`Room`): Ok(None) for the
+/// crate, Err where none can be made, which is the call's error value, never the crate.
+#[inline]
+fn guard_for(pat: &mut Pat, key: Key, len: usize, caps: bool) -> Result<Option<(Rc<Guard>, u64)>, ()> {
+    if pat.room.holds(len, caps) {
+        return Ok(None);
+    }
+    guard_past_room(pat, key, len, caps)
+}
+
+#[inline(never)]
+fn guard_past_room(pat: &mut Pat, key: Key, len: usize, caps: bool) -> Result<Option<(Rc<Guard>, u64)>, ()> {
+    let key = key.strings();
+    let (room, made) = exact_room(pat, &key);
+    if room.fits(len, caps) {
+        if room.compiled() {
+            return Ok(None);
+        }
+        // A pattern the guard took first, on a text the crate may search: its Regex compiled now,
+        // once, and kept with it.
+        if let Ok((r, step)) = compile_stepped(&key.0, &key.1) {
+            let room = room.with_crate(true);
+            store(&key, &r, step * 2, room);
+            pat.r = r;
+            pat.room = room;
+            return Ok(None);
+        }
+    }
+    guard_of(key, made).map(|g| Some((g, room.caps_ps))).ok_or(())
+}
+
+/// A guarded call's caches, made once for all its searches.
+struct Guarding<'g> {
+    g: &'g Guard,
+    fwd: hybrid::dfa::Cache,
+    /// Made with the DFA back, where a match first needs it.
+    rev: Option<hybrid::dfa::Cache>,
+    /// The cache of `Inner`'s DFA back, where the search first needs it.
+    inner: Option<hybrid::dfa::Cache>,
+    /// Made where the PikeVM runs, its size charged first (see `room_for_bytes`): it holds each
+    /// state's slots twice, and `(?:(a)|…×3000)*` made 785 MB for a `re.test` that never used it
+    /// (found in review).
+    groups: Option<thompson::pikevm::Cache>,
+    track: Option<thompson::backtrack::Cache>,
+    onepass: Option<regex_automata::dfa::onepass::Cache>,
+    caps: regex_automata::util::captures::Captures,
+    /// The pattern's groups, the whole match among them.
+    count: usize,
+    /// What a byte of a match's groups costs, at the most (`Room`).
+    caps_ps: u64,
+    clock: Clock,
+}
+
+/// Why a guarded search stopped short.
+#[derive(Clone, Copy)]
+enum Halt {
+    /// Past what the call may compute: the call's error value.
+    Time,
+    /// Past `--max-compute`: the request's stop, as Q-976's searches stop it (the watchdog's flag
+    /// is taken as it is read, so an error value would let the request go on).
+    Compute,
+}
+
+/// The most steps that may make a state between two looks at the clock, and the NFA states they may
+/// follow in all between them (see `Clock::weigh`): a debug build's (`SLOWER`) fewer.
+const STEPS_MOST: u32 = 4096;
+const STATE_WORK: usize = 40_000 / SLOWER as usize;
+
+/// What a guarded call may compute, in all: a tenth of a second and `GUARD_PER_BYTE` a byte of its
+/// text, of its thread's own time (see there), and never past what the request may still compute
+/// under `--max-compute`; looked at by the wall clock, which is cheap, and then by the thread's,
+/// which a loaded machine does not run ahead.
+struct Clock {
+    cpu_from: Duration,
+    allowed: Duration,
+    until: std::time::Instant,
+    /// When `--max-compute` ends the request, by its own (wall) clock.
+    compute_until: Option<std::time::Instant>,
+    bytes: u32,
+    steps: u32,
+    /// How many steps that may make a state go between looks (`weigh`).
+    every: u32,
+}
+
+impl Clock {
+    fn new(len: usize) -> Clock {
+        let now = std::time::Instant::now();
+        let allowed = Duration::from_millis(100) * SLOWER + GUARD_PER_BYTE.saturating_mul(u32::try_from(len).unwrap_or(u32::MAX));
+        Clock { cpu_from: thread_time(), allowed, until: now + allowed, compute_until: crate::httpd::compute_left().map(|d| now + d), bytes: 0, steps: 0, every: STEPS_MOST }
+    }
+
+    /// The steps between looks for a DFA of an NFA of `states` states, the fewest of those it steps:
+    /// making a state follows at most each state of the NFA, so that `STATE_WORK` over the states
+    /// is about 2 ms of making at 50 ns a state, and never more than now for a large one (16). Each
+    /// match state is a step that may make a state, and a look every 16 of them was a fifth of a
+    /// tokenizer's search (`Instant::now`; found profiling).
+    fn weigh(&mut self, states: usize) {
+        let every = (STATE_WORK / states.max(1)).clamp(16, STEPS_MOST as usize);
+        self.every = self.every.min(every as u32);
+    }
+
+    /// Whether `cost` more fits before `--max-compute` ends the request.
+    fn compute_fits(&self, cost: Duration) -> bool {
+        self.compute_until.is_none_or(|c| std::time::Instant::now() + cost < c)
+    }
+
+    /// Whether `cost` more fits what the call may still compute and what `--max-compute` leaves.
+    fn room_for(&self, cost: Duration) -> Result<(), Halt> {
+        if !self.compute_fits(cost) {
+            return Err(Halt::Compute);
+        }
+        if thread_time().saturating_sub(self.cpu_from) + cost > self.allowed {
+            return Err(Halt::Time);
+        }
+        Ok(())
+    }
+
+    /// A byte stepped over.
+    #[inline]
+    fn byte(&mut self) -> Result<(), Halt> {
+        self.bytes(1)
+    }
+
+    /// `n` bytes stepped over.
+    #[inline]
+    fn bytes(&mut self, n: usize) -> Result<(), Halt> {
+        self.bytes = self.bytes.saturating_add(u32::try_from(n).unwrap_or(u32::MAX));
+        if self.bytes < 4096 {
+            return Ok(());
+        }
+        self.bytes = 0;
+        self.look()
+    }
+
+    /// A step that may have made a state.
+    #[inline]
+    fn slow(&mut self) -> Result<(), Halt> {
+        self.steps += 1;
+        if self.steps < self.every {
+            return Ok(());
+        }
+        self.steps = 0;
+        self.look()
+    }
+
+    #[inline(never)]
+    fn look(&mut self) -> Result<(), Halt> {
+        let now = std::time::Instant::now();
+        if self.compute_until.is_some_and(|c| now >= c) || crate::httpd::OVER_TIME.load(std::sync::atomic::Ordering::Relaxed) && crate::httpd::over_time() {
+            return Err(Halt::Compute);
+        }
+        if now < self.until {
+            return Ok(());
+        }
+        let used = thread_time().saturating_sub(self.cpu_from);
+        if used > self.allowed {
+            return Err(Halt::Time);
+        }
+        self.until = now + (self.allowed - used);
+        Ok(())
+    }
+}
+
+/// The next state from `sid` on `b`: from the table where it is known, else made (and looked at
+/// the clock for).
+#[inline(always)]
+fn step(dfa: &hybrid::dfa::DFA, cache: &mut hybrid::dfa::Cache, clock: &mut Clock, sid: hybrid::LazyStateID, b: u8) -> Result<hybrid::LazyStateID, Halt> {
+    if !sid.is_tagged() {
+        let next = dfa.next_state_untagged(cache, sid, b);
+        if !next.is_unknown() {
+            return Ok(next);
+        }
+    }
+    clock.slow()?;
+    dfa.next_state(cache, sid, b).map_err(|_| Halt::Time)
+}
+
+/// Where the leftmost-first match from `input`'s start ends, stepped as regex-automata's
+/// `find_fwd` steps it (its start, match, dead and quit states, its prefilter from a start state,
+/// the transition past the end), with the clock looked at.
+fn forward(dfa: &hybrid::dfa::DFA, cache: &mut hybrid::dfa::Cache, clock: &mut Clock, input: &Input<'_>) -> Result<Option<usize>, Halt> {
+    if input.is_done() {
+        return Ok(None);
+    }
+    let hay = input.haystack();
+    let pre = if input.get_anchored().is_anchored() { None } else { dfa.get_config().get_prefilter() };
+    let universal = dfa.get_nfa().look_set_prefix_any().is_empty();
+    let restart = |cache: &mut hybrid::dfa::Cache, at: usize| {
+        let mut i = input.clone();
+        i.set_start(at);
+        dfa.start_state_forward(cache, &i).map_err(|_| Halt::Time)
+    };
+    let mut end = None;
+    let mut sid = dfa.start_state_forward(cache, input).map_err(|_| Halt::Time)?;
+    let mut at = input.start();
+    if let Some(pre) = pre {
+        match pre.find(hay, regex_automata::Span::from(at..input.end())) {
+            None => return Ok(None),
+            Some(sp) => {
+                at = sp.start;
+                if !universal {
+                    sid = restart(cache, at)?;
+                }
+            }
+        }
+    }
+    while at < input.end() {
+        // Through untagged states from the table, as the crate's loop goes, and the clock looked at
+        // once for each 4,096 bytes (found in review: a step and a count a byte made ordinary
+        // patterns slower than the crate).
+        if !sid.is_tagged() {
+            let stop = input.end().min(at + 4096);
+            let from = at;
+            // SAFETY (each step): `sid` is a state of this DFA, not tagged (looked at before it is
+            // stepped from), and the byte's index is below `stop`, at most the haystack's end.
+            while at + 4 <= stop {
+                let a = unsafe { dfa.next_state_untagged_unchecked(cache, sid, *hay.get_unchecked(at)) };
+                if a.is_tagged() {
+                    break;
+                }
+                let b = unsafe { dfa.next_state_untagged_unchecked(cache, a, *hay.get_unchecked(at + 1)) };
+                if b.is_tagged() {
+                    sid = a;
+                    at += 1;
+                    break;
+                }
+                let c = unsafe { dfa.next_state_untagged_unchecked(cache, b, *hay.get_unchecked(at + 2)) };
+                if c.is_tagged() {
+                    sid = b;
+                    at += 2;
+                    break;
+                }
+                let d = unsafe { dfa.next_state_untagged_unchecked(cache, c, *hay.get_unchecked(at + 3)) };
+                if d.is_tagged() {
+                    sid = c;
+                    at += 3;
+                    break;
+                }
+                sid = d;
+                at += 4;
+            }
+            while at < stop && !sid.is_tagged() {
+                let next = unsafe { dfa.next_state_untagged_unchecked(cache, sid, *hay.get_unchecked(at)) };
+                if next.is_tagged() {
+                    break;
+                }
+                sid = next;
+                at += 1;
+            }
+            clock.bytes(at - from)?;
+            if at == stop {
+                continue;
+            }
+        }
+        sid = step(dfa, cache, clock, sid, hay[at])?;
+        if sid.is_tagged() {
+            if sid.is_start() {
+                if let (Some(pre), None) = (pre, end) {
+                    match pre.find(hay, regex_automata::Span::from(at..input.end())) {
+                        None => return Ok(None),
+                        Some(sp) if sp.start > at => {
+                            at = sp.start;
+                            if !universal {
+                                sid = restart(cache, at)?;
+                            }
+                            continue;
+                        }
+                        Some(_) => {}
+                    }
+                }
+            } else if sid.is_match() {
+                end = Some(at);
+                if input.get_earliest() {
+                    return Ok(end);
+                }
+            } else if sid.is_dead() {
+                return Ok(end);
+            } else if sid.is_quit() {
+                return Err(Halt::Time);
+            }
+        }
+        // Counted by `step` where it may make a state or leaves a tagged one, and the steps of the
+        // loop above by their run: each step here from an untagged state is one the loop above
+        // stopped before, followed by a counted one (a tokenizer's match states made two counts
+        // of each byte, found measuring).
+        at += 1;
+    }
+    sid = match hay.get(input.end()) {
+        Some(&b) => dfa.next_state(cache, sid, b),
+        None => dfa.next_eoi_state(cache, sid),
+    }
+    .map_err(|_| Halt::Time)?;
+    if sid.is_match() {
+        end = Some(input.end());
+    }
+    Ok(end)
+}
+
+/// Where the match that ends at `input`'s end begins, back from there, anchored, as regex-automata's
+/// `find_rev` steps it, with the clock looked at.
+fn backward(dfa: &hybrid::dfa::DFA, cache: &mut hybrid::dfa::Cache, clock: &mut Clock, input: &Input<'_>) -> Result<Option<usize>, Halt> {
+    let hay = input.haystack();
+    let mut start = None;
+    let mut sid = dfa.start_state_reverse(cache, input).map_err(|_| Halt::Time)?;
+    if input.start() < input.end() {
+        let mut at = input.end() - 1;
+        loop {
+            // Through untagged states from the table, as `forward` does.
+            if !sid.is_tagged() {
+                let from = at;
+                loop {
+                    // SAFETY: `sid` is a state of this DFA and not tagged, and `at` is within the
+                    // haystack (at most `input.end() - 1`, at least its start).
+                    let next = unsafe { dfa.next_state_untagged_unchecked(cache, sid, *hay.get_unchecked(at)) };
+                    if next.is_tagged() || at == input.start() {
+                        break;
+                    }
+                    sid = next;
+                    at -= 1;
+                }
+                clock.bytes(from - at)?;
+            }
+            sid = step(dfa, cache, clock, sid, hay[at])?;
+            if sid.is_tagged() {
+                if sid.is_match() {
+                    start = Some(at + 1);
+                } else if sid.is_dead() {
+                    return Ok(start);
+                } else if sid.is_quit() {
+                    return Err(Halt::Time);
+                }
+            }
+            if at == input.start() {
+                break;
+            }
+            // Counted as in `forward`: a step here leaves a tagged state, which `step` counts, or
+            // is the one the loop above stopped before (a match state at each byte, as reading back
+            // a run of `[^;\n{}]+` has, made two counts of each).
+            at -= 1;
+        }
+    }
+    sid = match input.start().checked_sub(1) {
+        Some(i) => dfa.next_state(cache, sid, hay[i]),
+        None => dfa.next_eoi_state(cache, sid),
+    }
+    .map_err(|_| Halt::Time)?;
+    if sid.is_match() {
+        start = Some(input.start());
+    }
+    Ok(start)
+}
+
+/// Where the match from `input`'s start (anchored) ends, or Err where the reading stopped with
+/// none, as regex-automata's `stopat::hybrid_try_search_half_fwd` reads it, with the clock looked
+/// at.
+fn forward_stopat(dfa: &hybrid::dfa::DFA, cache: &mut hybrid::dfa::Cache, clock: &mut Clock, input: &Input<'_>) -> Result<Result<usize, usize>, Halt> {
+    let hay = input.haystack();
+    let mut end = None;
+    let mut sid = dfa.start_state_forward(cache, input).map_err(|_| Halt::Time)?;
+    let mut at = input.start();
+    while at < input.end() {
+        sid = step(dfa, cache, clock, sid, hay[at])?;
+        if sid.is_tagged() {
+            if sid.is_match() {
+                end = Some(at);
+                if input.get_earliest() {
+                    return Ok(end.ok_or(at));
+                }
+            } else if sid.is_dead() {
+                return Ok(end.ok_or(at));
+            } else if sid.is_quit() {
+                return Err(Halt::Time);
+            }
+        }
+        at += 1;
+        clock.byte()?;
+    }
+    sid = match hay.get(input.end()) {
+        Some(&b) => dfa.next_state(cache, sid, b),
+        None => dfa.next_eoi_state(cache, sid),
+    }
+    .map_err(|_| Halt::Time)?;
+    if sid.is_quit() {
+        return Err(Halt::Time);
+    }
+    if sid.is_match() {
+        end = Some(input.end());
+    }
+    Ok(end.ok_or(at))
+}
+
+/// Where the match that ends at `input`'s end begins, back from there, anchored, as regex-automata's
+/// `limited::hybrid_try_search_half_rev` reads it, with the clock looked at: None where it would
+/// read before `min_start`, or reached the start without its DFA dying (which could be a match
+/// that starts earlier), the crate's signs that the search should go forward instead.
+fn back_limited(dfa: &hybrid::dfa::DFA, cache: &mut hybrid::dfa::Cache, clock: &mut Clock, input: &Input<'_>, min_start: usize) -> Result<Option<Option<usize>>, Halt> {
+    let hay = input.haystack();
+    let mut start = None;
+    let mut sid = dfa.start_state_reverse(cache, input).map_err(|_| Halt::Time)?;
+    let eoi = |sid: &mut hybrid::LazyStateID, start: &mut Option<usize>, cache: &mut hybrid::dfa::Cache| -> Result<(), Halt> {
+        *sid = match input.start().checked_sub(1) {
+            Some(i) => dfa.next_state(cache, *sid, hay[i]),
+            None => dfa.next_eoi_state(cache, *sid),
+        }
+        .map_err(|_| Halt::Time)?;
+        if sid.is_quit() {
+            return Err(Halt::Time);
+        }
+        if sid.is_match() {
+            *start = Some(input.start());
+        }
+        Ok(())
+    };
+    if input.start() == input.end() {
+        eoi(&mut sid, &mut start, cache)?;
+        return Ok(Some(start));
+    }
+    let mut at = input.end() - 1;
+    loop {
+        sid = step(dfa, cache, clock, sid, hay[at])?;
+        clock.byte()?;
+        if sid.is_tagged() {
+            if sid.is_match() {
+                start = Some(at + 1);
+            } else if sid.is_dead() {
+                return Ok(Some(start));
+            } else if sid.is_quit() {
+                return Err(Halt::Time);
+            }
+        }
+        if at == input.start() {
+            break;
+        }
+        at -= 1;
+        if at < min_start {
+            return Ok(None);
+        }
+    }
+    let was_dead = sid.is_dead();
+    eoi(&mut sid, &mut start, cache)?;
+    if at == input.start() && start.is_some_and(|s| s > input.start()) && !was_dead {
+        return Ok(None);
+    }
+    Ok(Some(start))
+}
+
+impl<'g> Guarding<'g> {
+    fn new(g: &'g Guard, caps_ps: u64, len: usize) -> Guarding<'g> {
+        let count = g.groups.get_nfa().group_info().group_len(regex_automata::PatternID::ZERO);
+        Guarding {
+            g,
+            fwd: g.forward.create_cache(),
+            rev: None,
+            inner: None,
+            groups: None,
+            track: None,
+            onepass: None,
+            caps: g.groups.create_captures(),
+            count,
+            caps_ps,
+            clock: {
+                let mut clock = Clock::new(len);
+                clock.weigh(g.forward.get_nfa().states().len());
+                clock
+            },
+        }
+    }
+
+    /// The first match from `from` on (`earliest`: whether there is one, ended where it is first
+    /// known, its groups not looked for), or Err past the call's time, or where the match's groups
+    /// could take longer to find than `GUARD_BUDGET_PS`.
+    #[inline]
+    fn find(&mut self, s: &str, from: usize, earliest: bool) -> Result<Option<Found>, Halt> {
+        if let Some(pre) = &self.g.literal {
+            return self.find_literal(pre, s, from, earliest);
+        }
+        if self.g.end_anchored {
+            return self.find_at_end(s, from, earliest);
+        }
+        if self.g.inner.is_some() {
+            return self.find_inner(s, from, earliest);
+        }
+        self.find_forward(s, from, earliest)
+    }
+
+    /// `find` for a pattern that is its literals and nothing else (`Guard::literal`): the next one the
+    /// prefilter finds, as regex-automata's "Pre" search (`Pre::search`) answers, with what it read
+    /// counted. Each step of the guard's search took twice as long as the crate's memchr-like
+    /// reading where a match is on almost every byte: `\d` and `[ ]` on 10 MB 55% slower than
+    /// 0.8.8 (found measuring). One reading takes at most a few nanoseconds a byte, under what a
+    /// call may compute a byte (`GUARD_PER_BYTE`), so the clock looked at after it bounds it.
+    #[inline(always)]
+    fn find_literal(&mut self, pre: &Prefilter, s: &str, from: usize, earliest: bool) -> Result<Option<Found>, Halt> {
+        if from > s.len() {
+            return Ok(None);
+        }
+        let found = pre.find(s.as_bytes(), regex_automata::Span::from(from..s.len()));
+        self.clock.bytes(found.map_or(s.len(), |sp| sp.end) - from)?;
+        Ok(found.map(|sp| Found { start: if earliest { sp.end } else { sp.start }, end: sp.end, groups: Vec::new() }))
+    }
+
+    /// `find` from the pattern's inner literal (`Inner`), as regex-automata's "reverse inner"
+    /// search goes (`ReverseInner::try_search_full`): to each literal by the prefilter, back from
+    /// it to where a match starts (no further back than the last literal, `min_match_start`), and
+    /// forward from there to where it ends; where a literal is before where the last forward
+    /// reading stopped, or the reading back would pass the last literal, the search goes forward
+    /// from the start instead, as the crate's does, so that no byte is read over and over. Each
+    /// step is a step of the guard's, counted by its clock.
+    #[inline(never)]
+    fn find_inner(&mut self, s: &str, from: usize, earliest: bool) -> Result<Option<Found>, Halt> {
+        let inner = self.g.inner.as_ref().expect("looked at by `find`");
+        let mut span = regex_automata::Span::from(from..s.len());
+        let (mut min_match_start, mut min_pre_start) = (0usize, 0usize);
+        loop {
+            let Some(lit) = inner.pre.find(s.as_bytes(), span) else { break };
+            self.clock.bytes(lit.start - span.start)?;
+            if lit.start < min_pre_start {
+                return self.find_forward(s, from, earliest);
+            }
+            let back = Input::new(s).anchored(Anchored::Yes).span(from..lit.start);
+            if self.inner.is_none() {
+                self.clock.weigh(inner.rev.get_nfa().states().len());
+                self.inner = Some(inner.rev.create_cache());
+            }
+            let cache = self.inner.as_mut().expect("made above");
+            match back_limited(&inner.rev, cache, &mut self.clock, &back, min_match_start)? {
+                None => return self.find_forward(s, from, earliest),
+                Some(Some(start)) => {
+                    let ahead = Input::new(s).anchored(Anchored::Yes).span(start..s.len()).earliest(earliest);
+                    match forward_stopat(&self.g.forward, &mut self.fwd, &mut self.clock, &ahead)? {
+                        Err(stopat) => {
+                            min_pre_start = stopat;
+                            span.start = lit.start + 1;
+                        }
+                        Ok(end) if earliest => return Ok(Some(Found { start: end, end, groups: Vec::new() })),
+                        Ok(end) => return self.groups_of(s, start, end),
+                    }
+                }
+                Some(None) => {}
+            }
+            if span.start >= span.end {
+                break;
+            }
+            span.start = lit.start + 1;
+            min_match_start = lit.end;
+        }
+        Ok(None)
+    }
+
+    /// `find`, forward to where the match ends, and back from there to where it starts.
+    #[inline(always)]
+    fn find_forward(&mut self, s: &str, from: usize, earliest: bool) -> Result<Option<Found>, Halt> {
+        let fdfa = &self.g.forward;
+        let mut input = Input::new(s).range(from..).earliest(earliest);
+        let mut end = forward(fdfa, &mut self.fwd, &mut self.clock, &input)?;
+        // An empty match inside a character, which `\B` can find between the bytes of `é`: passed
+        // over a byte at a time, as the crate does (UTF-8 mode).
+        if fdfa.get_nfa().has_empty() && fdfa.get_nfa().is_utf8() {
+            while let Some(e) = end {
+                if s.is_char_boundary(e) {
+                    break;
+                }
+                input.set_start(input.start() + 1);
+                end = forward(fdfa, &mut self.fwd, &mut self.clock, &input)?;
+            }
+        }
+        let Some(end) = end else { return Ok(None) };
+        if earliest {
+            return Ok(Some(Found { start: end, end, groups: Vec::new() }));
+        }
+        let start = if end == from || fdfa.get_nfa().is_always_start_anchored() {
+            from
+        } else {
+            let back = Input::new(s).span(from..end).anchored(Anchored::Yes).earliest(false);
+            self.back(&back)?.ok_or(Halt::Time)?
+        };
+        self.groups_of(s, start, end)
+    }
+
+    /// Where the match that ends at `input`'s end begins, by the DFA back (made where it is first
+    /// needed).
+    #[inline(always)]
+    fn back(&mut self, input: &Input<'_>) -> Result<Option<usize>, Halt> {
+        let rdfa = self.g.reverse().ok_or(Halt::Time)?;
+        if self.rev.is_none() {
+            self.clock.weigh(rdfa.get_nfa().states().len());
+            self.rev = Some(rdfa.create_cache());
+        }
+        let cache = self.rev.as_mut().expect("made above");
+        backward(rdfa, cache, &mut self.clock, input)
+    }
+
+    /// `find` for a pattern whose every match ends where the text does (`Guard::end_anchored`):
+    /// back from there, anchored, for the match that starts first (the crate's "reverse anchored"
+    /// search, and its answer), where forward would read the whole text.
+    #[inline(never)]
+    fn find_at_end(&mut self, s: &str, from: usize, earliest: bool) -> Result<Option<Found>, Halt> {
+        if from > s.len() {
+            return Ok(None);
+        }
+        let back = Input::new(s).span(from..s.len()).anchored(Anchored::Yes).earliest(false);
+        let Some(start) = self.back(&back)? else { return Ok(None) };
+        // Never inside a character, which the DFA's UTF-8 classes cannot end a match in; were one
+        // found there, the search goes forward instead, as any other (never taken in tests).
+        if !s.is_char_boundary(start) {
+            return self.find_forward(s, from, earliest);
+        }
+        if earliest {
+            return Ok(Some(Found { start: s.len(), end: s.len(), groups: Vec::new() }));
+        }
+        self.groups_of(s, start, s.len())
+    }
+
+    /// The match from `start` to `end`, with its groups where the pattern has any.
+    #[inline(always)]
+    fn groups_of(&mut self, s: &str, start: usize, end: usize) -> Result<Option<Found>, Halt> {
+        // No groups to find: the PikeVM went over every match, and `(?:a*){900}` on 1 MB of `a`
+        // took 7.7 s where the crate took 2 ms (found in review).
+        if self.count <= 1 {
+            return Ok(Some(Found { start, end, groups: Vec::new() }));
+        }
+        // Finding them follows each state, its ranges and its slots, a byte of the match at the most
+        // (`Room`): past the budget, given up as a search is (`((?:a*){900})` took 1.3 s on 200 KB;
+        // found in review).
+        let within = Input::new(s).span(start..end).anchored(Anchored::Yes);
+        // One-pass: linear in the match, whatever its length.
+        if let Some(o) = self.g.onepass() {
+            let cache = self.onepass.get_or_insert_with(|| o.create_cache());
+            if o.try_search(cache, &within, &mut self.caps).is_ok() {
+                let groups = (1..self.count).map(|i| self.caps.get_group(i).map(|g| (g.start, g.end))).collect();
+                return Ok(Some(Found { start, end, groups }));
+            }
+        }
+        // Within the match, from its start: what lies around it is still looked at by `\b` and `$`.
+        // The bounded backtracker where the match fits its own small set of visits, as the crate
+        // does: each state at each byte once, a few milliseconds at most there.
+        let tracked = match &self.g.track {
+            Some(t) if end - start <= t.max_haystack_len() => {
+                let cache = self.track.get_or_insert_with(|| t.create_cache());
+                t.try_search(cache, &within, &mut self.caps).is_ok()
+            }
+            _ => false,
+        };
+        if !tracked {
+            let cost = (self.caps_ps as u128).saturating_mul((end - start) as u128);
+            let nfa = self.g.groups.get_nfa();
+            let pikevm_bytes = (nfa.states().len() as u128).saturating_mul(nfa.group_info().slot_len() as u128).saturating_mul(16);
+            if cost <= GUARD_BUDGET_PS && (self.groups.is_some() || room_for_bytes(pikevm_bytes)) {
+                // Nor past `--max-compute`: it cannot be stopped once it starts.
+                if !self.clock.compute_fits(Duration::from_nanos(u64::try_from(cost / 1000).unwrap_or(u64::MAX))) {
+                    return Err(Halt::Compute);
+                }
+                let cache = self.groups.get_or_insert_with(|| self.g.groups.create_cache());
+                self.g.groups.search(cache, &within, &mut self.caps);
+            } else {
+                self.track_long(&within, end - start)?;
+            }
+        }
+        let groups = (1..self.count).map(|i| self.caps.get_group(i).map(|g| (g.start, g.end))).collect();
+        Ok(Some(Found { start, end, groups }))
+    }
+
+    /// A long match's groups where the PikeVM's bound does not fit: regex-automata's bounded
+    /// backtracker (`nfa::thompson::backtrack`), as it is there, run here so that its stack can be
+    /// charged as it grows. It visits each state at each byte once, and keeps a group's slots in the
+    /// frame it saves them in rather than copying them all for each thread as the PikeVM does, so
+    /// its time is the states times the bytes, with no factor of slots (`TRACK_PS`), held to what the
+    /// call may still compute and to `--max-compute`, and the clock looked at as it goes. Its set of
+    /// visits (a bit for each state at each byte) is asked for first; its stack, which nothing else
+    /// bounds, is asked for as it grows, each time with the visits and the buffer it grows from
+    /// (`room_for_bytes`), and past that room the call gives up: charged at its worst up front (a
+    /// frame of 16 bytes for each visit), `^(\S+)\s*(.*)$` was refused from 340 KB, where 0.8.8
+    /// read a 1 MB line in 20 ms and its stack takes about 50 bytes a byte; uncharged, a thousand
+    /// groups on 20 KB took 974 MB (found in reviews; FEEDBACK75.md, Q-1075; branch feedback75).
+    #[inline(never)]
+    fn track_long(&mut self, within: &Input<'_>, span: usize) -> Result<(), Halt> {
+        let nfa = self.g.groups.get_nfa();
+        let states = nfa.states().len() as u128;
+        let ps = states.saturating_mul(span as u128).saturating_mul(TRACK_PS);
+        self.clock.room_for(Duration::from_nanos(u64::try_from(ps / 1000).unwrap_or(u64::MAX)))?;
+        let visits = states.saturating_mul(span as u128 + 1);
+        let blocks = visits.div_ceil(64);
+        let visited_bytes = blocks.saturating_mul(8);
+        if !room_for_bytes(visited_bytes) {
+            return Err(Halt::Time);
+        }
+        let mut visited: Vec<u64> = Vec::new();
+        visited.try_reserve_exact(usize::try_from(blocks).map_err(|_| Halt::Time)?).map_err(|_| Halt::Time)?;
+        visited.resize(blocks as usize, 0);
+        let mut track = Track { nfa, hay: within.haystack(), start: within.start(), end: within.end(), stride: span + 1, visited, stack: Vec::new(), visited_bytes, steps: 0 };
+        let caps = &mut self.caps;
+        caps.set_pattern(None);
+        let slots = caps.slots_mut();
+        slots.iter_mut().for_each(|slot| *slot = None);
+        track.push(Frame::Step { sid: nfa.start_anchored(), at: within.start() })?;
+        while let Some(frame) = track.stack.pop() {
+            match frame {
+                Frame::Step { sid, at } => {
+                    if track.step(sid, at, slots, &mut self.clock)? {
+                        caps.set_pattern(Some(regex_automata::PatternID::ZERO));
+                        return Ok(());
+                    }
+                }
+                Frame::Restore { slot, offset } => slots[slot as usize] = offset,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A frame of `Track`'s stack: a state to try at a place, or a slot to put back (regex-automata's
+/// `backtrack::Frame`), 16 bytes.
+enum Frame {
+    Step { sid: regex_automata::util::primitives::StateID, at: usize },
+    Restore { slot: u32, offset: Option<regex_automata::util::primitives::NonMaxUsize> },
+}
+
+/// regex-automata's bounded backtracker over one anchored span (`Guarding::track_long`).
+struct Track<'a> {
+    nfa: &'a thompson::NFA,
+    hay: &'a [u8],
+    start: usize,
+    end: usize,
+    stride: usize,
+    visited: Vec<u64>,
+    stack: Vec<Frame>,
+    /// What the visits take, charged with the stack each time it grows.
+    visited_bytes: u128,
+    steps: u32,
+}
+
+impl Track<'_> {
+    /// `frame` onto the stack, which grows only where its room, with the visits and the buffer it
+    /// grows from, fits (`room_for_bytes`).
+    #[inline(always)]
+    fn push(&mut self, frame: Frame) -> Result<(), Halt> {
+        if self.stack.len() == self.stack.capacity() {
+            self.grow()?;
+        }
+        self.stack.push(frame);
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self) -> Result<(), Halt> {
+        let old = self.stack.capacity();
+        let new = old.saturating_mul(2).max(1024);
+        let frame = std::mem::size_of::<Frame>() as u128;
+        if !room_for_bytes(self.visited_bytes.saturating_add(frame.saturating_mul(old as u128 + new as u128))) {
+            return Err(Halt::Time);
+        }
+        self.stack.try_reserve_exact(new - self.stack.len()).map_err(|_| Halt::Time)
+    }
+
+    /// From `sid` at `at`, as regex-automata's `BoundedBacktracker::step` goes: true at a match.
+    #[inline(always)]
+    fn step(&mut self, mut sid: regex_automata::util::primitives::StateID, mut at: usize, slots: &mut [Option<regex_automata::util::primitives::NonMaxUsize>], clock: &mut Clock) -> Result<bool, Halt> {
+        loop {
+            let index = sid.as_usize() * self.stride + (at - self.start);
+            let (block, bit) = (index / 64, 1u64 << (index % 64));
+            if self.visited[block] & bit != 0 {
+                return Ok(false);
+            }
+            self.visited[block] |= bit;
+            // The clock, every 4,096 visits.
+            self.steps = self.steps.wrapping_add(1);
+            if self.steps % 4096 == 0 {
+                clock.look()?;
+            }
+            match self.nfa.state(sid) {
+                thompson::State::ByteRange { trans } => {
+                    if at >= self.end || !trans.matches(self.hay, at) {
+                        return Ok(false);
+                    }
+                    sid = trans.next;
+                    at += 1;
+                }
+                thompson::State::Sparse(sparse) => {
+                    if at >= self.end {
+                        return Ok(false);
+                    }
+                    let Some(next) = sparse.matches(self.hay, at) else { return Ok(false) };
+                    sid = next;
+                    at += 1;
+                }
+                thompson::State::Dense(dense) => {
+                    if at >= self.end {
+                        return Ok(false);
+                    }
+                    let Some(next) = dense.matches(self.hay, at) else { return Ok(false) };
+                    sid = next;
+                    at += 1;
+                }
+                thompson::State::Look { look, next } => {
+                    if !self.nfa.look_matcher().matches(*look, self.hay, at) {
+                        return Ok(false);
+                    }
+                    sid = *next;
+                }
+                thompson::State::Union { alternates } => {
+                    let Some(&first) = alternates.first() else { return Ok(false) };
+                    sid = first;
+                    for &alt in alternates[1..].iter().rev() {
+                        self.push(Frame::Step { sid: alt, at })?;
+                    }
+                }
+                thompson::State::BinaryUnion { alt1, alt2 } => {
+                    sid = *alt1;
+                    self.push(Frame::Step { sid: *alt2, at })?;
+                }
+                thompson::State::Capture { next, slot, .. } => {
+                    if slot.as_usize() < slots.len() {
+                        self.push(Frame::Restore { slot: slot.as_u32(), offset: slots[slot.as_usize()] })?;
+                        slots[slot.as_usize()] = regex_automata::util::primitives::NonMaxUsize::new(at);
+                    }
+                    sid = *next;
+                }
+                thompson::State::Fail => return Ok(false),
+                thompson::State::Match { .. } => return Ok(true),
+            }
+        }
+    }
+}
+
+/// The most a guarded search may make for its own work, where nothing else holds it, as an
+/// `http.*` answer's reading may (FEEDBACK75.md, Q-1072).
+const WORK_MOST: u128 = 256 << 20;
+
+/// Whether `bytes` more of a guarded search's own work fit: within `WORK_MOST`, and within
+/// `--max-memory` where it is set. Where not, the search goes another way, or gives up (found in
+/// review: the PikeVM's cache and the backtracker's stack were neither).
+fn room_for_bytes(bytes: u128) -> bool {
+    bytes <= WORK_MOST && usize::try_from(bytes).is_ok_and(|b| crate::httpd::making(b).is_ok())
+}
+
+/// The error value of a guarded search that gave up (out of line: in it, each call's frame was
+/// larger, found measuring short calls).
+#[cold]
+#[inline(never)]
+fn gave_up(f: &str, len: usize) -> Value {
+    Value::err(Value::str(format!(
+        "`{}`: the pattern is too costly for this text: from each place a match may start, the search follows more ways at once than it can keep (as [ab]*a[ab]{{900}}c does on a text of a and b), and following them one by one over these {} bytes could take longer than the quarter of a second a search may; repeat less, or search a shorter text",
+        f, len
+    )))
 }
 
 /// The time this thread has spent computing: what it waited, or another thread's work on its core,
@@ -522,6 +2013,38 @@ fn matches(r: &Regex, s: &str, most: usize) -> Result<Vec<Found>, Stop> {
     Ok(out)
 }
 
+/// `matches`, each search made by the guard (FEEDBACK75.md, Q-1075; branch feedback75), its caches
+/// made here: a loop of its own, so that the crate's is 0.8.8's, and the guard's state is out of the
+/// frames of calls by the crate (found in review: 130 instructions a call).
+#[inline(never)]
+fn guarded_matches(s: &str, most: usize, g: &Guard, caps_ps: u64) -> Result<Vec<Found>, Stop> {
+    let mut guarding = Guarding::new(g, caps_ps, s.len());
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let mut may_read = 0u64;
+    let mut timed: Option<(Duration, Duration)> = None;
+    let each = std::mem::size_of::<Found>() + guarding.count.saturating_sub(1) * std::mem::size_of::<Option<(usize, usize)>>();
+    'all: while pos <= s.len() && out.len() < most {
+        let until = if most == 1 {
+            1
+        } else {
+            look(&mut out, s, pos, most, each, &mut may_read, &mut timed)?;
+            (out.len() + 64).min(most)
+        };
+        while pos <= s.len() && out.len() < until {
+            let found = guarding.find(s, pos, false).map_err(|h| match h {
+                Halt::Time => Stop::GaveUp,
+                Halt::Compute => Stop::Compute,
+            })?;
+            let Some(found) = found else { break 'all };
+            let (start, end) = (found.start, found.end);
+            out.push(found);
+            pos = if end > start { end } else { end + s[end..].chars().next().map_or(1, char::len_utf8) };
+        }
+    }
+    Ok(out)
+}
+
 /// What `matches` looks at before each 64 searches: the compute limit, the time the searches
 /// take once they may have read `SCANS` times the text (each of the 64 counted as reading from
 /// here to the end), and room for 64 more, made as the list would grow and asked about first
@@ -549,9 +2072,26 @@ fn look(out: &mut Vec<Found>, s: &str, pos: usize, most: usize, each: usize, may
 
 /// `matches` for `f`, its stops as its errors: the compute limit's and the memory limit's end the
 /// request; too many readings of the text is an error value (Q-976).
-fn all_matches(r: &Regex, s: &str, most: usize, f: &str, line: u32) -> Result<Result<Vec<Found>, Value>, Ctrl> {
-    match matches(r, s, most) {
+/// The guard's searches where one is given, out of line, so that the crate's path is 0.8.8's (found
+/// measuring: in line, 77 instructions more a `re.find` of a short text).
+fn all_matches(r: &Regex, s: &str, most: usize, f: &str, line: u32, guard: Option<(&Guard, u64)>) -> Result<Result<Vec<Found>, Value>, Ctrl> {
+    match guard {
+        None => stopped(matches(r, s, most), s, f, line),
+        Some((g, caps_ps)) => all_guarded(g, caps_ps, s, most, f, line),
+    }
+}
+
+#[inline(never)]
+fn all_guarded(g: &Guard, caps_ps: u64, s: &str, most: usize, f: &str, line: u32) -> Result<Result<Vec<Found>, Value>, Ctrl> {
+    stopped(guarded_matches(s, most, g, caps_ps), s, f, line)
+}
+
+/// What `all_matches` gives for what the searches found or why they stopped.
+#[inline(always)]
+fn stopped(found: Result<Vec<Found>, Stop>, s: &str, f: &str, line: u32) -> Result<Result<Vec<Found>, Value>, Ctrl> {
+    match found {
         Ok(found) => Ok(Ok(found)),
+        Err(Stop::GaveUp) => Ok(Err(gave_up(f, s.len()))),
         Err(Stop::Compute) => fail(line, crate::httpd::over_compute()),
         Err(Stop::Memory(stop)) => Err(stop.at(line)),
         Err(Stop::Scans(allowed)) => Ok(Err(Value::err(Value::str(format!(
@@ -563,9 +2103,53 @@ fn all_matches(r: &Regex, s: &str, most: usize, f: &str, line: u32) -> Result<Re
     }
 }
 
+/// `re.test` by the guard (see `guarded_matches`).
+#[inline(never)]
+fn guarded_test(g: &Guard, caps_ps: u64, s: &str, line: u32) -> R {
+    match Guarding::new(g, caps_ps, s.len()).find(s, 0, true) {
+        Ok(m) => Ok(Value::Bool(m.is_some())),
+        Err(Halt::Time) => Ok(gave_up("re.test", s.len())),
+        Err(Halt::Compute) => fail(line, crate::httpd::over_compute()),
+    }
+}
+
+/// Where a call's group names are read: the crate's Regex, or the guard's NFA where the call went
+/// by the guard (whose Regex may be `unused()`). The same names, in the same order: both are the
+/// group info of one pattern compiled the same way.
+#[derive(Clone, Copy)]
+enum Names<'a> {
+    Crate(&'a Regex),
+    Guard(&'a Guard),
+}
+
+impl<'a> Names<'a> {
+    fn of(r: &'a Regex, guard: Option<&'a (Rc<Guard>, u64)>) -> Names<'a> {
+        match guard {
+            Some((g, _)) => Names::Guard(g),
+            None => Names::Crate(r),
+        }
+    }
+
+    /// Each group's name, the whole match's (none) first.
+    fn list(self) -> Vec<Option<&'a str>> {
+        match self {
+            Names::Crate(r) => r.capture_names().collect(),
+            Names::Guard(g) => g.groups.get_nfa().group_info().pattern_names(regex_automata::PatternID::ZERO).collect(),
+        }
+    }
+
+    /// `f` of each named group's index and name.
+    fn each(self, mut f: impl FnMut(usize, &'a str)) {
+        match self {
+            Names::Crate(r) => r.capture_names().enumerate().for_each(|(i, n)| n.into_iter().for_each(|n| f(i, n))),
+            Names::Guard(g) => g.groups.get_nfa().group_info().pattern_names(regex_automata::PatternID::ZERO).enumerate().for_each(|(i, n)| n.into_iter().for_each(|n| f(i, n))),
+        }
+    }
+}
+
 /// A match as a map: `{ text, start, end, groups, named }`, with positions
 /// in characters (`chars` counts them up to `at`, from where it got last).
-fn match_value(r: &Regex, s: &str, m: &Found, chars: &mut (usize, usize)) -> Value {
+fn match_value(names: Names, s: &str, m: &Found, chars: &mut (usize, usize)) -> Value {
     let mut count = |to: usize| {
         if to < chars.0 {
             *chars = (0, 0);
@@ -578,11 +2162,11 @@ fn match_value(r: &Regex, s: &str, m: &Found, chars: &mut (usize, usize)) -> Val
     let end = count(m.end);
     let text = |g: Option<(usize, usize)>| g.map_or(Value::Nil, |(a, b)| Value::str(&s[a..b]));
     let mut named = Map::new();
-    for (i, name) in r.capture_names().enumerate().skip(1) {
-        if let Some(n) = name {
+    names.each(|i, n| {
+        if i > 0 {
             named.insert(n.into(), text(m.groups[i - 1]));
         }
-    }
+    });
     let mut v = Map::new();
     v.insert("text".into(), Value::str(&s[m.start..m.end]));
     v.insert("start".into(), Value::Int(start as i64));
@@ -610,25 +2194,37 @@ fn valid(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn test(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = text_arg(&args, "re.test", line)?;
-    Ok(Value::Bool(regex_of(&args, 2, "re.test", line)?.is_match(&s)))
+    let mut pat = pattern(&args, 2, "re.test", line, s.len(), false)?;
+    // By its guard where the crate could take too long (FEEDBACK75.md, Q-1075; branch feedback75).
+    let Ok(guard) = guard_for(&mut pat, Key { args: &args, flags_at: 2 }, s.len(), false) else { return Ok(gave_up("re.test", s.len())) };
+    if let Some((g, caps_ps)) = guard {
+        return guarded_test(&g, caps_ps, &s, line);
+    }
+    Ok(Value::Bool(pat.r.is_match(&s)))
 }
 
 /// `re.find(s, pattern, flags)`: the first match, or null.
 fn find(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = text_arg(&args, "re.find", line)?;
-    let r = regex_of(&args, 2, "re.find", line)?;
-    let found = match all_matches(&r, &s, 1, "re.find", line)? {
+    let mut pat = pattern(&args, 2, "re.find", line, s.len(), true)?;
+    let Ok(guard) = guard_for(&mut pat, Key { args: &args, flags_at: 2 }, s.len(), true) else { return Ok(gave_up("re.find", s.len())) };
+    let r = &pat.r;
+    let found = match all_matches(r, &s, 1, "re.find", line, guard.as_ref().map(|(g, n)| (&**g, *n)))? {
         Ok(found) => found,
         Err(e) => return Ok(e),
     };
-    Ok(found.first().map_or(Value::Nil, |m| match_value(&r, &s, m, &mut (0, 0))))
+    Ok(found.first().map_or(Value::Nil, |m| match_value(Names::of(r, guard.as_ref()), &s, m, &mut (0, 0))))
 }
 
 /// `re.find_all(s, pattern, flags)`: every match, from left to right.
 fn find_all(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = text_arg(&args, "re.find_all", line)?;
-    let r = regex_of(&args, 2, "re.find_all", line)?;
-    let found = match all_matches(&r, &s, usize::MAX, "re.find_all", line)? {
+    let mut pat = pattern(&args, 2, "re.find_all", line, s.len(), true)?;
+    // Its searches by the guard where one could take too long (FEEDBACK75.md, Q-1075; branch
+    // feedback75).
+    let Ok(guard) = guard_for(&mut pat, Key { args: &args, flags_at: 2 }, s.len(), true) else { return Ok(gave_up("re.find_all", s.len())) };
+    let r = &pat.r;
+    let found = match all_matches(r, &s, usize::MAX, "re.find_all", line, guard.as_ref().map(|(g, n)| (&**g, *n)))? {
         Ok(found) => found,
         Err(e) => return Ok(e),
     };
@@ -636,7 +2232,8 @@ fn find_all(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // security).
     crate::httpd::making(found.len().saturating_mul(ITEM_BYTES)).map_err(|s| s.at(line))?;
     let mut chars = (0, 0);
-    Ok(Value::list(found.iter().map(|m| match_value(&r, &s, m, &mut chars)).collect()))
+    let names = Names::of(r, guard.as_ref());
+    Ok(Value::list(found.iter().map(|m| match_value(names, &s, m, &mut chars)).collect()))
 }
 
 /// `re.replace(s, pattern, with, flags)`: every match replaced by `with`,
@@ -644,13 +2241,17 @@ fn find_all(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// or a function given the match (as `re.find` gives it).
 fn replace(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = text_arg(&args, "re.replace", line)?;
-    let r = regex_of(&args, 3, "re.replace", line)?;
+    let mut pat = pattern(&args, 3, "re.replace", line, s.len(), true)?;
+    // Its searches by the guard where one could take too long (FEEDBACK75.md, Q-1075; branch
+    // feedback75).
+    let Ok(guard) = guard_for(&mut pat, Key { args: &args, flags_at: 3 }, s.len(), true) else { return Ok(gave_up("re.replace", s.len())) };
+    let r = &pat.r;
     let with = args.get(2).cloned().unwrap_or(Value::Nil);
     if !matches!(with, Value::Str(_) | Value::Func(_) | Value::Builtin(..)) {
         return fail(line, format!("`re.replace` expects what to put in (a str or a function) as argument 3, got {}", with.type_name()));
     }
-    let names: Vec<Option<&str>> = r.capture_names().collect();
-    let found = match all_matches(&r, &s, usize::MAX, "re.replace", line)? {
+    let names: Vec<Option<&str>> = Names::of(r, guard.as_ref()).list();
+    let found = match all_matches(r, &s, usize::MAX, "re.replace", line, guard.as_ref().map(|(g, n)| (&**g, *n)))? {
         Ok(found) => found,
         Err(e) => return Ok(e),
     };
@@ -664,7 +2265,7 @@ fn replace(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         match &with {
             Value::Str(t) => expand(t, &s, &m, &names, &mut out).or_else(|e| fail(line, format!("`re.replace`: {}", e)))?,
             f => {
-                let v = match_value(&r, &s, &m, &mut chars);
+                let v = match_value(Names::of(r, guard.as_ref()), &s, &m, &mut chars);
                 // The function's error is given back: its text went into the text, and a `?` in
                 // it wrote "err(...)" (FEEDBACK55.md, Q-784; branch feedback55).
                 match it.call(f, vec![v], line)? {
@@ -726,10 +2327,14 @@ fn expand(t: &str, s: &str, m: &Found, names: &[Option<&str>], out: &mut Held) -
 /// `re.split(s, pattern, flags)`: the text between the matches.
 fn split(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = text_arg(&args, "re.split", line)?;
-    let r = regex_of(&args, 2, "re.split", line)?;
+    let mut pat = pattern(&args, 2, "re.split", line, s.len(), true)?;
+    // Its searches by the guard where one could take too long (FEEDBACK75.md, Q-1075; branch
+    // feedback75).
+    let Ok(guard) = guard_for(&mut pat, Key { args: &args, flags_at: 2 }, s.len(), true) else { return Ok(gave_up("re.split", s.len())) };
+    let r = &pat.r;
     let mut out = Vec::new();
     let mut last = 0;
-    let found = match all_matches(&r, &s, usize::MAX, "re.split", line)? {
+    let found = match all_matches(r, &s, usize::MAX, "re.split", line, guard.as_ref().map(|(g, n)| (&**g, *n)))? {
         Ok(found) => found,
         Err(e) => return Ok(e),
     };
