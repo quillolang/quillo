@@ -32,6 +32,10 @@ pub struct Styles {
     files: std::collections::HashSet<String>,
     sheets: HashMap<String, Sheet>,
     tick: u64,
+    /// The ids of `by_id`, as a page's marks have them: what `ids_known` keeps of a page, taken
+    /// out from under the lock that instances share, so a page is looked through without it
+    /// (FEEDBACK75.md, Q-1054; branch feedback75).
+    known: Arc<std::collections::HashSet<[u8; 8]>>,
 }
 
 struct Sheet {
@@ -108,11 +112,17 @@ impl Styles {
             out.push_str(&if global { css.clone() } else { scope(css, &id) });
             out.push('\n');
         }
-        Ok(Styles { by_id, files, ..Default::default() })
+        let known = Arc::new(by_id.keys().filter_map(|id| <[u8; 8]>::try_from(id.as_bytes()).ok()).collect());
+        Ok(Styles { by_id, files, known, ..Default::default() })
     }
 
     pub fn is_empty(&self) -> bool {
         self.by_id.is_empty()
+    }
+
+    /// The ids a page's sheet can be made of (see `ids_known`).
+    pub fn known(&self) -> Arc<std::collections::HashSet<[u8; 8]>> {
+        self.known.clone()
     }
 
     pub fn ids(&self) -> Vec<String> {
@@ -310,17 +320,53 @@ fn unique<'a>(styles: impl Iterator<Item = &'a str>) -> String {
 
 /// The ids of the styles whose elements are in `html` (`data-q-<id>`).
 pub fn ids_in(html: &[u8]) -> Vec<String> {
-    const MARK: &[u8] = b"data-q-";
+    ids_where(html, |_| true)
+}
+
+/// `ids_in`, of the ids of the program's own styles (`Styles::known`), the only ones a page's
+/// sheet is made of: nothing is looked for where the program has none. The others, which text a
+/// visitor wrote can hold as many of as it likes, are passed over, not kept (FEEDBACK75.md,
+/// Q-1054; branch feedback75).
+pub fn ids_known(html: &[u8], known: &std::collections::HashSet<[u8; 8]>) -> Vec<String> {
+    if known.is_empty() {
+        return Vec::new();
+    }
+    ids_where(html, |id| known.contains(id))
+}
+
+/// What marks an element of a style's (`data-q-<id>`), and memchr's searcher for it, made once
+/// (2026-11-09, the server benchmark).
+const MARK: &[u8] = b"data-q-";
+static FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> = std::sync::LazyLock::new(|| memchr::memmem::Finder::new(MARK));
+
+/// Whether `html` has a style's mark at all: a page with none is looked through no further
+/// (FEEDBACK75.md, Q-1054; branch feedback75).
+pub fn marked(html: &[u8]) -> bool {
+    FINDER.find(html).is_some()
+}
+
+/// Each id `keep` takes, once, in the order found. Each found is looked up in a set of those kept,
+/// where it was compared with each of them: 40,000 ids in a visitor's comment took 1.3 s of every
+/// view of its page, past `--max-compute`, and 625,000 (a 10 MB comment) about 5 minutes
+/// (FEEDBACK75.md, Q-1054; branch feedback75). The one found just before, which the next element
+/// of a component nearly always has, is passed over first.
+fn ids_where(html: &[u8], keep: impl Fn(&[u8; 8]) -> bool) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    // memchr's search, not byte by byte, its searcher made once (2026-11-09, the server
-    // benchmark).
-    static FINDER: std::sync::LazyLock<memchr::memmem::Finder<'static>> = std::sync::LazyLock::new(|| memchr::memmem::Finder::new(MARK));
+    let mut seen: std::collections::HashSet<[u8; 8]> = std::collections::HashSet::new();
+    // No id: not hex.
+    let mut last = [0u8; 8];
     for at in FINDER.find_iter(html) {
         let start = at + MARK.len();
         let Some(id) = html.get(start..start + 8).filter(|id| id.iter().all(u8::is_ascii_hexdigit)) else { continue };
-        let id = String::from_utf8_lossy(id).into_owned();
-        if !out.contains(&id) {
-            out.push(id);
+        let id: [u8; 8] = id.try_into().expect("8 bytes");
+        if id == last {
+            continue;
+        }
+        last = id;
+        if !seen.contains(&id) && keep(&id) {
+            seen.insert(id);
+            // Hex digits, which are ASCII.
+            out.push(String::from_utf8_lossy(&id).into_owned());
         }
     }
     out

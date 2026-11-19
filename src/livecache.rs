@@ -41,6 +41,16 @@ use std::time::{Duration, Instant};
 /// How long a run is shared: the pages told of one change ask within it.
 pub const SHARED_FOR: Duration = Duration::from_secs(2);
 
+/// What the runs kept for sharing may weigh in all (`weight`) (FEEDBACK75.md, Q-1057's review;
+/// branch feedback75).
+pub const RUNS_BYTES: usize = 64 << 20;
+
+/// What keeping a run takes: its answer's tree, which with serde's 80 bytes a value is up to about
+/// 40 bytes for each byte of its text (a list of zeros), the text, its topics and its place.
+fn weight(a: &Answer, topics: &[String]) -> usize {
+    a.text.len().saturating_mul(41).saturating_add(topics.iter().map(|t| t.len() + 24).sum::<usize>()).saturating_add(KEPT_ENTRY)
+}
+
 /// Values kept to make patches against, and patches, in bytes.
 const KEPT_BYTES: usize = 64 << 20;
 /// What keeping a value costs besides its text, as near as it can be said: its place in the map
@@ -65,7 +75,10 @@ pub fn everyone(scope: &str) -> u64 {
 
 #[derive(Default)]
 pub struct LiveCache {
-    runs: HashMap<RunKey, Run>,
+    /// By a keyed hash of the key (`run_digest`), not the key: it holds the arguments as the page
+    /// sent them, up to `--max-body` each, and 256 calls of about 10 KB of gzip kept 2.5 GB for
+    /// good (FEEDBACK75.md, Q-1057; branch feedback75).
+    runs: ByDigest<Run>,
     /// By the value's hash and whose it is: one store for all viewers answered a page that said
     /// it had any value, and the patch told it what that viewer's held, so that Bob found Alice's
     /// PIN with hashes he worked out at home (FEEDBACK55.md, Q-884; branch feedback55).
@@ -73,10 +86,14 @@ pub struct LiveCache {
     bytes: usize,
     patches: HashMap<((u64, u64), u64), Arc<str>>,
     patch_bytes: usize,
-    swept: Option<Instant>,
+    /// What the shared runs weigh in all (`weight`), and the runs in the order they were kept,
+    /// the oldest first, to let go of those past their time and, past `RUNS_BYTES`, the oldest,
+    /// as each is kept (FEEDBACK75.md, Q-1057's review; branch feedback75).
+    run_bytes: usize,
+    order: std::collections::VecDeque<(Digest, Instant)>,
     /// Runs under way, and the runs known to read the request or to act, which cannot be
     /// given to anyone, so that nothing waits for them.
-    flights: HashMap<RunKey, Arc<Flight>>,
+    flights: ByDigest<(u64, Arc<Flight>)>,
     /// By the hash of the key, as a key holds its arguments: 4,096 of a megabyte each were 4 GB
     /// (FEEDBACK55.md, Q-881, found in review; branch feedback55).
     personal: HashSet<u64>,
@@ -121,10 +138,116 @@ pub enum Begun {
 /// the function, its arguments as the page sent them, and the host.
 pub type RunKey = (String, String, Vec<u8>, String);
 
+/// What a run is kept by: a hash of its whole key with a key of this process's that nobody outside
+/// can work out, so no key anyone sends can be made to meet another's, as `personal` keeps them.
+/// A run is this process's alone, so the hash is the maps' own, SipHash-1-3 with the process's
+/// random key, made once, and the maps take it as it is (`AsIs`) (FEEDBACK75.md, Q-1057; branch
+/// feedback75).
+type Digest = u64;
+
+fn run_digest(key: &RunKey) -> Digest {
+    use std::hash::BuildHasher;
+    static KEYED: std::sync::LazyLock<std::collections::hash_map::RandomState> = std::sync::LazyLock::new(Default::default);
+    KEYED.hash_one(key)
+}
+
+/// A map by a `Digest`, which is a keyed hash already: hashed again, a lookup paid twice.
+type ByDigest<V> = HashMap<Digest, V, std::hash::BuildHasherDefault<AsIs>>;
+
+/// What a call is known by in the cache, each worked out once, when first asked, for all a call
+/// asks (FEEDBACK75.md, Q-1057's second review; branch feedback75): its digest (`runs`,
+/// `flights`), a second hash of its key, made another way, which a run or a flight keeps and is
+/// compared with, so that two keys whose digests meet are not taken for one another, and its hash
+/// in `personal`. A loader known to be nobody else's, while no run is shared, pays the one hash it
+/// paid before.
+pub struct RunIds<'k> {
+    key: &'k RunKey,
+    digest: std::cell::OnceCell<u64>,
+    check: std::cell::OnceCell<u64>,
+    personal: std::cell::OnceCell<u64>,
+}
+
+impl<'k> RunIds<'k> {
+    pub fn of(key: &'k RunKey) -> RunIds<'k> {
+        RunIds { key, digest: Default::default(), check: Default::default(), personal: Default::default() }
+    }
+
+    fn digest(&self) -> u64 {
+        *self.digest.get_or_init(|| run_digest(self.key))
+    }
+
+    fn check(&self) -> u64 {
+        *self.check.get_or_init(|| {
+            let mut h = Fold::default();
+            self.key.hash(&mut h);
+            h.finish()
+        })
+    }
+
+    fn personal(&self) -> u64 {
+        *self.personal.get_or_init(|| key_hash(self.key))
+    }
+
+    /// What a run under way is known by, for its end (`LiveCache::land_by`).
+    pub fn mark(&self) -> RunMark {
+        RunMark { digest: self.digest(), check: self.check(), personal: self.personal() }
+    }
+}
+
+/// A run under way, as its end finds it again: no copy of its key, whose arguments may be large.
+#[derive(Clone, Copy)]
+pub struct RunMark {
+    digest: u64,
+    check: u64,
+    personal: u64,
+}
+
+/// The second hash of a key (`RunIds::check`): a multiply and rotate over its bytes, which
+/// nothing shares with SipHash, so that a key whose digest meets another's, which nobody can
+/// bring about, has its own check too.
+#[derive(Default)]
+struct Fold(u64);
+
+impl Hasher for Fold {
+    fn finish(&self) -> u64 {
+        (self.0 ^ (self.0 >> 31)).wrapping_mul(0x94d0_49bb_1331_11eb)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            self.0 = (self.0.rotate_left(23) ^ u64::from_le_bytes(c.try_into().expect("8 bytes"))).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+        for &b in chunks.remainder() {
+            self.0 = (self.0.rotate_left(23) ^ u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+}
+
+/// The hasher of `ByDigest`: the digest as it is.
+#[derive(Default)]
+struct AsIs(u64);
+
+impl Hasher for AsIs {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(b);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
 struct Run {
     seq: u64,
     topics: Vec<String>,
     at: Instant,
+    weight: usize,
+    /// The key's second hash (`RunIds::check`): a run kept by another key's digest is not given.
+    check: u64,
     answer: Arc<Answer>,
 }
 
@@ -171,9 +294,18 @@ impl LiveCache {
     /// A run another page made that this one may have: the answer, its
     /// topics and the sequence number it was made at.
     pub fn shared(&mut self, key: &RunKey, unchanged: impl Fn(&[String], u64) -> bool) -> Option<Shared> {
-        let r = self.runs.get(key)?;
+        self.shared_by(&RunIds::of(key), unchanged)
+    }
+
+    /// `shared`, for a call's `RunIds`. With no run shared, nothing is hashed.
+    pub fn shared_by(&mut self, ids: &RunIds, unchanged: impl Fn(&[String], u64) -> bool) -> Option<Shared> {
+        if self.runs.is_empty() {
+            return None;
+        }
+        let at = ids.digest();
+        let r = self.runs.get(&at).filter(|r| r.check == ids.check())?;
         if r.at.elapsed() >= SHARED_FOR {
-            self.runs.remove(key);
+            self.drop_run(&at);
             return None;
         }
         unchanged(&r.topics, r.seq).then(|| (r.answer.clone(), r.topics.clone(), r.seq))
@@ -181,43 +313,97 @@ impl LiveCache {
 
     /// A call with no answer to share, for `key`.
     pub fn begin(&mut self, key: &RunKey) -> Begun {
-        if self.personal.contains(&key_hash(key)) {
+        self.begin_by(&RunIds::of(key))
+    }
+
+    /// `begin`, for a call's `RunIds`. Another key's run under way with the same digest is not
+    /// waited for: this one runs beside it.
+    pub fn begin_by(&mut self, ids: &RunIds) -> Begun {
+        if self.personal.contains(&ids.personal()) {
             return Begun::Alone;
         }
-        if let Some(f) = self.flights.get(key) {
-            return Begun::Wait(f.clone());
+        match self.flights.get(&ids.digest()) {
+            Some((check, f)) if *check == ids.check() => Begun::Wait(f.clone()),
+            Some(_) => Begun::Alone,
+            None => {
+                self.flights.insert(ids.digest(), (ids.check(), Default::default()));
+                Begun::Run
+            }
         }
-        self.flights.insert(key.clone(), Default::default());
-        Begun::Run
     }
 
     /// The run `begin` said to make has ended, whatever became of it; `personal`
     /// if it can be nobody else's.
     pub fn land(&mut self, key: &RunKey, personal: bool) {
-        if let Some(f) = self.flights.remove(key) {
-            f.end();
+        self.land_by(RunIds::of(key).mark(), personal)
+    }
+
+    /// `land`, for the mark of the run `begin_by` said to make.
+    pub fn land_by(&mut self, mark: RunMark, personal: bool) {
+        if self.flights.get(&mark.digest).is_some_and(|(check, _)| *check == mark.check) {
+            if let Some((_, f)) = self.flights.remove(&mark.digest) {
+                f.end();
+            }
         }
         if personal {
             if self.personal.len() >= 4096 {
                 self.personal.clear();
             }
-            self.personal.insert(key_hash(key));
+            self.personal.insert(mark.personal);
         } else {
-            self.personal.remove(&key_hash(key));
+            self.personal.remove(&mark.personal);
         }
     }
 
     pub fn share(&mut self, key: RunKey, seq: u64, topics: Vec<String>, answer: Arc<Answer>) {
-        if self.runs.len() > 256 && self.swept.map_or(true, |t| t.elapsed() >= Duration::from_secs(1)) {
-            self.swept = Some(Instant::now());
-            self.runs.retain(|_, r| r.at.elapsed() < SHARED_FOR);
+        // Runs past their time are let go as each is kept, however few there are: past 256 only,
+        // those under it stayed until the same call came again, which a call with arguments of its
+        // own never does (FEEDBACK75.md, Q-1057; branch feedback75). And the oldest, past what the
+        // runs may weigh in all: 20 live calls answering 800 KB each kept 612 MB after they ended
+        // (FEEDBACK75.md, Q-1057's review). A run heavier than that is not kept: the next page
+        // runs the loader again.
+        let weight = weight(&answer, &topics);
+        if weight > RUNS_BYTES {
+            return;
         }
-        self.runs.insert(key, Run { seq, topics, at: Instant::now(), answer });
+        let ids = RunIds::of(&key);
+        let (at, check) = (ids.digest(), ids.check());
+        self.drop_run(&at);
+        let now = Instant::now();
+        while let Some(&(d, t)) = self.order.front() {
+            let gone = self.runs.get(&d).map_or(true, |r| r.at != t);
+            if gone || now.duration_since(t) >= SHARED_FOR || self.run_bytes + weight > RUNS_BYTES {
+                self.order.pop_front();
+                if !gone {
+                    self.drop_run(&d);
+                }
+                continue;
+            }
+            break;
+        }
+        self.runs.insert(at, Run { seq, topics, at: now, weight, check, answer });
+        self.run_bytes += weight;
+        self.order.push_back((at, now));
+    }
+
+    /// Lets the run kept by `at` go, if there is one.
+    fn drop_run(&mut self, at: &Digest) {
+        if let Some(r) = self.runs.remove(at) {
+            self.run_bytes -= r.weight;
+        }
     }
 
     /// Drops the shared runs that read a topic under one of `wildcards` (`db:*`).
     pub fn forget_under(&mut self, wildcards: &[&str]) {
-        self.runs.retain(|_, r| !r.topics.iter().any(|t| wildcards.iter().any(|w| crate::shared::under(w, t))));
+        let mut freed = 0;
+        self.runs.retain(|_, r| {
+            let keep = !r.topics.iter().any(|t| wildcards.iter().any(|w| crate::shared::under(w, t)));
+            if !keep {
+                freed += r.weight;
+            }
+            keep
+        });
+        self.run_bytes -= freed;
     }
 
     /// Keeps a value a page now has, by its hash, for patches against it: `owner` is whose it is,
@@ -619,6 +805,35 @@ mod tests {
         assert!(matches!(c.begin(&key(2)), Begun::Run));
         c.land(&key(2), false);
         assert_eq!(std::mem::size_of_val(c.personal.iter().next().unwrap()), 8);
+    }
+
+    /// A run or a flight kept under a digest another key's meets is not given to that key, nor
+    /// waited for: its second hash is not that key's (FEEDBACK75.md, Q-1057's second review;
+    /// branch feedback75).
+    #[test]
+    fn a_digest_that_meets_anothers_is_not_taken_for_it() {
+        let mut c = LiveCache::default();
+        let key = |n: u8| (String::new(), "f".to_string(), vec![n], String::new());
+        let (a, b) = (key(1), key(2));
+        c.share(a.clone(), 1, Vec::new(), Arc::new(Answer::new(json!(1), false)));
+        // B's digest made A's: A's run is under it, with A's check.
+        let run = c.runs.remove(&run_digest(&a)).unwrap();
+        c.runs.insert(run_digest(&b), run);
+        assert!(c.shared(&b, |_, _| true).is_none());
+        let (da, ca) = (RunIds::of(&a).digest(), RunIds::of(&a).check());
+        assert_ne!(ca, RunIds::of(&b).check());
+        // A flight of A's under B's digest: B runs beside it, and A's end ends A's flight only.
+        c.flights.insert(run_digest(&b), (ca, Default::default()));
+        assert!(matches!(c.begin(&b), Begun::Alone));
+        c.land(&b, false);
+        assert!(c.flights.contains_key(&run_digest(&b)));
+        // As ever: the same key finds its own.
+        let _ = da;
+        c.flights.clear();
+        assert!(matches!(c.begin(&a), Begun::Run));
+        assert!(matches!(c.begin(&a), Begun::Wait(_)));
+        c.land(&a, false);
+        assert!(c.flights.is_empty());
     }
 
     /// Two servers with one secret agree; with another, or none, they do not.

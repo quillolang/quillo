@@ -101,7 +101,7 @@ fn parse_urlencoded_held(s: &str) -> Result<Map, crate::httpd::OverMemory> {
 /// `--max-memory` where `held`: the text made from it (U+FFFD three bytes for each byte that is
 /// not UTF-8), its JSON's lists, maps and texts, and a form's fields, each as it is made
 /// (FEEDBACK71.md, Q-977, the review's bounded readers; branch security).
-fn body_parts(req: &HttpRequest, ctype: &str, held: bool) -> Result<(Value, Value, Value, Value), crate::httpd::OverMemory> {
+fn body_parts(req: &HttpRequest, ctype: &str, held: bool) -> Result<((Value, Value, Value, Value), usize), crate::httpd::OverMemory> {
     // Files: their bytes stay in the body (see `upload`), which is no text.
     let multipart = crate::upload::boundary(ctype);
     let body = if multipart.is_some() {
@@ -117,12 +117,21 @@ fn body_parts(req: &HttpRequest, ctype: &str, held: bool) -> Result<(Value, Valu
     // another site can send `text/plain` without asking first, and must
     // not reach routes that expect JSON.
     let looks_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+    let mut made = 0;
     let json = if is_json_type(ctype) || (ctype.trim().is_empty() && looks_json) {
         // RFC 8259 lets a reader skip a byte-order mark (FEEDBACK31.md, Q-386; branch
         // feedback27-35-fixes).
-        // Read straight into values, with a budget of them (FEEDBACK51.md, Q-660).
+        // Read straight into values, with a budget of them (FEEDBACK51.md, Q-660): a visitor's,
+        // where each list and map counts its own room and the fewest are what `--max-memory`
+        // holds (FEEDBACK75.md, Q-1070; branch feedback75).
         let text = body.strip_prefix('\u{FEFF}').unwrap_or(&body);
-        if held { Value::parse_json_held(text)? } else { Value::parse_json(text) }.unwrap_or(Value::Nil)
+        match Value::parse_json_body(text, held)? {
+            Ok((v, n)) => {
+                made = n;
+                v
+            }
+            Err(_) => Value::Nil,
+        }
     } else {
         Value::Nil
     };
@@ -132,7 +141,7 @@ fn body_parts(req: &HttpRequest, ctype: &str, held: bool) -> Result<(Value, Valu
         None if essence(ctype) == "application/x-www-form-urlencoded" => (if held { parse_urlencoded_held(&body)? } else { parse_urlencoded(&body) }, Map::new()),
         None => (Map::new(), Map::new()),
     };
-    Ok((Value::str(body), json, Value::map(form), Value::map(files)))
+    Ok(((Value::str(body), json, Value::map(form), Value::map(files)), made))
 }
 
 /// What a request's body read to, held, made once at the start of the request where
@@ -142,6 +151,8 @@ struct BodyRead {
     at: usize,
     len: usize,
     parts: (Value, Value, Value, Value),
+    /// The bytes its JSON made, as `--max-memory` counts them (`Value::parse_json_body`).
+    made: usize,
 }
 
 thread_local! {
@@ -152,17 +163,22 @@ thread_local! {
 /// where a value it reads to would be bigger than `--max-memory` allows.
 fn read_body_held(req: &HttpRequest) -> Result<(), crate::httpd::OverMemory> {
     let ctype = req.headers.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case("content-type")).map_or("", |(_, v)| v.as_str());
-    let parts = body_parts(req, ctype, true)?;
-    BODY_READ.with(|b| *b.borrow_mut() = Some(BodyRead { at: req.body.as_ptr() as usize, len: req.body.len(), parts }));
+    let (parts, made) = body_parts(req, ctype, true)?;
+    BODY_READ.with(|b| *b.borrow_mut() = Some(BodyRead { at: req.body.as_ptr() as usize, len: req.body.len(), parts, made }));
     Ok(())
 }
 
 /// What `read_body_held` kept of `req`'s body, if it read it.
 fn body_read(req: &HttpRequest) -> Option<(Value, Value, Value, Value)> {
+    body_read_made(req).map(|(p, _)| p)
+}
+
+/// `body_read`, and the bytes its JSON made.
+fn body_read_made(req: &HttpRequest) -> Option<((Value, Value, Value, Value), usize)> {
     if !crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    BODY_READ.with(|b| b.borrow().as_ref().filter(|r| r.at == req.body.as_ptr() as usize && r.len == req.body.len()).map(|r| r.parts.clone()))
+    BODY_READ.with(|b| b.borrow().as_ref().filter(|r| r.at == req.body.as_ptr() as usize && r.len == req.body.len()).map(|r| (r.parts.clone(), r.made)))
 }
 
 /// `req` as `request`, its form as `all_values` makes it, for `{ form: { tag: [str] } }`.
@@ -568,7 +584,7 @@ pub(crate) fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map
     // Read at the request's start, held, where it could read past `--max-memory`; else here.
     let (body, json, form, files) = match body_read(req) {
         Some(parts) => parts,
-        None => body_parts(req, &ctype, false).unwrap_or((Value::str(""), Value::Nil, Value::map(Map::new()), Value::map(Map::new()))),
+        None => body_parts(req, &ctype, false).map(|(p, _)| p).unwrap_or((Value::str(""), Value::Nil, Value::map(Map::new()), Value::map(Map::new()))),
     };
 
     let mut headers = Map::with_capacity(req.headers.len());
@@ -970,7 +986,16 @@ impl Interp {
         // feedback8-fixes).
         let unmarked = std::mem::take(&mut self.styles_used);
         if html && req.method != "HEAD" {
-            let mut ids = crate::styles::ids_in(&resp.body);
+            // Only the program's own styles' ids, each found once by a set: a visitor's comment
+            // of `data-q-` words held every view of its page for seconds (FEEDBACK75.md, Q-1054;
+            // branch feedback75).
+            // The lock only for a page with a mark: one with none pays a search, as before.
+            let mut ids = if crate::styles::marked(&resp.body) {
+                let known = self.styles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).known();
+                crate::styles::ids_known(&resp.body, &known)
+            } else {
+                Vec::new()
+            };
             ids.extend(bundle_styles);
             ids.extend(unmarked);
             // The libraries named `with preload` or `with preconnect`, before the
@@ -1917,12 +1942,37 @@ impl Interp {
             if req.body.len() > MARKDOWN_BODY {
                 return rpc_error(413, "markdown here takes at most 1 MB of JSON: make a longer text's in a route or a server fn");
             }
-            let args = match crate::value::json_value(&req.body) {
-                Ok(serde_json::Value::Array(a)) if (1..=2).contains(&a.len()) => a.iter().map(Value::from_json).collect(),
+            // Read straight into values with a visitor's budget, not as serde's and then copied
+            // (FEEDBACK75.md, Q-1069; branch feedback75).
+            let held = crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed);
+            let args = match std::str::from_utf8(&req.body).map(|t| Value::parse_json_body(t, held)) {
+                Ok(Ok(Ok((Value::List(a), _)))) if (1..=2).contains(&a.len()) => a.to_vec(),
+                Ok(Err(_)) => return over_memory_answer(),
                 _ => return rpc_error(400, "the body must be a JSON array: [text, options]"),
             };
+            // What pulldown-cmark's tree will take, worked out from the text before it is made,
+            // held to `--max-memory`: 1 MB of `[` (1.2 KB of gzip) made 178 MB under 8 MB
+            // (FEEDBACK75.md, Q-1069; branch feedback75).
+            if let Some(Value::Str(text)) = args.first() {
+                if crate::httpd::making(markdown_room(text)).is_err() {
+                    return over_memory_answer();
+                }
+            }
             return match crate::builtins::markdown(self, args, 0) {
-                Ok(v) => json_response(200, serde_json::json!({ "ok": v.display() })),
+                // Written once, from the HTML: it was copied to a text, to serde's string and to
+                // the answer, three more of a text that is many times the request (FEEDBACK75.md,
+                // Q-1069; branch feedback75).
+                Ok(v) => {
+                    let html = match &v {
+                        Value::Html(h) => h.clone(),
+                        other => Arc::from(other.display()),
+                    };
+                    let mut body = Vec::with_capacity(html.len() + 10);
+                    body.extend_from_slice(b"{\"ok\":");
+                    let _ = serde_json::to_writer(&mut body, &*html);
+                    body.push(b'}');
+                    HttpResponse { status: 200, headers: vec![("content-type".into(), "application/json".into())], body }
+                }
                 // Past `--max-compute`: the server's limit, a 500 as a route's (Q-706); the policy's
                 // too, known by the stop's own words, its file said in the log and not to the page
                 // (FEEDBACK55.md, Q-849; branch feedback55).
@@ -1983,45 +2033,64 @@ impl Interp {
         let Some(Value::Func(c)) = lookup(&self.globals, name) else {
             return rpc_error(404, &format!("no server fn `{}`", name));
         };
+        // What the request's start read of the body, held, under `--max-memory` (`read_body_held`):
+        // the arguments are taken from it, not read a second time.
+        // Not a body with two content types, of which the start read the last and this call reads
+        // the first (as 0.8.8 did: FEEDBACK75.md, Q-1052's review; branch feedback75).
+        let one_type = req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case("content-type")).count() == 1;
+        let read = body_read_made(req).filter(|_| one_type);
         // With files: the arguments are the `args` part, and each file
         // (`{"$quillo_file": i}` there) is the upload in part `file<i>`.
-        let (json_args, files) = match &boundary {
-            Some(b) => {
+        let (form_args, files) = match (&boundary, &read) {
+            (Some(_), Some(((_, _, Value::Map(form), Value::Map(files)), _))) => (Some(form.get("args").map(|v| v.display()).unwrap_or_default()), (**files).clone()),
+            (Some(b), _) => {
                 let (form, files) = crate::upload::parse(b, &req.body);
-                (form.get("args").map(|v| v.display().into_bytes()).unwrap_or_default(), files)
+                (Some(form.get("args").map(|v| v.display()).unwrap_or_default()), files)
             }
-            None => (req.body.clone(), Map::new()),
+            (None, _) => (None, Map::new()),
         };
-        // A file anywhere in them, a list's or a map's too (FEEDBACK30.md, Q-364; branch
-        // feedback27-35-fixes).
-        fn arg_of(j: &serde_json::Value, files: &Map) -> Value {
-            match j {
-                serde_json::Value::Object(o) if o.len() == 1 && o.contains_key("$quillo_file") => match o["$quillo_file"].as_u64() {
-                    Some(i) => files.get(format!("file{}", i).as_str()).cloned().unwrap_or(Value::Nil),
-                    None => Value::Nil,
-                },
-                serde_json::Value::Array(a) => Value::list(a.iter().map(|x| arg_of(x, files)).collect()),
-                // A map of one key that starts with `$`, as the page sends it so that it is not
-                // taken for one of these (`island_json`; FEEDBACK55.md, Q-875's review; branch
-                // feedback55).
-                serde_json::Value::Object(o) if o.len() == 1 && o.get("$").and_then(|x| x.as_array()).is_some_and(|a| a.len() == 2 && a[0].is_string()) => {
-                    let a = o["$"].as_array().map(Vec::as_slice).unwrap_or_default();
-                    let mut m = Map::new();
-                    m.insert(a[0].as_str().unwrap_or_default().into(), arg_of(&a[1], files));
-                    Value::map(m)
-                }
-                // Decimals and large ints as the page sends them ({"$dec": "12.50"}).
-                serde_json::Value::Object(o) if o.len() == 1 && o.keys().all(|k| matches!(k.as_str(), "$dec" | "$int" | "$quillo_err")) => crate::interp::from_island_json(j),
-                serde_json::Value::Object(o) => Value::map(o.iter().map(|(k, v)| (k.as_str().into(), arg_of(v, files))).collect()),
-                other => crate::interp::from_island_json(other),
-            }
+        let json_args: &[u8] = form_args.as_deref().map_or(&req.body, str::as_bytes);
+        // Read straight into values, with a visitor's budget of them and each held to
+        // `--max-memory`, then their marks (a file anywhere in them, a list's or a map's too:
+        // FEEDBACK30.md, Q-364; a decimal, an int, an error, a map of one `$` key: FEEDBACK55.md,
+        // Q-875's review) made into what they stand for (`value::island_marks`). They were read
+        // as serde's values with no budget and copied: one call of 10 KB of gzip made 1 GB, past
+        // `--max-memory`, before its arguments were checked (FEEDBACK75.md, Q-1052; branch
+        // feedback75). As deep as every reader takes, and said so (FEEDBACK55.md, Q-875's second
+        // review; branch feedback55).
+        let bad = || rpc_error(400, "the body must be a JSON array of arguments");
+        if crate::value::json_depth(json_args) > crate::value::JSON_NESTING {
+            return rpc_error(400, &format!("the arguments' JSON {}", crate::value::json_too_deep()));
         }
-        // As deep as every reader takes, and said so (FEEDBACK55.md, Q-875's second review; branch
-        // feedback55).
-        let args = match crate::value::json_value(&json_args) {
-            Ok(serde_json::Value::Array(a)) => a.iter().map(|j| arg_of(j, &files)).collect::<Vec<_>>(),
-            Err(e) if e == crate::value::json_too_deep() => return rpc_error(400, &format!("the arguments' JSON {}", e)),
-            _ => return rpc_error(400, "the body must be a JSON array of arguments"),
+        let Ok(text) = std::str::from_utf8(json_args) else { return bad() };
+        let held = crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed);
+        // A call with no arguments, as most live loaders are, has nothing to read: the reader's own
+        // setup cost such a call 2% (FEEDBACK75.md, Q-1052's second review; branch feedback75).
+        let args = if text.trim_matches(|c: char| c.is_ascii_whitespace()) == "[]" {
+            Vec::new()
+        } else {
+            // The body as JSON, as the request's start read it; but not a body it read otherwise (a
+            // byte-order mark).
+            let (parsed, made) = match &read {
+                Some(((_, json, _, _), made)) if boundary.is_none() && !text.starts_with('\u{FEFF}') => (json.clone(), *made),
+                _ => match Value::parse_json_body(text, held) {
+                    Ok(Ok(v)) => v,
+                    Ok(Err(_)) => return bad(),
+                    Err(_) => return over_memory_answer(),
+                },
+            };
+            // What the marks make is counted with what the JSON made, against `--max-memory`: 3.8 KB
+            // of gzip, `[[{"$":["k",0]},...]]`, made 152 MB under 64 MB (FEEDBACK75.md, Q-1052's
+            // review; branch feedback75).
+            let room = if held { usize::try_from(crate::httpd::memory_limit()).unwrap_or(usize::MAX).saturating_sub(made) } else { usize::MAX };
+            let Ok(marked) = crate::value::island_marks_held(&parsed, Some(&files), room) else {
+                return over_memory_answer();
+            };
+            drop(parsed);
+            match marked {
+                Value::List(a) => Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()),
+                _ => return bad(),
+            }
         };
         let args = match take_args(self, &c.def, args) {
             Ok(a) => a,
@@ -2059,7 +2128,7 @@ impl Interp {
         let had = hdr("x-quillo-had").and_then(crate::livecache::parse_hash);
         let scope = self.run_scope();
         let everyone = crate::livecache::everyone(&scope);
-        let key = boundary.is_none().then(|| (scope, name.to_string(), json_args.clone(), hdr("host").unwrap_or("").to_string()));
+        let key = boundary.is_none().then(|| (scope, name.to_string(), json_args.to_vec(), hdr("host").unwrap_or("").to_string()));
         let (found, mut flying) = match &key {
             Some(k) => self.live_turn(k),
             None => (None, None),
@@ -2224,17 +2293,20 @@ impl Interp {
     /// (the landing, for those that wait for it). One run at a time of a call.
     pub(crate) fn live_turn(&mut self, key: &crate::livecache::RunKey) -> (Option<crate::livecache::Shared>, Option<Landing>) {
         let shared = self.shared.clone();
+        // Each hash of the key made once for the whole turn, and only where it is asked for
+        // (FEEDBACK75.md, Q-1057's second review; branch feedback75).
+        let ids = crate::livecache::RunIds::of(key);
         let find = || {
             let mut cache = shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            cache.shared(key, |t, seq| shared.unchanged_since(t, seq))
+            cache.shared_by(&ids, |t, seq| shared.unchanged_since(t, seq))
         };
         if let Some(f) = find() {
             return (Some(f), None);
         }
         for _ in 0..3 {
-            let begun = shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).begin(key);
+            let begun = shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).begin_by(&ids);
             match begun {
-                crate::livecache::Begun::Run => return (None, Some(Landing { shared: shared.clone(), key: key.clone(), personal: false })),
+                crate::livecache::Begun::Run => return (None, Some(Landing { shared: shared.clone(), mark: ids.mark(), personal: false })),
                 crate::livecache::Begun::Alone => break,
                 crate::livecache::Begun::Wait(f) => {
                     if crate::httpd::wait_elsewhere(move || f.wait(crate::livecache::SHARED_FOR)).is_err() {
@@ -2284,13 +2356,13 @@ const LIVE_GZ_KEPT: usize = 16 << 10;
 /// The end of a run others may be waiting for, however it ends.
 pub(crate) struct Landing {
     shared: Arc<Shared>,
-    key: crate::livecache::RunKey,
+    mark: crate::livecache::RunMark,
     pub personal: bool,
 }
 
 impl Drop for Landing {
     fn drop(&mut self) {
-        self.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).land(&self.key, self.personal);
+        self.shared.live_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).land_by(self.mark, self.personal);
     }
 }
 
@@ -4613,6 +4685,112 @@ pub const MAX_BODY: usize = 10 << 20;
 /// Largest body `/_quillo/markdown` takes, in bytes (FEEDBACK55.md, Q-706; branch feedback55).
 pub const MARKDOWN_BODY: usize = 1 << 20;
 
+/// The bytes that can begin or end an element of Markdown's: each may be a node of
+/// pulldown-cmark's tree, which with the HTML made from it took up to about 200 bytes for each
+/// (`[`, `<`, `>`; a heading's, link's, table's or list's marks and new lines about the same),
+/// where plain words take a few (FEEDBACK75.md, Q-1069; branch feedback75).
+const MARKDOWN_MARKS: [bool; 256] = {
+    let mut t = [false; 256];
+    let marks = b"[]<>*_!|&`\\~#-+.():\n";
+    let mut i = 0;
+    while i < marks.len() {
+        t[marks[i] as usize] = true;
+        i += 1;
+    }
+    t
+};
+
+/// What making `text` into HTML takes at most, worked out from it line by line (FEEDBACK75.md,
+/// Q-1069 and its second review; branch feedback75):
+/// - six bytes for each byte: the text, its HTML as it grows, the answer (plain words took four);
+/// - `MARKDOWN_MARK_BYTES` for each byte that can begin or end an element;
+/// - `MARKDOWN_CONTROL_BYTES` for each control character, which the answer writes `\u0001`;
+/// - `MARKDOWN_CODE_BYTES` for each byte inside a fenced code block, which is highlighted: its
+///   characters, its spans and the HTML made of them. A fence in a quote or a list item is taken
+///   to run to the end, where pulldown-cmark may end it sooner;
+/// - `MARKDOWN_CELL_BYTES` for each cell of each row of a table, those its header has and a row
+///   leaves out (a row with no `|` at all) too.
+pub fn markdown_room(text: &str) -> usize {
+    let mut room = text.len().saturating_mul(6);
+    // The fence being read: its character, its length, and whether a line can close it.
+    let mut fence: Option<(u8, usize, bool)> = None;
+    let (mut cols, mut pipes_before) = (0usize, false);
+    for line in text.as_bytes().split_inclusive(|&c| c == b'\n') {
+        if let Some((c, n, closes)) = fence {
+            if closes && fence_closes(line, c, n) {
+                fence = None;
+            } else {
+                room = room.saturating_add(line.len().saturating_mul(MARKDOWN_CODE_BYTES));
+            }
+            continue;
+        }
+        let (mut marks, mut controls) = (0usize, 0usize);
+        for &b in line {
+            marks += MARKDOWN_MARKS[b as usize] as usize;
+            controls += (b < 0x20 && !matches!(b, b'\n' | b'\r' | b'\t')) as usize;
+        }
+        room = room.saturating_add(marks.saturating_mul(MARKDOWN_MARK_BYTES)).saturating_add(controls.saturating_mul(MARKDOWN_CONTROL_BYTES));
+        if let Some(open) = fence_opens(line) {
+            fence = Some(open);
+            (cols, pipes_before) = (0, false);
+            continue;
+        }
+        let blank = line.iter().all(u8::is_ascii_whitespace);
+        if cols > 0 && !blank {
+            room = room.saturating_add(cols.saturating_mul(MARKDOWN_CELL_BYTES));
+        } else if blank {
+            cols = 0;
+        } else if let Some(n) = table_delimiter(line).filter(|_| pipes_before) {
+            cols = n;
+        }
+        pipes_before = line.contains(&b'|');
+    }
+    room
+}
+
+/// Where `line` opens a fenced code block: its character, its length, and whether a later line
+/// can close it as this reckons, which only one at the top (up to three spaces before it) can.
+fn fence_opens(line: &[u8]) -> Option<(u8, usize, bool)> {
+    let at = line.iter().position(|b| !matches!(b, b' ' | b'\t' | b'>' | b'-' | b'*' | b'+' | b'.' | b')' | b'0'..=b'9'))?;
+    let c = *line.get(at).filter(|c| matches!(c, b'`' | b'~'))?;
+    let n = line[at..].iter().take_while(|&&b| b == c).count();
+    let top = at <= 3 && line[..at].iter().all(|&b| b == b' ');
+    (n >= 3).then_some((c, n, top))
+}
+
+/// Whether `line` closes a fence of `n` of `c` opened at the top: up to three spaces, at least `n`
+/// of `c`, and nothing after them but spaces.
+fn fence_closes(line: &[u8], c: u8, n: usize) -> bool {
+    let at = line.iter().take_while(|&&b| b == b' ').count();
+    let run = line[at..].iter().take_while(|&&b| b == c).count();
+    at <= 3 && run >= n && line[at + run..].iter().all(u8::is_ascii_whitespace)
+}
+
+/// The cells a table's delimiter row (`|---|:-:|`, in a quote too) says it has: the most of its
+/// runs of `-` and its cells, or none for a line that is no delimiter row.
+fn table_delimiter(line: &[u8]) -> Option<usize> {
+    let body: &[u8] = {
+        let at = line.iter().position(|b| !matches!(b, b' ' | b'\t' | b'>')).unwrap_or(line.len());
+        &line[at..]
+    };
+    if !body.contains(&b'-') || !body.iter().all(|b| matches!(b, b'|' | b'-' | b':' | b' ' | b'\t' | b'\r' | b'\n')) {
+        return None;
+    }
+    let runs = body.split(|&b| b != b'-').filter(|r| !r.is_empty()).count();
+    Some(runs.max(body.iter().filter(|&&b| b == b'|').count() + 1))
+}
+
+/// More than the worst shapes measured took for each mark, besides the six a byte (`*a `, one
+/// mark in three bytes, and nested `1. `: about 230 a mark; `>`: 175; `[` and `<`: 140), so that
+/// what it lets through fits (tests/feedback75b.rs `the_markdown_doors_estimate_covers_what_is_made`).
+const MARKDOWN_MARK_BYTES: usize = 300;
+
+/// What a control character, a byte inside a fenced code block and a table's cell take at most,
+/// besides the six a byte, as measured (tests/feedback75b.rs, the same test).
+const MARKDOWN_CONTROL_BYTES: usize = 16;
+const MARKDOWN_CODE_BYTES: usize = 80;
+const MARKDOWN_CELL_BYTES: usize = 160;
+
 /// Whether a header can be sent as it is: a name made of token characters,
 /// and a value without line breaks or other control characters, which would
 /// let text from a request add headers of its own.
@@ -4859,7 +5037,12 @@ impl Worker {
         // (FEEDBACK71.md, Q-977; branch security). `--max-body` holds the bytes as they come. The
         // size first: a body under 1,260 bytes reads to less than 64 KB however it is read (a
         // form's field takes 80 bytes for at least two of the body's), and pays a compare.
-        let body_over = if req.body.len() >= crate::httpd::LARGE / 52 && crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
+        // Not a service's join, which never reads its body as a request's and refuses one larger
+        // than a join before reading it, its signature checked over the bytes: read here, the
+        // JSON of a join with no valid signature was made first (FEEDBACK75.md, Q-1052; branch
+        // feedback75).
+        let joins = || req.url.split('?').next() == Some("/_quillo/join");
+        let body_over = if req.body.len() >= crate::httpd::LARGE / 52 && crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) && !joins() {
             read_body_held(&req).err()
         } else {
             None

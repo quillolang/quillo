@@ -173,6 +173,9 @@ fn sign_join(key: &str, t: u64, service: &str, nonce: &str, body: &[u8]) -> Stri
     sign_app(key, t, service, "_join", "", nonce, "", "", "", body)
 }
 
+/// The most a join's body may be: its service's name, port and address, with room to spare.
+pub const JOIN_BODY: usize = 4 << 10;
+
 /// `POST /_quillo/join` on the app: a copy of one of its services joining
 /// (or, `leave: true`, leaving), signed with the services' secret. Its
 /// address is the connection's, with the port it gives, as limer takes it.
@@ -190,7 +193,15 @@ pub fn join_here(it: &Interp, req: &HttpRequest) -> HttpResponse {
     let Some(nonce) = header("x-quillo-call").filter(|c| !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric())) else {
         return refused(401, "a join carries its nonce (x-quillo-call)");
     };
-    let Ok(body) = crate::value::json_value(&req.body) else {
+    // A join is a few short fields, `{"service":...,"port":...,"leave":...,"url":...}`: one larger
+    // is refused before it is read, as its signature can only be checked with the service it
+    // names. Its JSON was read whole first, with no budget, and 1 KB of gzip made 100 MB with no
+    // valid signature (FEEDBACK75.md, Q-1052; branch feedback75).
+    if req.body.len() > JOIN_BODY {
+        return refused(413, &format!("a join's body is at most {} bytes", JOIN_BODY));
+    }
+    // Read as a visitor's JSON is, its signature not yet checked (FEEDBACK75.md, Q-1052).
+    let Ok(body) = crate::value::json_from_page(&req.body) else {
         return refused(400, "the body is JSON: {\"service\": ..., \"port\": ...}");
     };
     let service = body["service"].as_str().unwrap_or("").to_string();

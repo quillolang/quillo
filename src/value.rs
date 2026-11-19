@@ -942,7 +942,7 @@ impl Value {
     /// At most `JSON_NESTING` levels deep, as every reader of JSON takes (`json_value`), the
     /// database's and the browser's too (FEEDBACK55.md, Q-875's reviews; branch feedback55).
     pub fn parse_json(text: &str) -> serde_json::Result<Value> {
-        Value::parse_json_as(text).0
+        Value::parse_json_as(text, None).0
     }
 
     /// `parse_json`, where a value it would make past `--max-memory` is the request's stop: each
@@ -950,26 +950,191 @@ impl Value {
     /// none is made past it (FEEDBACK71.md, Q-977, the review's bounded readers: a body's JSON was
     /// counted at 48 bytes a value, where a map's entry takes about 74; branch security).
     pub fn parse_json_held(text: &str) -> Result<serde_json::Result<Value>, crate::httpd::OverMemory> {
-        match Value::parse_json_as(text) {
-            (_, true) => Err(crate::httpd::OverMemory),
-            (r, false) => Ok(r),
+        match Value::parse_json_as(text, None) {
+            (_, true, _) => Err(crate::httpd::OverMemory),
+            (r, false, _) => Ok(r),
         }
     }
 
-    /// `parse_json`, and whether `--max-memory` stopped it.
-    fn parse_json_as(text: &str) -> (serde_json::Result<Value>, bool) {
+    /// `parse_json` for what a visitor sends (a request's body, a server fn's arguments, the
+    /// markdown door's). With no `--max-memory`, as `parse_json` reads it: its budget of values is
+    /// a guard against amplification only, and what 0.8.8 read is read. Under the limit, each
+    /// text, list and map is counted at what it takes (its place, its allocation and the room a
+    /// list or a map grows to), and past the limit in all it stops: 3 MB of `{},` (3 KB of gzip)
+    /// made 136 MB under 64 MB, and 7.4 MB of `{"a":0}` 116 MB under 8 MB, as each list was
+    /// compared alone (FEEDBACK75.md, Q-1070 and its review; branch feedback75). Gives the value
+    /// and the bytes it made as the limit counts them (0 with none), for what is made from it
+    /// after (`island_marks_held`). `held`: a stop at `--max-memory` is the request's, as
+    /// `parse_json_held`'s; else an error, as `parse_json`'s.
+    pub fn parse_json_body(text: &str, held: bool) -> Result<serde_json::Result<(Value, usize)>, crate::httpd::OverMemory> {
+        match Value::parse_json_as(text, room_of_limit()) {
+            (_, true, _) if held => Err(crate::httpd::OverMemory),
+            (r, _, made) => Ok(r.map(|v| (v, made))),
+        }
+    }
+
+    /// `parse_json`, counted against `room` bytes where given (`parse_json_body`): whether
+    /// `--max-memory` stopped it, and the bytes it made.
+    fn parse_json_as(text: &str, room: Option<usize>) -> (serde_json::Result<Value>, bool, usize) {
         use serde::Deserialize;
         let budget = (text.len() / 8).max(JSON_VALUES);
-        let outer = JSON_LEFT.with(|l| l.replace(budget));
-        let outer_depth = JSON_DEPTH.with(|d| d.replace(0));
-        let outer_over = JSON_OVER.with(|o| o.replace(false));
+        let outer = JSON.with(|j| j.enter(budget));
         let mut de = serde_json::Deserializer::from_str(text);
         de.disable_recursion_limit();
-        let r = Parsed::deserialize(&mut de).and_then(|p| de.end().map(|_| p.0));
-        JSON_LEFT.with(|l| l.set(outer));
-        let deep = JSON_DEPTH.with(|d| d.replace(outer_depth)) > JSON_NESTING;
-        let over = JSON_OVER.with(|o| o.replace(outer_over));
-        (r.map_err(|e| if deep { <serde_json::Error as serde::de::Error>::custom(json_too_deep()) } else { e }), over)
+        // Under the limit a reader of its own, which counts what each value takes: with none, the
+        // reader is a program's, and pays nothing for it (FEEDBACK75.md, Q-1070; branch feedback75).
+        let (r, made) = match room {
+            None => (Parsed::<false>::deserialize(&mut de).and_then(|p| de.end().map(|_| p.0)), 0),
+            Some(room) => {
+                let outer_room = JSON.with(|j| j.room.replace(room));
+                let r = Parsed::<true>::deserialize(&mut de).and_then(|p| de.end().map(|_| p.0));
+                (r, room - JSON.with(|j| j.room.replace(outer_room)))
+            }
+        };
+        let (deep, over) = JSON.with(|j| j.leave(outer));
+        let deep = deep > JSON_NESTING;
+        (r.map_err(|e| if deep { <serde_json::Error as serde::de::Error>::custom(json_too_deep()) } else { e }), over, made)
+    }
+}
+
+/// The bytes a visitor's JSON may make: `--max-memory`, where it is set (see
+/// `Value::parse_json_body`).
+fn room_of_limit() -> Option<usize> {
+    if !crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    Some(usize::try_from(crate::httpd::memory_limit()).unwrap_or(usize::MAX))
+}
+
+/// What a list's allocation takes besides its items (its `Arc` and `Vec`), a map's (its `Arc` and
+/// table), and a text's besides its bytes (its `Arc`), as a visitor's JSON is counted under
+/// `--max-memory` (FEEDBACK75.md, Q-1070's review; branch feedback75).
+const LIST_HEAD: usize = std::mem::size_of::<Vec<Value>>() + 16;
+const MAP_HEAD: usize = std::mem::size_of::<Map>() + 16;
+const TEXT_HEAD: usize = 16;
+
+/// The room a map of one to three entries takes: its table's least.
+const MAP_LEAST: usize = 3;
+
+/// `v` with the marks of a value sent from a page made into what they stand for, as
+/// `interp::from_island_json` reads them from serde's tree, read straight into values first
+/// (`Value::parse_json_body`): `{"$dec": t}` a decimal, `{"$int": t}` an int, `{"$quillo_err": x}`
+/// an error value, `{"$": [k, x]}` the map of that one key, and, given `files`,
+/// `{"$quillo_file": i}` the upload in part `file<i>` (a server fn's call with files; not inside
+/// the value of a `$dec`, `$int` or `$quillo_err` mark, as 0.8.8 read them). A server fn's
+/// arguments were read as serde's values, with no budget, then copied: 10 KB of gzip made 1 GB
+/// (FEEDBACK75.md, Q-1052; branch feedback75). What has no mark is the value given, shared, not
+/// copied. src/sites.rs `island_marks` reads a site's answer the same way, with no files.
+pub fn island_marks(v: &Value, files: Option<&Map>) -> Value {
+    island_marks_held(v, files, usize::MAX).unwrap_or(Value::Nil)
+}
+
+/// `island_marks`, what it makes (the lists and maps it copies, the maps and errors it makes)
+/// counted against `room` bytes: past them, `OverMemory` (the room left of `--max-memory` after
+/// the JSON it was read from: FEEDBACK75.md, Q-1052's review; branch feedback75).
+pub fn island_marks_held(v: &Value, files: Option<&Map>, room: usize) -> Result<Value, crate::httpd::OverMemory> {
+    let mut left = room;
+    Ok(marks_in(v, files, 0, &mut left)?.unwrap_or_else(|| v.clone()))
+}
+
+/// `n` bytes more of `left`, or `OverMemory`.
+fn take_room(left: &mut usize, n: usize) -> Result<(), crate::httpd::OverMemory> {
+    *left = left.checked_sub(n).ok_or(crate::httpd::OverMemory)?;
+    Ok(())
+}
+
+/// `island_marks_held`, or none where `v` has no mark.
+fn marks_in(v: &Value, files: Option<&Map>, depth: usize, left: &mut usize) -> Result<Option<Value>, crate::httpd::OverMemory> {
+    let next = |x: &Value, files: Option<&Map>, left: &mut usize| deeper(depth, || marks_in(x, files, depth + 1, left));
+    match v {
+        Value::List(l) => {
+            let mut out: Option<Vec<Value>> = None;
+            for (i, x) in l.iter().enumerate() {
+                match next(x, files, left)? {
+                    Some(y) => {
+                        let o = match &mut out {
+                            Some(o) => o,
+                            None => {
+                                take_room(left, LIST_HEAD + l.len().saturating_mul(ITEM_BYTES))?;
+                                let mut o = Vec::with_capacity(l.len());
+                                o.extend_from_slice(&l[..i]);
+                                out.insert(o)
+                            }
+                        };
+                        o.push(y);
+                    }
+                    None => {
+                        if let Some(o) = &mut out {
+                            o.push(x.clone());
+                        }
+                    }
+                }
+            }
+            Ok(out.map(Value::list))
+        }
+        Value::Map(m) => {
+            if let (1, Some((k, x))) = (m.len(), m.get_index(0)) {
+                match (&**k, x, files) {
+                    ("$quillo_file", x, Some(files)) => {
+                        return Ok(Some(match x {
+                            Value::Int(i) if *i >= 0 => files.get(format!("file{}", i).as_str()).cloned().unwrap_or(Value::Nil),
+                            _ => Value::Nil,
+                        }))
+                    }
+                    ("$dec", Value::Str(t), _) => return Ok(Some(crate::decimal::Dec::parse(t).map_or_else(|| Value::Str(t.clone()), Value::Dec))),
+                    ("$int", Value::Str(t), _) => return Ok(Some(t.parse::<i64>().map_or_else(|_| Value::Str(t.clone()), Value::Int))),
+                    ("$quillo_err", x, _) => {
+                        take_room(left, TEXT_HEAD + ITEM_BYTES)?;
+                        return Ok(Some(Value::err(next(x, None, left)?.unwrap_or_else(|| x.clone()))));
+                    }
+                    ("$", Value::List(a), _) if a.len() == 2 && matches!(a[0], Value::Str(_)) => {
+                        take_room(left, MAP_HEAD + MAP_LEAST * ENTRY_BYTES)?;
+                        let mut one = Map::new();
+                        let x = next(&a[1], files, left)?.unwrap_or_else(|| a[1].clone());
+                        one.insert(a[0].display().into(), x);
+                        return Ok(Some(Value::map(one)));
+                    }
+                    // What else such a map holds is read as from_island_json reads it, with no
+                    // files, as in 0.8.8.
+                    ("$dec" | "$int", x, Some(_)) => {
+                        return match next(x, None, left)? {
+                            Some(y) => {
+                                take_room(left, MAP_HEAD + MAP_LEAST * ENTRY_BYTES)?;
+                                let mut one = Map::new();
+                                one.insert(k.clone(), y);
+                                Ok(Some(Value::map(one)))
+                            }
+                            None => Ok(None),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut out: Option<Map> = None;
+            for (i, (k, x)) in m.iter().enumerate() {
+                match next(x, files, left)? {
+                    Some(y) => {
+                        let o = match &mut out {
+                            Some(o) => o,
+                            None => {
+                                take_room(left, MAP_HEAD + m.len().max(MAP_LEAST).saturating_mul(ENTRY_BYTES))?;
+                                let mut o = Map::with_capacity(m.len());
+                                o.extend(m.iter().take(i).map(|(k, x)| (k.clone(), x.clone())));
+                                out.insert(o)
+                            }
+                        };
+                        o.insert(k.clone(), y);
+                    }
+                    None => {
+                        if let Some(o) = &mut out {
+                            o.insert(k.clone(), x.clone());
+                        }
+                    }
+                }
+            }
+            Ok(out.map(Value::map))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -1022,7 +1187,10 @@ pub fn json_value_depth(j: &serde_json::Value) -> usize {
 }
 
 /// JSON text read as serde's values, at most `JSON_NESTING` deep, as `Value::parse_json` reads a
-/// program's: serde's own limit took 127.
+/// program's: serde's own limit took 127. For JSON Quillo trusts (a split service's answers and
+/// calls, an idempotent answer kept, an MCP tool's answer read back, a channel's kept values):
+/// what a visitor sends is read by `json_from_page` (FEEDBACK75.md, Q-1052's review; branch
+/// feedback75).
 pub fn json_value(b: &[u8]) -> Result<serde_json::Value, String> {
     use serde::Deserialize;
     if json_depth(b) > JSON_NESTING {
@@ -1035,14 +1203,148 @@ pub fn json_value(b: &[u8]) -> Result<serde_json::Value, String> {
     Ok(j)
 }
 
-/// A value read from JSON (`Value::parse_json`).
-struct Parsed(Value);
+/// `json_value` for what a visitor sends as serde's values (a page's channel message, a service's
+/// join before its signature is checked): with the budget of values `Value::parse_json` has, and
+/// under `--max-memory` each list, map and text counted at what serde's take (80 bytes a value),
+/// past the limit in all an error that says it. It had neither: one channel message of 1 MiB made
+/// 75 MB, and a join with no valid signature 100 MB (FEEDBACK75.md, Q-1052; branch feedback75).
+pub fn json_from_page(b: &[u8]) -> Result<serde_json::Value, String> {
+    use serde::Deserialize;
+    if json_depth(b) > JSON_NESTING {
+        return Err(json_too_deep());
+    }
+    let outer = JSON.with(|j| j.enter((b.len() / 8).max(JSON_VALUES)));
+    let mut de = serde_json::Deserializer::from_slice(b);
+    de.disable_recursion_limit();
+    let r = match room_of_limit() {
+        None => Tree::<false>::deserialize(&mut de).and_then(|t| de.end().map(|_| t.0)),
+        Some(room) => {
+            let outer_room = JSON.with(|j| j.room.replace(room));
+            let r = Tree::<true>::deserialize(&mut de).and_then(|t| de.end().map(|_| t.0));
+            JSON.with(|j| j.room.set(outer_room));
+            r
+        }
+    };
+    JSON.with(|j| j.leave(outer));
+    r.map_err(|e| e.to_string())
+}
+
+/// Bytes a serde list's place for each value takes, and a serde map's for each entry (its key and
+/// value, the hash kept beside them and its place in the table), as `ITEM_BYTES` and
+/// `ENTRY_BYTES` are a value's.
+const TREE_ITEM: usize = std::mem::size_of::<serde_json::Value>();
+const TREE_ENTRY: usize = std::mem::size_of::<(String, serde_json::Value)>() + 24;
+
+/// A value read as serde's (`json_from_page`), as `serde_json::Value` reads one, with its budget;
+/// `ROOM`, counted against `--max-memory`.
+struct Tree<const ROOM: bool>(serde_json::Value);
+
+struct TreeKey(String);
+
+impl<'de, const ROOM: bool> serde::Deserialize<'de> for Tree<ROOM> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Tree<ROOM>, D::Error> {
+        d.deserialize_any(TreeVisitor::<ROOM>)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for TreeKey {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<TreeKey, D::Error> {
+        struct V;
+        impl serde::de::Visitor<'_> for V {
+            type Value = TreeKey;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a key")
+            }
+            fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<TreeKey, E> {
+                Ok(TreeKey(s.to_owned()))
+            }
+        }
+        d.deserialize_str(V)
+    }
+}
+
+struct TreeVisitor<const ROOM: bool>;
+
+impl<'de, const ROOM: bool> serde::de::Visitor<'de> for TreeVisitor<ROOM> {
+    type Value = Tree<ROOM>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("JSON")
+    }
+
+    fn visit_unit<E>(self) -> Result<Tree<ROOM>, E> {
+        Ok(Tree(serde_json::Value::Null))
+    }
+
+    fn visit_bool<E>(self, b: bool) -> Result<Tree<ROOM>, E> {
+        Ok(Tree(serde_json::Value::Bool(b)))
+    }
+
+    fn visit_i64<E>(self, n: i64) -> Result<Tree<ROOM>, E> {
+        Ok(Tree(serde_json::Value::Number(n.into())))
+    }
+
+    fn visit_u64<E>(self, n: u64) -> Result<Tree<ROOM>, E> {
+        Ok(Tree(serde_json::Value::Number(n.into())))
+    }
+
+    fn visit_f64<E>(self, n: f64) -> Result<Tree<ROOM>, E> {
+        Ok(Tree(serde_json::Number::from_f64(n).map_or(serde_json::Value::Null, serde_json::Value::Number)))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Tree<ROOM>, E> {
+        if ROOM {
+            room::<E>(s.len())?;
+        }
+        Ok(Tree(serde_json::Value::String(s.to_owned())))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Tree<ROOM>, A::Error> {
+        nested(|| {
+            let mut out: Vec<serde_json::Value> = Vec::new();
+            while let Some(Tree::<ROOM>(v)) = seq.next_element()? {
+                one_more()?;
+                let charged = if ROOM { grown::<A::Error>(out.len(), out.capacity(), 4, TREE_ITEM)? } else { 0 };
+                out.push(v);
+                if ROOM {
+                    settle::<A::Error>(charged, out.capacity(), TREE_ITEM)?;
+                }
+            }
+            Ok(Tree(serde_json::Value::Array(out)))
+        })
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Tree<ROOM>, A::Error> {
+        nested(|| {
+            let mut out = serde_json::Map::new();
+            while let Some(TreeKey(k)) = map.next_key()? {
+                let Tree::<ROOM>(v) = map.next_value()?;
+                one_more()?;
+                if ROOM {
+                    // A small map's table takes room for three entries.
+                    let entries = match out.len() {
+                        0 => MAP_LEAST,
+                        n if n < MAP_LEAST => 0,
+                        _ => 1,
+                    };
+                    room((entries * TREE_ENTRY).saturating_add(k.len()))?;
+                }
+                out.insert(k, v);
+            }
+            Ok(Tree(serde_json::Value::Object(out)))
+        })
+    }
+}
+
+/// A value read from JSON (`Value::parse_json`); `ROOM`, a visitor's under `--max-memory`, each
+/// value counted at what it takes (`Value::parse_json_body`).
+struct Parsed<const ROOM: bool>(Value);
 
 struct ParsedKey(Key);
 
-impl<'de> serde::Deserialize<'de> for Parsed {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Parsed, D::Error> {
-        d.deserialize_any(ParsedVisitor)
+impl<'de, const ROOM: bool> serde::Deserialize<'de> for Parsed<ROOM> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Parsed<ROOM>, D::Error> {
+        d.deserialize_any(ParsedVisitor::<ROOM>)
     }
 }
 
@@ -1063,34 +1365,105 @@ impl<'de> serde::Deserialize<'de> for ParsedKey {
     }
 }
 
-struct ParsedVisitor;
+struct ParsedVisitor<const ROOM: bool>;
 
 /// The fewest values `Value::parse_json` takes from any text.
 pub const JSON_VALUES: usize = 1_000_000;
 
-thread_local! {
+/// What the JSON being read on this thread has left, in one place, so a read sets it up and puts
+/// it back with one look each (FEEDBACK75.md, Q-1052's second review: four of them, looked at
+/// three times each, cost a server fn's call of one argument 1%; branch feedback75).
+struct JsonState {
     /// How many more values the JSON being read may have (see `Value::parse_json`).
-    static JSON_LEFT: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
+    left: std::cell::Cell<usize>,
     /// How deep the JSON being read is now; past `JSON_NESTING` once it was too deep.
-    static JSON_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    depth: std::cell::Cell<usize>,
     /// Whether `--max-memory` stopped the JSON being read (see `Value::parse_json_held`).
-    static JSON_OVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    over: std::cell::Cell<bool>,
+    /// The bytes a visitor's JSON being read may still make (see `Value::parse_json_body`).
+    room: std::cell::Cell<usize>,
+}
+
+impl JsonState {
+    /// A read begins with `budget` values: what was there, to put back (`leave`).
+    #[inline(always)]
+    fn enter(&self, budget: usize) -> (usize, usize, bool) {
+        (self.left.replace(budget), self.depth.replace(0), self.over.replace(false))
+    }
+
+    /// A read ends: how deep it went and whether `--max-memory` stopped it, `outer` put back.
+    #[inline(always)]
+    fn leave(&self, outer: (usize, usize, bool)) -> (usize, bool) {
+        self.left.set(outer.0);
+        (self.depth.replace(outer.1), self.over.replace(outer.2))
+    }
+}
+
+thread_local! {
+    static JSON: JsonState = const {
+        JsonState {
+            left: std::cell::Cell::new(usize::MAX),
+            depth: std::cell::Cell::new(0),
+            over: std::cell::Cell::new(false),
+            room: std::cell::Cell::new(usize::MAX),
+        }
+    };
+}
+
+/// The room a list or a map of `len` items with room for `cap` is charged for before one more is
+/// put in it: where it is full, the room it grows to (twice, at least `least`), counted before it
+/// is made, so that it is not made past the limit (FEEDBACK75.md, Q-1070's second review; branch
+/// feedback75). Gives the room charged for.
+#[inline(always)]
+fn grown<E: serde::de::Error>(len: usize, cap: usize, least: usize, each: usize) -> Result<usize, E> {
+    if len < cap {
+        return Ok(cap);
+    }
+    let to = cap.saturating_mul(2).max(least);
+    room((to - cap).saturating_mul(each))?;
+    Ok(to)
+}
+
+/// After `grown`: the room it grew to, where it is not what was charged for, charged or given back.
+#[inline(always)]
+fn settle<E: serde::de::Error>(charged: usize, cap: usize, each: usize) -> Result<(), E> {
+    if cap > charged {
+        room((cap - charged).saturating_mul(each))
+    } else {
+        if cap < charged {
+            JSON.with(|j| j.room.set(j.room.get().saturating_add((charged - cap).saturating_mul(each))));
+        }
+        Ok(())
+    }
+}
+
+/// `n` bytes more of what a visitor's JSON may make under `--max-memory` (`JsonState::room`), or
+/// the stop (FEEDBACK75.md, Q-1070's review; branch feedback75).
+#[inline(always)]
+fn room<E: serde::de::Error>(n: usize) -> Result<(), E> {
+    JSON.with(|j| match j.room.get().checked_sub(n) {
+        Some(left) => {
+            j.room.set(left);
+            Ok(())
+        }
+        None => Err(over_in_json()),
+    })
 }
 
 /// The error that stops JSON being read at `--max-memory`, and the mark that it did.
 #[cold]
 #[inline(never)]
 fn over_in_json<E: serde::de::Error>() -> E {
-    JSON_OVER.with(|o| o.set(true));
+    JSON.with(|j| j.over.set(true));
     E::custom(crate::httpd::over_memory())
 }
 
 /// A list or a map read from JSON, inside what is being read: an error past `JSON_NESTING`, and
 /// `f` run with room on the stack for it.
 fn nested<R, E: serde::de::Error>(f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
-    let depth = JSON_DEPTH.with(|d| {
-        let n = d.get() + 1;
-        d.set(n);
+    let depth = JSON.with(|j| {
+        let n = j.depth.get() + 1;
+        j.depth.set(n);
         n
     });
     if depth > JSON_NESTING {
@@ -1098,75 +1471,95 @@ fn nested<R, E: serde::de::Error>(f: impl FnOnce() -> Result<R, E>) -> Result<R,
     }
     let r = crate::stack::maybe_grow(64 << 10, 1 << 20, f);
     if r.is_ok() {
-        JSON_DEPTH.with(|d| d.set(depth - 1));
+        JSON.with(|j| j.depth.set(depth - 1));
     }
     r
 }
 
 /// One more value read from JSON, or an error past the budget.
 fn one_more<E: serde::de::Error>() -> Result<(), E> {
-    JSON_LEFT.with(|l| match l.get() {
+    JSON.with(|j| match j.left.get() {
         0 => Err(E::custom("more values than JSON of its length may have")),
         n => {
-            l.set(n - 1);
+            j.left.set(n - 1);
             Ok(())
         }
     })
 }
 
-impl<'de> serde::de::Visitor<'de> for ParsedVisitor {
-    type Value = Parsed;
+impl<'de, const ROOM: bool> serde::de::Visitor<'de> for ParsedVisitor<ROOM> {
+    type Value = Parsed<ROOM>;
 
     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str("JSON")
     }
 
-    fn visit_unit<E>(self) -> Result<Parsed, E> {
-        Ok(Parsed(Value::Nil))
+    fn visit_unit<E>(self) -> Result<Parsed<ROOM>, E> {
+        Ok(Parsed::<ROOM>(Value::Nil))
     }
 
-    fn visit_bool<E>(self, b: bool) -> Result<Parsed, E> {
-        Ok(Parsed(Value::Bool(b)))
+    fn visit_bool<E>(self, b: bool) -> Result<Parsed<ROOM>, E> {
+        Ok(Parsed::<ROOM>(Value::Bool(b)))
     }
 
-    fn visit_i64<E>(self, n: i64) -> Result<Parsed, E> {
-        Ok(Parsed(Value::Int(n)))
+    fn visit_i64<E>(self, n: i64) -> Result<Parsed<ROOM>, E> {
+        Ok(Parsed::<ROOM>(Value::Int(n)))
     }
 
-    fn visit_u64<E>(self, n: u64) -> Result<Parsed, E> {
-        Ok(Parsed(i64::try_from(n).map_or(Value::Float(n as f64), Value::Int)))
+    fn visit_u64<E>(self, n: u64) -> Result<Parsed<ROOM>, E> {
+        Ok(Parsed::<ROOM>(i64::try_from(n).map_or(Value::Float(n as f64), Value::Int)))
     }
 
-    fn visit_f64<E>(self, n: f64) -> Result<Parsed, E> {
-        Ok(Parsed(Value::Float(n)))
+    fn visit_f64<E>(self, n: f64) -> Result<Parsed<ROOM>, E> {
+        Ok(Parsed::<ROOM>(Value::Float(n)))
     }
 
     // Each text, list and map held to `--max-memory` as it is made (see `parse_json_held`): a
     // compare where a list or a map grows, which a `push` makes anyway.
-    fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Parsed, E> {
+    fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Parsed<ROOM>, E> {
         crate::httpd::making(s.len()).map_err(|_| over_in_json())?;
-        Ok(Parsed(Value::str(s)))
+        if ROOM {
+            room::<E>(TEXT_HEAD + s.len())?;
+        }
+        Ok(Parsed::<ROOM>(Value::str(s)))
     }
 
-    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Parsed, A::Error> {
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Parsed<ROOM>, A::Error> {
+        if ROOM {
+            room(LIST_HEAD)?;
+        }
         nested(|| {
             let mut out = Vec::new();
-            while let Some(Parsed(v)) = seq.next_element()? {
+            while let Some(Parsed::<ROOM>(v)) = seq.next_element()? {
                 one_more()?;
+                let charged = if ROOM { grown::<A::Error>(out.len(), out.capacity(), 4, ITEM_BYTES)? } else { 0 };
                 push_held(&mut out, v).map_err(|_| over_in_json())?;
+                if ROOM {
+                    settle::<A::Error>(charged, out.capacity(), ITEM_BYTES)?;
+                }
             }
-            Ok(Parsed(Value::list(out)))
+            Ok(Parsed::<ROOM>(Value::list(out)))
         })
     }
 
-    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Parsed, A::Error> {
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Parsed<ROOM>, A::Error> {
+        if ROOM {
+            room(MAP_HEAD)?;
+        }
         nested(|| {
             let mut out = Map::new();
-            while let Some((ParsedKey(k), Parsed(v))) = map.next_entry()? {
+            while let Some((ParsedKey(k), Parsed::<ROOM>(v))) = map.next_entry()? {
                 one_more()?;
+                if ROOM && k.len() > 22 {
+                    room(TEXT_HEAD + k.len())?;
+                }
+                let charged = if ROOM { grown::<A::Error>(out.len(), out.capacity(), MAP_LEAST, ENTRY_BYTES)? } else { 0 };
                 insert_held(&mut out, k, v).map_err(|_| over_in_json())?;
+                if ROOM {
+                    settle::<A::Error>(charged, out.capacity(), ENTRY_BYTES)?;
+                }
             }
-            Ok(Parsed(Value::map(out)))
+            Ok(Parsed::<ROOM>(Value::map(out)))
         })
     }
 }
