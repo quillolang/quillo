@@ -493,8 +493,9 @@ fn inbox_ok(p: &Peer, ch: &str) -> bool {
 /// leave, `["m", channel, value]` for the channel's handler; `["v", stream]`
 /// to watch a stream (see `media`), `["u", stream]` to stop.
 pub fn from_page(p: &Arc<Peer>, text: &str) {
-    // A page that cannot wait for room (a datagram, a page of this process): its message past its
-    // shares is dropped and counted, and past the count the oldest message goes, as before.
+    // A message that cannot wait for room, a WebTransport datagram (the only caller; an app's
+    // window or a phone's web view joins as a WebSocket and waits): past its shares it is dropped
+    // and counted, and past the count the oldest message goes, as before.
     take_from_page(p, text, false);
 }
 

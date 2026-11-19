@@ -108,7 +108,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("read_file", "path", "The file's text, with bytes that are not UTF-8 replaced; an error value if it cannot be read."),
     ("write_file", "path, v", "Writes `v` as text, making folders and replacing the file; null, or an error value."),
     ("delete_file", "path", "Removes a file, or a folder and what is in it; nothing there is no error."),
-    ("check_program", "path, files", "What `quillo check` says of a program, as maps; `files` gives text in place of what is on disk."),
+    ("check_program", "path, files", "What `quillo check` says of a program, as maps; `files` gives text for disk's. Past its budget, one error: too complex."),
     ("run_script", "source, vars, options", "Runs users' code in a sandbox that sees `vars`, for 100 ms unless `options.timeout` says; its last value, or an error value."),
     ("allow_cross_site", "path", "Lets routes under `path` take form posts from other sites' pages, otherwise refused."),
     ("site_headers", "path, headers", "At the top: headers for every answer (under `path`) that sets none of its own; null takes one of Quillo's away."),
@@ -135,7 +135,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("locale_from", "f", "Sets how a request's locale is found: `f` gets the request, and null means the usual way."),
     ("locale", "", "The current locale, or null without `translations`."),
     ("with_locale", "locale, f", "Runs `f` in `locale` and gives its result (for an email in the recipient's language)."),
-    ("t", "key, vars", "The text of `key` in the current locale, `{name}` filled from `vars`; `count` picks a plural form."),
+    ("t", "key, vars", "The text of `key` in the locale, `{name}` filled from `vars`; `count` picks a plural. Missing, in `raw(...)`: escaped."),
     // Tenants
     ("tenant", "", "The tenant the code runs for, or null."),
     ("tenant_from", "rule", "Sets each request's tenant: the host's part before the domain `rule`, or what a function of it gives."),
@@ -225,15 +225,15 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("udp.send", "host, port, data, options", "Sends one packet: text, a list of byte values, or a value as JSON. Null, or an error value."),
     ("udp.reply", "packet, data", "Sends `data` back to where `packet` came from, from the port it came to."),
     // Channels
-    ("channel.on", "name, f, options", "At the top, `f(msg, peer)` gets pages' messages; `{ join, leave, tenants }`, a room per tenant."),
+    ("channel.on", "name, f, options", "At the top, `f(msg, peer)` gets pages' messages; `{ join, leave, tenants }`, a room per tenant; `join(peer, name)`."),
     ("channel.send", "name, peer, value, options", "Sends `value` to one page, by peer or id, and gives whether it was there."),
     ("channel.broadcast", "name, value, options", "Sends `value` to every page in the channel, and gives how many took it; `{ except, reliable }`."),
     ("channel.peers", "name", "The ids of the pages in the channel."),
     ("channel.open", "name, f, options", "In a component, `f` gets what the server sends on the channel; the result's `.send(value)` sends."),
     // Media
-    ("media.rtp", "name, options", "Makes a stream from RTP on `{ video, audio, host }`: H.264 and Opus, each on a port of its own."),
+    ("media.rtp", "name, options", "A stream from RTP on `{ video, audio, host }` (host 127.0.0.1 unless given): H.264 and Opus, one sender at a time."),
     ("media.close", "name", "Ends a stream and lets its ports go; true if there was such a stream."),
-    ("media.on", "name, options", "Who may send stream `name` (`*`: each it starts) and watch it: `{ publish, watch, tenants }`."),
+    ("media.on", "name, options", "Who may send stream `name` (`*`: each it starts) and watch it: `{ publish, watch, tenants }`, called `(peer, name)`."),
     ("media.streams", "", "The streams, in order of name, as `{ name, viewers, video, audio }`."),
     // Dates
     ("date.today", "tz", "Today's date as `YYYY-MM-DD`, in the zone `tz`: UTC unless given."),
