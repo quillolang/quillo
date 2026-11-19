@@ -28,6 +28,10 @@ A typed parameter in the prefix (`:team(int)`) is matched and converted as in a 
 line, and a value that does not fit lets matching go on to the next route, so
 `/teams/abc` can still be answered by a later `route GET /teams/:slug`.
 
+The group's path starts with `/`: `routes admin-tools { ... }` is an error that says so
+(`` a group's path starts with `/`: `routes /admin-tools { ... }` ``) *(since 0.8.8: it
+said "`routes` is no keyword")*.
+
 ## Middleware
 
 A check is a function that takes the request and either gives it back or ends the
@@ -185,6 +189,9 @@ routes writes /email | signed_in {
   other sites](#requests-from-other-sites)).
 - The two go in either order. Together they are warned of: Quillo's worker keeps an
   offline page ahead with a prefetch, which writes nothing.
+- A space goes between a tag and the path: `routes offline/help { ... }` is an error that
+  says so (`` `offline` is a tag, and a space goes between it and the group's path: `routes
+  offline /help { ... }` ``) *(since 0.8.8: it said "`routes` is no keyword")*.
 
 ## Rules
 

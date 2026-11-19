@@ -464,7 +464,9 @@ visitor:
   that surely writes (the database, a global, the session or a cookie, a file, `publish`,
   `notification.send`, a service) and reads who the visitor is (`session()`, `cookie()`,
   the request's headers), there or in a function, component or middleware it goes
-  through.
+  through. A request pattern reads them when any of its `|` alternatives takes the
+  headers or cookies, or one under `as`, so `route GET /seen { query: { who: str } } |
+  { cookies: { who: str } } { ... }` that writes is warned of *(since 0.8.8: it was not)*.
 
 The renewal of a session above, written without `writes`, is warned of so:
 
