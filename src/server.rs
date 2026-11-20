@@ -412,6 +412,19 @@ fn local_peer(peer: &str) -> bool {
     }
 }
 
+/// In a service its app started, the app's word on the visitor's identity (`service::IDENTITY_WORD`),
+/// on a request from the app (`FROM_APP`): checked, and made the mark `IDENTITY_MARK` the request
+/// map reads; the word goes either way (FEEDBACK78.md, A.13 and A.14; branch feedback75).
+fn apps_identity(req: &mut HttpRequest) {
+    let Some(i) = req.headers.iter().rposition(|(k, _)| k.eq_ignore_ascii_case(crate::service::IDENTITY_WORD)) else { return };
+    let from_app = req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(FROM_APP));
+    let json = if from_app { crate::service::identity_of_word(&req.headers[i].1) } else { None };
+    req.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(crate::service::IDENTITY_WORD));
+    if let Some(j) = json {
+        req.headers.push((IDENTITY_MARK.into(), j));
+    }
+}
+
 /// In a service its app started, the app's policies for the request's path (`service::POLICY_WORD`),
 /// on a request from the app (the mark `FROM_APP`, which httpd's parser puts on it alone): below the
 /// program's own `site_headers` rules, before its page is written, so that the policy the visitor
@@ -634,7 +647,159 @@ pub(crate) fn build_request(req: &HttpRequest, path: &str, query: &Value) -> Map
     m.insert("form".into(), form);
     m.insert("files".into(), files);
     m.insert("ip".into(), Value::str(&req.remote));
+    // Who the visitor is to a proxy `--trust-proxy` names, from the headers the operator named
+    // (FEEDBACK78.md, A.13 and A.14, the user's decision; branch feedback75).
+    if let Some((cert, user)) = proxy_identity(req) {
+        m.insert("client_cert".into(), cert);
+        m.insert("remote_user".into(), user);
+    }
     m
+}
+
+/// The mark a service its app started puts on a request whose identity its app vouched for
+/// (`service::IDENTITY_WORD`): the JSON of it, checked; httpd takes it off any request a client
+/// sends (FEEDBACK78.md, A.13 and A.14; branch feedback75).
+pub(crate) const IDENTITY_MARK: &str = "x-quillo-app-identity";
+
+/// `request.client_cert` and `request.remote_user`, where `--client-cert-header` or
+/// `--user-header` names a header, or the app vouched for them (a service it started): the
+/// certificate's identity (`{ name, subject, uri }`, by `accept_calls`' parser, `name` the
+/// SPIFFE id or the CN) and the user's text, each null where the header is missing or not
+/// believed. Believed only on a request from a proxy `--trust-proxy` names (the mark the parser
+/// puts on it), never from the visitor's own header. None where nothing names either, and the
+/// request map has neither key.
+fn proxy_identity(req: &HttpRequest) -> Option<(Value, Value)> {
+    if crate::httpd::takes_app_word() {
+        if let Some((_, json)) = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(IDENTITY_MARK)) {
+            let v: serde_json::Value = serde_json::from_str(json).ok()?;
+            let cert = match &v["cert"] {
+                serde_json::Value::Object(o) => {
+                    let mut m = Map::new();
+                    for k in ["name", "subject", "uri"] {
+                        if let Some(t) = o.get(k).and_then(|t| t.as_str()) {
+                            m.insert(k.into(), Value::str(t));
+                        }
+                    }
+                    Value::map(m)
+                }
+                _ => Value::Nil,
+            };
+            let user = v["user"].as_str().map_or(Value::Nil, Value::str);
+            return Some((cert, user));
+        }
+    }
+    let (cert_header, user_header) = crate::httpd::identity_headers();
+    if cert_header.is_none() && user_header.is_none() {
+        return None;
+    }
+    let trusted = req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(crate::httpd::PROXIED));
+    let lines = |name: &str| req.headers.iter().filter(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str()).collect::<Vec<&str>>();
+    let cert = match cert_header {
+        None => Value::Nil,
+        Some((name, subject)) => {
+            let lines = lines(name);
+            match (lines.is_empty(), trusted) {
+                (true, _) => Value::Nil,
+                (false, false) => {
+                    identity_not_believed(name, &req.remote);
+                    Value::Nil
+                }
+                (false, true) => {
+                    // Every line, joined as RFC 9110 §5.3 joins a header's, as `accept_calls` reads it.
+                    let read = match (*subject, lines.len()) {
+                        (true, 1) => crate::svcauth::subject_caller(lines[0]),
+                        (true, n) => Err(format!("has {} lines: a subject is one", n)),
+                        (false, _) => crate::svcauth::cert_caller(&lines.join(","), false),
+                    };
+                    match read {
+                        Ok((n, extra)) => {
+                            let mut m = Map::new();
+                            m.insert("name".into(), Value::str(n));
+                            for (k, v) in extra {
+                                m.insert(k.into(), v);
+                            }
+                            Value::map(m)
+                        }
+                        Err(why) => {
+                            // Not `accept_calls`' own advice, which a route has no option for.
+                            let why = why.split_once(" (Envoy's SANITIZE_SET)").map_or(why.clone(), |(w, _)| format!("{} (Envoy's SANITIZE_SET)", w));
+                            identity_unread(name, &why);
+                            Value::Nil
+                        }
+                    }
+                }
+            }
+        }
+    };
+    let user = match user_header {
+        None => Value::Nil,
+        Some(name) => {
+            let lines = lines(name);
+            match (lines.as_slice(), trusted) {
+                ([], _) => Value::Nil,
+                (_, false) => {
+                    identity_not_believed(name, &req.remote);
+                    Value::Nil
+                }
+                // A comma is two values joined, as RFC 9110 §5.3 joins a header's lines: a proxy
+                // that appends (Apache's `RequestHeader append`) or a hop that merges them puts the
+                // visitor's first, so it is refused as two lines are; account names (`user@REALM`,
+                // `DOMAIN\user`) have none (FEEDBACK78.md, A.13, found in review; branch feedback75).
+                ([one], true) if one.contains(',') => {
+                    identity_unread(name, "has several values (a comma): the proxy is to set it once, in place of any the visitor sent");
+                    Value::Nil
+                }
+                ([one], true) if !one.trim().is_empty() => Value::str(one.trim()),
+                ([_], true) => Value::Nil,
+                (more, true) => {
+                    identity_unread(name, &format!("has {} lines: the proxy is to set it once, in place of any the visitor sent", more.len()));
+                    Value::Nil
+                }
+            }
+        }
+    };
+    Some((cert, user))
+}
+
+/// The identity a request carries to a proxy `--trust-proxy` names, as JSON, for a service under
+/// `--split` (`service::IDENTITY_WORD`); none where neither is known.
+pub(crate) fn proxy_identity_json(req: &HttpRequest) -> Option<String> {
+    let (cert, user) = proxy_identity(req)?;
+    if matches!((&cert, &user), (Value::Nil, Value::Nil)) {
+        return None;
+    }
+    let cert = match &cert {
+        Value::Map(m) => serde_json::Value::Object(m.iter().filter_map(|(k, v)| match v {
+            Value::Str(t) => Some((k.to_string(), serde_json::Value::String(t.to_string()))),
+            _ => None,
+        }).collect()),
+        _ => serde_json::Value::Null,
+    };
+    let user = match &user {
+        Value::Str(t) => serde_json::Value::String(t.to_string()),
+        _ => serde_json::Value::Null,
+    };
+    Some(serde_json::json!({ "cert": cert, "user": user }).to_string())
+}
+
+/// Said once: a request carried a header `--client-cert-header` or `--user-header` names from an
+/// address `--trust-proxy` does not name, which a visitor can send.
+#[cold]
+fn identity_not_believed(name: &str, peer: &str) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("quillo: warning: a request from {} carried `{}`, which is believed only from a proxy --trust-proxy names: request.client_cert and request.remote_user are null for it. Said once", crate::httpd::named_address(peer), name);
+    }
+}
+
+/// Said once: a proxy's header that names no identity.
+#[cold]
+fn identity_unread(name: &str, why: &str) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let why: String = why.chars().filter(|c| !c.is_control()).take(300).collect();
+        eprintln!("quillo: warning: `{}` from the proxy {}, so it is null for that request. Said once", name, why);
+    }
 }
 
 impl Interp {
@@ -5147,7 +5312,12 @@ impl Worker {
     /// Answers a request, a streamed answer on `sink` (the connection) as it
     /// is made. The caller holds the interpreter lock.
     pub(crate) fn answer(&mut self, app: &Arc<App>, mut req: HttpRequest, sink: Option<&mut dyn crate::stream::Sink>) -> Answer {
-        let mut app_rules = if crate::httpd::takes_app_word() { apps_policies(&mut req) } else { Vec::new() };
+        let mut app_rules = if crate::httpd::takes_app_word() {
+            apps_identity(&mut req);
+            apps_policies(&mut req)
+        } else {
+            Vec::new()
+        };
         let took_policies = !app_rules.is_empty();
         if let Some(token) = &app.launch_token {
             if let Some(resp) = launch_gate(&req, token).filter(|_| !is_job_request(&req)) {
@@ -5886,17 +6056,19 @@ pub fn log_url(u: &str) -> std::borrow::Cow<'_, str> {
 /// `user.password`, `user[password]`, `API_KEY`), and signatures, credentials, verifiers and
 /// tokens of other names (`X-Amz-Signature`, `X-Amz-Credential`, `code_verifier`, `sig`, `jwt`,
 /// `auth`) (Q-1158, review).
+/// Session ids and `Authorization` too (`session_id`, `sid`, `PHPSESSID`, `tokens`) (Q-1158, recheck).
 const SECRET_NAMES: &[&str] = &[
-    "password", "passwd", "pwd", "pass", "token", "code", "secret", "key", "otp", "state", "samlrequest", "samlresponse", "ticket", "sig", "signature", "credential", "credentials", "verifier", "jwt",
-    "auth",
+    "password", "passwd", "pwd", "pass", "token", "tokens", "code", "secret", "key", "otp", "state", "samlrequest", "samlresponse", "ticket", "sig", "signature", "credential", "credentials", "verifier",
+    "jwt", "auth", "authorization", "session", "sessionid", "sid",
 ];
 
-/// Words that mark a secret wherever they are in a name (`id_token_hint`, `password_confirm`).
-const SECRET_ANYWHERE: &[&str] = &["password", "passwd", "token", "secret", "signature", "credential", "credentials", "verifier", "jwt"];
+/// Words that mark a secret wherever they are in a name (`id_token_hint`, `password_confirm`,
+/// `session_id`); each is one of `SECRET_NAMES`, which a one-word name is looked up in alone.
+const SECRET_ANYWHERE: &[&str] = &["password", "passwd", "token", "tokens", "secret", "signature", "credential", "credentials", "verifier", "jwt", "authorization", "session"];
 
 /// What a name's last word ends with that marks a secret, words run together (`apikey`,
-/// `accesstoken`, `clientsecret`, `newpassword`).
-const SECRET_ENDS: &[&str] = &["key", "token", "secret", "password"];
+/// `accesstoken`, `clientsecret`, `newpassword`, `jsessionid`, `PHPSESSID`).
+const SECRET_ENDS: &[&str] = &["key", "token", "secret", "password", "sessionid", "sessid"];
 
 /// Whether a query's `name=value` has a value the log writes `[hidden]` (see `log_url`): the launch
 /// token's, or a secret's. A name is decoded only where it has a `%` or a `+`.
@@ -5906,7 +6078,11 @@ fn hidden_in_log(pair: &str) -> bool {
         return false;
     }
     let one_of = |w: &str, list: &[&str]| list.iter().any(|s| w.eq_ignore_ascii_case(s));
-    let ends = |w: &str| SECRET_ENDS.iter().any(|s| w.len() >= s.len() && w.as_bytes()[w.len() - s.len()..].eq_ignore_ascii_case(s.as_bytes()));
+    // Each end is told by its last letter first, as few names end in one (Q-1158, recheck).
+    let ends = |w: &str| {
+        matches!(w.as_bytes().last().map(u8::to_ascii_lowercase), Some(b'y' | b'n' | b't' | b'd'))
+            && SECRET_ENDS.iter().any(|s| w.len() >= s.len() && w.as_bytes()[w.len() - s.len()..].eq_ignore_ascii_case(s.as_bytes()))
+    };
     // One small word, as most names are (`page`, `q`, `password`): itself, and its end.
     let (mut plain, mut coded) = (true, false);
     for &b in k.as_bytes() {
@@ -5917,7 +6093,7 @@ fn hidden_in_log(pair: &str) -> bool {
         }
     }
     if plain {
-        return one_of(k, SECRET_NAMES) || ends(k);
+        return secret_name(k) || ends(k);
     }
     let decoded;
     let name = if coded {
@@ -5926,7 +6102,7 @@ fn hidden_in_log(pair: &str) -> bool {
     } else {
         k
     };
-    if name == LAUNCH_PARAM || one_of(name, SECRET_NAMES) {
+    if name == LAUNCH_PARAM || secret_name(name) {
         return true;
     }
     // Its words: between `_`, `-`, `.`, `[` and `]`, and in each from a capital that follows a
@@ -5950,7 +6126,29 @@ fn hidden_in_log(pair: &str) -> bool {
             return true;
         }
     }
-    one_of(last, SECRET_NAMES) || ends(last)
+    secret_name(last) || ends(last)
+}
+
+/// Whether `w` is one of `SECRET_NAMES`, in any case: those of its length alone compared, as most
+/// names are none (FEEDBACK78.md, Q-1158, recheck: the list grew; branch feedback75).
+fn secret_name(w: &str) -> bool {
+    let of_length: &[&str] = match w.len() {
+        3 => &["pwd", "otp", "key", "sig", "jwt", "sid"],
+        4 => &["pass", "code", "auth"],
+        5 => &["token", "state"],
+        6 => &["tokens", "secret", "passwd", "ticket"],
+        7 => &["session"],
+        8 => &["password", "verifier"],
+        9 => &["signature", "sessionid"],
+        10 => &["credential"],
+        11 => &["credentials", "samlrequest"],
+        12 => &["samlresponse"],
+        13 => &["authorization"],
+        _ => return false,
+    };
+    let found = of_length.iter().any(|s| w.eq_ignore_ascii_case(s));
+    debug_assert_eq!(found, SECRET_NAMES.iter().any(|s| w.eq_ignore_ascii_case(s)), "{}", w);
+    found
 }
 
 /// Marks a version of the program as replaced by a reload: itself, what it
@@ -6177,6 +6375,24 @@ fn island_loader(srcs: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The log's names looked up by length are the list's, every one, in any case, and no other;
+    // each word that counts anywhere is one of them, as a one-word name is looked up alone
+    // (FEEDBACK78.md, Q-1158, recheck; branch feedback75).
+    #[test]
+    fn secret_names_by_length_are_the_lists() {
+        for n in SECRET_NAMES {
+            assert!(secret_name(n) && secret_name(&n.to_ascii_uppercase()), "{}", n);
+        }
+        for w in SECRET_ANYWHERE {
+            assert!(SECRET_NAMES.contains(w), "{}", w);
+        }
+        let mut words: Vec<String> = SECRET_NAMES.iter().map(|w| w.to_string()).collect();
+        words.extend(["page", "q", "keys", "sessions", "authorize", "tokenize", "cod", "passw", ""].map(String::from));
+        for w in &words {
+            assert_eq!(secret_name(w), SECRET_NAMES.contains(&w.as_str()), "{}", w);
+        }
+    }
 
     /// `is_html` by one comparison is the long way's answer, as the third review of branch pwa
     /// asked for it: every ASCII byte at each of the first ten places of three types, the cases

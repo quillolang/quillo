@@ -2175,11 +2175,32 @@ fn collect_private(program: &[Arc<Vec<Stmt>>], natives: &HashSet<String>) -> Has
             }
         }
     }
-    let sources: HashSet<&str> = PRIVATE_SOURCES.iter().copied().collect();
+    // The program's own top-level names: one that is a source's (`fn uuid() = "fixed"`, `let crypto
+    // = { name: "x" }`, `let args = 5`) is the program's, not the builtin, and private only if its
+    // own value is, as any other name's is (FEEDBACK75.md, Q-1063, recheck; branch feedback75).
+    let mut own: HashSet<String> = HashSet::new();
+    for stmts in program {
+        for st in stmts.iter() {
+            match st {
+                Stmt::Let(p, ..) => {
+                    let mut names = Vec::new();
+                    pattern_names(p, &mut names);
+                    own.extend(names);
+                }
+                Stmt::Fn(d) => {
+                    own.insert(d.name.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    let sources: HashSet<&str> = PRIVATE_SOURCES.iter().copied().filter(|s| !own.contains(*s)).collect();
+    let natives: HashSet<&str> = natives.iter().map(String::as_str).filter(|n| !own.contains(*n)).collect();
+    let env_builtin = !own.contains("env");
     let mut vars: HashSet<String> = HashSet::new();
     // Functions that use what is private: calling one gives a private value.
     // They can be called as methods too (`"KEY".env`).
-    let mut fns: HashSet<String> = ["env", "read_file"].iter().map(|s| s.to_string()).collect();
+    let mut fns: HashSet<String> = ["env", "read_file"].iter().filter(|s| !own.contains(**s)).map(|s| s.to_string()).collect();
     // A source called as a method (`"40 + 2".run_script()`, a plugin's `x.sign()`), or on a value
     // that is no map (`"KEY".env`): `x.file` alone may be a field (Q-1063, review).
     let method = |x: &Expr, bound: &[String]| {
@@ -2205,7 +2226,7 @@ fn collect_private(program: &[Arc<Vec<Stmt>>], natives: &HashSet<String>) -> Has
             let Met::Expr(x) = m else { return };
             found |= method(x, bound);
             match x {
-                Expr::Ident(n, _) if n == "env" => envs += 1,
+                Expr::Ident(n, _) if env_builtin && n == "env" => envs += 1,
                 Expr::Ident(n, _) => {
                     found |= sources.contains(n.as_str()) || natives.contains(n.as_str()) || services.contains(n.as_str()) || vars.contains(n.as_str()) || fns.contains(n.as_str())
                 }
@@ -2226,7 +2247,7 @@ fn collect_private(program: &[Arc<Vec<Stmt>>], natives: &HashSet<String>) -> Has
             let Met::Expr(x) = m else { return };
             found |= method(x, bound);
             match x {
-                Expr::Ident(n, _) if n == "env" => envs += 1,
+                Expr::Ident(n, _) if env_builtin && n == "env" => envs += 1,
                 Expr::Ident(n, _) => found |= sources.contains(n.as_str()) || natives.contains(n.as_str()) || vars.contains(n.as_str()),
                 Expr::Call(f, args, _) if public_env(f, args).is_some() => public += 1,
                 _ => {}

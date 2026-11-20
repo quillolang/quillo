@@ -1579,6 +1579,135 @@ fn check_follows_page_states_through_views_and_scopes() {
     assert!(with_state < plain * 3 + Duration::from_millis(500), "with a state {:?}, without {:?}", with_state, plain);
 }
 
+// ---- After the recheck of wave 2: Q-1063, Q-1058; and FEEDBACK75's Q-1067 ---------------------------
+
+/// A top-level name of the program's own that is a source's (`fn uuid`, `let crypto`, `let args`)
+/// is the program's, and a component may read a constant made from it, as in 0.8.8; one whose own
+/// value is the server's is refused as any other is (FEEDBACK75.md, Q-1063, recheck; branch
+/// feedback75)
+#[test]
+fn the_programs_own_names_hide_the_builtins_of_theirs() {
+    let _one = serial();
+    let load = |head: &str| {
+        let src = format!("{}\ncomponent Pay() {{\n    state n = 0\n    <button onclick={{() => {{ n = n + 1 }}}}>Pay {{n}} {{K}}</button>\n}}\nroute GET / = <html><body><Pay/></body></html>\n", head);
+        let mut it = Interp::new(env!("CARGO_MANIFEST_DIR"));
+        match it.load_source(&src, "case.qwe") {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    };
+    for head in [
+        "fn uuid() = \"fixed\"\nlet K = uuid()",
+        "let crypto = { name: \"ünï\" }\nlet K = crypto.name",
+        "let args = 5\nlet K = args",
+        "fn env(name) = \"plain \" + name\nlet K = env(\"HOME\")",
+        "fn uuid(x) = \"fixed \" + x\nlet K = \"x\".uuid()",
+        "let [file, db] = [\"a\", \"b\"]\nlet K = file + db",
+    ] {
+        assert_eq!(load(head), "", "{}", head);
+    }
+    let refused = "`K` is read from the server's environment, files, database, a service, a plugin, its command line or input, a site or `crypto`, and would be sent to every browser";
+    for head in [
+        "fn uuid() {\n    return crypto.token()\n}\nlet K = uuid()",
+        "let args = env(\"SECRET\") ?? \"\"\nlet K = args",
+        "let crypto = read_file(\"k.txt\") ?? \"\"\nlet K = crypto",
+        "let K = uuid()",
+    ] {
+        let said = load(head);
+        assert!(said.contains(refused), "{}: {}", head, said);
+    }
+}
+
+/// `quillo check`'s error for a server fn that reaches a page state through a helper says `sets`
+/// where the helper only assigns it, and `reads` where it reads it (FEEDBACK75.md, Q-1058, recheck;
+/// branch feedback75)
+#[test]
+fn check_says_a_server_fn_sets_a_page_state_through_a_helper() {
+    let src = "state count = 0\nfn reset() {\n    count = 0\n}\nfn shown() {\n    return count\n}\nfn both() {\n    count = count + 1\n}\nserver fn clear() {\n    reset()\n}\nserver fn look() {\n    return shown()\n}\nserver fn bump() {\n    both()\n}\nroute GET / = \"x\"\n";
+    let d = dir("check-sets", &[("main.qwe", src)]);
+    let _gone = Gone(d.clone());
+    let (ok, said) = check_said(&d, "main.qwe");
+    assert!(!ok, "{}", said);
+    assert!(said.contains("main.qwe:11: error: `count` is the page's state, and server fn `clear` runs for no page (it sets it through `reset`): pass it as an argument"), "{}", said);
+    assert!(said.contains("main.qwe:14: error: `count` is the page's state, and server fn `look` runs for no page (it reads it through `shown`): pass it as an argument"), "{}", said);
+    assert!(said.contains("server fn `bump` runs for no page (it reads it through `both`)"), "{}", said);
+}
+
+const SLOW_EXPORT: &str = "db.exec(\"create table if not exists items (id integer primary key, body text)\")\ndb.exec(\"create table if not exists seen (n int)\")\nif db.one(\"select count(*) as n from items\").n == 0 {\n    db.transaction(() => {\n        for i in range(2000) {\n            db.exec(\"insert into items (body) values (?)\", \"x\".repeat(10000))\n        }\n    })\n}\nroute GET /export.txt = stream(send => db.transaction(() => {\n    db.exec(\"insert into seen (n) values (1)\")\n    for row in db.query(\"select body from items\") {\n        send(row.body)\n    }\n}))\nroute GET /plain.txt = stream(send => {\n    for row in db.query(\"select body from items\") {\n        send(row.body)\n    }\n})\nroute GET /seen = db.one(\"select count(*) as n from seen\").n\nroute GET /ping = \"pong\"\n";
+
+/// A stream sent inside a SQLite transaction to a client that reads nothing, or a row now and then,
+/// holds the instance a second at most, in all: what the socket does not take waits on the
+/// connection up to 4 MiB, then the send fails as a client gone's and the transaction rolls back,
+/// where 0.8.8 held every other request 35 s for each such client. A client that reads gets the
+/// whole stream, its transaction committed; a stream outside a transaction waits for its client
+/// off the lock as before (FEEDBACK75.md, Q-1067; branch feedback75)
+#[test]
+fn a_slow_reader_inside_a_sqlite_transaction_holds_the_instance_a_second_at_most() {
+    let d = dir("slow-tx", &[("main.qwe", SLOW_EXPORT)]);
+    let _gone = Gone(d.clone());
+    let (ok, said) = check_said(&d, "main.qwe");
+    assert!(ok && said.contains("main.qwe:13: warning: `send` inside `db.transaction` waits for the client to read"), "{}", said);
+    let (_g, port) = serve(&d, "main.qwe", &["--no-check"], &[], "slow-tx.log");
+    let idle = |path: &str| {
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.write_all(format!("GET {} HTTP/1.1\r\nHost: localhost\r\n\r\n", path).as_bytes()).unwrap();
+        c
+    };
+    let timed = |path: &str| {
+        let t = Instant::now();
+        let body = support::send(port, "GET", path, &[], "").body;
+        (t.elapsed(), body)
+    };
+    // Two that read nothing: about a second each, where each held it 35 s.
+    let held: Vec<_> = (0..2).map(|_| idle("/export.txt")).collect();
+    std::thread::sleep(Duration::from_millis(100));
+    let (t, body) = timed("/ping");
+    assert!(body == "pong" && t < Duration::from_secs(4), "{:?}", t);
+    let (t, _) = timed("/ping");
+    assert!(t < Duration::from_millis(500), "{:?}", t);
+    // One that reads a row now and then: a second in all, not a second for each row.
+    let mut drip = idle("/export.txt");
+    let dripping = std::thread::spawn(move || {
+        let mut buf = [0u8; 10_000];
+        let end = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(200));
+            if matches!(drip.read(&mut buf), Ok(0) | Err(_)) {
+                break;
+            }
+        }
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    let (t, body) = timed("/ping");
+    assert!(body == "pong" && t < Duration::from_secs(3), "{:?}", t);
+    dripping.join().unwrap();
+    // One that reads: all of it, committed; the others rolled back.
+    let (_, all) = timed("/export.txt");
+    assert!(all.len() >= 20_000_000 && all.bytes().all(|b| b == b'x' || b.is_ascii_hexdigit() || b == b'\r' || b == b'\n'), "{}", all.len());
+    assert_eq!(timed("/seen").1, "1");
+    // Outside a transaction a stream waits for its client as before, holding nothing.
+    let _waiting = idle("/plain.txt");
+    std::thread::sleep(Duration::from_millis(300));
+    let (t, _) = timed("/ping");
+    assert!(t < Duration::from_millis(500), "{:?}", t);
+    drop(held);
+}
+
+/// `quillo check` warns of a stream's `send`, by whatever name its function gives it, called in
+/// the function `db.transaction` runs (or `db.atomic`'s); not of one outside it, nor of a name
+/// bound again inside (FEEDBACK75.md, Q-1067; branch feedback75)
+#[test]
+fn check_warns_of_a_streams_send_inside_a_transaction() {
+    let src = "route GET /a = stream((out) => {\n    db.transaction(() => {\n        out(\"one\")\n    })\n})\nroute GET /b = events((send) => {\n    send({ n: 1 })\n    db.transaction(() => {\n        db.exec(\"select 1\")\n    })\n})\nroute GET /c = stream((send) => {\n    db.transaction(() => {\n        let send = (x) => x\n        send(\"not the stream's\")\n    })\n})\nroute GET /d = events((send) => db.transaction(() => send({ n: 2 })))\n";
+    let d = dir("check-tx-send", &[("main.qwe", src)]);
+    let _gone = Gone(d.clone());
+    let (ok, said) = check_said(&d, "main.qwe");
+    assert!(ok, "{}", said);
+    assert!(said.contains("main.qwe:3: warning: `out` inside `db.transaction` waits for the client to read: on SQLite the transaction holds every other request of the instance meanwhile"), "{}", said);
+    assert!(said.contains("main.qwe:18: warning: `send` inside `db.transaction` waits"), "{}", said);
+    assert_eq!(said.matches("inside `db.transaction` waits").count(), 2, "{}", said);
+}
+
 // ---- FEEDBACK78 (Q-1158, Q-1159): kept apart from FEEDBACK75's above ---------------------------
 
 /// The request log writes `[hidden]` for the values of query parameters whose names mark a secret,
@@ -1621,7 +1750,9 @@ fn the_log_hides_secrets_named_any_way() {
     ] {
         assert_eq!(log_url(&format!("/cb?page=2&{}=s3cr3t&q=ünï", name)), format!("/cb?page=2&{}=[hidden]&q=ünï", name), "{}", name);
     }
-    for name in ["page", "q", "keyword", "passage", "author", "authority", "sort_by", "tokens_left", "signed", "id", "user[name]", "PAGE_SIZE", "statement"] {
+    // `tokens_left` is hidden since the recheck: `tokens`, as `token`, marks a secret wherever it
+    // is (Q-1158, recheck), so it moved to the test below.
+    for name in ["page", "q", "keyword", "passage", "author", "authority", "sort_by", "signed", "id", "user[name]", "PAGE_SIZE", "statement"] {
         let url = format!("/cb?{}=v", name);
         assert_eq!(log_url(&url), url, "{}", name);
     }
@@ -1681,4 +1812,124 @@ globalThis.fetch = async (url, o) => ({ ok: true, text: async () => JSON.stringi
         in_node(prelude, src),
         r#"[[{ id: "Ab_c", type: "public-key", response: { clientDataJSON: "eyJ9", n: 2 } }, {}, "2026-11-20T01:02:03.000Z", { k: "ünï", l: [1, 2] }], "{\"id\":\"Ab_c\",\"type\":\"public-key\",\"response\":{\"clientDataJSON\":\"eyJ9\",\"n\":2}}"]"#
     );
+}
+
+/// The log hides session ids (`session_id`, `sid`, `JSESSIONID`, `PHPSESSID`), `tokens` and
+/// `authorization` too (FEEDBACK78.md, Q-1158, recheck; branch feedback75)
+#[test]
+fn the_log_hides_session_ids_and_authorization() {
+    use quillo::server::log_url;
+    for name in ["session_id", "sessionId", "sid", "sessionid", "SESSIONID", "JSESSIONID", "PHPSESSID", "session", "tokens", "refresh_tokens", "tokens_left", "authorization", "x-authorization", "Authorization"] {
+        assert_eq!(log_url(&format!("/a?page=2&{}=s3cr3t", name)), format!("/a?page=2&{}=[hidden]", name), "{}", name);
+    }
+    for name in ["sides", "authority", "sidebar", "consider"] {
+        let url = format!("/a?{}=v", name);
+        assert_eq!(log_url(&url), url, "{}", name);
+    }
+}
+
+// ---- FEEDBACK78 A.13 and A.14: who the visitor is to a trusted proxy ------------------------------
+
+const WHO: &str = "route GET /who = { cert: request.client_cert, user: request.remote_user }\n";
+const XFCC: &str = "By=spiffe://cluster.local/ns/edge/sa/envoy;Hash=abc;Subject=\"CN=ann,O=Example\";URI=spiffe://cluster.local/ns/shop/sa/ann";
+
+/// `request.client_cert` and `request.remote_user` come from the headers `--client-cert-header` and
+/// `--user-header` name, from a peer `--trust-proxy` names only: Envoy's element read by
+/// `accept_calls`' parser (the SPIFFE id, or the CN), the user's text; null where the header is
+/// missing, has several elements or lines (one the visitor sent beside the proxy's), or comes from
+/// any other peer, whose own header is never believed (FEEDBACK78.md, A.13 and A.14, the user's
+/// decision; branch feedback75)
+#[test]
+fn a_trusted_proxys_headers_say_who_the_visitor_is() {
+    let d = dir("who", &[("main.qwe", WHO)]);
+    let _gone = Gone(d.clone());
+    checked(&d, "main.qwe");
+    let who = |port: u16, hs: &[(&str, &str)]| support::send(port, "GET", "/who", hs, "").body;
+    let flags = ["--client-cert-header", "x-forwarded-client-cert", "--user-header", "X-Remote-User"];
+    let (_g, port) = serve(&d, "main.qwe", &[&["--trust-proxy", "127.0.0.1"], &flags[..]].concat(), &[], "who.log");
+    assert_eq!(who(port, &[]), r#"{"cert":null,"user":null}"#);
+    assert_eq!(
+        who(port, &[("X-Forwarded-Client-Cert", XFCC), ("x-remote-user", " ann@EXAMPLE.ORG ")]),
+        r#"{"cert":{"name":"spiffe://cluster.local/ns/shop/sa/ann","subject":"CN=ann,O=Example","uri":"spiffe://cluster.local/ns/shop/sa/ann"},"user":"ann@EXAMPLE.ORG"}"#
+    );
+    assert_eq!(who(port, &[("x-forwarded-client-cert", "Hash=abc;Subject=\"CN=bob,O=x\"")]), r#"{"cert":{"name":"bob","subject":"CN=bob,O=x"},"user":null}"#);
+    // Several elements, or a line the visitor sent beside the proxy's: nobody's.
+    let two = format!("{},{}", XFCC, "Hash=def;Subject=\"CN=root,O=x\"");
+    assert_eq!(who(port, &[("x-forwarded-client-cert", &two)]), r#"{"cert":null,"user":null}"#);
+    assert_eq!(who(port, &[("x-forwarded-client-cert", "Hash=def;Subject=\"CN=root,O=x\""), ("x-forwarded-client-cert", XFCC)]), r#"{"cert":null,"user":null}"#);
+    assert_eq!(who(port, &[("x-remote-user", "root"), ("x-remote-user", "ann")]), r#"{"cert":null,"user":null}"#);
+    assert_eq!(who(port, &[("x-remote-user", "   ")]), r#"{"cert":null,"user":null}"#);
+    // Two values joined by a comma, as a proxy that appends or a hop that merges lines gives
+    // them, the visitor's first: refused as two lines are (FEEDBACK78.md, A.13, found in review).
+    assert_eq!(who(port, &[("x-remote-user", "admin, alice")]), r#"{"cert":null,"user":null}"#);
+    assert_eq!(who(port, &[("x-remote-user", "admin,alice@EXAMPLE.ORG")]), r#"{"cert":null,"user":null}"#);
+    assert_eq!(who(port, &[("x-remote-user", "CORP\\ann")]), r#"{"cert":null,"user":"CORP\\ann"}"#);
+    // Another header of the same kind is no one's.
+    assert_eq!(who(port, &[("x-client-dn", "CN=root"), ("remote-user", "root")]), r#"{"cert":null,"user":null}"#);
+    // From a peer no --trust-proxy names (the visitor, here): never.
+    let (_h, other) = serve(&d, "main.qwe", &[&["--trust-proxy", "10.9.9.9"], &flags[..]].concat(), &[], "who2.log");
+    assert_eq!(who(other, &[("x-forwarded-client-cert", XFCC), ("x-remote-user", "ann")]), r#"{"cert":null,"user":null}"#);
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut log = String::new();
+    while !log.contains("believed only from a proxy --trust-proxy names") && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+        log = std::fs::read_to_string(d.join("who2.log")).unwrap_or_default();
+    }
+    assert!(log.contains("a request from 127.0.0.1 carried `x-forwarded-client-cert`, which is believed only from a proxy --trust-proxy names"), "{}", log);
+    // No option, no keys: null, as before.
+    let (_n, none) = serve(&d, "main.qwe", &["--trust-proxy", "127.0.0.1"], &[], "who3.log");
+    assert_eq!(who(none, &[("x-forwarded-client-cert", XFCC), ("x-remote-user", "ann")]), r#"{"cert":null,"user":null}"#);
+}
+
+/// `--client-cert-subject`: the header is the certificate's subject alone (nginx's
+/// `$ssl_client_s_dn`), escapes read as RFC 4514 writes them, one line only; the options are
+/// refused without `--trust-proxy`, without a header's name, or given twice (FEEDBACK78.md, A.14;
+/// branch feedback75)
+#[test]
+fn a_subject_header_and_the_options_rules() {
+    let d = dir("who-subject", &[("main.qwe", WHO)]);
+    let _gone = Gone(d.clone());
+    let (_g, port) = serve(&d, "main.qwe", &["--trust-proxy", "127.0.0.1", "--client-cert-header", "x-client-dn", "--client-cert-subject"], &[], "subject.log");
+    let who = |hs: &[(&str, &str)]| support::send(port, "GET", "/who", hs, "").body;
+    assert_eq!(who(&[("x-client-dn", r"CN=Ann\, Lee,O=Example\+Co")]), r#"{"cert":{"name":"Ann, Lee","subject":"CN=Ann\\, Lee,O=Example\\+Co"},"user":null}"#);
+    assert_eq!(who(&[("x-client-dn", "CN=ünï,O=x")]), r#"{"cert":{"name":"ünï","subject":"CN=ünï,O=x"},"user":null}"#);
+    assert_eq!(who(&[("x-client-dn", "CN=a,OU=x,CN=b")]), r#"{"cert":null,"user":null}"#);
+    assert_eq!(who(&[("x-client-dn", "CN=a"), ("x-client-dn", "CN=b")]), r#"{"cert":null,"user":null}"#);
+    assert_eq!(who(&[("x-client-dn", XFCC)]), r#"{"cert":null,"user":null}"#);
+    let refused = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "main.qwe", "--port", "0"]).args(args).current_dir(&d).stdin(Stdio::null()).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stderr).to_string())
+    };
+    let (code, said) = refused(&["--user-header", "x-remote-user"]);
+    assert!(code == Some(2) && said.contains("believed only from the addresses --trust-proxy names: give --trust-proxy too"), "{:?} {}", code, said);
+    let (code, said) = refused(&["--trust-proxy", "127.0.0.1", "--client-cert-subject"]);
+    assert!(code == Some(2) && said.contains("--client-cert-subject says how the header --client-cert-header names is written"), "{}", said);
+    let (code, said) = refused(&["--trust-proxy", "127.0.0.1", "--user-header", "x:y"]);
+    assert!(code == Some(2) && said.contains("--user-header needs a header's name"), "{}", said);
+    let (code, said) = refused(&["--trust-proxy", "127.0.0.1", "--user-header", "a", "--user-header", "b"]);
+    assert!(code == Some(2) && said.contains("--user-header needs a header's name, as x-remote-user, once"), "{}", said);
+}
+
+/// Under `--split`, a service has the visitor's `request.client_cert` and `request.remote_user` as
+/// its app read them, from the app's signed word; a visitor's own word or mark is not taken
+/// (FEEDBACK78.md, A.13 and A.14; branch feedback75)
+#[test]
+fn a_split_service_knows_who_the_visitor_is() {
+    let app = "service /shop = \"shop.qwe\"\nroute GET /who = { cert: request.client_cert, user: request.remote_user }\n";
+    let shop = "route GET / = \"shop\"\nroute GET /who = { cert: request.client_cert, user: request.remote_user }\n";
+    let d = dir("who-split", &[("app.qwe", app), ("shop.qwe", shop)]);
+    let _gone = Gone(d.clone());
+    let (_g, port) = serve(&d, "app.qwe", &["--split", "--trust-proxy", "127.0.0.1", "--client-cert-header", "x-forwarded-client-cert", "--user-header", "x-remote-user"], &[], "who-split.log");
+    let end = Instant::now() + Duration::from_secs(20);
+    while support::send(port, "GET", "/shop/", &[], "").body != "shop" {
+        assert!(Instant::now() < end, "the service did not start: {}", std::fs::read_to_string(d.join("who-split.log")).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let hs = [("x-forwarded-client-cert", "Hash=abc;Subject=\"CN=ann,O=Example\""), ("x-remote-user", "ann@EXAMPLE.ORG")];
+    let want = r#"{"cert":{"name":"ann","subject":"CN=ann,O=Example"},"user":"ann@EXAMPLE.ORG"}"#;
+    assert_eq!(support::send(port, "GET", "/who", &hs, "").body, want);
+    assert_eq!(support::send(port, "GET", "/shop/who", &hs, "").body, want);
+    assert_eq!(support::send(port, "GET", "/shop/who", &[], "").body, r#"{"cert":null,"user":null}"#);
+    let forged = [("x-quillo-app-identity", r#"{"cert":null,"user":"root"}"#), ("x-quillo-identity", "t=1;sig=00;e30")];
+    assert_eq!(support::send(port, "GET", "/shop/who", &forged, "").body, r#"{"cert":null,"user":null}"#);
 }

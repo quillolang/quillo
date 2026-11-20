@@ -88,6 +88,11 @@ options for `run`:
   --max-memory 512MB  end a request that would make one value bigger than this, as a 500
   --drain 30s    on a stop, cut off what is still running after this long (default: wait for it all)
   --trust-proxy A,B believe X-Forwarded-For and X-Forwarded-Proto from these addresses or networks
+  --client-cert-header NAME  request.client_cert from this header of a --trust-proxy proxy
+                 that ends mTLS (Envoy's x-forwarded-client-cert; --client-cert-subject
+                 when it holds the certificate's subject alone, as nginx's $ssl_client_s_dn)
+  --user-header NAME  request.remote_user from this header of a --trust-proxy proxy that
+                 signs the user in (Kerberos by SPNEGO: Apache's mod_auth_gssapi, IIS)
   -- a b         what follows is the program's, for args()
   --allow-path DIR  read_file and write_file may use DIR too, for a script
                  used as a tool (any part of the program may then)
@@ -232,13 +237,13 @@ fn main() {
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--listen", "--socket-mode", "--policy", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
     "--max-body", "--max-compute", "--max-memory", "--drain", "--max-tool-calls", "--allow-path", "--trust-proxy", "--live-per-client", "--max-connections", "--connections-per-client", "--allowed-hosts", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
-    "--scale", "--join", "--with", "--allow-join", "--join-as",
+    "--scale", "--join", "--with", "--allow-join", "--join-as", "--client-cert-header", "--user-header",
 ];
 
 /// Options of `run`, `app` and `check` that take no value.
 const FLAG_OPTIONS: &[&str] = &[
     "--watch", "--watch=reload", "--reload", "--no-check", "--split", "--as-service", "--no-wt", "--no-prefetch", "--no-view-cache",
-    "--no-jobs", "--plain-http", "--metrics", "--query-stats", "--strict-null", "--describe", "--no-join", "--checked", "--no-build",
+    "--no-jobs", "--plain-http", "--metrics", "--query-stats", "--strict-null", "--describe", "--no-join", "--checked", "--no-build", "--client-cert-subject",
 ];
 
 /// What an unknown option was probably meant to be: the nearest known one
@@ -883,6 +888,8 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         tools: None,
     };
     let mut tls: (Option<PathBuf>, Option<PathBuf>) = (None, None);
+    // `--client-cert-header`, `--client-cert-subject`, and whether either identity header is named.
+    let (mut cert_header, mut cert_subject, mut identity_named): (Option<String>, bool, bool) = (None, false, false);
     let mut i = 0;
     while i < flags.len() {
         let value = flags.get(i + 1);
@@ -1129,6 +1136,21 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
             }
+            // Who the visitor is to a proxy that ended mTLS or signed them in, from the header the
+            // operator names (FEEDBACK78.md, A.13 and A.14, the user's decision; branch feedback75).
+            ("--client-cert-header", Some(v)) => cert_header = Some(v.to_string()),
+            ("--user-header", Some(v)) => {
+                if !quillo::httpd::user_header(v) {
+                    eprintln!("quillo: --user-header needs a header's name, as x-remote-user, once");
+                    return Err(2);
+                }
+                identity_named = true;
+            }
+            ("--client-cert-subject", _) => {
+                cert_subject = true;
+                i += 1;
+                continue;
+            }
             // Tool calls a minute each caller may make at the MCP door (FEEDBACK56.md, C.4, Q-860; branch
             // feedback56).
             ("--max-tool-calls", Some(v)) => match v.parse::<usize>() {
@@ -1224,6 +1246,26 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
     }
     if quillo::wt::TLS_CERT.get().is_some() != quillo::wt::TLS_KEY.get().is_some() {
         eprintln!("quillo: --tls-cert and --tls-key go together");
+        return Err(2);
+    }
+    match cert_header {
+        Some(h) => {
+            if !quillo::httpd::client_cert_header(&h, cert_subject) {
+                eprintln!("quillo: --client-cert-header needs a header's name, as x-forwarded-client-cert, once");
+                return Err(2);
+            }
+            identity_named = true;
+        }
+        None if cert_subject => {
+            eprintln!("quillo: --client-cert-subject says how the header --client-cert-header names is written: give that too");
+            return Err(2);
+        }
+        None => {}
+    }
+    // Believed from a proxy only, never from a visitor, who can send any header (FEEDBACK78.md,
+    // A.13 and A.14).
+    if identity_named && !quillo::httpd::trusts_proxies() {
+        eprintln!("quillo: --client-cert-header and --user-header read a proxy's header, believed only from the addresses --trust-proxy names: give --trust-proxy too (any visitor can send that header)");
         return Err(2);
     }
     // The files are there, said with the other options (FEEDBACK31.md, Q-381; branch

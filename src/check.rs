@@ -445,6 +445,11 @@ fn request_t() -> T {
         // At the MCP door, `{ client, version }` as the client says it; null on any other
         // request (FEEDBACK56.md, Q-859; branch feedback56).
         (Arc::from("mcp"), T::ANY),
+        // What a proxy `--trust-proxy` names says of the visitor, in the headers
+        // `--client-cert-header` and `--user-header` name: `{ name, subject, uri }`, and the user;
+        // null else (FEEDBACK78.md, A.13 and A.14; branch feedback75).
+        (Arc::from("client_cert"), T::of(MAP | NIL)),
+        (Arc::from("remote_user"), T::of(STR | NIL)),
     ])
 }
 
@@ -3222,6 +3227,7 @@ impl Checker {
         self.check_nesting(&order);
         self.page_states_through_calls(&order);
         self.page_states_to_pages(&order);
+        self.stream_sends_in_transactions(&order);
         for (file, e) in std::mem::take(&mut self.natives) {
             let sig = native_sig(&e, &file);
             let short = file.rsplit('/').next().unwrap_or(&file).to_string();
@@ -4811,7 +4817,8 @@ impl Checker {
             }
             if let Some(t) = through[i].filter(|&t| t != i) {
                 let state = graph.reads[t].as_deref().unwrap_or_default();
-                let msg = format!("`{}` is the page's state, and server fn `{}` runs for no page (it reads it through `{}`): pass it as an argument", state, d.name, defs[t].1.name);
+                let verb = if graph.sets_only[t] { "sets" } else { "reads" };
+                let msg = format!("`{}` is the page's state, and server fn `{}` runs for no page (it {} it through `{}`): pass it as an argument", state, d.name, verb, defs[t].1.name);
                 self.diag_at((*file).clone(), d.line, Severity::Error, msg);
             }
         }
@@ -4854,6 +4861,64 @@ impl Checker {
                 );
                 self.diag_at(file.clone(), *line, Severity::Warning, msg);
             }
+        }
+    }
+
+    /// A `stream`'s or an `events`' `send` called in the function `db.transaction` or `db.atomic`
+    /// runs: on SQLite the transaction keeps the instance's lock, so its client's reading held up
+    /// every other request; Quillo keeps up to 4 MiB of what is sent and then ends the transaction
+    /// (FEEDBACK75.md, Q-1067; branch feedback75). Written out: `send` itself, by the name the
+    /// stream's function gives it, where nothing in between binds that name again.
+    fn stream_sends_in_transactions(&mut self, order: &[Item]) {
+        use crate::client::{each_free, Met};
+        let mut found: Vec<(Arc<str>, u32, String, &'static str)> = Vec::new();
+        for it in order {
+            let roots: Vec<&Expr> = match &it.stmt {
+                Stmt::Route(r) => vec![&r.body],
+                Stmt::Fn(d) => vec![&d.body],
+                Stmt::Let(_, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) => vec![e],
+                _ => continue,
+            };
+            for root in roots {
+                each_free(root, true, &mut Vec::new(), &mut |m, bound| {
+                    let Met::Expr(Expr::Call(c, args, _)) = m else { return };
+                    let streams = matches!(&**c, Expr::Ident(n, _) if (n == "stream" || n == "events") && !bound.iter().any(|b| b == n.as_str()));
+                    let Some(Expr::Lambda(f)) = args.first().filter(|_| streams) else { return };
+                    let Some(send) = f.params.first().map(|p| p.name.to_string()) else { return };
+                    each_free(&f.body, true, &mut f.params.iter().skip(1).map(|p| p.name.to_string()).collect(), &mut |m, bound| {
+                        let Met::Expr(Expr::Call(c, targs, _)) = m else { return };
+                        let tx = match &**c {
+                            Expr::Field(o, name, _) if matches!(&**o, Expr::Ident(db, _) if db == "db" && !bound.iter().any(|b| b == "db")) => match name.as_str() {
+                                "transaction" => "db.transaction",
+                                "atomic" => "db.atomic",
+                                _ => return,
+                            },
+                            _ => return,
+                        };
+                        if bound.iter().any(|b| *b == send) {
+                            return;
+                        }
+                        for t in targs {
+                            if let Expr::Lambda(g) = t {
+                                each_free(&g.body, true, &mut g.params.iter().map(|p| p.name.to_string()).collect(), &mut |m, _| {
+                                    if let Met::Expr(Expr::Ident(n, line)) = m {
+                                        if *n == send.as_str() {
+                                            found.push((it.file.clone(), *line, send.clone(), tx));
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    });
+                });
+            }
+        }
+        for (file, line, send, tx) in found {
+            let msg = format!(
+                "`{}` inside `{}` waits for the client to read: on SQLite the transaction holds every other request of the instance meanwhile, so Quillo keeps up to 4 MiB of what it sends, then ends the transaction (it rolls back) if the client has not read within a second. Read the rows in the transaction and send them after it",
+                send, tx
+            );
+            self.diag_at(file, line, Severity::Warning, msg);
         }
     }
 
@@ -11528,9 +11593,11 @@ impl<'a, 'c> GetWalk<'a, 'c> {
 /// shows) (FEEDBACK75.md, Q-1058, review; branch feedback75).
 struct CallGraph<'a> {
     index: HashMap<&'a str, usize>,
-    /// The first page state each reads itself, and all of them.
+    /// The first page state each reads itself (or, reading none, sets), and all it reads or sets.
     reads: Vec<Option<String>>,
     all_reads: Vec<Vec<String>>,
+    /// Whether it only sets the state `reads` names.
+    sets_only: Vec<bool>,
     callers: Vec<Vec<usize>>,
 }
 
@@ -11541,19 +11608,27 @@ impl<'a> CallGraph<'a> {
         let index: HashMap<&'a str, usize> = defs.iter().enumerate().map(|(i, d)| (d.name.as_str(), i)).collect();
         let mut reads = Vec::with_capacity(defs.len());
         let mut all_reads = Vec::with_capacity(defs.len());
+        let mut sets_only = Vec::with_capacity(defs.len());
         let mut callers: Vec<Vec<usize>> = vec![Vec::new(); defs.len()];
         for (i, d) in defs.iter().enumerate() {
             let mut read: Vec<String> = Vec::new();
+            let mut first_read: Option<String> = None;
             let mut calls = Vec::new();
             called_names(&d.body, &mut calls);
             crate::client::free_fn(d, &mut Vec::new(), &mut |m, _| {
-                let n = match m {
-                    Met::Expr(Expr::Ident(n, _)) => n.as_str(),
-                    Met::Assigned(n) => n,
+                let (n, reading) = match m {
+                    Met::Expr(Expr::Ident(n, _)) => (n.as_str(), true),
+                    Met::Assigned(n) => (n, false),
                     Met::Tag(t) if t.starts_with(|c: char| c.is_ascii_uppercase()) => return calls.push(t.to_string()),
                     Met::Tag(_) | Met::Expr(_) => return,
                 };
-                if state(n) && !read.iter().any(|r| r == n) {
+                if !state(n) {
+                    return;
+                }
+                if reading && first_read.is_none() {
+                    first_read = Some(n.to_string());
+                }
+                if !read.iter().any(|r| r == n) {
                     read.push(n.to_string());
                 }
             });
@@ -11564,10 +11639,12 @@ impl<'a> CallGraph<'a> {
                     }
                 }
             }
-            reads.push(read.first().cloned());
+            // The message says `sets` of one that only sets it (FEEDBACK75.md, Q-1058, recheck).
+            sets_only.push(first_read.is_none() && !read.is_empty());
+            reads.push(first_read.or_else(|| read.first().cloned()));
             all_reads.push(read);
         }
-        CallGraph { index, reads, all_reads, callers }
+        CallGraph { index, reads, all_reads, sets_only, callers }
     }
 
     /// From `from` up to all who call them, each labelled with the one of `from` it came from: a

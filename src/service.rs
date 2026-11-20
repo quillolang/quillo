@@ -1316,6 +1316,40 @@ pub(crate) fn client_of_word(word: &str) -> Option<std::net::IpAddr> {
 /// on a request httpd took as its app's (`httpd::from_app`); one a client sends is dropped.
 pub const POLICY_WORD: &str = "x-quillo-policy";
 
+/// The header a request an app passes on to a service carries who the visitor is to the app's
+/// proxy in (`request.client_cert`, `request.remote_user`, read from the headers
+/// `--client-cert-header` and `--user-header` name), as JSON, signed as `POLICY_WORD` is: the
+/// service has neither option nor `--trust-proxy`, and believes it only from its app
+/// (`httpd::from_app`) (FEEDBACK78.md, A.13 and A.14; branch feedback75).
+pub const IDENTITY_WORD: &str = "x-quillo-identity";
+
+/// The app's word on the visitor's identity (`IDENTITY_WORD`), signed now; none without a shared
+/// secret.
+pub(crate) fn identity_word(json: &str) -> Option<String> {
+    let key = secret()?;
+    let t = now_secs();
+    let text = crate::crypto::b64url(json.as_bytes());
+    Some(format!("t={};sig={};{}", t, signed_text(&key, "quillo-identity-1", &text, t), text))
+}
+
+/// The JSON in an app's word on the visitor's identity, when it is one: signed with a shared
+/// secret, within `WINDOW`.
+pub(crate) fn identity_of_word(word: &str) -> Option<String> {
+    let mut parts = word.splitn(3, ';');
+    let t = parts.next()?.strip_prefix("t=")?.parse::<u64>().ok()?;
+    let sig = parts.next()?.strip_prefix("sig=")?;
+    let text = parts.next()?;
+    if now_secs().abs_diff(t) > WINDOW {
+        return None;
+    }
+    shared_signed(sig, |k| signed_text(k, "quillo-identity-1", text, t))?;
+    String::from_utf8(crate::crypto::unb64url(text)?).ok()
+}
+
+fn signed_text(key: &str, what: &str, text: &str, t: u64) -> String {
+    crate::crypto::hex(&crate::crypto::hmac_sha256(key.as_bytes(), format!("{}\n{}\n{}", what, text, t).as_bytes()))
+}
+
 /// What a service's answer says when it took its app's policies (`POLICY_WORD`): the app then adds
 /// none, and takes the mark off.
 pub const POLICY_TAKEN: &str = "x-quillo-policy-taken";
@@ -2436,6 +2470,9 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest, poli
     let word = crate::server::known_scheme(req).and_then(scheme_word);
     let client = client_word(&req.remote);
     let policy = policy.map(str::to_string);
+    // Who the visitor is to the app's proxy, for the service's `request.client_cert` and
+    // `request.remote_user` (FEEDBACK78.md, A.13 and A.14).
+    let identity = crate::server::proxy_identity_json(req).and_then(|j| identity_word(&j));
     let (method, body, remote) = (req.method.clone(), req.body.clone(), req.remote.clone());
     let host = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.clone()).unwrap_or_default();
     let prefix = prefix.to_string();
@@ -2458,6 +2495,9 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest, poli
         }
         if let Some(p) = &policy {
             rq = rq.set(POLICY_WORD, p);
+        }
+        if let Some(w) = &identity {
+            rq = rq.set(IDENTITY_WORD, w);
         }
         let resp = match if body.is_empty() { rq.call() } else { rq.send_bytes(&body) } {
             Ok(r) | Err(ureq::Error::Status(_, r)) => r,
@@ -2517,7 +2557,7 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest, poli
 /// The headers only an app sends its service, which a client's request loses here: the app's words
 /// and the mark a service puts on a request from its app (FEEDBACK70.md, Q-986; FEEDBACK75.md,
 /// Q-1064, Q-1087).
-const APPS_OWN: &[&str] = &[SCHEME_WORD, CLIENT_WORD, POLICY_WORD, crate::server::FROM_APP];
+const APPS_OWN: &[&str] = &[SCHEME_WORD, CLIENT_WORD, POLICY_WORD, IDENTITY_WORD, crate::server::FROM_APP, crate::server::IDENTITY_MARK];
 
 /// A service's answer, passed on: read whole, or to be streamed through (`pass_on`).
 enum Passed {

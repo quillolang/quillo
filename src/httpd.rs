@@ -2177,7 +2177,7 @@ fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -
             Item::Request { req, keep_alive, http10 } => {
                 let head = req.method == "HEAD";
                 c.http10 = http10;
-                let mut sink = ConnSink(c, keep_alive);
+                let mut sink = ConnSink(c, keep_alive, Duration::ZERO);
                 let answer = worker.answer(app, req, Some(&mut sink));
                 // An answer given while the server stops closes its connection, and says so: the
                 // client kept it, and its next request there was cut off when the drain closed it
@@ -2220,8 +2220,9 @@ fn answer(app: &Arc<App>, worker: &mut Worker, c: &mut Conn, items: Vec<Item>) -
 /// sent goes out at once; when the client reads slower than that, the
 /// request waits (on a pool thread, as for the database) until it takes more.
 /// With whether the connection is kept after the answer: as the request asked, until a streamed
-/// head says otherwise.
-struct ConnSink<'a>(&'a mut Conn, bool);
+/// head says otherwise; and how long it has waited for its client in place, holding the instance
+/// (`held_write`).
+struct ConnSink<'a>(&'a mut Conn, bool, Duration);
 
 impl crate::stream::Sink for ConnSink<'_> {
     fn chunked(&self) -> bool {
@@ -2246,6 +2247,9 @@ impl crate::stream::Sink for ConnSink<'_> {
     fn write(&mut self, data: &[u8]) -> bool {
         let c = &mut *self.0;
         c.output.extend_from_slice(data);
+        if held() {
+            return held_write(c, &mut self.2);
+        }
         loop {
             match flush(c) {
                 Err(_) => return false,
@@ -2256,6 +2260,65 @@ impl crate::stream::Sink for ConnSink<'_> {
                 return false;
             }
         }
+    }
+}
+
+/// What a stream sent inside a SQLite transaction (`held`) may keep waiting for its client: the
+/// instance's lock is held then, so the socket is not waited on as a stream's is elsewhere, for up
+/// to `SLOW`, while every other request of the instance waited; a few clients that read nothing
+/// kept it stopped (FEEDBACK75.md, Q-1067; branch feedback75). No more than one value may take
+/// (`--max-memory`).
+const HELD_OUTPUT: usize = 4 << 20;
+
+/// How long, in all, a streamed answer inside a SQLite transaction waits in place, past
+/// `HELD_OUTPUT`, for its client to read, before its `send` fails as a client gone's, which ends
+/// the transaction: it rolls back. In all, not for each `send`: a client that read a row a second
+/// would have kept the instance as long as it liked.
+const HELD_WAIT: Duration = Duration::from_secs(1);
+
+/// `ConnSink::write` while a SQLite transaction holds the instance: what the socket does not take
+/// now waits on the connection, as a whole answer's does, up to `HELD_OUTPUT`; past it, the socket
+/// is waited on in place, for what is left of the answer's `HELD_WAIT` (`waited` so far). A client
+/// that has not read enough by then is gone, its connection's output dropped.
+fn held_write(c: &mut Conn, waited: &mut Duration) -> bool {
+    let most = (HELD_OUTPUT as u64).min(value_most()) as usize;
+    loop {
+        match flush(c) {
+            Err(_) => break,
+            Ok(true) => return true,
+            Ok(false) if c.output.len() <= most => return true,
+            Ok(false) => {}
+        }
+        let left = HELD_WAIT.saturating_sub(*waited);
+        if left.is_zero() {
+            break;
+        }
+        let t = Instant::now();
+        let ready = writable_within(&c.stream, left);
+        *waited += t.elapsed();
+        if !ready {
+            break;
+        }
+    }
+    c.output = Vec::new();
+    c.closing = true;
+    false
+}
+
+/// Whether the socket takes more within `wait`, waited on here (a request that holds the instance).
+fn writable_within(s: &TcpStream, wait: Duration) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mut p = libc::pollfd { fd: s.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+        // SAFETY: one pollfd, of a socket this request holds open.
+        unsafe { libc::poll(&mut p, 1, wait.as_millis().clamp(1, i32::MAX as u128) as libc::c_int) > 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = s;
+        std::thread::sleep(wait.min(Duration::from_millis(5)));
+        true
     }
 }
 
@@ -2385,6 +2448,39 @@ pub fn trusts_proxies() -> bool {
     TRUSTED.get().is_some()
 }
 
+/// `--client-cert-header NAME` (with `--client-cert-subject` when it holds a subject alone), in
+/// lower case: the header a proxy `--trust-proxy` names gives the client certificate it checked
+/// in, read into `request.client_cert` by the parser `accept_calls { client_cert }` uses. Named by
+/// the operator, as a proxy sets one header and passes any other a visitor sent (FEEDBACK78.md,
+/// A.14, the user's decision; branch feedback75).
+static CLIENT_CERT_HEADER: std::sync::OnceLock<(String, bool)> = std::sync::OnceLock::new();
+
+/// `--user-header NAME`, in lower case: the header a proxy `--trust-proxy` names gives the user it
+/// signed in (Kerberos by SPNEGO: Apache's mod_auth_gssapi, IIS), read into `request.remote_user`
+/// (FEEDBACK78.md, A.13, the user's decision; branch feedback75).
+static USER_HEADER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Whether `name` is a header's name (RFC 9110's token), for `--client-cert-header` and
+/// `--user-header`.
+fn header_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// `--client-cert-header NAME`; false for no header's name.
+pub fn client_cert_header(name: &str, subject: bool) -> bool {
+    header_name(name) && CLIENT_CERT_HEADER.set((name.to_ascii_lowercase(), subject)).is_ok()
+}
+
+/// `--user-header NAME`; false for no header's name.
+pub fn user_header(name: &str) -> bool {
+    header_name(name) && USER_HEADER.set(name.to_ascii_lowercase()).is_ok()
+}
+
+/// The two headers, as named: the certificate's (and whether it is a subject alone), the user's.
+pub(crate) fn identity_headers() -> (Option<&'static (String, bool)>, Option<&'static String>) {
+    (CLIENT_CERT_HEADER.get(), USER_HEADER.get())
+}
+
 /// Under `quillo fcgi` the web server is the proxy: each request's `X-Forwarded-Proto` is the one
 /// fcgi.rs writes from the web server's `HTTPS` parameter, a client's own dropped there, and it is
 /// believed as a `--trust-proxy` proxy's is. Set once, as `quillo fcgi` starts: no connection of
@@ -2451,7 +2547,7 @@ pub(crate) fn forwarded_proto_not_believed(peer: &str) {
 
 /// An address for the log, as `--trust-proxy` takes it: an IPv4 address in IPv6's clothes (a
 /// listener on `::`) as IPv4; anything that is no address, only what an address is made of.
-fn named_address(peer: &str) -> String {
+pub(crate) fn named_address(peer: &str) -> String {
     match peer.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V6(a)) => a.to_ipv4_mapped().map_or(a.to_string(), |v4| v4.to_string()),
         Ok(a) => a.to_string(),
@@ -2519,9 +2615,13 @@ fn client_of(peer: &str, headers: &[(String, String)]) -> String {
 /// and so does a policy word that did not come from the app (FEEDBACK75.md, Q-1064 and its review;
 /// branch feedback75). The connections the app holds are not one client's: loopback holds no place
 /// of `CONNECTIONS_PER_CLIENT`'s (`place_for`).
+/// The app's word on who the visitor is to its proxy (`service::IDENTITY_WORD`) is kept as its
+/// policy word is, and the mark made of it (`server::IDENTITY_MARK`) goes from a client's request
+/// (FEEDBACK78.md, A.13 and A.14).
 fn from_app(peer: &str, hs: &mut Vec<(String, String)>) -> Option<String> {
-    use crate::service::{CLIENT_WORD, POLICY_WORD};
-    let named = |k: &str| k.eq_ignore_ascii_case(CLIENT_WORD) || k.eq_ignore_ascii_case(crate::server::FROM_APP) || k.eq_ignore_ascii_case(POLICY_WORD);
+    use crate::service::{CLIENT_WORD, IDENTITY_WORD, POLICY_WORD};
+    let words = |k: &str| k.eq_ignore_ascii_case(POLICY_WORD) || k.eq_ignore_ascii_case(IDENTITY_WORD);
+    let named = |k: &str| k.eq_ignore_ascii_case(CLIENT_WORD) || k.eq_ignore_ascii_case(crate::server::FROM_APP) || k.eq_ignore_ascii_case(crate::server::IDENTITY_MARK) || words(k);
     if !hs.iter().any(|(k, _)| named(k)) {
         return None;
     }
@@ -2531,7 +2631,7 @@ fn from_app(peer: &str, hs: &mut Vec<(String, String)>) -> Option<String> {
         Err(_) => false,
     };
     let visitor = if local { hs.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(CLIENT_WORD)).and_then(|(_, v)| crate::service::client_of_word(v)) } else { None };
-    hs.retain(|(k, _)| !named(k) || (visitor.is_some() && k.eq_ignore_ascii_case(POLICY_WORD)));
+    hs.retain(|(k, _)| !named(k) || (visitor.is_some() && words(k)));
     let visitor = visitor?;
     hs.push((crate::server::FROM_APP.into(), "1".into()));
     Some(visitor.to_string())
