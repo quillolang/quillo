@@ -3020,8 +3020,8 @@ const translate = (k, vars, html) => {
   // about:blank#blocked where what is written there makes a javascript: or vbscript: URL, as in
   // markup; one written without quotes that holds a value is quoted (FEEDBACK75.md, Q-1083 and
   // its reviews; branch feedback75).
-  // A placeholder no reading placed (kind 6) is blocked as a script URL, else written with each
-  // character a character reference; code and a page (`onclick`, `srcdoc`,
+  // A placeholder no reading puts in a value for sure (kind 6) is blocked as a script URL, else
+  // written with each character a character reference; code and a page (`onclick`, `srcdoc`,
   // an attribute whose name holds a value: kind 5) are emptied; a `<` that is text before a value
   // (kind 7) is &lt;; a value written without quotes is quoted, a " of the text in it &quot;; as on
   // the server (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1176's and Q-1083's reviews;
