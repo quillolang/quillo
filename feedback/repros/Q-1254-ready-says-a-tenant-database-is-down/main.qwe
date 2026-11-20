@@ -1,0 +1,11 @@
+// Q-1254 With a database per tenant, `/_quillo/ready` says the database is "down" (503) though every tenant's page works: an orchestrator's readiness probe never sends the app traffic
+// mode: script
+// script: steps.sh
+// open-when: "database":"down"
+// fixed-when: "ready":true
+// From FEEDBACK79.md §Q-1254 (found by quillo-videos-36 on 238dac2, 0.8.6, in Help Desk; open on 68da426, 0.8.8).
+
+tenant_from("localhost")
+db.open("data/{tenant}.db")
+route POST /teams = new_tenant("acme", () => "made")
+route GET / with db = `tenant ${tenant()}: ${len(db.query("select 1 as one"))} row`

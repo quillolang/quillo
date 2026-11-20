@@ -1,0 +1,10 @@
+// Q-1250 A string in `style=` is not escaped as CSS: a visitor's value adds declarations (`position: fixed; inset: 0`) and covers the page, where a style map escapes the same value (Q-668)
+// mode: serve
+// get: /?c=red%3B%20position%3A%20fixed%3B%20inset%3A%200%3B%20background%3A%20red
+// open-when: style="color: red; position: fixed
+// fixed-when: color: red\3b
+// From FEEDBACK79.md §Q-1250 (found on 238dac2, 0.8.6; open on 68da426, 0.8.8).
+
+route GET / ? { c: str = "green" } = <html><body>
+    <p style={`color: ${c}`}>a note</p>
+</body></html>

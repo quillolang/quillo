@@ -1,0 +1,12 @@
+// Q-1266 WebTransport listens on 127.0.0.1 alone and the ticket names no host: a page at http://localhost goes to [::1] and is refused
+// mode: script
+// script: steps.sh
+// fixed-when: /UDP \[::1\]:\d+|"host":"127\.0\.0\.1"/
+
+component Listen() {
+    state lines = []
+    let chat = channel.open("chat", (line) => { lines = lines + [line] })
+    <ul>{for l in lines => <li>{l}</li>}</ul>
+}
+
+route GET / = <html><body><Listen/></body></html>

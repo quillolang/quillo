@@ -1,0 +1,6 @@
+// Q-1263 `db.exec("vacuum into 'backups/b.db'")` counts its path from the process's working folder, while db.open counts from the main file's: started from another folder, the backup fails (`unable to open database`)
+// mode: script
+// script: steps.sh
+// open-when: unable to open database
+// fixed-when: backed up
+// From FEEDBACK80.md §Q-1263 (found by quillo-videos-36 on 238dac2, 0.8.6, in the Database course; open on 47869ad, 0.8.8).

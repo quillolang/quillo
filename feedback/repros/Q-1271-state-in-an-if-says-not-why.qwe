@@ -1,0 +1,11 @@
+// Q-1271 `state` inside an `if` in a component is a parse error that doesn't say why ("expected end of statement, found `extra`")
+// mode: check
+// open-when: expected end of statement, found `extra`
+// fixed-when: /`state`/
+
+component S(show: bool) {
+    if show { state extra = "extra" }
+    <p>hi</p>
+}
+
+route GET / = <html><body><S show={true}/></body></html>

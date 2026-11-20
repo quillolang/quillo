@@ -1,0 +1,9 @@
+// Q-1262 A route's etag makes the answer a 304, but the log says 200 and the request metrics count a 2xx
+// mode: script
+// script: steps.sh
+// open-when: GET /help/hours -> 200
+// open-when: quillo_requests_total{status="3xx"} 0
+// fixed-when: GET /help/hours -> 304
+// From FEEDBACK80.md §Q-1262 (found by quillo-videos-36 on 238dac2, 0.8.6, in the Advanced course; open on 47869ad, 0.8.8).
+
+route GET /help/:slug = respond(200, <html><body><h1>{slug}</h1></body></html>, { etag: `"${slug}"` })

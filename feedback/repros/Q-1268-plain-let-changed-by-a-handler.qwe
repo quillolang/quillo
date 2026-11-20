@@ -1,0 +1,11 @@
+// Q-1268 A plain `let` that a handler changes and the markup shows never updates on the page, and check says ok
+// mode: check
+// fixed-when: /warning.*clicks/
+
+// Clicked three times in Chromium, the button still shows 0 (0.8.6 and 0.8.8).
+component Clicks() {
+    let clicks = 0
+    <button onclick={() => { clicks += 1 }}>{clicks}</button>
+}
+
+route GET / = <html><body><Clicks/></body></html>

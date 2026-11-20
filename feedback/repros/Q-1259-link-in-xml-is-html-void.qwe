@@ -1,0 +1,8 @@
+// Q-1259 In an XML answer, `<link>` is written as HTML's empty element: an Atom feed's `<link href="..."/>` comes out with no end, so the feed isn't XML; and an RSS channel's `<link>text</link>` fails check
+// mode: serve
+// get: /atom.xml
+// open-when: <link href="http://example.com/help"></feed>
+// fixed-when: /<link href="http:\/\/example\.com\/help"\s*(\/>|><\/link>)<\/feed>/
+// From FEEDBACK79.md §Q-1259 (found by quillo-videos-36 on 238dac2, 0.8.6, in the Advanced course; open on fac998b, 0.8.8).
+
+route GET /atom.xml = <feed xmlns="http://www.w3.org/2005/Atom"><title>Help</title><link href="http://example.com/help"/></feed>

@@ -1,0 +1,19 @@
+// Q-1265 On a clean stop, the server leaves its WebTransport sessions open: after a restart, a page that only listens hears nothing for 10 to 20 s
+// mode: script
+// script: steps.sh
+// open-when: /first heard post ([6-9]|[1-9]\d)\b/
+// fixed-when: /first heard post [1-3]\b/
+
+// What anyone posts to /say goes to every page in the channel.
+route POST /say { form: { text: str } } {
+    channel.broadcast("chat", text)
+    respond(204, null)
+}
+
+component Listen() {
+    state lines = []
+    let chat = channel.open("chat", (line) => { lines = lines + [line] })
+    <ul id="lines">{for l in lines => <li>{l}</li>}</ul>
+}
+
+route GET / = <html><body><Listen/></body></html>

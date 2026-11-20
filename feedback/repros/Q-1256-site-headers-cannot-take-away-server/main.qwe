@@ -1,0 +1,10 @@
+// Q-1256 `site_headers({ "server": null })` does not take away `server: Quillo`, though the guide says a null takes away one Quillo sends (it does for `x-frame-options`); a route's own `respond` can
+// mode: script
+// script: steps.sh
+// open-when: /: server: Quillo
+// fixed-when: /: (no server)
+// From FEEDBACK79.md §Q-1256 (found on 238dac2, 0.8.6, making video 174; open on 68da426, 0.8.8).
+
+site_headers({ "server": null, "x-frame-options": null })
+route GET / = <p>hi</p>
+route GET /own = respond(200, "hi", { "server": null })

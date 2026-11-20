@@ -1,0 +1,6 @@
+// The program: a backup with vacuum into, to backups/ beside it.
+db.open("lib.db")
+route POST /backup with db {
+    db.exec("vacuum into 'backups/b.db'")?
+    "backed up"
+}

@@ -1,0 +1,14 @@
+// Q-1272 An error value shown in markup prints as err("..."), and check says ok
+// mode: check
+// fixed-when: /warning.*news/
+
+// A server fn that fails gives an error value; shown as {news}, the page reads: News: err("503 Service Unavailable")
+// (0.8.6, 0.8.8 and 0.8.9, in Chromium).
+server fn load_news() -> str ! str = err("503 Service Unavailable")
+
+component News() {
+    state news = load_news()
+    <p>News: {news}</p>
+}
+
+route GET / = <html><body><News/></body></html>

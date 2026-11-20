@@ -1,0 +1,9 @@
+// Q-1253 `int()` takes " 5", "5 ", "+2" and "02": the guide says "text of digits", and a route's int pattern refuses all four (Q-542 kept int() as it was)
+// mode: run
+// open-when: " 5" -> 5
+// fixed-when: " 5" -> error
+// From FEEDBACK79.md §Q-1253 (found on 238dac2, 0.8.6; the same on 68da426, 0.8.8). A fix may be the guide's.
+
+for v in ["5", " 5", "5 ", "+2", "02", "1e1"] {
+    print(`"${v}" -> ${is_err(int(v)) ? "error" : int(v)}`)
+}

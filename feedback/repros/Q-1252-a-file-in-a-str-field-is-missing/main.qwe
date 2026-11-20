@@ -1,0 +1,10 @@
+// Q-1252 A file sent in a field the form pattern names `str` is "missing" in the log, and a default takes its place without a word; the file is in `request.files`
+// mode: script
+// script: steps.sh
+// open-when: is missing, and must be a str
+// open-when: name is (none)
+// fixed-when: /is a file/
+// From FEEDBACK79.md §Q-1252 (found on 238dac2, 0.8.6; open on 68da426, 0.8.8).
+
+route POST /a { form: { name: str = "(none)" } } = `name is ${name}`
+route POST /b { form: { name: str } } = `name is ${name}`

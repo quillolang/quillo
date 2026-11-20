@@ -1,0 +1,10 @@
+// Q-1255 `/_quillo/ready` is logged and counted in `quillo_requests_total`, where the guide says "Neither request is logged or counted"; a 503 from it counts as a 5xx
+// mode: script
+// script: steps.sh
+// open-when: quillo_requests_total{status="2xx"} 2
+// open-when: ready log lines: 2
+// fixed-when: quillo_requests_total{status="2xx"} 0
+// From FEEDBACK79.md §Q-1255 (found by quillo-videos-36 on 238dac2, 0.8.6; open on 68da426, 0.8.8).
+
+db.open("app.db")
+route GET / = "hi"

@@ -1,0 +1,12 @@
+// Q-1270 Lowercase `onchange` on an input runs at each keystroke, as `@input`: the guide maps only React's `onChange` so, and says the DOM's names are compared as written
+// mode: script
+// script: steps.sh
+// open-when: after 5 input events: n = 5
+// fixed-when: after 5 input events: n = 0; after a change event: n = 1
+
+component C() {
+    state n = 0
+    <div><input onchange={() => { n += 1 }}/><p>{n}</p></div>
+}
+
+route GET / = <html><body><C/></body></html>

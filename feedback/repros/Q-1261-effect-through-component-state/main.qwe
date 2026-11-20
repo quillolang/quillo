@@ -1,0 +1,13 @@
+// Q-1261 `quillo check` misses an effect a route needs through a component's state initializer: ok, then a 500 at run time (it does see the effect when the route calls the fn itself)
+// mode: check
+// open-when: main.qwe: ok (1 route, 2 functions, 1 component)
+// fixed-when: needs the time effect
+// From FEEDBACK80.md §Q-1261 (found by quillo-videos-36 on 238dac2, 0.8.6, in the Advanced course; open on 47869ad, 0.8.8).
+
+fn stamp() -> str with time = str(now())
+server fn load_it() -> str = stamp()
+component Shows() {
+    state v = load_it()
+    <p>{v}</p>
+}
+route GET / with db = <html><body><Shows/></body></html>

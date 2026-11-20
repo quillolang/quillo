@@ -1,0 +1,12 @@
+// Q-1269 A form's reset empties a field bound with `value={name}`, but the state keeps the old text: the page and the field disagree
+// mode: script
+// script: steps.sh
+// open-when: input "", text "Hello, Ana"
+// fixed-when: input "", text "Hello, "
+
+component Reset() {
+    state name = ""
+    <form><input value={name}/><button type="reset">Clear</button><p>Hello, {name}</p></form>
+}
+
+route GET / = <html><body><Reset/></body></html>

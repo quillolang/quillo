@@ -1,0 +1,16 @@
+// Q-1258 The warning that "a group guards its routes, not the server fns their pages call" sees only components written in the route's own body: through a helper fn, no warning, and the server fn stays open to anyone
+// mode: check
+// open-when: main.qwe: ok (1 route, 3 functions, 1 component)
+// fixed-when: warning: `load_tickets` is called by `GET /desk`'s page
+// From FEEDBACK79.md §Q-1258 (found by quillo-videos-36 on 238dac2, 0.8.6, in Help Desk; open on fac998b, 0.8.8).
+
+fn agent(r) = session().name != null ? r : reply 303 redirect("/")
+server fn load_tickets() -> list = ["printer jam"]
+component TicketList() {
+    state ts = load_tickets()
+    <ul>{for t in ts ?? [] => <li>{t}</li>}</ul>
+}
+fn team_home() = <html><body><TicketList/></body></html>
+routes /desk | agent {
+    route GET / = team_home()
+}

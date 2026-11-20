@@ -1,0 +1,13 @@
+// Q-1260 On a clean stop (SIGINT), each SQLite database keeps its -wal and -shm, with the data still in the WAL; a backup copied over the file is then undone, without a word, by the stale WAL
+// mode: script
+// script: steps.sh
+// open-when: count after the restore: 0
+// fixed-when: count after the restore: 3
+// From FEEDBACK80.md §Q-1260 (found by quillo-videos-36 on 238dac2, 0.8.6, in the Database course; open on 47869ad, 0.8.8).
+
+db.open("library.db")
+db.migrate("migrations")
+route POST /loan with db { db.exec("insert into loans (book) values ('a book')")?; "ok" }
+route POST /backup with db { db.exec("vacuum into 'backups/good.db'")?; "backed up" }
+route POST /mistake with db { db.exec("delete from loans")?; "deleted" }
+route GET /count with db = db.one("select count(*) as n from loans").n

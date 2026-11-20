@@ -1,0 +1,24 @@
+// Q-1267 A dropped `push` is warned of only in an inline handler: in a component's fn, as `push(xs, v)` or `xs | push(v)`, and in a top-level fn, check says ok and nothing changes
+// mode: check
+// fixed-when: /:8: warning/ /:9: warning/ /:10: warning/ /:22: warning/
+
+// The same dropped new value five ways; only the inline handler (line 16) is warned of.
+component G() {
+    state items = ["milk"]
+    fn a() { items.push("eggs") }
+    fn b() { push(items, "eggs") }
+    fn c() { items | push("eggs") }
+    <div><button onclick={a}>a</button><button onclick={b}>b</button><button onclick={c}>c</button>{len(items)}</div>
+}
+
+component H() {
+    state items = ["milk"]
+    <button onclick={() => { items.push("eggs") }}>{len(items)}</button>
+}
+
+route GET / = <html><body><G/><H/></body></html>
+
+fn add(xs) {
+    xs.push("eggs")
+    xs
+}

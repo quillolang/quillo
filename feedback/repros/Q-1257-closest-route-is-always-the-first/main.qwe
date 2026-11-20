@@ -1,0 +1,9 @@
+// Q-1257 With two routes on one path, a 400 names the first route's miss, however far off it was: a JSON post missing `message` is told `form.name is missing`
+// mode: script
+// script: steps.sh
+// open-when: form.name` is missing
+// fixed-when: json.message
+// From FEEDBACK79.md §Q-1257 (found by quillo-videos-36 on 238dac2, 0.8.6, in the Advanced course; open on fac998b, 0.8.8).
+
+route POST /contact { form: { name: str, email: str, message: str, updates: bool } } = "form"
+route POST /contact { json: { name: str, email: str, message: str, updates: bool = false } } = "json"
