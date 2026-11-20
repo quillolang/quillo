@@ -302,7 +302,9 @@ Safety built in:
   plugin's functions, called or as methods (`"40 + 2".run_script()`, a plugin's `x.sign()`),
   are kept out the same way; a plugin whose file says `//! effects: none` gives what it is
   given. A name a function's parameter, a lambda's, a `let` or a loop binds is its own,
-  never the builtin of that name *(since 0.8.9: these went into the public bundle)*.
+  never the builtin of that name, and so is a top-level `let` or `fn` of the program's
+  (`fn uuid() = "fixed"`), kept out only when its own value is the server's *(since 0.8.9:
+  these went into the public bundle)*.
 - `http.*` in a component goes from the visitor's browser, never from the server, so it
   cannot reach the server's own network: while the server renders a component, a call
   from its code is an error before anything connects.

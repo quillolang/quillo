@@ -100,6 +100,20 @@ How long a wait may last:
 - Inside a SQLite transaction a wait holds up every request, since another request's SQL
   would land in the transaction: keep `http.*`, `sleep` and Rust (`.qwer`) calls out of
   them. A SQLite query itself always runs under the lock, on the loop's thread.
+- A stream's `send` inside a SQLite transaction does not wait for its client either. What
+  the client has not read yet is kept, up to 4 MiB (less under
+  [`--max-memory`](#options-of-quillo-run)); past that, the transaction waits a second in
+  all for the client, then `send` fails as it does for a client gone, and the transaction
+  rolls back. Read the rows inside the transaction and send them after it. `quillo check`
+  warns of a `send` inside `db.transaction` or `db.atomic` *(since 0.8.9: a client that read
+  nothing held every request of the instance for up to 30 s at each `send`)*:
+
+  ```quillo
+  route GET /export = stream((send) => {
+      let rows = db.transaction(() => db.query("select * from orders"))
+      for r in rows { send(json.stringify(r) + "\n") }
+  })
+  ```
 
 What a server is made of, for sizing a machine: the event loop's thread (a 16 MiB
 stack; each request's coroutine reserves as much, and grows as it needs), up to
@@ -600,16 +614,16 @@ with conditions and hit counts, logpoints, stepping, evaluation for hovers, the
 ## Logs and metrics
 
 Each request is logged on stderr as `GET /path?query -> 200 (0.4ms)`: the path with its
-query string. A query value whose name says a secret is written `[hidden]`:
-`/reset?token=[hidden]&page=2`. The names are `password`, `passwd`, `pwd`, `pass`, `token`,
-`code`, `secret`, `key`, `otp`, `state`, `ticket`, `sig`, `signature`, `credential`,
-`verifier`, `jwt`, `auth`, `authorization`, `session`, `sid`, SAML's `SAMLRequest` and
-`SAMLResponse`, in any case and as the last word of a longer name (`access_token`,
-`api-key`, `clientSecret`, `user[password]`, `API_KEY`, `PHPSESSID`), and `password`,
-`token`, `secret`, `signature`, `credential`, `verifier`, `jwt`, `authorization` and
-`session` anywhere in one (`id_token_hint`, `session_id`) *(since 0.8.9: a sign-in or
-reset link's token, OAuth's `code` and `state`, and a password in a URL went to the log
-as they were)*. Started with [`--log json`](#options-of-quillo-run), `quillo run main.qwe --log json`, the line is a
+query string. A query value whose name says a secret is written `[hidden]`, in the text
+line and the JSON one: `/reset?token=[hidden]&page=2`. The names are `password`, `passwd`,
+`pwd`, `pass`, `token`, `tokens`, `code`, `secret`, `key`, `otp`, `state`, `ticket`, `sig`,
+`signature`, `credential`, `verifier`, `jwt`, `auth`, `authorization`, session ids
+(`session`, `sessionid`, `sid`), and SAML's `SAMLRequest` and `SAMLResponse`, in any case
+and as the last word of a longer name (`access_token`, `api-key`, `clientSecret`,
+`user[password]`, `API_KEY`, `JSESSIONID`, `PHPSESSID`), and `password`, `token`, `secret`,
+`signature`, `credential`, `verifier`, `jwt`, `authorization` and `session` anywhere in one
+(`id_token_hint`, `session_id`) *(since 0.8.9: a sign-in or reset link's token, OAuth's
+`code` and `state`, a session id and a password in a URL went to the log as they were)*. Started with [`--log json`](#options-of-quillo-run), `quillo run main.qwe --log json`, the line is a
 JSON object instead, for log collectors:
 `time` (RFC 3339, UTC, with milliseconds), `method`, `path` (with the query string),
 `status`, `ms`, `ip` (the TCP peer), `tenant` when the request had one, and `rid` (the

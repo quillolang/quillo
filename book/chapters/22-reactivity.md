@@ -275,8 +275,10 @@ route GET / {
   page state that <Account> reads, so its whole value is written into each page that shows
   <Account>, and it comes from ... ``): give the component what it shows, as a prop or a
   state of those fields alone.
-- **Not where no page is made**: a `server fn` reading one is an error (`quillo check`
-  says so; pass what it needs as an argument), and so is a job, a timer or a channel's
+- **Not where no page is made**: a `server fn` reading one, or setting one, there or through
+  a function it calls, is an error (`quillo check` says so: `` `cart` is the page's state,
+  and server fn `save` runs for no page (it sets it through `remember`): pass it as an
+  argument ``), and so is a job, a timer or a channel's
   handler reading one when it runs. A request to Quillo's own addresses (a `server fn`'s
   call, live data) has none.
 - `state cart` and a `let` or `fn` named `cart` cannot both be; two `state cart` neither.

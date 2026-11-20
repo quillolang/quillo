@@ -68,7 +68,9 @@ both calls may run; a `GET` route that writes and reads who the visitor is (see 
 under [Routes](#routes)); a `media.on` rule *(since 0.8.9)* for a name ending in `*` whose
 `publish` or `watch` never reads which stream is asked for (see [Media](#media)); a page
 state *(since 0.8.9)* that a component reads and that comes from `env`, `read_file` or a
-`select *` row (see [Page state](#page-state)). Warnings never make it fail.
+`select *` row (see [Page state](#page-state)); a stream's `send` *(since 0.8.9)* inside
+`db.transaction` or `db.atomic`, which on SQLite holds every other request while the client
+reads (see [Concurrency](#concurrency-and-reloading)). Warnings never make it fail.
 
 A type grows as the code is read (a list of maps of lists, made again on each line), so
 the check keeps each to 1,000,000 parts and 64 levels, and takes what grows past them as

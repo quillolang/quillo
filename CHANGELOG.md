@@ -4,7 +4,7 @@
 
 Found by the security audit of 0.8.7 (FEEDBACK75.md, Q-1050 to Q-1095, and Q-1120 and Q-1121
 found in review), and by the study of authentication (FEEDBACK78.md, Q-1158, Q-1159, Q-1168,
-Q-1169 and Q-1170).
+Q-1169 and Q-1170, and its A.13 and A.14).
 
 ### Security
 
@@ -150,13 +150,16 @@ Q-1169 and Q-1170).
   user's password hash and TOTP secret, and a state set from `env` went to every visitor,
   though no component read them. A page now carries the states its components' code reads (the
   views they show included), and `quillo check` warns of one a component reads that comes from
-  `env`, `read_file` or a `select *` row (FEEDBACK75.md, Q-1058, the user's choice).
+  `env`, `read_file` or a `select *` row. The error for a `server fn` that reaches a page state
+  through a helper says whether the helper reads it or only sets it (``it sets it through
+  `remember` ``) (FEEDBACK75.md, Q-1058, the user's choice).
 - **The bundle keeps more of the server's values out.** Globals made from `args()`,
   `read_line`, `stdin`, `run_script`, `crypto`, `uuid`, a site's call or a plugin's function
   (as a method too) went into the public JavaScript bundle when a component read them; they are
   kept out as `env`'s are, a plugin whose file says `//! effects: none` aside. A name a
-  parameter, a lambda, a `let` or a loop binds is no longer taken for the builtin of that name
-  (FEEDBACK75.md, Q-1063).
+  parameter, a lambda, a `let` or a loop binds is no longer taken for the builtin of that name,
+  nor is a top-level `let` or `fn` of the program's (`fn uuid() = "fixed"`), which is kept out
+  only when its own value is the server's (FEEDBACK75.md, Q-1063).
 - **Under `--split`, a service sees the visitor's address.** Every visitor reached a service
   as the app's `127.0.0.1`, so a `request.ip` check that refused them in one process let them
   through, and the limits by client put everyone in one place. The app signs the address it
@@ -186,9 +189,10 @@ Q-1169 and Q-1170).
   (FEEDBACK75.md, Q-1087).
 - **The request log hides secrets in a URL.** A password, a sign-in or reset link's token,
   OAuth's `code` and `state` and SAML's messages in a query string went to the log as they
-  were, kept for months. A value whose name says a secret (`token`, `code`, `password`,
-  `key`, `state`, `sig`, `session`, and names ending so, `access_token`, `apiKey`) is written
-  `[hidden]` (FEEDBACK78.md, Q-1158).
+  were, kept for months. A value whose name says a secret (`token`, `tokens`, `code`,
+  `password`, `key`, `state`, `sig`, `authorization`, session ids such as `session`, `sid`,
+  `JSESSIONID` and `PHPSESSID`, and names ending so, `access_token`, `apiKey`) is written
+  `[hidden]`, in the text log and the JSON one (FEEDBACK78.md, Q-1158).
 - **A single regex search no longer holds an instance.** One `re.test` or `re.find` of a
   visitor's pattern (`[ab]*a[ab]{900}c` on 200 KB) held an instance for seconds to minutes,
   past `--max-compute`, as Q-976's limit covered only the calls that search many times. A
@@ -220,6 +224,29 @@ Q-1169 and Q-1170).
 - **`public_only` refuses more of this machine's addresses**: `::ffff:0:a.b.c.d`
   (IPv4-translated) is judged by its IPv4 address, as is ISATAP's `::5efe:a.b.c.d`, and the rest
   of `0::/8` is not public; `[http] private = false` refuses the same (FEEDBACK75.md, Q-1093).
+- **A slow reader inside a SQLite transaction holds the instance a second at most.** A
+  stream's `send` inside `db.transaction` waited on the client's socket while the transaction
+  held the instance's lock, so one client that read nothing stopped every other request for up
+  to 30 s at each `send` (`/ping` waited 34.9 s), and a few kept it stopped. What the client has
+  not read is kept, up to 4 MiB (less under `--max-memory`); past that the transaction waits a
+  second in all, then `send` fails as for a client gone and the transaction rolls back. A
+  client that keeps up gets the whole answer (a 20 MB export) and the transaction commits.
+  `quillo check` warns of `send` inside `db.transaction` or `db.atomic` (FEEDBACK75.md,
+  Q-1067).
+
+### Added
+
+- **Who a proxy says the visitor is.** `--client-cert-header NAME` gives `request.client_cert`,
+  `{ name, subject, uri }`, the client certificate a proxy in front checked, from its header
+  (Envoy's `x-forwarded-client-cert`, or with `--client-cert-subject` a subject alone, as
+  nginx's `$ssl_client_s_dn`), read as `accept_calls { client_cert }` reads it; `--user-header
+  NAME` gives `request.remote_user`, the user a proxy signed in (Kerberos by SPNEGO: Apache's
+  mod_auth_gssapi, IIS). Each needs `--trust-proxy`, and the program does not start without it;
+  each is believed only on a request from a `--trust-proxy` address, and is null for a missing
+  header, several elements, several lines or a comma-joined value, the log saying why once. A
+  service `--split` starts gets both from its app, signed. Where neither option is given,
+  `request` has neither field (FEEDBACK78.md, A.13 and A.14, the user's choice of a small
+  reading in core; the options' names are on the list for the user).
 
 ### Fixed
 
@@ -311,6 +338,9 @@ What a program may notice:
 - **A mounted program's answers get its parent's `site_headers`**, below its own rules, and a
   split service's pages the app's policy (Q-1087).
 - **A MySQL transaction with no connection free errors after 30 s** (Q-1170).
+- **A stream's `send` inside a SQLite transaction fails after a second** when its client has
+  not read past 4 MiB, and the transaction rolls back; `quillo check` warns of the `send`
+  (Q-1067).
 - **`http.*` drops a program's `content-length`, `transfer-encoding`, `connection`,
   `keep-alive`, `te`, `trailer` and `upgrade` headers**; `host` is sent as given (Q-1089).
 

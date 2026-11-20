@@ -109,7 +109,9 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
   ```
 - **Request pattern:** matched against the `request` map. Its fields, and all of them:
   `method`, `path`, `query`, `query_string` (the query as it came), `params`, `headers`,
-  `cookies`, `body`, `json`, `form`, `files`, `ip`, `id`. The host is `request.headers.host`; the tenant and the locale
+  `cookies`, `body`, `json`, `form`, `files`, `ip`, `id`, and `client_cert` and `remote_user`
+  where `--client-cert-header` or `--user-header` names a header (see [Who a proxy says the
+  visitor is](#who-a-proxy-says-the-visitor-is)) *(since 0.8.9)*. The host is `request.headers.host`; the tenant and the locale
   are `tenant()` and `locale()`. JSON is matched strictly: the string `"7"` is not an
   int. Form fields, headers and cookies are converted like query values. `{ json: User }`
   takes the body as a [record](#records). A pattern on the host is a pattern on the
@@ -771,6 +773,83 @@ fn touch() {
   cookie's value is the session as JSON, with its expiry, base64url-encoded and signed,
   so a session over about 3,900 bytes is a runtime error, and so is one nested deeper
   than 128 levels, as deep as JSON is read back.
+
+### Who a proxy says the visitor is
+
+Quillo ends no TLS itself and speaks no Kerberos. A proxy in front does: it checks a client
+certificate from the company's CA, or signs a person in with Kerberos (SPNEGO, Windows'
+integrated sign-in), and says who it was in a header. Name that header when the program
+starts, beside the proxy *(since 0.8.9: the program read the header itself)*:
+
+```sh
+quillo run main.qwe --trust-proxy 127.0.0.1 \
+  --client-cert-header x-client-dn --client-cert-subject --user-header x-remote-user
+```
+
+nginx asking for a certificate, and Apache with mod_auth_gssapi for Kerberos, each setting
+its header in place of any the visitor sent:
+
+```nginx
+ssl_client_certificate /etc/nginx/staff-ca.pem;
+ssl_verify_client on;
+location / {
+    proxy_set_header X-Client-DN $ssl_client_s_dn;
+    proxy_pass http://127.0.0.1:8080;
+}
+```
+
+```apache
+<Location />
+    AuthType GSSAPI
+    AuthName "Corp sign-in"
+    GssapiCredStore keytab:/etc/apache2/http.keytab
+    Require valid-user
+    RequestHeader set X-Remote-User expr=%{REMOTE_USER}
+</Location>
+ProxyPass / http://127.0.0.1:8080/
+```
+
+The routes read `request.client_cert` and `request.remote_user`, and compare them with what
+the program's table holds:
+
+```quillo
+db.open("app.db")
+db.exec("create table if not exists staff (id integer primary key, cert_dn text unique, principal text unique)")
+
+route GET /staff {
+    let cert = request.client_cert ?? reply 401 "A staff certificate is needed"
+    let row = db.one("select id from staff where cert_dn = ?", cert.subject) ?? reply 403 "Not on the staff list"
+    <html><body><p>Staff member {row.id}: {cert.name}</p></body></html>
+}
+
+route GET /intranet {
+    let who = request.remote_user ?? reply 401 "Sign in to Windows first"      // ada@CORP.EXAMPLE
+    let row = db.one("select id from staff where principal = ?", lower(who)) ?? reply 403 "Not on the staff list"
+    <html><body><p>Hello, {who}: staff member {row.id}</p></body></html>
+}
+```
+
+- `request.client_cert` is `{ name, subject, uri }`: `name` the certificate's SPIFFE id
+  where it has one, else its subject's CN; `subject` the subject as the proxy wrote it;
+  `uri` its URI, where it has one. The header is read as `accept_calls { client_cert }`
+  reads it (see [Authentication between services](#authentication-between-services)):
+  Envoy's `x-forwarded-client-cert`, one proxy's element, unless `--client-cert-subject`
+  says it holds the subject alone, in RFC 2253's form. Compare the whole subject, or `name`,
+  never a CN picked out of the subject by hand: escapes (`CN=Acme\, Inc.`) make that easy to
+  fool.
+- `request.remote_user` is the user as the proxy wrote it, trimmed (`ada@CORP.EXAMPLE`,
+  `CORP\ada`).
+- Each is believed only on a request from an address [`--trust-proxy`](#options-of-quillo-run)
+  names, and either option stops the program at start without it (`quillo:
+  --client-cert-header and --user-header read a proxy's header, believed only from the
+  addresses --trust-proxy names: give --trust-proxy too (any visitor can send that
+  header)`). Each is null where its header is missing, comes from another address, or is not
+  one value the proxy set: several elements of a certificate's header, several lines, a
+  value with a comma in it (two joined: a proxy that appends put the visitor's first). The
+  log says why, once. Keep Quillo where only the proxy reaches it, on its default
+  `--host`, 127.0.0.1.
+- Where neither option names a header, `request` has neither field. A service
+  [`--split`](#options-of-quillo-run) starts gets both from its app, signed.
 
 ## What a route returns
 

@@ -65,6 +65,8 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64). Give fewer where an account limits its threads (shared hosting), more for many slow calls at once |
 | `--instances N` | to use N cores on one machine: run the program N times over, one event loop each, each with its own variables (see [Concurrency](#concurrency-and-reloading)); not with `--watch`, `--register` or `--split`; more than the machine's cores is warned of |
 | `--trust-proxy 10.0.0.0/8` *(since 0.7)* | when a proxy (limer, nginx, Apache) is in front: believe `X-Forwarded-For` and `X-Forwarded-Proto` from these addresses, so `request.ip`, the limits per client and the request's scheme are the visitor's (see [Live data](#live-data)). The first time an `X-Forwarded-Proto` would have counted (a write with an `Origin`, a `delete_cookie`, a push subscription) but came from an address it does not name, the log says so once, with that address (`...if that address is your proxy, --trust-proxy <it>; if not, a visitor sent it and it is ignored`) *(since 0.8.7: anyone's `X-Forwarded-Proto` decided `delete_cookie`'s `Secure` and a push subscription's origin)* |
+| `--client-cert-header NAME` *(since 0.8.9)* | when that proxy ends mutual TLS: `request.client_cert` is the certificate it checked, from this header, Envoy's `x-forwarded-client-cert` form; with `--client-cert-subject`, the header holds the subject alone, as nginx's `$ssl_client_s_dn` (see [Who a proxy says the visitor is](#who-a-proxy-says-the-visitor-is)). Needs `--trust-proxy` |
+| `--user-header NAME` *(since 0.8.9)* | when that proxy signs people in (Kerberos by SPNEGO: Apache's mod_auth_gssapi, IIS): `request.remote_user` is the user it names in this header. Needs `--trust-proxy` |
 | `--live-per-client N` *(since 0.7)* | when one address is many visitors (an office behind one address): the pages one client may have waiting for live data (default 256) |
 | `--plain-http` | when the site is served over plain HTTP on purpose, on a network you trust (a factory's kiosks at `http://10.0.0.5:8080`): cookies are not `Secure`, which browsers would drop there (see [Cookies and sessions](#cookies-and-sessions)) |
 | `--allow-path DIR` *(since 0.7)* | when a script used as a tool must read or write files outside its folder, or a deploy links a folder from elsewhere (`uploads -> /srv/shared/uploads`): `read_file` and `write_file` may use `DIR` too; any part of the program may then, routes too (see [Paths and links](#paths-and-links)) |
@@ -4110,8 +4112,10 @@ route GET / {
   page state that <Account> reads, so its whole value is written into each page that shows
   <Account>, and it comes from ... ``): give the component what it shows, as a prop or a
   state of those fields alone.
-- **Not where no page is made**: a `server fn` reading one is an error (`quillo check`
-  says so; pass what it needs as an argument), and so is a job, a timer or a channel's
+- **Not where no page is made**: a `server fn` reading one, or setting one, there or through
+  a function it calls, is an error (`quillo check` says so: `` `cart` is the page's state,
+  and server fn `save` runs for no page (it sets it through `remember`): pass it as an
+  argument ``), and so is a job, a timer or a channel's
   handler reading one when it runs. A request to Quillo's own addresses (a `server fn`'s
   call, live data) has none.
 - `state cart` and a `let` or `fn` named `cart` cannot both be; two `state cart` neither.
@@ -4305,7 +4309,9 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
   ```
 - **Request pattern:** matched against the `request` map. Its fields, and all of them:
   `method`, `path`, `query`, `query_string` (the query as it came), `params`, `headers`,
-  `cookies`, `body`, `json`, `form`, `files`, `ip`, `id`. The host is `request.headers.host`; the tenant and the locale
+  `cookies`, `body`, `json`, `form`, `files`, `ip`, `id`, and `client_cert` and `remote_user`
+  where `--client-cert-header` or `--user-header` names a header (see [Who a proxy says the
+  visitor is](#who-a-proxy-says-the-visitor-is)) *(since 0.8.9)*. The host is `request.headers.host`; the tenant and the locale
   are `tenant()` and `locale()`. JSON is matched strictly: the string `"7"` is not an
   int. Form fields, headers and cookies are converted like query values. `{ json: User }`
   takes the body as a [record](#records). A pattern on the host is a pattern on the
@@ -4967,6 +4973,83 @@ fn touch() {
   cookie's value is the session as JSON, with its expiry, base64url-encoded and signed,
   so a session over about 3,900 bytes is a runtime error, and so is one nested deeper
   than 128 levels, as deep as JSON is read back.
+
+#### Who a proxy says the visitor is
+
+Quillo ends no TLS itself and speaks no Kerberos. A proxy in front does: it checks a client
+certificate from the company's CA, or signs a person in with Kerberos (SPNEGO, Windows'
+integrated sign-in), and says who it was in a header. Name that header when the program
+starts, beside the proxy *(since 0.8.9: the program read the header itself)*:
+
+```sh
+quillo run main.qwe --trust-proxy 127.0.0.1 \
+  --client-cert-header x-client-dn --client-cert-subject --user-header x-remote-user
+```
+
+nginx asking for a certificate, and Apache with mod_auth_gssapi for Kerberos, each setting
+its header in place of any the visitor sent:
+
+```nginx
+ssl_client_certificate /etc/nginx/staff-ca.pem;
+ssl_verify_client on;
+location / {
+    proxy_set_header X-Client-DN $ssl_client_s_dn;
+    proxy_pass http://127.0.0.1:8080;
+}
+```
+
+```apache
+<Location />
+    AuthType GSSAPI
+    AuthName "Corp sign-in"
+    GssapiCredStore keytab:/etc/apache2/http.keytab
+    Require valid-user
+    RequestHeader set X-Remote-User expr=%{REMOTE_USER}
+</Location>
+ProxyPass / http://127.0.0.1:8080/
+```
+
+The routes read `request.client_cert` and `request.remote_user`, and compare them with what
+the program's table holds:
+
+```quillo
+db.open("app.db")
+db.exec("create table if not exists staff (id integer primary key, cert_dn text unique, principal text unique)")
+
+route GET /staff {
+    let cert = request.client_cert ?? reply 401 "A staff certificate is needed"
+    let row = db.one("select id from staff where cert_dn = ?", cert.subject) ?? reply 403 "Not on the staff list"
+    <html><body><p>Staff member {row.id}: {cert.name}</p></body></html>
+}
+
+route GET /intranet {
+    let who = request.remote_user ?? reply 401 "Sign in to Windows first"      // ada@CORP.EXAMPLE
+    let row = db.one("select id from staff where principal = ?", lower(who)) ?? reply 403 "Not on the staff list"
+    <html><body><p>Hello, {who}: staff member {row.id}</p></body></html>
+}
+```
+
+- `request.client_cert` is `{ name, subject, uri }`: `name` the certificate's SPIFFE id
+  where it has one, else its subject's CN; `subject` the subject as the proxy wrote it;
+  `uri` its URI, where it has one. The header is read as `accept_calls { client_cert }`
+  reads it (see [Authentication between services](#authentication-between-services)):
+  Envoy's `x-forwarded-client-cert`, one proxy's element, unless `--client-cert-subject`
+  says it holds the subject alone, in RFC 2253's form. Compare the whole subject, or `name`,
+  never a CN picked out of the subject by hand: escapes (`CN=Acme\, Inc.`) make that easy to
+  fool.
+- `request.remote_user` is the user as the proxy wrote it, trimmed (`ada@CORP.EXAMPLE`,
+  `CORP\ada`).
+- Each is believed only on a request from an address [`--trust-proxy`](#options-of-quillo-run)
+  names, and either option stops the program at start without it (`quillo:
+  --client-cert-header and --user-header read a proxy's header, believed only from the
+  addresses --trust-proxy names: give --trust-proxy too (any visitor can send that
+  header)`). Each is null where its header is missing, comes from another address, or is not
+  one value the proxy set: several elements of a certificate's header, several lines, a
+  value with a comma in it (two joined: a proxy that appends put the visitor's first). The
+  log says why, once. Keep Quillo where only the proxy reaches it, on its default
+  `--host`, 127.0.0.1.
+- Where neither option names a header, `request` has neither field. A service
+  [`--split`](#options-of-quillo-run) starts gets both from its app, signed.
 
 ### What a route returns
 
@@ -7443,7 +7526,9 @@ Safety built in:
   plugin's functions, called or as methods (`"40 + 2".run_script()`, a plugin's `x.sign()`),
   are kept out the same way; a plugin whose file says `//! effects: none` gives what it is
   given. A name a function's parameter, a lambda's, a `let` or a loop binds is its own,
-  never the builtin of that name *(since 0.8.9: these went into the public bundle)*.
+  never the builtin of that name, and so is a top-level `let` or `fn` of the program's
+  (`fn uuid() = "fixed"`), kept out only when its own value is the server's *(since 0.8.9:
+  these went into the public bundle)*.
 - `http.*` in a component goes from the visitor's browser, never from the server, so it
   cannot reach the server's own network: while the server renders a component, a call
   from its code is an error before anything connects.
@@ -9091,7 +9176,9 @@ both calls may run; a `GET` route that writes and reads who the visitor is (see 
 under [Routes](#routes)); a `media.on` rule *(since 0.8.9)* for a name ending in `*` whose
 `publish` or `watch` never reads which stream is asked for (see [Media](#media)); a page
 state *(since 0.8.9)* that a component reads and that comes from `env`, `read_file` or a
-`select *` row (see [Page state](#page-state)). Warnings never make it fail.
+`select *` row (see [Page state](#page-state)); a stream's `send` *(since 0.8.9)* inside
+`db.transaction` or `db.atomic`, which on SQLite holds every other request while the client
+reads (see [Concurrency](#concurrency-and-reloading)). Warnings never make it fail.
 
 A type grows as the code is read (a list of maps of lists, made again on each line), so
 the check keeps each to 1,000,000 parts and 64 levels, and takes what grows past them as
@@ -9251,6 +9338,20 @@ How long a wait may last:
 - Inside a SQLite transaction a wait holds up every request, since another request's SQL
   would land in the transaction: keep `http.*`, `sleep` and Rust (`.qwer`) calls out of
   them. A SQLite query itself always runs under the lock, on the loop's thread.
+- A stream's `send` inside a SQLite transaction does not wait for its client either. What
+  the client has not read yet is kept, up to 4 MiB (less under
+  [`--max-memory`](#options-of-quillo-run)); past that, the transaction waits a second in
+  all for the client, then `send` fails as it does for a client gone, and the transaction
+  rolls back. Read the rows inside the transaction and send them after it. `quillo check`
+  warns of a `send` inside `db.transaction` or `db.atomic` *(since 0.8.9: a client that read
+  nothing held every request of the instance for up to 30 s at each `send`)*:
+
+  ```quillo
+  route GET /export = stream((send) => {
+      let rows = db.transaction(() => db.query("select * from orders"))
+      for r in rows { send(json.stringify(r) + "\n") }
+  })
+  ```
 
 What a server is made of, for sizing a machine: the event loop's thread (a 16 MiB
 stack; each request's coroutine reserves as much, and grows as it needs), up to
@@ -9751,16 +9852,16 @@ with conditions and hit counts, logpoints, stepping, evaluation for hovers, the
 ### Logs and metrics
 
 Each request is logged on stderr as `GET /path?query -> 200 (0.4ms)`: the path with its
-query string. A query value whose name says a secret is written `[hidden]`:
-`/reset?token=[hidden]&page=2`. The names are `password`, `passwd`, `pwd`, `pass`, `token`,
-`code`, `secret`, `key`, `otp`, `state`, `ticket`, `sig`, `signature`, `credential`,
-`verifier`, `jwt`, `auth`, `authorization`, `session`, `sid`, SAML's `SAMLRequest` and
-`SAMLResponse`, in any case and as the last word of a longer name (`access_token`,
-`api-key`, `clientSecret`, `user[password]`, `API_KEY`, `PHPSESSID`), and `password`,
-`token`, `secret`, `signature`, `credential`, `verifier`, `jwt`, `authorization` and
-`session` anywhere in one (`id_token_hint`, `session_id`) *(since 0.8.9: a sign-in or
-reset link's token, OAuth's `code` and `state`, and a password in a URL went to the log
-as they were)*. Started with [`--log json`](#options-of-quillo-run), `quillo run main.qwe --log json`, the line is a
+query string. A query value whose name says a secret is written `[hidden]`, in the text
+line and the JSON one: `/reset?token=[hidden]&page=2`. The names are `password`, `passwd`,
+`pwd`, `pass`, `token`, `tokens`, `code`, `secret`, `key`, `otp`, `state`, `ticket`, `sig`,
+`signature`, `credential`, `verifier`, `jwt`, `auth`, `authorization`, session ids
+(`session`, `sessionid`, `sid`), and SAML's `SAMLRequest` and `SAMLResponse`, in any case
+and as the last word of a longer name (`access_token`, `api-key`, `clientSecret`,
+`user[password]`, `API_KEY`, `JSESSIONID`, `PHPSESSID`), and `password`, `token`, `secret`,
+`signature`, `credential`, `verifier`, `jwt`, `authorization` and `session` anywhere in one
+(`id_token_hint`, `session_id`) *(since 0.8.9: a sign-in or reset link's token, OAuth's
+`code` and `state`, a session id and a password in a URL went to the log as they were)*. Started with [`--log json`](#options-of-quillo-run), `quillo run main.qwe --log json`, the line is a
 JSON object instead, for log collectors:
 `time` (RFC 3339, UTC, with milliseconds), `method`, `path` (with the query string),
 `status`, `ms`, `ip` (the TCP peer), `tenant` when the request had one, and `rid` (the
