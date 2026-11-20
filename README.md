@@ -315,22 +315,24 @@ for f in app/*.qwe tests/programs/*.qwe; do ./target/release/quillo check "$f"; 
 
 ### Test coverage
 
-**Rust: 98.25% of lines** run under the tests (78,506 lines, 1,376 not run), **97.00% of
-regions** (188,943, 5,676 not run).
-**Browser runtime (`src/client/runtime.js`): 99.89% of lines** (6,631 lines, 7 not run).
-Both were measured together on 2026-11-19 on 0.8.8's code (f35bf2d) on macOS, from 4,121
+**Rust: 98.22% of lines** run under the tests (84,361 lines, 1,504 not run), **96.95% of
+regions** (203,060, 6,193 not run).
+**Browser runtime (`src/client/runtime.js`): 99.90% of lines** (6,769 lines, 7 not run).
+Both were measured together on 2026-11-20 on 0.8.9's code (77ffcd0) on macOS, from 4,406
 tests with Chrome, PostgreSQL and MariaDB included; none failed (three that failed under the
-load, a debugger test, a UDP test's order and closing a desktop app's window, which needs the
-screen unlocked, passed run alone). The total rose from 0.8.7's 97.92% with the tests written
-for the lines 0.8.7 added that no test ran (branch coverage-087), which also found the bugs
-0.8.8 fixes. runtime.js's 7 lines are defensive guards. The Rust figures are the Lines and Regions columns of `cargo llvm-cov`'s total. A line counts as
+load, two of the compiled code's deep calls and a function read once, passed run alone; the
+test that closes a desktop app's window ran, the screen unlocked). Of the 10,287 lines 0.8.9
+added to `src/`, 115 are not run: the tests written for its lines that no test ran
+(`tests/cover089_*.rs`) brought them down from 353, and with three reviews found 15 of the
+bugs 0.8.9 fixes; the rest are mostly guards and races the tests cannot bring about. The
+total is 0.03 points under 0.8.8's 98.25%, with 5,855 more lines counted. runtime.js's 7 lines are defensive guards. The Rust figures are the Lines and Regions columns of `cargo llvm-cov`'s total. A line counts as
 run when any part of it ran, so `let x = f()?;` is run though `f` never failed; regions
 count each part, which is why they are lower (FEEDBACK49.md). The runtime's is V8's own
 coverage from headless Chrome and every Node a test starts, mapped back to runtime.js's
 lines. What Rust does not run is mostly operating system failures (a thread or a socket
 that cannot be made), other systems' branches (`src/platform.rs`, `src/desktop.rs`),
-`unreachable!` arms and timers; the files with the most are `src/value.rs` (130 lines),
-`src/check.rs` (92), `src/ws.rs` (79) and `src/interp.rs` (76).
+`unreachable!` arms and timers; the files with the most are `src/value.rs` (133 lines),
+`src/check.rs` (107), `src/ws.rs` (79) and `src/interp.rs` (75).
 
 Rust must stay at **97.90% of lines or above** (the aim is 99%), and runtime.js at
 **99.50% or above** on every change, and every line a change
