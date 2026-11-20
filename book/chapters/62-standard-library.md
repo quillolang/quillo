@@ -26,7 +26,16 @@
   repetition, `((?:a|b)*)`), and not at the same cost: one search on the server (`re.test`,
   `re.find`) takes time in proportion to the text, whatever it is, and the browser's backtracks, so `(a+)+$` can hang a tab with no way to stop it, which `quillo
   check` warns of. Bound the counts (`{1,8}`), or run a visitor's own pattern in a `server
-  fn`. Finding every match (`find_all`, `replace`, `split`) searches again after each one, and
+  fn`. On the server, the proportion can still be large: a pattern that follows many ways at
+  once from each place (`[ab]*a[ab]{900}c` on a text of `a` and `b`) can take long on a long
+  text, so a search whose work would pass a quarter of a second is run step by step,
+  counted, and stops after 0.1 s and 0.15 µs a byte of the text (the thread's own time),
+  within [`--max-compute`](#options-of-quillo-run), and before its own work takes 256 MiB or
+  [`--max-memory`](#concurrency-and-reloading); the call is then an error value (`` `re.test`:
+  the pattern is too costly for this text: ...; repeat less, or search a shorter text ``), in
+  every `re.*` call *(since 0.8.9: one search held an instance for seconds to minutes, past
+  `--max-compute`)*. Ordinary patterns, a long one on a long text too, answer as before.
+  Finding every match (`find_all`, `replace`, `split`) searches again after each one, and
   a pattern whose searches read on past their match (`[a-z]+X|[a-z]` on letters) reads the
   text once per match: once its searches have read the text 64 times over and computed for
   more than 0.25 s plus 4 µs a byte (the thread's own time), the call is an error value (`the
@@ -287,7 +296,13 @@ Safety built in:
 - Globals read with `env`, `read_file`, the database or a service are never written
   into the browser bundle, nor are those made by a function that reads them
   (`let CONFIG = load_config()`); a component that uses one is a load-time error. Only
-  variables named `PUBLIC_...`, read with the name written out, are.
+  variables named `PUBLIC_...`, read with the name written out, are. Globals made from the
+  server's command line or input (`args()`, `read_line`, `stdin`), from `crypto` and `uuid`
+  (a key, a token), from `run_script`, from a site's call (`site shop = ...`), and from a
+  plugin's functions, called or as methods (`"40 + 2".run_script()`, a plugin's `x.sign()`),
+  are kept out the same way; a plugin whose file says `//! effects: none` gives what it is
+  given. A name a function's parameter, a lambda's, a `let` or a loop binds is its own,
+  never the builtin of that name *(since 0.8.9: these went into the public bundle)*.
 - `http.*` in a component goes from the visitor's browser, never from the server, so it
   cannot reach the server's own network: while the server renders a component, a call
   from its code is an error before anything connects.
@@ -820,7 +835,9 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
   with `inf` counted nothing)*; a mean or a spread has them as Python's does. Statistics of no data, or of too little, is an error, as in Python, except
   `describe([])`, which is `{ count: 0, sum: 0 }` with the rest `null`, and `zscore` and
   `normalize` of a constant list, which give zeros. `mode` and `multimode` take any
-  values, text too. Python's `median_grouped` and the rest of `NormalDist` are not
+  values, text too, and count them in time in proportion to the data, whatever numbers it
+  holds *(since 0.8.9: numbers made to fall together made 3 MB of JSON take 3.5 s)*.
+  Python's `median_grouped` and the rest of `NormalDist` are not
   there.
 - **`vec`:** `add sub mul div mod` (two lists of one length, or a list and a number; ints stay
   ints, as with the operators), `pow dot norm(xs, p = 2)`, `cumsum cumprod diff`,
@@ -1425,7 +1442,8 @@ sends one on purpose. Back it up with `db.exec("vacuum into
   `pool_max` set the pool. An idle connection is kept a minute, and `inactive_connection_ttl`
   (seconds) sets that *(since 0.8.9: the driver closed every connection handed back past ten
   idle ones, so a busy program opened thousands a second and ran out of ports)*. A
-  transaction keeps one connection until it ends; nested
+  transaction keeps one connection until it ends, and waits up to 30 s for one when all are
+  in use, then gets an error (see [Concurrency](#concurrency-and-reloading)); nested
   ones are savepoints. A Unix socket is `?socket=/path`.
 - `db.migrate()` takes turns through a named lock (`get_lock`). A migration may change
   the schema, but such a statement commits at once in MySQL (outside the refusal above),
@@ -1767,12 +1785,21 @@ one `</x>; rel=a, </y>; rel=b`), `set-cookie`'s lines joined by a line break, as
 cannot be by a comma, and also given one by one in `cookies`, a list; `body` as text
 (bytes that are not UTF-8 replaced), `json` the body parsed, or `null`. A body longer than
 64 MiB is an error value that says to read it with `http.stream` *(since 0.7: it was cut
-there, and cut JSON was `null`)*.
+there, and cut JSON was `null`)*. The answers being read whole, every call's at once, take
+at most 256 MiB past the first MiB of each, counted as they arrive: a call whose answer
+would pass that is an error value (``...: the answers being read at once would take more
+than the 256 MiB read at once; try again shortly, or read it with http.stream``) *(since
+0.8.9: each call could take 64 MiB, and 64 answers of 200 KB of gzip asked for 13 GB)*.
 Interim answers (`100 Continue`, `103 Early Hints`) are passed over to the final one. A
 body in `gzip`, `deflate` or `br` is decoded; another coding is an error value that names
 it (`the answer is in a coding Quillo cannot read: content-encoding zstd`). Requests say `User-Agent: quillo/<version>` unless
 the headers give another; some APIs (OpenStreetMap's Nominatim) refuse that one, so
-name your program. `http.stream(url, f, opts)` reads an answer as it arrives (see [Streaming](#streaming)).
+name your program. The headers that frame the body or belong to the connection,
+`content-length`, `transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer` and
+`upgrade`, in any case, are left out of a program's: the client writes them from what it
+sends, as `fetch` does in a browser *(since 0.8.9: `content-length: 3` before a longer body
+made the server at the other end read the rest as a second request)*. `host` is sent as
+given, to reach a virtual host by its address. `http.stream(url, f, opts)` reads an answer as it arrives (see [Streaming](#streaming)).
 Text is sent as `text/plain`, HTML as `text/html`, other values (numbers and decimals
 too) as JSON, unless the headers give a `content-type`. That JSON is written as
 `json.stringify` writes it: a function in the body, at any depth, is an error value that
@@ -1798,7 +1825,11 @@ http.get(url, {}, { timeout: 5 })                   // an error value after 5 se
 - `public_only: true` connects only to the public internet: not this machine, a private
   network, or a cloud's metadata service (`169.254.169.254`), however the address is
   written, checked on the address the name gives as it connects (and again for each
-  redirect) *(since 0.8.7: RFC 8215's local-use NAT64, `64:ff9b:1::/48`, counted as public)*. Use it whenever someone else may choose the URL. `quillo check` warns about
+  redirect) *(since 0.8.7: RFC 8215's local-use NAT64, `64:ff9b:1::/48`, counted as public)*.
+  An IPv4-translated address (`::ffff:0:127.0.0.1`) is judged as the IPv4 address in it, as
+  `::ffff:127.0.0.1` is, so is an ISATAP one (`::5efe:10.0.0.1`), and the rest of `0::/8` is
+  not public; a policy's `private = false` refuses the same *(since 0.8.9: these were taken
+  for public)*. Use it whenever someone else may choose the URL. `quillo check` warns about
   a call whose host comes from a value (a parameter, `request`, text put together before
   the host ends) unless its options say `public_only`, either way: `false` says the call
   is meant to reach inside.

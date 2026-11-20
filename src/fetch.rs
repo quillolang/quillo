@@ -436,8 +436,9 @@ fn call(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, Stri
 
 /// Whether a request header is one the client writes itself, never the program (see `call`): the
 /// body's framing and the connection's own headers. A program's `Host` is still sent, as before:
-/// programs reach a virtual host by its address with it, and it frames nothing (the user's
-/// decision, 2026-11-19).
+/// programs reach a virtual host by its address with it, and it frames nothing (Quillo Coder's
+/// call for FEEDBACK75.md, Q-1089, 2026-11-19, on the list of decisions for the user; branch
+/// feedback75).
 fn framing_header(name: &str) -> bool {
     let name = name.trim();
     ["content-length", "transfer-encoding", "connection", "keep-alive", "te", "trailer", "upgrade"].iter().any(|h| name.eq_ignore_ascii_case(h))

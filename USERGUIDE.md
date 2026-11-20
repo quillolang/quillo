@@ -3318,7 +3318,9 @@ The error value's text says what happened: ``server fn `x` could not be reached:
 refused it (400 with the argument that did not fit, 403 from another site, 404 for no
 such function, 500 `internal error in x`, whose real message is on the server's
 stderr, and under `--watch` in the 500 as well, with its file and line, as
-``server fn `x` failed (500): main.qwe:9: division by zero``), and ``server fn `x` answered something that is not its answer (text/html, 1234
+``server fn `x` failed (500): main.qwe:9: division by zero``; a record's default that fails
+as an argument is made is such a 500 too, the function's own failure *(since 0.8.9: a 400
+that gave any caller its file, line and message)*), and ``server fn `x` answered something that is not its answer (text/html, 1234
 characters)`` when a 2xx came back that the server did not send, or cut short: a sign-in page a
 redirect led to, a proxy's page, an empty body. Quillo's server marks what it sends with
 `x-quillo-answer`, so `respond` and `reply` still give `null` (a proxy that drops the mark turns those
@@ -4099,6 +4101,15 @@ route GET / {
 - **In the browser**, the page starts from the value its render left, which it carries; a
   component that shows one starts with the page, so it follows a change made elsewhere
   before anyone reaches for it (one that only sets it waits, as any component does).
+- **Only what a component reads goes to the browser.** A page carries the states its
+  components' code reads (the views they show included), each whole, and no other: a state
+  only the route's own HTML shows stays on the server, and the DevTools panel sees only
+  those sent *(since 0.8.9: every state went into every page that had a component, so
+  `state me = load_user()` sent the user's password hash)*. `quillo check` warns of a state
+  a component reads that comes from `env`, `read_file` or a `select *` row (`` `me` is a
+  page state that <Account> reads, so its whole value is written into each page that shows
+  <Account>, and it comes from ... ``): give the component what it shows, as a prop or a
+  state of those fields alone.
 - **Not where no page is made**: a `server fn` reading one is an error (`quillo check`
   says so; pass what it needs as an argument), and so is a job, a timer or a channel's
   handler reading one when it runs. A request to Quillo's own addresses (a `server fn`'s
@@ -4344,7 +4355,10 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
   form (`GET http://host/path`) takes its host from the target. A `HEAD` answer carries
   the `Content-Length` the `GET` would. A body sent with `Content-Encoding: gzip` reaches
   the route decoded, [`--max-body`](#options-of-quillo-run) (`quillo run main.qwe --max-body 50MB`; 10MB unless
-  given) counting what it decodes to (more is 413); one in
+  given) counting what it decodes to (more is 413), and it may decode to no more than 100
+  times what was sent and 64 KB (more is 413 too, `request body too large for what was sent
+  (once decompressed, more than 100 times its size)`; real uploads compress 3 to 20 times)
+  *(since 0.8.9: 10 KB sent could carry 10 MB to the route)*; one in
   another coding gets 415, and one that is not the gzip it says, 400. An `Expect` other
   than `100-continue` gets 417. An HTTP/1.0 request gets no `100 Continue` (a 1.0 client
   would take it for the answer) and no chunks: a streamed answer goes with no length and
@@ -4414,7 +4428,7 @@ The statuses the server answers by itself:
 | 408 | a request head not whole after 30 s, or a body of which nothing came for 30 s (logged: `POST /up HTTP/1.1 -> 408 (nothing of the body came for 30 s)`) |
 | 409, 422 | an [idempotent request](#idempotent-requests) running, or sent again with another body |
 | 412 | a file whose `If-Match` or `If-Unmodified-Since` it does not meet |
-| 413 | a body larger than `--max-body`, sent or once decoded |
+| 413 | a body larger than `--max-body`, sent or once decoded; a gzip body that decodes to more than 100 times its size and 64 KB *(since 0.8.9)* |
 | 414 | a request line over 64 KiB |
 | 415 | a body in a coding other than gzip; a `server fn` call without `content-type: application/json` |
 | 416 | a `Range` past the end of a file |
@@ -4423,7 +4437,7 @@ The statuses the server answers by itself:
 | 431 | a request head over 64 KiB, or more than 100 headers |
 | 500 | a runtime error in the route (the body is `internal error`; the message is on stderr, and on the page under [`--watch`](#options-of-quillo-run)) |
 | 501 | a `transfer-encoding` other than `chunked`; a method HTTP does not define |
-| 503 | the server stopping or its program failed to load; a prefetch refused; too many files being sent or pages waiting (with `retry-after: 5`) |
+| 503 | the server stopping or its program failed to load (and a request still arriving 30 s after a stop *(since 0.8.9)*); a prefetch refused; too many files being sent or pages waiting (with `retry-after: 5`) |
 
 ### Route groups
 
@@ -4669,6 +4683,9 @@ A file anywhere in the arguments goes as a file, inside a list or a map too, and
 `FileList` (`e.target.files`) is a list of files, so `add_photos(e.target.files)` gets a
 list of records. Such a call is sent as multipart with an `X-Quillo-Rpc` header, which
 pages of other sites cannot add without asking first; a form another site posts is refused.
+An object of the browser's that keeps its fields in getters and has a `toJSON` (a passkey's
+credential from `navigator.credentials`, a push subscription, a position) goes as what its
+`toJSON` gives, as `JSON.stringify` writes it *(since 0.8.9: it went as `{}`)*.
 
 ### Checking code from a program
 
@@ -4756,7 +4773,11 @@ a temporary file of its own and moves it in place, so two at once to one target 
 finish, the last one's file kept.
 
 JPEG, PNG, WebP and GIF are read. `image.info` reads only the header, so it is a cheap
-check that an upload is an image at all. Decoding is limited to 12,000 pixels a side
+check that an upload is an image at all, eight files at a time. A PNG's colour profile
+(`iCCP`), which is compressed, is read up to 4 MiB once inflated; a larger one is an error
+value (`the PNG's colour profile (iCCP) is larger than the 4 MiB read`), for `image.info`
+and `image.convert` alike *(since 0.8.9: a 146 KB PNG made `image.info` take 264 MiB)*.
+Decoding is limited to 12,000 pixels a side
 and 512 MiB, so a small file claiming to be enormous is refused before anything is
 allocated; both run off the event loop. At most four conversions run at once (fewer on
 a machine with fewer cores), so many uploads together cannot each take 512 MiB; the rest
@@ -4971,7 +4992,8 @@ fn touch() {
   `reply 303 redirect("/login")`; `quillo check` warns of one nothing takes.
 - An error the program wrote, `err("That name is taken")`, is sent as it is. One a builtin
   made says `internal error` instead, wherever it would reach a visitor: as a route's
-  value, inside a map or list, in markup, or from a `server fn`, and when it is turned
+  value, inside a map or list, in markup, or from a `server fn`, in what a `stream` or
+  `events` answer sends *(since 0.8.9: a stream sent it as it was)*, and when it is turned
   into text: a template string, `str`, `join`, `json.stringify`. A database's has the SQL
   and the tables, an `http` call's the address with its key, a file's its path, so that
   text goes to the log with the request. `print` shows it too, as [`--watch`](#options-of-quillo-run)
@@ -5078,6 +5100,14 @@ fn touch() {
   site_headers({ "content-security-policy": "default-src 'self'", "referrer-policy": "same-origin" })
   site_headers("/embed", { "x-frame-options": null, "content-security-policy": "frame-ancestors *" })
   ```
+
+  They reach the answers of a program it mounts, and of a service it serves under a prefix,
+  too, below their own rules: the mounted program's rules and its routes' headers win, and
+  what they take away (`null`) stays away. A mounted program's page is written with the
+  mounting program's policy as well as its own, so that Quillo's scripts in it are let
+  through both; a service `--split` starts is sent the app's policy for the path with each
+  request (signed) and writes its page with it the same way *(since 0.8.9: a program's CSP,
+  HSTS and `Referrer-Policy` never reached `/shop/*` or a service's pages)*.
 - Text answers are gzipped for browsers that accept it: a 200 with a body of 1 KiB or
   more whose type is `text/*` or names `json`, `javascript` or `svg`, with `vary:
   accept-encoding`, which the plain copy of such an answer, sent to a client that takes
@@ -6231,7 +6261,9 @@ view Header(user) = <header>
   page. It holds only the keys the components' code can ask for: each `t("literal")`,
   every key that starts with a template's literal start (`` t(`sec.${x}`) `` sends
   `sec.*`), and the `quillo.*` keys. A key worked out any other way (`t(k)`) sends all
-  of them. Cached views are kept once per locale.
+  of them. A key in `raw(t(...))` counts as one in `t(...)` *(since 0.8.9: it was left out,
+  and the page showed the key itself once its components took over)*. Cached views are kept
+  once per locale.
 - `ask()`'s buttons follow the page's locale: the program's own `quillo.ok` and
   `quillo.cancel` translations when it has them, else Quillo's own for about thirty
   languages (Spanish Aceptar and Cancelar, French, German, Japanese, Chinese, Arabic,
@@ -6256,7 +6288,9 @@ prefix. Its cookies are set for the prefix (`Path=/shop`), its session cookie is
 and under `--base`; see [Cookies and sessions](#cookies-and-sessions)), and is signed for
 that mount, so the two programs' sessions never pass for each other, in their channels'
 handlers too *(since 0.8.9: `quillo_session` at `Path=/shop` whatever the scheme, and the
-other program's handlers took a page's session)*. Its file paths count from its own folder; the services it declares are
+other program's handlers took a page's session)*. The mounting program's `site_headers` reach its
+answers below its own rules (see [What a route returns](#what-a-route-returns)) *(since 0.8.9)*.
+Its file paths count from its own folder; the services it declares are
 shared with the program that mounts it. `/_quillo/health` and `/_quillo/metrics` are
 the process's, at the root only. `mount`, like `service`, is written at the top level.
 Changes to mounted files are picked up by [`--watch`](#options-of-quillo-run) (`quillo run main.qwe --watch`). See
@@ -6326,7 +6360,18 @@ answers the same, with billing in a process of its own.
   is still running, whichever copy a balancer sends it to. Use HTTPS (or a private
   network) between services so calls cannot be seen. The tenant goes with the call. Only `server fn`s are offered. Its routes, under its prefix, are passed on to it,
   but not Quillo's own addresses there (`/billing/_quillo/rpc/...`, `.../service/...`,
-  `.../job/...`). Run alone, a service is a program served as one:
+  `.../job/...`). What the app passes on of a visitor's request leaves out the app's own
+  session cookies (`__Host-quillo_session`, a mounted program's `__Host-<mount>.quillo_session`),
+  which the service never reads; its own `quillo_session` and every other cookie go as
+  before *(since 0.8.9: the app's session cookie went to whatever address `--service-url`
+  names)*. The service's answer is asked for as it is (`Accept-Encoding: identity`) and the
+  app compresses what it sends, as for its own; one over 1 MiB, or with no length (a
+  `stream`), goes through to the visitor as it comes, held to 5 s to connect and 60 s
+  between its bytes, a large text gzipped on the way; a shorter one is read whole, within
+  256 MiB or [`--max-memory`](#concurrency-and-reloading), and past it the visitor gets
+  502; each header once, and the connection's own left out *(since 0.8.9: every answer was
+  read whole into the app first, up to 256 MB a request, so a service's `stream` came all at
+  once at its end)*. Run alone, a service is a program served as one:
   `quillo run billing.qwe --base /billing --as-service` ([`--base`](#options-of-quillo-run): the path it is
   served under, which its links and redirects carry; [`--as-service`](#options-of-quillo-run): see below).
 - `quillo run app.qwe --split` runs each service the app declares (and those they
@@ -6727,7 +6772,9 @@ server fn refund(account: int, cents: int) for ["shop"] {
 `server fn refund(...) for ["shop"]` takes calls from those callers only, checked before
 the arguments are read: another gets 403 (`` `refund` takes calls from shop only; this is
 `notify` ``). Pages cannot call it at `/_quillo/rpc/refund`, which answers 404, and their
-script has no `server.refund` *(since 0.7: anyone could)*. `quillo check` refuses `for []`, `for [shop]` (a caller is named in plain
+script has no `server.refund` *(since 0.7: anyone could)*. The 404 says what it says of a
+name that is no `server fn`, `` no server fn `refund` `` *(since 0.8.9: it named the callers
+it takes, to anyone)*. `quillo check` refuses `for []`, `for [shop]` (a caller is named in plain
 text, `"shop"`) and `for "shop"`, and `quillo docs` puts each function's callers in
 `x-quillo-callers`, for a gateway to enforce too.
 
@@ -6755,6 +6802,11 @@ scheme from its app: each request the app passes on carries the app's verdict (w
 service's deletions are `Secure` and its writes compared by scheme as the app's are. Only a service
 `--split` started reads that word, and only from this machine; the app and any other server ignore
 it, and the visitor's `X-Forwarded-Proto` passed on with it is not believed *(since 0.8.7)*.
+The visitor's address comes the same way (`x-quillo-client`, as the app took it with its own
+`--trust-proxy`), so in such a service `request.ip`, a "this machine only" check, the limits by
+client and the log are the visitor's, as its `Secure` cookies, push origins and `Origin`
+check are by the scheme *(since 0.8.9: every visitor was the app's `127.0.0.1` there, so a
+check that refused others let everyone in)*. A word a client sends the app is dropped.
 
 Answers are signed back with the key the call was signed with, and a caller that signs
 with a key of its own takes no answer without it (``service billing: the answer from
@@ -7115,7 +7167,16 @@ stays the simpler choice when the next move depends on the answer.
   repetition, `((?:a|b)*)`), and not at the same cost: one search on the server (`re.test`,
   `re.find`) takes time in proportion to the text, whatever it is, and the browser's backtracks, so `(a+)+$` can hang a tab with no way to stop it, which `quillo
   check` warns of. Bound the counts (`{1,8}`), or run a visitor's own pattern in a `server
-  fn`. Finding every match (`find_all`, `replace`, `split`) searches again after each one, and
+  fn`. On the server, the proportion can still be large: a pattern that follows many ways at
+  once from each place (`[ab]*a[ab]{900}c` on a text of `a` and `b`) can take long on a long
+  text, so a search whose work would pass a quarter of a second is run step by step,
+  counted, and stops after 0.1 s and 0.15 µs a byte of the text (the thread's own time),
+  within [`--max-compute`](#options-of-quillo-run), and before its own work takes 256 MiB or
+  [`--max-memory`](#concurrency-and-reloading); the call is then an error value (`` `re.test`:
+  the pattern is too costly for this text: ...; repeat less, or search a shorter text ``), in
+  every `re.*` call *(since 0.8.9: one search held an instance for seconds to minutes, past
+  `--max-compute`)*. Ordinary patterns, a long one on a long text too, answer as before.
+  Finding every match (`find_all`, `replace`, `split`) searches again after each one, and
   a pattern whose searches read on past their match (`[a-z]+X|[a-z]` on letters) reads the
   text once per match: once its searches have read the text 64 times over and computed for
   more than 0.25 s plus 4 µs a byte (the thread's own time), the call is an error value (`the
@@ -7376,7 +7437,13 @@ Safety built in:
 - Globals read with `env`, `read_file`, the database or a service are never written
   into the browser bundle, nor are those made by a function that reads them
   (`let CONFIG = load_config()`); a component that uses one is a load-time error. Only
-  variables named `PUBLIC_...`, read with the name written out, are.
+  variables named `PUBLIC_...`, read with the name written out, are. Globals made from the
+  server's command line or input (`args()`, `read_line`, `stdin`), from `crypto` and `uuid`
+  (a key, a token), from `run_script`, from a site's call (`site shop = ...`), and from a
+  plugin's functions, called or as methods (`"40 + 2".run_script()`, a plugin's `x.sign()`),
+  are kept out the same way; a plugin whose file says `//! effects: none` gives what it is
+  given. A name a function's parameter, a lambda's, a `let` or a loop binds is its own,
+  never the builtin of that name *(since 0.8.9: these went into the public bundle)*.
 - `http.*` in a component goes from the visitor's browser, never from the server, so it
   cannot reach the server's own network: while the server renders a component, a call
   from its code is an error before anything connects.
@@ -7909,7 +7976,9 @@ math.comb(52, 5)  math.log(8, 2)  math.fsum(xs)  math.isclose(a, b)  math.pi
   with `inf` counted nothing)*; a mean or a spread has them as Python's does. Statistics of no data, or of too little, is an error, as in Python, except
   `describe([])`, which is `{ count: 0, sum: 0 }` with the rest `null`, and `zscore` and
   `normalize` of a constant list, which give zeros. `mode` and `multimode` take any
-  values, text too. Python's `median_grouped` and the rest of `NormalDist` are not
+  values, text too, and count them in time in proportion to the data, whatever numbers it
+  holds *(since 0.8.9: numbers made to fall together made 3 MB of JSON take 3.5 s)*.
+  Python's `median_grouped` and the rest of `NormalDist` are not
   there.
 - **`vec`:** `add sub mul div mod` (two lists of one length, or a list and a number; ints stay
   ints, as with the operators), `pow dot norm(xs, p = 2)`, `cumsum cumprod diff`,
@@ -8514,7 +8583,8 @@ sends one on purpose. Back it up with `db.exec("vacuum into
   `pool_max` set the pool. An idle connection is kept a minute, and `inactive_connection_ttl`
   (seconds) sets that *(since 0.8.9: the driver closed every connection handed back past ten
   idle ones, so a busy program opened thousands a second and ran out of ports)*. A
-  transaction keeps one connection until it ends; nested
+  transaction keeps one connection until it ends, and waits up to 30 s for one when all are
+  in use, then gets an error (see [Concurrency](#concurrency-and-reloading)); nested
   ones are savepoints. A Unix socket is `?socket=/path`.
 - `db.migrate()` takes turns through a named lock (`get_lock`). A migration may change
   the schema, but such a statement commits at once in MySQL (outside the refusal above),
@@ -8856,12 +8926,21 @@ one `</x>; rel=a, </y>; rel=b`), `set-cookie`'s lines joined by a line break, as
 cannot be by a comma, and also given one by one in `cookies`, a list; `body` as text
 (bytes that are not UTF-8 replaced), `json` the body parsed, or `null`. A body longer than
 64 MiB is an error value that says to read it with `http.stream` *(since 0.7: it was cut
-there, and cut JSON was `null`)*.
+there, and cut JSON was `null`)*. The answers being read whole, every call's at once, take
+at most 256 MiB past the first MiB of each, counted as they arrive: a call whose answer
+would pass that is an error value (``...: the answers being read at once would take more
+than the 256 MiB read at once; try again shortly, or read it with http.stream``) *(since
+0.8.9: each call could take 64 MiB, and 64 answers of 200 KB of gzip asked for 13 GB)*.
 Interim answers (`100 Continue`, `103 Early Hints`) are passed over to the final one. A
 body in `gzip`, `deflate` or `br` is decoded; another coding is an error value that names
 it (`the answer is in a coding Quillo cannot read: content-encoding zstd`). Requests say `User-Agent: quillo/<version>` unless
 the headers give another; some APIs (OpenStreetMap's Nominatim) refuse that one, so
-name your program. `http.stream(url, f, opts)` reads an answer as it arrives (see [Streaming](#streaming)).
+name your program. The headers that frame the body or belong to the connection,
+`content-length`, `transfer-encoding`, `connection`, `keep-alive`, `te`, `trailer` and
+`upgrade`, in any case, are left out of a program's: the client writes them from what it
+sends, as `fetch` does in a browser *(since 0.8.9: `content-length: 3` before a longer body
+made the server at the other end read the rest as a second request)*. `host` is sent as
+given, to reach a virtual host by its address. `http.stream(url, f, opts)` reads an answer as it arrives (see [Streaming](#streaming)).
 Text is sent as `text/plain`, HTML as `text/html`, other values (numbers and decimals
 too) as JSON, unless the headers give a `content-type`. That JSON is written as
 `json.stringify` writes it: a function in the body, at any depth, is an error value that
@@ -8887,7 +8966,11 @@ http.get(url, {}, { timeout: 5 })                   // an error value after 5 se
 - `public_only: true` connects only to the public internet: not this machine, a private
   network, or a cloud's metadata service (`169.254.169.254`), however the address is
   written, checked on the address the name gives as it connects (and again for each
-  redirect) *(since 0.8.7: RFC 8215's local-use NAT64, `64:ff9b:1::/48`, counted as public)*. Use it whenever someone else may choose the URL. `quillo check` warns about
+  redirect) *(since 0.8.7: RFC 8215's local-use NAT64, `64:ff9b:1::/48`, counted as public)*.
+  An IPv4-translated address (`::ffff:0:127.0.0.1`) is judged as the IPv4 address in it, as
+  `::ffff:127.0.0.1` is, so is an ISATAP one (`::5efe:10.0.0.1`), and the rest of `0::/8` is
+  not public; a policy's `private = false` refuses the same *(since 0.8.9: these were taken
+  for public)*. Use it whenever someone else may choose the URL. `quillo check` warns about
   a call whose host comes from a value (a parameter, `request`, text put together before
   the host ends) unless its options say `public_only`, either way: `false` says the call
   is meant to reach inside.
@@ -9006,8 +9089,9 @@ JSON (`` this route's answer holds a function at `f` ``), the program's own or o
 route's block makes (`fn helper() = 2`, `let f = (x) => x`; a call of it is a value); a job or tick named twice where
 both calls may run; a `GET` route that writes and reads who the visitor is (see `writes`
 under [Routes](#routes)); a `media.on` rule *(since 0.8.9)* for a name ending in `*` whose
-`publish` or `watch` never reads which stream is asked for (see [Media](#media)). Warnings
-never make it fail.
+`publish` or `watch` never reads which stream is asked for (see [Media](#media)); a page
+state *(since 0.8.9)* that a component reads and that comes from `env`, `read_file` or a
+`select *` row (see [Page state](#page-state)). Warnings never make it fail.
 
 A type grows as the code is read (a list of maps of lists, made again on each line), so
 the check keeps each to 1,000,000 parts and 64 levels, and takes what grows past them as
@@ -9140,7 +9224,12 @@ How long a wait may last:
 
 - [`--workers N`](#options-of-quillo-run) (64 by default) requests can wait at once, each on a pool thread; more
   wait for a thread, while requests that only compute go on being answered. PostgreSQL
-  queries take no thread. A thread the system will not start (an account's process
+  queries take no thread, but a statement of a PostgreSQL or MySQL transaction does: it
+  goes before the other waits, and takes a thread past `--workers` when all are taken, so
+  the transaction that holds a row's lock always finishes, however many requests wait on
+  that row *(since 0.8.9: with every thread waiting on one row's lock, the commit had none,
+  and PostgreSQL waited for good, a graceful stop with it, and MariaDB 50 s and then error
+  1205)*. A thread the system will not start (an account's process
   limit, which on Linux counts threads) is said once in the log, `quillo: cannot start a
   thread for waiting work (...; the account's process limit?); requests wait for the N
   threads there are`; with none at all, it tries again a few times within a tenth of a
@@ -9152,7 +9241,11 @@ How long a wait may last:
   a `service` elsewhere: 5 s to connect, 10 s for a try, or its `timeout` (see
   [Services](#services)).
 - A PostgreSQL connection: when all of the pool's are taken, a request waits up to 30 s
-  for one, then gets an error.
+  for one, then gets an error. A MySQL transaction waits for one of its pool's the same
+  way, holding no thread meanwhile, then gets `` no MySQL connection free after 30 s: all
+  the pool's are in use (`?pool_max=N` in the URL allows more) `` *(since 0.8.9: it waited
+  on a thread with no limit, and took the threads other requests, and the transactions
+  holding the connections, needed)*.
 - A query has no limit from Quillo: give the database one (on PostgreSQL,
   `alter role app set statement_timeout = '5s'`).
 - Inside a SQLite transaction a wait holds up every request, since another request's SQL
@@ -9233,7 +9326,11 @@ computing), closes idle ones, answers every request in progress, however long it
 that a transaction under way commits whole, finishes sending the large files being sent
 (a download), and exits with status 0. An answer given
 meanwhile closes its connection and says so (`connection: close`), so the client sends its
-next request elsewhere. Every 5 s it says what it still waits for:
+next request elsewhere. A request still arriving 30 s after the stop (its head, or a body
+not yet whole) has had no work done, and is answered 503 (`the server is stopping`) and its
+connection closed, the log saying why *(since 0.8.9: a body trickled at a little over 1 KiB
+a second held the stop for as long as it kept coming)*. Every 5 s it says what it still
+waits for:
 
 ```
 quillo: stopping once the requests in progress are answered (again to stop now)
@@ -9654,7 +9751,16 @@ with conditions and hit counts, logpoints, stepping, evaluation for hovers, the
 ### Logs and metrics
 
 Each request is logged on stderr as `GET /path?query -> 200 (0.4ms)`: the path with its
-query string. Started with [`--log json`](#options-of-quillo-run), `quillo run main.qwe --log json`, the line is a
+query string. A query value whose name says a secret is written `[hidden]`:
+`/reset?token=[hidden]&page=2`. The names are `password`, `passwd`, `pwd`, `pass`, `token`,
+`code`, `secret`, `key`, `otp`, `state`, `ticket`, `sig`, `signature`, `credential`,
+`verifier`, `jwt`, `auth`, `authorization`, `session`, `sid`, SAML's `SAMLRequest` and
+`SAMLResponse`, in any case and as the last word of a longer name (`access_token`,
+`api-key`, `clientSecret`, `user[password]`, `API_KEY`, `PHPSESSID`), and `password`,
+`token`, `secret`, `signature`, `credential`, `verifier`, `jwt`, `authorization` and
+`session` anywhere in one (`id_token_hint`, `session_id`) *(since 0.8.9: a sign-in or
+reset link's token, OAuth's `code` and `state`, and a password in a URL went to the log
+as they were)*. Started with [`--log json`](#options-of-quillo-run), `quillo run main.qwe --log json`, the line is a
 JSON object instead, for log collectors:
 `time` (RFC 3339, UTC, with milliseconds), `method`, `path` (with the query string),
 `status`, `ms`, `ip` (the TCP peer), `tenant` when the request had one, and `rid` (the

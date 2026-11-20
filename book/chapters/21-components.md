@@ -1497,7 +1497,9 @@ The error value's text says what happened: ``server fn `x` could not be reached:
 refused it (400 with the argument that did not fit, 403 from another site, 404 for no
 such function, 500 `internal error in x`, whose real message is on the server's
 stderr, and under `--watch` in the 500 as well, with its file and line, as
-``server fn `x` failed (500): main.qwe:9: division by zero``), and ``server fn `x` answered something that is not its answer (text/html, 1234
+``server fn `x` failed (500): main.qwe:9: division by zero``; a record's default that fails
+as an argument is made is such a 500 too, the function's own failure *(since 0.8.9: a 400
+that gave any caller its file, line and message)*), and ``server fn `x` answered something that is not its answer (text/html, 1234
 characters)`` when a 2xx came back that the server did not send, or cut short: a sign-in page a
 redirect led to, a proxy's page, an empty body. Quillo's server marks what it sends with
 `x-quillo-answer`, so `respond` and `reply` still give `null` (a proxy that drops the mark turns those

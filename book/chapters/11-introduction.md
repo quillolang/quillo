@@ -123,6 +123,7 @@ behind.
 ```quillo
 udp.listen(9000, (p) => channel.broadcast("readings", json.parse(p.text)))
 media.rtp("cam", { video: 5004, audio: 5006 })
+media.on("cam", { watch: (peer) => peer.session.user != null })
 
 component Gauge() {
     state last = null

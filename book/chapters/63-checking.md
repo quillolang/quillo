@@ -66,8 +66,9 @@ JSON (`` this route's answer holds a function at `f` ``), the program's own or o
 route's block makes (`fn helper() = 2`, `let f = (x) => x`; a call of it is a value); a job or tick named twice where
 both calls may run; a `GET` route that writes and reads who the visitor is (see `writes`
 under [Routes](#routes)); a `media.on` rule *(since 0.8.9)* for a name ending in `*` whose
-`publish` or `watch` never reads which stream is asked for (see [Media](#media)). Warnings
-never make it fail.
+`publish` or `watch` never reads which stream is asked for (see [Media](#media)); a page
+state *(since 0.8.9)* that a component reads and that comes from `env`, `read_file` or a
+`select *` row (see [Page state](#page-state)). Warnings never make it fail.
 
 A type grows as the code is read (a list of maps of lists, made again on each line), so
 the check keeps each to 1,000,000 parts and 64 levels, and takes what grows past them as

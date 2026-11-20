@@ -2,8 +2,9 @@
 
 ## Unreleased (0.8.9)
 
-Found by the security audit of 0.8.7 (FEEDBACK75.md, Q-1050 to Q-1095, and Q-1120 found in
-review), and by the study of authentication (FEEDBACK78.md, Q-1169).
+Found by the security audit of 0.8.7 (FEEDBACK75.md, Q-1050 to Q-1095, and Q-1120 and Q-1121
+found in review), and by the study of authentication (FEEDBACK78.md, Q-1158, Q-1159, Q-1168,
+Q-1169 and Q-1170).
 
 ### Security
 
@@ -144,6 +145,81 @@ review), and by the study of authentication (FEEDBACK78.md, Q-1169).
   browser gives a worker the Cookie Store API (Chromium's), Quillo's worker follows
   `quillo_tag` itself, and reads it after a redirect, so the session's pages go at once
   (FEEDBACK75.md, Q-1082).
+- **A page carries only the page states its components read.** Every top-level `state` went,
+  whole, into the HTML of each page that had a component, so `state me = load_user()` sent the
+  user's password hash and TOTP secret, and a state set from `env` went to every visitor,
+  though no component read them. A page now carries the states its components' code reads (the
+  views they show included), and `quillo check` warns of one a component reads that comes from
+  `env`, `read_file` or a `select *` row (FEEDBACK75.md, Q-1058, the user's choice).
+- **The bundle keeps more of the server's values out.** Globals made from `args()`,
+  `read_line`, `stdin`, `run_script`, `crypto`, `uuid`, a site's call or a plugin's function
+  (as a method too) went into the public JavaScript bundle when a component read them; they are
+  kept out as `env`'s are, a plugin whose file says `//! effects: none` aside. A name a
+  parameter, a lambda, a `let` or a loop binds is no longer taken for the builtin of that name
+  (FEEDBACK75.md, Q-1063).
+- **Under `--split`, a service sees the visitor's address.** Every visitor reached a service
+  as the app's `127.0.0.1`, so a `request.ip` check that refused them in one process let them
+  through, and the limits by client put everyone in one place. The app signs the address it
+  took (with its own `--trust-proxy`) into each request it passes on, and only a service it
+  started takes it, from this machine; one a client sends is dropped (FEEDBACK75.md, Q-1064).
+- **`stream` and `events` hide a builtin's error**, as routes, `server fn`s and channels do: a
+  database's error or an internal URL with its key went to the visitor (FEEDBACK75.md,
+  Q-1068).
+- **A split service's answer is not held whole in the app.** It was read into the app's
+  memory, up to 256 MB a request, outside `--max-memory`. One over 1 MiB, or with no length,
+  goes through to the visitor as it comes (5 s to connect, 60 s between its bytes), so a
+  service's `stream` arrives as it is sent; a shorter one is read within 256 MiB or
+  `--max-memory`, else the visitor gets 502 (FEEDBACK75.md, Q-1071).
+- **The app's session cookie stays with the app**: every visitor header went to a split
+  service, the root site's `__Host-quillo_session` included, at whatever address
+  `--service-url` names. The app's own session cookies are left out of the `Cookie` line
+  (FEEDBACK75.md, Q-1081).
+- **A `server fn` tells a caller no internals.** A record's default that failed as an argument
+  was made gave any caller its file, line and error in a 400, outside `--watch`; it is the
+  function's 500, the details in the log. `/_quillo/rpc/<name>` of a `for [...]` function named
+  the services it takes calls from; it is the 404 of a name that is no `server fn`
+  (FEEDBACK75.md, Q-1086).
+- **A program's `site_headers` reach what it mounts.** Its CSP, HSTS and `Referrer-Policy`
+  never reached `/shop/*` or a service under a prefix. They are added below the mounted
+  program's own rules, and its page, or a split service's (sent the app's policy, signed, with
+  each request), is written with the policy so that Quillo's scripts are let through
+  (FEEDBACK75.md, Q-1087).
+- **The request log hides secrets in a URL.** A password, a sign-in or reset link's token,
+  OAuth's `code` and `state` and SAML's messages in a query string went to the log as they
+  were, kept for months. A value whose name says a secret (`token`, `code`, `password`,
+  `key`, `state`, `sig`, `session`, and names ending so, `access_token`, `apiKey`) is written
+  `[hidden]` (FEEDBACK78.md, Q-1158).
+- **A single regex search no longer holds an instance.** One `re.test` or `re.find` of a
+  visitor's pattern (`[ab]*a[ab]{900}c` on 200 KB) held an instance for seconds to minutes,
+  past `--max-compute`, as Q-976's limit covered only the calls that search many times. A
+  search whose work would pass a quarter of a second runs on Quillo's own counted engine,
+  which stops at 0.1 s plus 0.15 µs a byte, within `--max-compute`, and before its work takes
+  256 MiB or `--max-memory`, giving the error value `the pattern is too costly for this text`.
+  Ordinary patterns give the answers 0.8.8 gave, long texts faster (FEEDBACK75.md, Q-1075).
+- **A PNG's colour profile is read to 4 MiB**: a 146 KB PNG made `image.info` allocate 264 MiB,
+  and a 486 KB one 512 MiB, outside every image and memory limit. A larger profile is an error
+  value, and headers are read eight at a time (FEEDBACK75.md, Q-1051).
+- **`http.*` answers share 256 MiB.** Each call could take its 64 MiB, and each gzip answer
+  doubled its buffer past that, so a 200 KB gzip answer held about 200 MB a call and 64 calls
+  asked for 13 GB. Answers are read in pieces, never copied whole, and those being read at once
+  take 256 MiB at most past each one's first MiB; a call past it is an error value
+  (FEEDBACK75.md, Q-1072).
+- **A program's headers cannot frame its request.** `http.*` sent a program's
+  `content-length` against the body it sent, so one that passed a visitor's headers on let
+  them smuggle a second request to the upstream. `content-length`, `transfer-encoding`,
+  `connection`, `keep-alive`, `te`, `trailer` and `upgrade` are left out of a program's
+  headers, as `fetch` leaves them out (FEEDBACK75.md, Q-1089).
+- **A gzip request body decodes to 100 times its size at most**, and 64 KB: 10 KB on the wire
+  carried 10 MB to the route and every limit after it. More is 413 (FEEDBACK75.md, Q-1090).
+- **A body trickled in cannot hold a graceful stop**: with no `--drain`, a body arriving a
+  little over 1 KiB a second held the stop for as long as it kept coming. A request still
+  arriving 30 s after the stop is answered 503 and closed (FEEDBACK75.md, Q-1091).
+- **`stats.mode` and `stats.multimode` count with a keyed hash**: crafted numbers fell in one
+  bucket, and 3 MB of JSON held an instance 3.5 s, past `--max-compute` (216 ms to 15 ms on
+  3 MB) (FEEDBACK75.md, Q-1092).
+- **`public_only` refuses more of this machine's addresses**: `::ffff:0:a.b.c.d`
+  (IPv4-translated) is judged by its IPv4 address, as is ISATAP's `::5efe:a.b.c.d`, and the rest
+  of `0::/8` is not public; `[http] private = false` refuses the same (FEEDBACK75.md, Q-1093).
 
 ### Fixed
 
@@ -166,6 +242,22 @@ review), and by the study of authentication (FEEDBACK78.md, Q-1169).
   stops early, so 3,000 unknown names among 3,000 functions of 67 letters check in about a
   second, where they took 82 s, with the same suggestions (FEEDBACK75.md, Q-1120, found in
   review).
+- **Transactions on one row at once all end**, on PostgreSQL and MySQL. Each statement of such a
+  transaction waits on one of the server's threads, and with every thread waiting on a row's
+  lock the transaction holding it had none for its commit: PostgreSQL waited for good, and a
+  graceful stop with it, and MariaDB 50 s and then error 1205. A statement inside a transaction
+  goes before other waits and may take a thread past `--workers`, and a waiting job wakes a
+  thread every time, so 100 requests on one row all finish (FEEDBACK78.md, Q-1168).
+- **A MySQL transaction waits for a connection without a thread**, for 30 s at most, as
+  PostgreSQL's does, then gets `` no MySQL connection free after 30 s: all the pool's are in use
+  (`?pool_max=N` in the URL allows more) ``; it waited on a thread with no limit, taking the
+  threads other requests needed (FEEDBACK78.md, Q-1170).
+- **`raw(t(...))` in a component keeps its text in the browser**: its key was left out of the
+  translations the page loads, and the page showed the key once its components took over
+  (FEEDBACK75.md, Q-1121, found in review).
+- **A passkey's credential reaches a `server fn`**: an object of the browser's made of getters,
+  with a `toJSON` (a `PublicKeyCredential`, a push subscription, a position), went as `{}`; it
+  goes as its `toJSON` gives (FEEDBACK78.md, Q-1159).
 
 ### Changed
 
@@ -202,8 +294,25 @@ What a program may notice:
 - **`raw(t(key))` of a key no locale has is escaped text**, and a URL attribute of a
   translation's markup that a value makes a `javascript:` one is `about:blank#blocked`
   (Q-1059, Q-1083).
-
-<!-- FEEDBACK75 slices D and B wave 2: to add -->
+- **A regex on a multi-megabyte text may give the error value `the pattern is too costly for
+  this text`** where its search would take long, past 0.1 s and 0.15 µs a byte (Q-1075).
+- **A split service is asked for its answers uncompressed** (`Accept-Encoding: identity`),
+  and the app compresses what it sends on (Q-1071).
+- **The request log writes `[hidden]`** for a query value whose name says a secret (Q-1158).
+- **A page carries only the states its components read**: a state only the route's own HTML
+  shows stays on the server, and the DevTools panel sees only the states sent (Q-1058).
+- **The bundle guard refuses more sources**: a component that reads a global made from
+  `args()`, `read_line`, `stdin`, `run_script`, `crypto`, `uuid`, a site's call or a plugin's
+  function is a load-time error, as one made from `env` is (Q-1063).
+- **A wrong caller of a `for [...]` `server fn` at `/_quillo/rpc/<name>` gets `no server fn
+  ...`**, the 404 of an unknown name (Q-1086).
+- **A record's default that fails as a `server fn`'s argument is made is a 500**, `internal
+  error in x`, where it was a 400 with the error's text (Q-1086).
+- **A mounted program's answers get its parent's `site_headers`**, below its own rules, and a
+  split service's pages the app's policy (Q-1087).
+- **A MySQL transaction with no connection free errors after 30 s** (Q-1170).
+- **`http.*` drops a program's `content-length`, `transfer-encoding`, `connection`,
+  `keep-alive`, `te`, `trailer` and `upgrade` headers**; `host` is sent as given (Q-1089).
 
 ## 0.8.8 (2026-11-19)
 

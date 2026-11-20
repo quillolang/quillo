@@ -73,7 +73,12 @@ How long a wait may last:
 
 - [`--workers N`](#options-of-quillo-run) (64 by default) requests can wait at once, each on a pool thread; more
   wait for a thread, while requests that only compute go on being answered. PostgreSQL
-  queries take no thread. A thread the system will not start (an account's process
+  queries take no thread, but a statement of a PostgreSQL or MySQL transaction does: it
+  goes before the other waits, and takes a thread past `--workers` when all are taken, so
+  the transaction that holds a row's lock always finishes, however many requests wait on
+  that row *(since 0.8.9: with every thread waiting on one row's lock, the commit had none,
+  and PostgreSQL waited for good, a graceful stop with it, and MariaDB 50 s and then error
+  1205)*. A thread the system will not start (an account's process
   limit, which on Linux counts threads) is said once in the log, `quillo: cannot start a
   thread for waiting work (...; the account's process limit?); requests wait for the N
   threads there are`; with none at all, it tries again a few times within a tenth of a
@@ -85,7 +90,11 @@ How long a wait may last:
   a `service` elsewhere: 5 s to connect, 10 s for a try, or its `timeout` (see
   [Services](#services)).
 - A PostgreSQL connection: when all of the pool's are taken, a request waits up to 30 s
-  for one, then gets an error.
+  for one, then gets an error. A MySQL transaction waits for one of its pool's the same
+  way, holding no thread meanwhile, then gets `` no MySQL connection free after 30 s: all
+  the pool's are in use (`?pool_max=N` in the URL allows more) `` *(since 0.8.9: it waited
+  on a thread with no limit, and took the threads other requests, and the transactions
+  holding the connections, needed)*.
 - A query has no limit from Quillo: give the database one (on PostgreSQL,
   `alter role app set statement_timeout = '5s'`).
 - Inside a SQLite transaction a wait holds up every request, since another request's SQL
@@ -166,7 +175,11 @@ computing), closes idle ones, answers every request in progress, however long it
 that a transaction under way commits whole, finishes sending the large files being sent
 (a download), and exits with status 0. An answer given
 meanwhile closes its connection and says so (`connection: close`), so the client sends its
-next request elsewhere. Every 5 s it says what it still waits for:
+next request elsewhere. A request still arriving 30 s after the stop (its head, or a body
+not yet whole) has had no work done, and is answered 503 (`the server is stopping`) and its
+connection closed, the log saying why *(since 0.8.9: a body trickled at a little over 1 KiB
+a second held the stop for as long as it kept coming)*. Every 5 s it says what it still
+waits for:
 
 ```
 quillo: stopping once the requests in progress are answered (again to stop now)
@@ -587,7 +600,16 @@ with conditions and hit counts, logpoints, stepping, evaluation for hovers, the
 ## Logs and metrics
 
 Each request is logged on stderr as `GET /path?query -> 200 (0.4ms)`: the path with its
-query string. Started with [`--log json`](#options-of-quillo-run), `quillo run main.qwe --log json`, the line is a
+query string. A query value whose name says a secret is written `[hidden]`:
+`/reset?token=[hidden]&page=2`. The names are `password`, `passwd`, `pwd`, `pass`, `token`,
+`code`, `secret`, `key`, `otp`, `state`, `ticket`, `sig`, `signature`, `credential`,
+`verifier`, `jwt`, `auth`, `authorization`, `session`, `sid`, SAML's `SAMLRequest` and
+`SAMLResponse`, in any case and as the last word of a longer name (`access_token`,
+`api-key`, `clientSecret`, `user[password]`, `API_KEY`, `PHPSESSID`), and `password`,
+`token`, `secret`, `signature`, `credential`, `verifier`, `jwt`, `authorization` and
+`session` anywhere in one (`id_token_hint`, `session_id`) *(since 0.8.9: a sign-in or
+reset link's token, OAuth's `code` and `state`, and a password in a URL went to the log
+as they were)*. Started with [`--log json`](#options-of-quillo-run), `quillo run main.qwe --log json`, the line is a
 JSON object instead, for log collectors:
 `time` (RFC 3339, UTC, with milliseconds), `method`, `path` (with the query string),
 `status`, `ms`, `ip` (the TCP peer), `tenant` when the request had one, and `rid` (the

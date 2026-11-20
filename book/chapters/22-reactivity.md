@@ -266,6 +266,15 @@ route GET / {
 - **In the browser**, the page starts from the value its render left, which it carries; a
   component that shows one starts with the page, so it follows a change made elsewhere
   before anyone reaches for it (one that only sets it waits, as any component does).
+- **Only what a component reads goes to the browser.** A page carries the states its
+  components' code reads (the views they show included), each whole, and no other: a state
+  only the route's own HTML shows stays on the server, and the DevTools panel sees only
+  those sent *(since 0.8.9: every state went into every page that had a component, so
+  `state me = load_user()` sent the user's password hash)*. `quillo check` warns of a state
+  a component reads that comes from `env`, `read_file` or a `select *` row (`` `me` is a
+  page state that <Account> reads, so its whole value is written into each page that shows
+  <Account>, and it comes from ... ``): give the component what it shows, as a prop or a
+  state of those fields alone.
 - **Not where no page is made**: a `server fn` reading one is an error (`quillo check`
   says so; pass what it needs as an argument), and so is a job, a timer or a channel's
   handler reading one when it runs. A request to Quillo's own addresses (a `server fn`'s
