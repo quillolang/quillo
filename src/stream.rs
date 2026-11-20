@@ -74,6 +74,9 @@ pub(crate) struct Pending {
     /// A page whose waiting components follow it, instead of a function
     /// (src/defer.rs; branch defer).
     pub page: Option<crate::defer::Page>,
+    /// A split service's answer, passed on as it comes, instead of a function (FEEDBACK75.md,
+    /// Q-1071; branch feedback75).
+    pub reader: Option<Box<dyn std::io::Read + Send + Sync>>,
 }
 
 thread_local! {
@@ -83,7 +86,7 @@ thread_local! {
 }
 
 pub(crate) fn made(f: Value, events: bool) {
-    MADE.with(|m| *m.borrow_mut() = Some(Pending { f, events, page: None }));
+    MADE.with(|m| *m.borrow_mut() = Some(Pending { f, events, page: None, reader: None }));
 }
 
 pub(crate) fn take_made() -> Option<Pending> {
@@ -279,6 +282,11 @@ fn send(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // What it makes held to `--max-memory`: anything but a text written as JSON held as it grows
     // (FEEDBACK71.md, Q-977, found in review; branch security).
     let v = args.first().unwrap_or(&Value::Nil);
+    // A builtin's error in it says `internal error`, its text to the log, as a route's answer, a
+    // server fn's and a channel's message do: a stream sent a database's error or an internal
+    // address with its key whole (FEEDBACK75.md, Q-1068; branch feedback75).
+    let hidden = if crate::value::hiding() { crate::server::hidden(v) } else { None };
+    let v = hidden.as_ref().unwrap_or(v);
     let Some(data) = encode(v, args.get(1), out.events) else {
         return Err(crate::httpd::OverMemory.at(line));
     };
@@ -350,6 +358,9 @@ pub(crate) fn run(it: &mut Interp, mut p: Pending, sink: &mut dyn Sink, chunked:
     if let Some(page) = p.page.take() {
         return run_page(it, page, sink, chunked);
     }
+    if let Some(reader) = p.reader.take() {
+        return run_reader(it, reader, sink, chunked);
+    }
     // SAFETY (lifetime): `stream_out` is cleared below, before `sink` goes.
     let sink: *mut (dyn Sink + '_) = sink;
     let sink: *mut dyn Sink = unsafe { std::mem::transmute(sink) };
@@ -371,6 +382,33 @@ pub(crate) fn run(it: &mut Interp, mut p: Pending, sink: &mut dyn Sink, chunked:
             Ended::Failed
         }
     }
+}
+
+/// A split service's answer, passed on as it comes, 64 KiB at a time, each read waited for away
+/// from the requests (`Interp::unlocked`): nothing of it is held but the piece on its way
+/// (FEEDBACK75.md, Q-1071; branch feedback75). An answer that stops coming ends the connection,
+/// as a stream that fails does.
+fn run_reader(it: &mut Interp, mut reader: Box<dyn std::io::Read + Send + Sync>, sink: &mut dyn Sink, chunked: bool) -> Ended {
+    let mut buf = vec![0u8; 64 << 10];
+    loop {
+        match it.unlocked(|| reader.read(&mut buf)) {
+            Ok(0) => break,
+            Ok(n) => {
+                if !piece(sink, &buf[..n], chunked) || crate::httpd::stopping() {
+                    return Ended::Gone;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                eprintln!("quillo: a service's answer stopped coming: {}", e);
+                return Ended::Failed;
+            }
+        }
+    }
+    if chunked && !sink.write(b"0\r\n\r\n") {
+        return Ended::Gone;
+    }
+    Ended::Done
 }
 
 /// A sink that keeps what is sent: the answer made whole, outside the server.

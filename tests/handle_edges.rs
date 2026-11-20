@@ -379,7 +379,12 @@ fn a_name_no_longer_a_function_is_no_server_fn() {
 #[test]
 fn a_record_argument_whose_default_fails_is_refused() {
     let mut it = app("fn boom() = 1 / 0\ntype Thing = { a: int = boom() }\nserver fn f(t: Thing) = 1\n");
-    says(call(&mut it, "f", "[{}]"), 400, "argument `t` of `f`");
+    // A 500 marked failed, as a body's failure is, its text shown only where errors are (as here,
+    // and under `--watch`), else `internal error in f`: the 400 told any caller its file, line and
+    // message (FEEDBACK75.md, Q-1086; branch feedback75).
+    let r = call(&mut it, "f", "[{}]");
+    let failed = r.headers.iter().any(|(k, v)| k == "x-quillo-answer" && v == "failed");
+    assert!(r.status == 500 && failed && (r.text().contains("internal error in `f`") || r.text().contains("division by zero")), "{} {:?}: {}", r.status, r.headers, r.text());
 }
 
 #[test]

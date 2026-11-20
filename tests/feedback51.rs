@@ -210,7 +210,9 @@ fn a_for_function_takes_no_calls_from_pages() {
     let call = |f: &str, body: &str| support::send(s.port, "POST", &format!("/_quillo/rpc/{}", f), &[("content-type", "application/json")], body);
     let r = call("add_credit", "[1, 1000000]");
     assert_eq!(r.status, 404, "{}", r.body);
-    assert!(r.body.contains("it takes calls from billing only"), "{}", r.body);
+    // Said as for any name that is no server fn: the services it takes calls from were named to
+    // every caller (FEEDBACK75.md, Q-1086; branch feedback75).
+    assert_eq!(r.body, r#"{"error":"no server fn `add_credit`"}"#);
     assert!(!r.body.contains("credited"), "{}", r.body);
     // A function with no `for` is the pages' as before; one that does not exist is still 404.
     let r = call("open_fn", "[1]");

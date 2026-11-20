@@ -245,7 +245,11 @@ fn fetch(port: u16, path: &str) -> (String, String) {
 // `style-src` made the same way. Every hash is of a script the page holds.
 #[test]
 fn quillos_own_scripts_and_island_style_pass_the_pages_policy() {
-    let d = dir("csp", &page("/p", "default-src 'self'", "<Counter/><Shared/>"));
+    // A component on the page reads the page's state, so the page carries it: since FEEDBACK75.md's
+    // Q-1058 (the user's choice, branch feedback75) a page carries only the states its components
+    // read, and `Shared`, a view the server renders, reads it alone.
+    let src = page("/p", "default-src 'self'", "<Counter/><Shared/><Reads/>") + "component Reads() {\n    <b id=\"r\">{shared}</b>\n}\n";
+    let d = dir("csp", &src);
     let (_g, port, _log) = serve_logged(&d, &[]);
     let (policy, body) = fetch(port, "/p");
     let hashes = script_hashes(&body);

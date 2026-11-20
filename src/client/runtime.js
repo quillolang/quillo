@@ -1442,6 +1442,15 @@ function coerce(t, s) {
 // A whole float is written as the server writes it, `2.0` (`writeJSON` writes it), so
 // that it is read back as a float on either side (FEEDBACK55.md, Q-775; branch feedback55);
 // `wire` "tools": as a number, for the developer's tools.
+// A page's object made of getters on its prototype, with no keys of its own, and a toJSON (a
+// passkey's PublicKeyCredential, a PushSubscription, a GeolocationPosition): what its toJSON gives,
+// as JSON.stringify writes it, where it was {} (FEEDBACK78.md, Q-1159; branch feedback75). Taken
+// once: a toJSON that gives such an object again gives {}.
+const gettersOnly = (v) => v.constructor !== Object && typeof v.toJSON === "function" && Object.keys(v).length === 0;
+const ownJSON = (v) => {
+  const j = v.toJSON();
+  return j !== null && typeof j === "object" && isMap(j) && gettersOnly(j) ? {} : j;
+};
 function toJSON(v, wire) {
   if (isNil(v)) return null;
   if (v instanceof Err) return { error: toJSON(v.error, wire) };
@@ -1452,6 +1461,7 @@ function toJSON(v, wire) {
   if (v instanceof Dec) return wire ? { $dec: decText(v) } : decText(v);
   if (typeof v === "bigint") return wire ? { $int: String(v) } : rawNum(String(v));
   if (v instanceof Fl) return wire === "tools" ? v.f : rawNum(flJSON(v.f));
+  if (isMap(v) && gettersOnly(v)) return toJSON(ownJSON(v), wire);
   if (isMap(v)) {
     // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
     const ord = ordOf(v), ks = ord === undefined ? Object.keys(v) : mkeys(v);
@@ -5978,6 +5988,7 @@ async function rpcSend(name, args, live, idem) {
     if (typeof Blob !== "undefined" && v instanceof Blob) { files.push(v); return { $quillo_file: files.length - 1 }; }
     if (typeof FileList !== "undefined" && v instanceof FileList) return Array.from(v, pack);
     if (Array.isArray(v)) return v.map(pack);
+    if (isMap(v) && gettersOnly(v)) return pack(ownJSON(v));
     // In the order set, and a map of one key that starts with `$` as `toJSON` writes it
     // (FEEDBACK55.md, Q-875 and its review; branch feedback55).
     if (isMap(v)) {

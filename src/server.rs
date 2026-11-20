@@ -382,9 +382,11 @@ pub(crate) fn known_scheme(req: &HttpRequest) -> Option<&'static str> {
 /// this machine, and never the visitor's header the app passed on with it (Q-986, review). No other
 /// server looks at the word: the app's own verdict is its proxy's, and a word a service echoed to a
 /// visitor must decide nothing there (recheck).
+/// A request whose address the app's word gave (`httpd::from_app`) came from a peer on this machine
+/// all the same, as its mark says (FEEDBACK75.md, Q-1064, review; branch feedback75).
 pub(crate) fn scheme_by<S: AsRef<str>>(mut last: impl FnMut(&str) -> Option<S>, peer: &str) -> Option<&'static str> {
     let fcgi = crate::httpd::web_server_scheme();
-    if crate::httpd::takes_app_word() && local_peer(peer) {
+    if crate::httpd::takes_app_word() && (local_peer(peer) || last(FROM_APP).is_some()) {
         if let Some(scheme) = last(crate::service::SCHEME_WORD).and_then(|w| crate::service::scheme_of_word(w.as_ref())) {
             return Some(scheme);
         }
@@ -409,6 +411,24 @@ fn local_peer(peer: &str) -> bool {
         Err(_) => false,
     }
 }
+
+/// In a service its app started, the app's policies for the request's path (`service::POLICY_WORD`),
+/// on a request from the app (the mark `FROM_APP`, which httpd's parser puts on it alone): below the
+/// program's own `site_headers` rules, before its page is written, so that the policy the visitor
+/// gets lets Quillo's scripts through (FEEDBACK75.md, Q-1087, review; branch feedback75). The word
+/// goes from the request either way.
+fn apps_policies(req: &mut HttpRequest) -> Vec<(String, Option<String>)> {
+    let Some(i) = req.headers.iter().rposition(|(k, _)| k.eq_ignore_ascii_case(crate::service::POLICY_WORD)) else { return Vec::new() };
+    let from_app = req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(FROM_APP));
+    let policies = if from_app { crate::service::policies_of_word(&req.headers[i].1).unwrap_or_default() } else { Vec::new() };
+    req.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(crate::service::POLICY_WORD));
+    policies.into_iter().map(|(k, v)| (k, Some(v))).collect()
+}
+
+/// The mark httpd's parser puts on a request that came from its app, a peer on this machine, whose
+/// address it took from the app's word (`httpd::from_app`) (FEEDBACK75.md, Q-1064, review; branch
+/// feedback75).
+pub(crate) const FROM_APP: &str = "x-quillo-from-app";
 
 /// The scheme an `X-Forwarded-Proto` value says, `http` or `https`, by its last item, so that
 /// `http, https` and the two in two headers are one (RFC 9110, 5.3); anything else, none.
@@ -533,14 +553,19 @@ pub fn route_path(path: &str) -> String {
     // Already in the form this gives, as nearly every path is: `/` and pieces, none empty, no
     // `%` to decode. The same text, without splitting, joining and `format!` (branch speed-bun,
     // 2026-11-09, the server benchmark).
-    let b = path.as_bytes();
-    if b.first() == Some(&b'/') && (b.len() == 1 || b[b.len() - 1] != b'/') && memchr::memchr(b'%', b).is_none() && memchr::memmem::find(b, b"//").is_none() {
+    if route_path_already(path) {
         return path.to_string();
     }
     // A `%2F` stays inside its piece, as routes keep it: `/payments%2Freturn` is one piece, not
     // `/payments/return`, which a rule of that path would then cover (found in review).
     let pieces: Vec<String> = path.split('/').filter(|s| !s.is_empty()).map(|s| percent_decode(s, false).replace('/', "%2F")).collect();
     format!("/{}", pieces.join("/"))
+}
+
+/// Whether `route_path` gives `path` as it is.
+fn route_path_already(path: &str) -> bool {
+    let b = path.as_bytes();
+    b.first() == Some(&b'/') && (b.len() == 1 || b[b.len() - 1] != b'/') && memchr::memchr(b'%', b).is_none() && memchr::memmem::find(b, b"//").is_none()
 }
 
 /// A `Host` as it names a host: lower case, without a trailing dot or the default port.
@@ -630,21 +655,52 @@ impl Interp {
                 r.headers.push(("cache-control".into(), "no-store".into()));
                 return r;
             }
-            let mut resp = crate::service::pass_on(self, &url, &prefix, req);
+            // Its page is written with this program's policies, which go with the request: those it
+            // was given, it decided, its own rules winning (FEEDBACK75.md, Q-1087, review; branch
+            // feedback75).
+            let rules = if self.site.headers.is_empty() && self.parent_rules.is_none() { Vec::new() } else { self.rules_for_mount(path) };
+            let policies: Vec<(String, String)> = rules.iter().filter_map(|(k, v)| v.as_ref().filter(|_| is_policy(k)).map(|v| (k.clone(), v.clone()))).collect();
+            let word = crate::service::policy_word(&policies);
+            let mut resp = crate::service::pass_on(self, &url, &prefix, req, word.as_deref());
             if self.site.offline.is_some() {
                 crate::pwa::unmarked(&mut resp);
             }
+            // A service that took them decided; a page from one that did not (one run apart, by
+            // `--service-url`, takes no word of its app's) keeps the policy it came with, as in
+            // 0.8.8: this one would block its scripts.
+            let taken = resp.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(crate::service::POLICY_TAKEN));
+            if taken {
+                resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(crate::service::POLICY_TAKEN));
+            }
+            let decided: Vec<String> = if taken || is_html(&resp) { policies.into_iter().map(|(k, _)| k).collect() } else { Vec::new() };
+            parent_headers_into(&rules, &mut resp, &decided);
             return resp;
         }
         self.pending_stream = None;
         // One a request made and nothing took (a job that gave back a stream).
         drop(crate::stream::take_made());
+        let mut mounted = None;
+        // Its own page lets Quillo's scripts through this program's policy as well as its own: its
+        // rules below its own, before its island step (FEEDBACK75.md, Q-1087, review; branch
+        // feedback75).
+        let under = |prefix: &str| path == prefix || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'));
+        let parent = match self.mounts.iter().position(|(p, _)| under(p)) {
+            Some(i) if !self.site.headers.is_empty() || self.parent_rules.is_some() => Some(self.mount_rules_for(i, path)),
+            _ => None,
+        };
         for (prefix, sub) in self.mounts.iter_mut() {
             if path == prefix.as_str() || path.starts_with(&format!("{}/", prefix)) {
                 let rest = &req.url[prefix.len()..];
                 let mut inner = req.clone();
                 inner.url = if rest.is_empty() || rest.starts_with('?') { format!("/{}", rest) } else { rest.to_string() };
                 sub.streams_direct = self.streams_direct;
+                // What its own rules leave out (`null`) stays out (Q-1087, review).
+                let left_out: Vec<String> = if parent.is_none() {
+                    Vec::new()
+                } else {
+                    sub.site_rules(inner.url.split('?').next().unwrap_or("/")).into_iter().filter(|(_, v)| v.is_none()).map(|(k, _)| k).collect()
+                };
+                sub.parent_rules = parent.clone();
                 let mut resp = sub.handle(&inner);
                 // Only the main program's worker marks are Quillo's (FEEDBACK67.md, B.2, third
                 // review; branch pwa).
@@ -659,8 +715,15 @@ impl Interp {
                     resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(crate::stream::MARK));
                     resp.body = crate::defer::whole(sub, page);
                 }
-                return resp;
+                mounted = Some((resp, left_out));
+                break;
             }
+        }
+        if let Some((mut resp, left_out)) = mounted {
+            if let Some(rules) = &parent {
+                parent_headers_into(rules, &mut resp, &left_out);
+            }
+            return resp;
         }
         self.rendered_island = false;
         self.island_names.clear();
@@ -907,9 +970,33 @@ impl Interp {
         if html && req.method != "HEAD" && std::mem::take(&mut self.rendered_island) {
             let has = rfind_tag;
             let mut tags = String::new();
+            // The page's bundle first: what its code reads decides what the page carries.
+            let whole = script_tag_for(&resp.body, b"/_quillo/quillo.js");
+            let page_ref = if whole {
+                None
+            } else {
+                let names = std::mem::take(&mut self.island_names);
+                Some(self.bundle_for_page(&names))
+            };
             // The page's states as its render left them, for its components to start from, before
-            // the code that reads them (FEEDBACK68.md; branch global-state).
-            let page = if self.page_states.is_empty() { Vec::new() } else { crate::value::page_values(&self.globals) };
+            // the code that reads them (FEEDBACK68.md; branch global-state): only those a
+            // component of the page's bundle reads (or, for the whole program's bundle, any
+            // component). Every page state went, a user row with its password hash and an `env`
+            // secret no component read among them (FEEDBACK75.md, Q-1058, the user's choice;
+            // branch feedback75).
+            let page = if self.page_states.is_empty() {
+                Vec::new()
+            } else {
+                let read = match &page_ref {
+                    Some(Some(p)) => p.states.clone(),
+                    _ => crate::client::all_states(self),
+                };
+                if read.is_empty() {
+                    Vec::new()
+                } else {
+                    crate::value::page_values(&self.globals).into_iter().filter(|(n, _)| read.iter().any(|r| r == n.as_str())).collect()
+                }
+            };
             if !page.is_empty() {
                 let mut m = crate::value::Map::new();
                 for (name, v) in page {
@@ -933,12 +1020,11 @@ impl Interp {
             };
             // Only the code of the components on the page (and what they
             // use), at an address that changes when it does.
-            if !script_tag_for(&resp.body, b"/_quillo/quillo.js") {
-                let names = std::mem::take(&mut self.island_names);
+            if let Some(page_ref) = page_ref {
                 // Its bundle, after the runtime file every page shares when
                 // it takes the runtime from there (FEEDBACK7.md, Q-064;
                 // branch feedback7-fixes).
-                let srcs = match self.bundle_for_page(&names) {
+                let srcs = match page_ref {
                     Some(page) => {
                         // The libraries its components use first (branch js-libraries).
                         let mut s = page.libs.clone();
@@ -1048,7 +1134,7 @@ impl Interp {
                 if self.streams_direct {
                     resp.headers.push((crate::stream::MARK.into(), "1".into()));
                     resp.headers.push(("x-accel-buffering".into(), "no".into()));
-                    self.pending_stream = Some(crate::stream::Pending { f: Value::Nil, events: false, page: Some(page) });
+                    self.pending_stream = Some(crate::stream::Pending { f: Value::Nil, events: false, page: Some(page), reader: None });
                 } else {
                     resp.body = crate::defer::whole(self, page);
                 }
@@ -1572,17 +1658,57 @@ impl Interp {
         }
     }
 
-    /// What every answer carries that its route did not set: the program's `site_headers`, then
-    /// Quillo's own defaults. A page made from who the visitor is (it read the session or a
-    /// cookie) is `Cache-Control: private` with `Vary: Cookie`, so a shared cache does not hand
-    /// it to the next visitor, and a page is not framed by another site, `X-Frame-Options:
-    /// SAMEORIGIN` (FEEDBACK31.md, Q-391; branch feedback27-35-fixes).
-    fn site_headers_into(&self, path: &str, sets_cookie: bool, resp: &mut HttpResponse) {
-        // On the path as routes read it (Q-537).
+    /// What a program this one mounts is given for `path` (`parent_rules`): this one's rules, and
+    /// below them those it was given itself (FEEDBACK75.md, Q-1087, review; branch feedback75).
+    pub(crate) fn rules_for_mount(&self, path: &str) -> Vec<(String, Option<String>)> {
+        let mut want = self.site_rules(path);
+        for (k, v) in self.parent_rules.iter().flat_map(|r| r.iter()) {
+            if !want.iter().any(|(n, _)| n == k) {
+                want.push((k.clone(), v.clone()));
+            }
+        }
+        want
+    }
+
+    /// `rules_for_mount` for the program mounted `i`th, kept where it is the same for every path
+    /// under its prefix (see `mount_rules`).
+    fn mount_rules_for(&mut self, i: usize, path: &str) -> Arc<Vec<(String, Option<String>)>> {
+        let prefix = &self.mounts[i].0;
+        if let Some((_, r)) = self.mount_rules.iter().find(|(p, _)| p == prefix) {
+            return r.clone();
+        }
+        let rules = Arc::new(self.rules_for_mount(path));
+        // Nothing deeper than the prefix, and no rules given from above (which may vary).
+        let deeper = |p: &str| {
+            let p = route_path(p);
+            p.len() > prefix.len() && p.starts_with(prefix.as_str()) && p.as_bytes()[prefix.len()] == b'/'
+        };
+        if self.parent_rules.is_none() && !self.site.headers.iter().any(|(p, _)| deeper(p)) {
+            let prefix = prefix.clone();
+            self.mount_rules.push((prefix, rules.clone()));
+        }
+        rules
+    }
+
+    /// The headers the program's `site_headers` rules give `path`: the longest rule's last.
+    fn site_rules(&self, path: &str) -> Vec<(String, Option<String>)> {
+        // None to look for: nothing made (FEEDBACK75.md, Q-1087, review: a mounted program's
+        // answers ask a program's rules three times; branch feedback75).
+        if self.site.headers.is_empty() {
+            return Vec::new();
+        }
+        // On the path as routes read it (Q-537), a rule's path too: each made only where it is not
+        // in that form already, and compared without making `p/` (Q-1087, review).
         let path = &route_path(path);
         let under = |p: &str| {
-            let p = route_path(p);
-            p == "/" || *path == p || path.starts_with(&format!("{}/", p))
+            let made;
+            let p = if route_path_already(p) {
+                p
+            } else {
+                made = route_path(p);
+                made.as_str()
+            };
+            p == "/" || path == p || (path.starts_with(p) && path.as_bytes().get(p.len()) == Some(&b'/'))
         };
         let mut want: Vec<(String, Option<String>)> = Vec::new();
         let mut rules: Vec<&(String, Vec<(String, Option<String>)>)> = self.site.headers.iter().filter(|(p, _)| under(p)).collect();
@@ -1593,6 +1719,25 @@ impl Interp {
                     Some(w) => w.1 = v.clone(),
                     None => want.push((k.clone(), v.clone())),
                 }
+            }
+        }
+        want
+    }
+
+    /// What every answer carries that its route did not set: the program's `site_headers`, then
+    /// Quillo's own defaults. A page made from who the visitor is (it read the session or a
+    /// cookie) is `Cache-Control: private` with `Vary: Cookie`, so a shared cache does not hand
+    /// it to the next visitor, and a page is not framed by another site, `X-Frame-Options:
+    /// SAMEORIGIN` (FEEDBACK31.md, Q-391; branch feedback27-35-fixes).
+    fn site_headers_into(&self, path: &str, sets_cookie: bool, resp: &mut HttpResponse) {
+        // The path as routes read it (Q-537) for the rules, and for what is said of it below, made
+        // only when something is: the rules' step made it first, and said the path as sent once it
+        // was made apart (FEEDBACK75.md, Q-1087, review; branch feedback75).
+        let mut want = self.site_rules(path);
+        // A mounted program's: the mounting program's rules, below its own (Q-1087, review).
+        for (k, v) in self.parent_rules.iter().flat_map(|r| r.iter()) {
+            if !want.iter().any(|(n, _)| n == k) {
+                want.push((k.clone(), v.clone()));
             }
         }
         let html = is_html(resp);
@@ -1642,7 +1787,7 @@ impl Interp {
             let mut tell: Option<bool> = None;
             let mut changed: Vec<(String, String, Option<String>)> = Vec::new();
             if resp.headers.iter().any(|(k, _)| cdn(k)) {
-                let tell = *tell.get_or_insert_with(|| !said_here(path));
+                let tell = *tell.get_or_insert_with(|| !said_here(&route_path(path)));
                 resp.headers.retain(|(k, v)| {
                     if tell && cdn(k) && v != DROPPED {
                         changed.push((k.to_ascii_lowercase(), v.clone(), None));
@@ -1655,7 +1800,7 @@ impl Interp {
                     continue;
                 }
                 if let Some(own) = kept_by_visitor_alone(v) {
-                    if *tell.get_or_insert_with(|| !said_here(path)) {
+                    if *tell.get_or_insert_with(|| !said_here(&route_path(path))) {
                         changed.push(("cache-control".into(), std::mem::replace(v, own.clone()), Some(own)));
                     } else {
                         *v = own;
@@ -1663,7 +1808,7 @@ impl Interp {
                 }
             }
             if !changed.is_empty() {
-                said_private(path, || {
+                said_private(&route_path(path), || {
                     changed
                         .iter()
                         .map(|(k, v, own)| match own {
@@ -2027,8 +2172,10 @@ impl Interp {
         // `for [...]` names the services that may call it, over their signed path: no page may,
         // nor anyone with curl. It was checked on that path only (FEEDBACK51.md, Q-641; branch
         // feedback51-fixes).
-        if let Some(callers) = self.fn_callers.get(name) {
-            return rpc_error(404, &format!("no server fn `{}` for pages: it takes calls from {} only", name, callers.join(", ")));
+        // Said as for a name that is no server fn: the services it takes calls from were named to
+        // any caller (FEEDBACK75.md, Q-1086; branch feedback75).
+        if self.fn_callers.contains_key(name) {
+            return rpc_error(404, &format!("no server fn `{}`", name));
         }
         let Some(Value::Func(c)) = lookup(&self.globals, name) else {
             return rpc_error(404, &format!("no server fn `{}`", name));
@@ -2092,9 +2239,17 @@ impl Interp {
                 _ => return bad(),
             }
         };
-        let args = match take_args(self, &c.def, args) {
-            Ok(a) => a,
-            Err(msg) => return rpc_error(400, &msg),
+        let args = match make_args(self, &c.def, args) {
+            Ok(Ok(a)) => a,
+            Ok(Err(msg)) => return rpc_error(400, &msg),
+            // A failure while an argument is made (a record's default that failed) is the
+            // function's own, hidden as its body's is, its text to the log: its file, line and
+            // message went to any caller in the 400 (FEEDBACK75.md, Q-1086; branch feedback75).
+            Err((p, Ctrl::Error(e))) => {
+                eprintln!("quillo: error in server fn `{}`, making its argument `{}`: {:#}", name, p, e);
+                return rpc_failed(name, &e);
+            }
+            Err((p, _)) => return rpc_error(400, &format!("argument `{}` of `{}` could not be made", p, c.def.name)),
         };
         let query = Value::map(parse_urlencoded(qs));
         let mut reqmap = build_request(req, path, &query);
@@ -4674,6 +4829,24 @@ pub(crate) fn allow_own(resp: &mut HttpResponse, scripts: &[String], styles: &[&
     }
 }
 
+/// The program's `site_headers` on an answer a program it mounts, or a service it serves under a
+/// prefix, made (`rules`, as `Interp::rules_for_mount` gives them): each header the answer lacks, as
+/// on the program's own paths, the mount's own rules and the route's headers winning. Its CSP, HSTS
+/// and Referrer-Policy never reached `/shop/*` or `/notes/*` (FEEDBACK75.md, Q-1087; branch
+/// feedback75). A mounted program's page has this program's policy from its own step
+/// (`parent_rules`), with Quillo's scripts let through; what its own rules leave out (`left_out`)
+/// is not added here. A service's page comes with this policy too, which the app sends with the
+/// request (`service::POLICY_WORD`) (Q-1087, review).
+fn parent_headers_into(rules: &[(String, Option<String>)], resp: &mut HttpResponse, left_out: &[String]) {
+    for (k, v) in rules {
+        if let Some(v) = v {
+            if resp.header(k).is_none() && !left_out.contains(k) {
+                resp.headers.push((k.clone(), v.clone()));
+            }
+        }
+    }
+}
+
 fn error_page(msg: &str) -> HttpResponse {
     HttpResponse {
         status: 500,
@@ -4865,15 +5038,34 @@ pub(crate) fn accepts_gzip(req: &HttpRequest) -> bool {
     star.unwrap_or(false)
 }
 
+/// Whether an answer of this type is gzipped for a client that takes it: text, JSON, scripts, SVG.
+fn gzips(ctype: &str) -> bool {
+    ctype.starts_with("text/") || ctype.contains("json") || ctype.contains("javascript") || ctype.contains("svg")
+}
+
+/// For a service's answer of more than a megabyte passed on as it comes (`service::pass_on`): whether
+/// it is gzipped as it goes, by `compress`'s rule, its headers made so (no length, the coding, `Vary`).
+/// A 3.6 MB text went out whole and uncompressed (FEEDBACK75.md, Q-1071, review; branch feedback75).
+pub(crate) fn gzipped_as_it_goes(accepts: bool, resp: &mut HttpResponse) -> bool {
+    if resp.status != 200 || resp.header("content-encoding").is_some() || !gzips(resp.header("content-type").unwrap_or("")) {
+        return false;
+    }
+    vary_by_encoding(resp);
+    if !accepts {
+        return false;
+    }
+    resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case("content-length"));
+    resp.headers.push(("content-encoding".into(), "gzip".into()));
+    true
+}
+
 fn compress(req: &HttpRequest, resp: &mut HttpResponse) {
     use std::io::Write;
     // A part of a file stays as it is: its byte range is of the file.
     if resp.status != 200 || resp.body.len() < 1024 || resp.header("content-encoding").is_some() {
         return;
     }
-    let ctype = resp.header("content-type").unwrap_or("");
-    let text = ctype.starts_with("text/") || ctype.contains("json") || ctype.contains("javascript") || ctype.contains("svg");
-    if !text {
+    if !gzips(resp.header("content-type").unwrap_or("")) {
         return;
     }
     // The copy not compressed varies by the header too: a shared cache that kept it from a
@@ -4954,7 +5146,9 @@ impl Worker {
 
     /// Answers a request, a streamed answer on `sink` (the connection) as it
     /// is made. The caller holds the interpreter lock.
-    pub(crate) fn answer(&mut self, app: &Arc<App>, req: HttpRequest, sink: Option<&mut dyn crate::stream::Sink>) -> Answer {
+    pub(crate) fn answer(&mut self, app: &Arc<App>, mut req: HttpRequest, sink: Option<&mut dyn crate::stream::Sink>) -> Answer {
+        let mut app_rules = if crate::httpd::takes_app_word() { apps_policies(&mut req) } else { Vec::new() };
+        let took_policies = !app_rules.is_empty();
         if let Some(token) = &app.launch_token {
             if let Some(resp) = launch_gate(&req, token).filter(|_| !is_job_request(&req)) {
                 return Answer::Respond(resp);
@@ -5075,6 +5269,7 @@ impl Worker {
                 (Some(it), _) => match {
                     it.streams_direct = sink.is_some();
                     it.request_id = Some(rid.clone());
+                    it.parent_rules = if app_rules.is_empty() { None } else { Some(Arc::new(std::mem::take(&mut app_rules))) };
                     run_program(it, &req)
                 } {
                     Some(r) => r,
@@ -5098,6 +5293,11 @@ impl Worker {
                 (None, Loaded::Ready(_)) => unreachable!(),
             }
         };
+        // The app's policies taken, as the app is told, which otherwise leaves them off the page
+        // (FEEDBACK75.md, Q-1087, review; branch feedback75).
+        if took_policies {
+            resp.headers.push((crate::service::POLICY_TAKEN.into(), "1".into()));
+        }
         // A page asking whether the save changed it (`x-quillo-hot: <its version>`): what the
         // version it was made with renders now, by the same request, as a print beside this one.
         if app.watch && is_html(&resp) {
@@ -5647,20 +5847,110 @@ const LAUNCH_COOKIE: &str = "quillo_launch";
 /// in; its value is never written to a log (see `log_url`).
 pub const LAUNCH_PARAM: &str = "_quillo_launch";
 
-/// A URL as the log writes it: a desktop window's launch token masked.
+/// A URL as the log writes it: the values of query parameters whose names mark a secret written
+/// `[hidden]`, as a desktop window's launch token was. A password, a sign-in or reset link's token,
+/// OAuth's `code` and `state` and SAML's messages in a URL went to the log, kept for months and
+/// read by more people than the database (FEEDBACK78.md, Q-1158; branch feedback75). A URL with no
+/// query is given back as it is, and one with none of those names after one look at each name.
 pub fn log_url(u: &str) -> std::borrow::Cow<'_, str> {
     let Some((path, q)) = u.split_once('?') else { return std::borrow::Cow::Borrowed(u) };
-    if !q.split('&').any(|p| p.split_once('=').map_or(false, |(k, v)| !v.is_empty() && percent_decode(k, true) == LAUNCH_PARAM)) {
-        return std::borrow::Cow::Borrowed(u);
+    // One pass: the text is made only from the first pair to hide on, the URL before it as it was.
+    let mut out: Option<String> = None;
+    let mut at = path.len() + 1;
+    for p in q.split('&') {
+        let hide = hidden_in_log(p);
+        match &mut out {
+            None if hide => {
+                let mut o = String::with_capacity(u.len() + 8);
+                o.push_str(&u[..at]);
+                out = Some(o);
+            }
+            None => {}
+            Some(o) => o.push('&'),
+        }
+        if let Some(o) = &mut out {
+            if hide {
+                o.push_str(p.split_once('=').map_or(p, |(k, _)| k));
+                o.push_str("=[hidden]");
+            } else {
+                o.push_str(p);
+            }
+        }
+        at += p.len() + 1;
     }
-    let parts: Vec<String> = q
-        .split('&')
-        .map(|p| match p.split_once('=') {
-            Some((k, v)) if !v.is_empty() && percent_decode(k, true) == LAUNCH_PARAM => format!("{}=[hidden]", k),
-            _ => p.to_string(),
-        })
-        .collect();
-    std::borrow::Cow::Owned(format!("{}?{}", path, parts.join("&")))
+    out.map_or(std::borrow::Cow::Borrowed(u), std::borrow::Cow::Owned)
+}
+
+/// The names whose values the log does not write: the suggestion's (FEEDBACK78.md, Q-1158), with
+/// `passwd` and `pwd`, as the last word of a name too (`access_token`, `api-key`, `clientSecret`,
+/// `user.password`, `user[password]`, `API_KEY`), and signatures, credentials, verifiers and
+/// tokens of other names (`X-Amz-Signature`, `X-Amz-Credential`, `code_verifier`, `sig`, `jwt`,
+/// `auth`) (Q-1158, review).
+const SECRET_NAMES: &[&str] = &[
+    "password", "passwd", "pwd", "pass", "token", "code", "secret", "key", "otp", "state", "samlrequest", "samlresponse", "ticket", "sig", "signature", "credential", "credentials", "verifier", "jwt",
+    "auth",
+];
+
+/// Words that mark a secret wherever they are in a name (`id_token_hint`, `password_confirm`).
+const SECRET_ANYWHERE: &[&str] = &["password", "passwd", "token", "secret", "signature", "credential", "credentials", "verifier", "jwt"];
+
+/// What a name's last word ends with that marks a secret, words run together (`apikey`,
+/// `accesstoken`, `clientsecret`, `newpassword`).
+const SECRET_ENDS: &[&str] = &["key", "token", "secret", "password"];
+
+/// Whether a query's `name=value` has a value the log writes `[hidden]` (see `log_url`): the launch
+/// token's, or a secret's. A name is decoded only where it has a `%` or a `+`.
+fn hidden_in_log(pair: &str) -> bool {
+    let Some((k, v)) = pair.split_once('=') else { return false };
+    if v.is_empty() || k.is_empty() {
+        return false;
+    }
+    let one_of = |w: &str, list: &[&str]| list.iter().any(|s| w.eq_ignore_ascii_case(s));
+    let ends = |w: &str| SECRET_ENDS.iter().any(|s| w.len() >= s.len() && w.as_bytes()[w.len() - s.len()..].eq_ignore_ascii_case(s.as_bytes()));
+    // One small word, as most names are (`page`, `q`, `password`): itself, and its end.
+    let (mut plain, mut coded) = (true, false);
+    for &b in k.as_bytes() {
+        match b {
+            b'a'..=b'z' | b'0'..=b'9' => {}
+            b'%' | b'+' => (plain, coded) = (false, true),
+            _ => plain = false,
+        }
+    }
+    if plain {
+        return one_of(k, SECRET_NAMES) || ends(k);
+    }
+    let decoded;
+    let name = if coded {
+        decoded = percent_decode(k, true);
+        decoded.as_str()
+    } else {
+        k
+    };
+    if name == LAUNCH_PARAM || one_of(name, SECRET_NAMES) {
+        return true;
+    }
+    // Its words: between `_`, `-`, `.`, `[` and `]`, and in each from a capital that follows a
+    // small letter or a digit, or that starts a word after capitals (`APIKey`: `API`, `Key`); one
+    // with no small letter is one word (`API_KEY`'s `KEY`).
+    let mut last = "";
+    for part in name.split(['_', '-', '.', '[', ']']).filter(|p| !p.is_empty()) {
+        let b = part.as_bytes();
+        let mut from = 0;
+        for i in 1..b.len() {
+            let cut = b[i].is_ascii_uppercase() && (b[i - 1].is_ascii_lowercase() || b[i - 1].is_ascii_digit() || (b[i - 1].is_ascii_uppercase() && b.get(i + 1).is_some_and(u8::is_ascii_lowercase)));
+            if cut {
+                if one_of(&part[from..i], SECRET_ANYWHERE) {
+                    return true;
+                }
+                from = i;
+            }
+        }
+        last = &part[from..];
+        if one_of(last, SECRET_ANYWHERE) {
+            return true;
+        }
+    }
+    one_of(last, SECRET_NAMES) || ends(last)
 }
 
 /// Marks a version of the program as replaced by a reload: itself, what it

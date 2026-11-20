@@ -3221,6 +3221,7 @@ impl Checker {
         }
         self.check_nesting(&order);
         self.page_states_through_calls(&order);
+        self.page_states_to_pages(&order);
         for (file, e) in std::mem::take(&mut self.natives) {
             let sig = native_sig(&e, &file);
             let short = file.rsplit('/').next().unwrap_or(&file).to_string();
@@ -4798,48 +4799,60 @@ impl Checker {
             return;
         }
         let defs: Vec<(&Arc<str>, &Arc<FnDef>)> = order.iter().filter_map(|it| if let Stmt::Fn(d) = &it.stmt { Some((&it.file, d)) } else { None }).collect();
-        // Each function: the page states it reads itself, and the functions it calls.
-        let mut reads: HashMap<String, (Option<String>, Vec<String>)> = HashMap::new();
-        for (_, d) in &defs {
-            let params: HashSet<String> = d.params.iter().map(|p| p.name.to_string()).collect();
-            let mut own = None;
-            walk_fn(d, &mut |x| {
-                if let Expr::Ident(n, _) = x {
-                    if own.is_none() && states.contains(n.as_str()) && !params.contains(n.as_str()) {
-                        own = Some(n.to_string());
-                    }
-                }
-            });
-            let mut calls = Vec::new();
-            called_names(&d.body, &mut calls);
-            reads.insert(d.name.clone(), (own, calls));
-        }
-        // What each reaches: (the page state, through which function), followed until nothing new.
-        let mut reach: HashMap<String, (String, String)> = reads.iter().filter_map(|(f, (own, _))| own.clone().map(|s| (f.clone(), (s, f.clone())))).collect();
-        loop {
-            let mut more = Vec::new();
-            for (f, (_, calls)) in &reads {
-                if reach.contains_key(f) {
-                    continue;
-                }
-                if let Some(r) = calls.iter().find_map(|c| reach.get(c)) {
-                    more.push((f.clone(), r.clone()));
-                }
-            }
-            if more.is_empty() {
-                break;
-            }
-            reach.extend(more);
-        }
-        for (file, d) in defs {
+        let graph = CallGraph::of(defs.iter().map(|(_, d)| *d), &|n| states.contains(n));
+        // What each reaches: (the page state, through which function), from those that read one
+        // themselves up to all who call them, once each: a fixpoint over every function took a
+        // chain of 16,000 calls 4.5 s (FEEDBACK75.md, Q-1058, review; branch feedback75).
+        let mut through: Vec<Option<usize>> = vec![None; defs.len()];
+        graph.reach(&mut (0..defs.len()).filter(|&i| graph.reads[i].is_some()), &mut through);
+        for (i, (file, d)) in defs.iter().enumerate() {
             if !d.server {
                 continue;
             }
-            if let Some((state, through)) = reach.get(&d.name) {
-                if through != &d.name {
-                    let msg = format!("`{}` is the page's state, and server fn `{}` runs for no page (it reads it through `{}`): pass it as an argument", state, d.name, through);
-                    self.diag_at(file.clone(), d.line, Severity::Error, msg);
-                }
+            if let Some(t) = through[i].filter(|&t| t != i) {
+                let state = graph.reads[t].as_deref().unwrap_or_default();
+                let msg = format!("`{}` is the page's state, and server fn `{}` runs for no page (it reads it through `{}`): pass it as an argument", state, d.name, defs[t].1.name);
+                self.diag_at((*file).clone(), d.line, Severity::Error, msg);
+            }
+        }
+    }
+
+    /// A page state a component reads goes, whole, into the HTML of each page that shows the
+    /// component: one made from `env`, a file or a `select *` row (a user's password hash, a TOTP
+    /// seed, an API key) is said here, as a warning, the user's choice (FEEDBACK75.md, Q-1058;
+    /// branch feedback75). Through the program's functions too, on either side, followed to the
+    /// end. A name a function takes as a parameter is its own.
+    fn page_states_to_pages(&mut self, order: &[Item]) {
+        let states: Vec<(Arc<str>, String, Expr, u32)> = order.iter().filter_map(|it| if let Stmt::State(n, e, l) = &it.stmt { Some((it.file.clone(), n.clone(), e.clone(), *l)) } else { None }).collect();
+        if states.is_empty() {
+            return;
+        }
+        let names: HashSet<&str> = states.iter().map(|s| s.1.as_str()).collect();
+        let defs: Vec<&Arc<FnDef>> = order.iter().filter_map(|it| if let Stmt::Fn(d) = &it.stmt { Some(d) } else { None }).collect();
+        let graph = CallGraph::of(defs.iter().copied(), &|n| names.contains(n));
+        let own_source: Vec<Option<&'static str>> = defs.iter().map(|d| server_source(&d.body)).collect();
+        let mut source_of: Vec<Option<usize>> = vec![None; defs.len()];
+        graph.reach(&mut (0..defs.len()).filter(|&i| own_source[i].is_some()), &mut source_of);
+        for (file, name, init, line) in &states {
+            let from = server_source(init).or_else(|| {
+                let mut calls = Vec::new();
+                called_names(init, &mut calls);
+                calls.iter().find_map(|c| graph.index.get(c.as_str()).and_then(|&i| source_of[i]).and_then(|j| own_source[j]))
+            });
+            let Some(from) = from else { continue };
+            let readers: Vec<usize> = (0..defs.len()).filter(|&i| graph.all_reads[i].iter().any(|r| r == name)).collect();
+            if readers.is_empty() {
+                continue;
+            }
+            let mut reads: Vec<Option<usize>> = vec![None; defs.len()];
+            graph.reach(&mut readers.into_iter(), &mut reads);
+            let reader = defs.iter().enumerate().find(|(i, d)| d.component && reads[*i].is_some()).map(|(_, d)| d);
+            if let Some(c) = reader {
+                let msg = format!(
+                    "`{}` is a page state that <{}> reads, so its whole value is written into each page that shows <{}>, and it comes from {}: give the component what it shows, as a prop or a state of those fields alone",
+                    name, c.name, c.name, from
+                );
+                self.diag_at(file.clone(), *line, Severity::Warning, msg);
             }
         }
     }
@@ -11505,6 +11518,105 @@ impl<'a, 'c> GetWalk<'a, 'c> {
         }
         self.o
     }
+}
+
+/// Where code reads what is the server's own, as a page state's warning says it
+/// (`page_states_to_pages`): `env`, a file, or a `select *` row with every column.
+/// The program's functions as `page_states_through_calls` and `page_states_to_pages` follow them:
+/// for each, the page states it reads where nothing of its own binds the name (a parameter, a
+/// `let`, a loop's), and who calls it, by a call, a pipe or a tag (`<Shows/>`, a view a component
+/// shows) (FEEDBACK75.md, Q-1058, review; branch feedback75).
+struct CallGraph<'a> {
+    index: HashMap<&'a str, usize>,
+    /// The first page state each reads itself, and all of them.
+    reads: Vec<Option<String>>,
+    all_reads: Vec<Vec<String>>,
+    callers: Vec<Vec<usize>>,
+}
+
+impl<'a> CallGraph<'a> {
+    fn of(defs: impl Iterator<Item = &'a Arc<FnDef>>, state: &dyn Fn(&str) -> bool) -> CallGraph<'a> {
+        use crate::client::Met;
+        let defs: Vec<&'a Arc<FnDef>> = defs.collect();
+        let index: HashMap<&'a str, usize> = defs.iter().enumerate().map(|(i, d)| (d.name.as_str(), i)).collect();
+        let mut reads = Vec::with_capacity(defs.len());
+        let mut all_reads = Vec::with_capacity(defs.len());
+        let mut callers: Vec<Vec<usize>> = vec![Vec::new(); defs.len()];
+        for (i, d) in defs.iter().enumerate() {
+            let mut read: Vec<String> = Vec::new();
+            let mut calls = Vec::new();
+            called_names(&d.body, &mut calls);
+            crate::client::free_fn(d, &mut Vec::new(), &mut |m, _| {
+                let n = match m {
+                    Met::Expr(Expr::Ident(n, _)) => n.as_str(),
+                    Met::Assigned(n) => n,
+                    Met::Tag(t) if t.starts_with(|c: char| c.is_ascii_uppercase()) => return calls.push(t.to_string()),
+                    Met::Tag(_) | Met::Expr(_) => return,
+                };
+                if state(n) && !read.iter().any(|r| r == n) {
+                    read.push(n.to_string());
+                }
+            });
+            for c in calls {
+                if let Some(&j) = index.get(c.as_str()) {
+                    if j != i && callers[j].last() != Some(&i) {
+                        callers[j].push(i);
+                    }
+                }
+            }
+            reads.push(read.first().cloned());
+            all_reads.push(read);
+        }
+        CallGraph { index, reads, all_reads, callers }
+    }
+
+    /// From `from` up to all who call them, each labelled with the one of `from` it came from: a
+    /// work list, each function once.
+    fn reach(&self, from: &mut dyn Iterator<Item = usize>, label: &mut [Option<usize>]) {
+        let mut work: Vec<usize> = Vec::new();
+        for i in from {
+            if label[i].is_none() {
+                label[i] = Some(i);
+                work.push(i);
+            }
+        }
+        while let Some(i) = work.pop() {
+            for &c in &self.callers[i] {
+                if label[c].is_none() {
+                    label[c] = label[i];
+                    work.push(c);
+                }
+            }
+        }
+    }
+}
+
+fn server_source(e: &Expr) -> Option<&'static str> {
+    let mut found = None;
+    walk_expr(e, &mut |x| {
+        if found.is_some() {
+            return;
+        }
+        found = match x {
+            Expr::Ident(n, _) if n == "env" => Some("`env`"),
+            Expr::Ident(n, _) if n == "read_file" => Some("a file (`read_file`)"),
+            Expr::Lit(Lit::Str(s)) if selects_every_column(s) => Some("a `select *` row"),
+            Expr::Template(parts) if parts.iter().any(|p| matches!(p, TPart::Lit(s) if selects_every_column(s))) => Some("a `select *` row"),
+            _ => None,
+        };
+    });
+    found
+}
+
+/// Whether SQL text selects every column: `select *` or `select t.*`, in any case.
+fn selects_every_column(sql: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    lower.match_indices("select").any(|(i, _)| {
+        let rest = lower[i + 6..].trim_start();
+        let rest = rest.strip_prefix("distinct").map_or(rest, str::trim_start);
+        let word: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        rest.starts_with('*') || (!word.is_empty() && rest[word.len()..].starts_with(".*"))
+    })
 }
 
 /// Names called in a body (not inside nested function definitions'

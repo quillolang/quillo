@@ -228,6 +228,19 @@ fn libs_of(it: &Interp, c: &Compiler) -> Vec<String> {
 }
 
 /// Every library's script, for the whole program's bundle.
+/// The page states any component of the program reads: what a page carries of them where it
+/// loads the whole program's bundle (`/_quillo/quillo.js`), worked out once for the program as it
+/// is loaded (FEEDBACK75.md, Q-1058; branch feedback75). None where it cannot be compiled: no
+/// component of it runs then.
+pub fn all_states(it: &Interp) -> Arc<Vec<String>> {
+    if let Some(s) = it.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).all_states.clone() {
+        return s;
+    }
+    let states = Arc::new(compiled(it, None).map(|(c, _)| c.states).unwrap_or_default());
+    it.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).all_states = Some(states.clone());
+    states
+}
+
 pub fn all_libs(it: &Interp) -> Vec<String> {
     let mut libs: Vec<&JsLib> = it.js_libs.values().filter(|l| l.export.is_none()).collect();
     libs.sort_by_key(|l| l.order);
@@ -343,6 +356,11 @@ fn program_text(it: &Interp, c: &Compiler, boots: bool, with_base: bool) -> Stri
 /// feedback7-fixes). With the program's runtime file, the bundle is the
 /// program's code alone, which takes the runtime from it (Q-064).
 pub fn bundle_for(it: &Interp, roots: &[String], rt: Option<&RuntimeFile>) -> Result<PageBundle, QuilloError> {
+    bundle_for_states(it, roots, rt).map(|(b, _)| b)
+}
+
+/// `bundle_for`, and the page states its code reads (see `Compiler::states`; FEEDBACK75.md, Q-1058).
+pub fn bundle_for_states(it: &Interp, roots: &[String], rt: Option<&RuntimeFile>) -> Result<(PageBundle, Arc<Vec<String>>), QuilloError> {
     let mut c = compiled(it, Some(roots))?;
     let set = components_of(it, &c.0);
     let mut sorted_roots = roots.to_vec();
@@ -356,15 +374,16 @@ pub fn bundle_for(it: &Interp, roots: &[String], rt: Option<&RuntimeFile>) -> Re
     let libs = libs_of(it, &c);
     let hints = hint_links(it, c.globals.keys().filter_map(|k| it.js_libs.get(k)));
     let t_keys = c.t_keys.clone().map(Arc::new);
+    let states = Arc::new(c.states.clone());
     if c.dev {
-        return Ok(PageBundle { js: dev::bundle(it, &c, boots), set, split: false, styles, libs, hints, t_keys });
+        return Ok((PageBundle { js: dev::bundle(it, &c, boots), set, split: false, styles, libs, hints, t_keys }, states));
     }
     if let Some(rt) = rt {
         if let Some(js) = rt.wrap(&program_text(it, &c, boots, false)) {
-            return Ok(PageBundle { js, set, split: true, styles, libs, hints, t_keys });
+            return Ok((PageBundle { js, set, split: true, styles, libs, hints, t_keys }, states));
         }
     }
-    Ok(PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false, styles, libs, hints, t_keys })
+    Ok((PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false, styles, libs, hints, t_keys }, states))
 }
 
 pub struct PageBundle {
@@ -393,6 +412,8 @@ pub struct PageRef {
     pub libs: Vec<String>,
     pub hints: String,
     pub t_keys: Option<Arc<Vec<String>>>,
+    /// The page states its code reads: the only ones the page carries (FEEDBACK75.md, Q-1058).
+    pub states: Arc<Vec<String>>,
 }
 
 /// The runtime as a file of its own, `/_quillo/r/<hash>.js`, which every
@@ -509,6 +530,8 @@ pub fn hash_text(js: &str) -> String {
 #[derive(Default)]
 pub struct Bundles {
     pub runtime: Option<Arc<RuntimeFile>>,
+    /// The page states any component of the program reads, once worked out (`all_states`).
+    all_states: Option<Arc<Vec<String>>>,
     /// The components a page rendered, sorted and joined, to its set's key.
     by_roots: HashMap<String, String>,
     by_set: HashMap<String, Made>,
@@ -533,6 +556,11 @@ impl Bundles {
     }
 
     pub fn keep(&mut self, roots: String, b: PageBundle) -> PageRef {
+        self.keep_with(roots, b, Arc::default())
+    }
+
+    /// `keep`, with the page states the bundle's code reads (FEEDBACK75.md, Q-1058).
+    pub fn keep_with(&mut self, roots: String, b: PageBundle, states: Arc<Vec<String>>) -> PageRef {
         let set = b.set.join(",");
         self.tick += 1;
         if self.by_roots.len() > 4 * KEPT {
@@ -543,7 +571,7 @@ impl Bundles {
             m.used = self.tick;
             return m.page.clone();
         }
-        let page = PageRef { hash: hash_text(&b.js), split: b.split, styles: b.styles, libs: b.libs, hints: b.hints, t_keys: b.t_keys };
+        let page = PageRef { hash: hash_text(&b.js), split: b.split, styles: b.styles, libs: b.libs, hints: b.hints, t_keys: b.t_keys, states };
         self.by_set.insert(set, Made { page: page.clone(), js: Arc::new(b.js), used: self.tick });
         crate::metrics::BUNDLES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         while self.by_set.len() > KEPT {
@@ -1616,6 +1644,9 @@ struct Compiler<'a> {
     /// made from parts (`sec.*`); `None` when one is worked out some other way. A page then
     /// carries only those (FEEDBACK30.md, Q-372; branch feedback27-35-fixes).
     t_keys: Option<Vec<String>>,
+    /// The page states the code reads, each once, in the order first read: what a page carries of
+    /// them (FEEDBACK75.md, Q-1058; branch feedback75).
+    states: Vec<String>,
     /// The lambda an `@event` or `@mount` attribute is, while it compiles (by
     /// its definition, which both of `function`'s passes see).
     handler: Option<*const FnDef>,
@@ -1924,6 +1955,182 @@ fn each_html_expr(el: &HtmlEl, f: &mut dyn FnMut(&Expr), fns: bool) {
     }
 }
 
+/// What `each_free` meets: an expression (an identifier only where nothing around it binds its
+/// name), a name assigned that nothing binds, or an element's tag.
+pub(crate) enum Met<'a> {
+    Expr(&'a Expr),
+    Assigned(&'a str),
+    Tag(&'a str),
+}
+
+/// As `each_expr_in`, with the names bound around each expression: a function's and a lambda's
+/// parameters, a `let`, a `state` or a `fn` in a block, a loop's and an arm's pattern. An identifier
+/// one of them binds is not met, so a lambda's `args` or a loop's `me` is not the builtin or the
+/// global of that name (FEEDBACK75.md, Q-1063 and Q-1058, review; branch feedback75). `bound` is
+/// as it was when it returns.
+pub(crate) fn each_free<'a>(e: &'a Expr, fns: bool, bound: &mut Vec<String>, f: &mut dyn FnMut(Met<'a>, &[String])) {
+    match e {
+        Expr::Ident(n, _) => {
+            if !bound.iter().any(|b| b == n.as_str()) {
+                f(Met::Expr(e), bound)
+            }
+            return;
+        }
+        _ => f(Met::Expr(e), bound),
+    }
+    match e {
+        Expr::Block(ss) => {
+            let at = bound.len();
+            free_stmts(ss, fns, bound, f);
+            bound.truncate(at);
+        }
+        Expr::Lambda(d) if fns => free_fn(d, bound, f),
+        Expr::Lambda(_) | Expr::Lit(_) | Expr::Ident(..) => {}
+        Expr::Template(parts) => parts.iter().for_each(|p| if let TPart::Expr(x) = p { each_free(x, fns, bound, f) }),
+        Expr::List(xs) => xs.iter().for_each(|x| each_free(x, fns, bound, f)),
+        Expr::Map(es) => es.iter().for_each(|(_, x)| each_free(x, fns, bound, f)),
+        Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => each_free(x, fns, bound, f),
+        Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) | Expr::Pipe(a, b, _) | Expr::Index(a, b, _) => {
+            each_free(a, fns, bound, f);
+            each_free(b, fns, bound, f)
+        }
+        Expr::Call(c, args, _) => {
+            each_free(c, fns, bound, f);
+            args.iter().for_each(|x| each_free(x, fns, bound, f))
+        }
+        Expr::If(c, a, b) => {
+            each_free(c, fns, bound, f);
+            each_free(a, fns, bound, f);
+            if let Some(b) = b {
+                each_free(b, fns, bound, f)
+            }
+        }
+        Expr::Match(x, arms, _) => {
+            each_free(x, fns, bound, f);
+            for a in arms {
+                let at = bound.len();
+                free_pattern(&a.pat, fns, bound, f);
+                bind_pattern(&a.pat, bound);
+                if let Some(g) = &a.guard {
+                    each_free(g, fns, bound, f)
+                }
+                each_free(&a.body, fns, bound, f);
+                bound.truncate(at);
+            }
+        }
+        Expr::For(p, i, b, _) => {
+            each_free(i, fns, bound, f);
+            let at = bound.len();
+            free_pattern(p, fns, bound, f);
+            bind_pattern(p, bound);
+            each_free(b, fns, bound, f);
+            bound.truncate(at);
+        }
+        Expr::While(i, b, _) => {
+            each_free(i, fns, bound, f);
+            each_free(b, fns, bound, f)
+        }
+        Expr::Reply(x, b, _) => {
+            each_free(x, fns, bound, f);
+            if let Some(b) = b {
+                each_free(b, fns, bound, f)
+            }
+        }
+        Expr::Html(el, _) => free_html(el, fns, bound, f),
+    }
+}
+
+/// A function's body with its parameters bound, their defaults first, as `each_free` does.
+pub(crate) fn free_fn<'a>(d: &'a FnDef, bound: &mut Vec<String>, f: &mut dyn FnMut(Met<'a>, &[String])) {
+    let at = bound.len();
+    for p in &d.params {
+        if let Some(x) = &p.default {
+            each_free(x, true, bound, f)
+        }
+        bound.push(p.name.to_string());
+    }
+    each_free(&d.body, true, bound, f);
+    bound.truncate(at);
+}
+
+fn free_stmts<'a>(ss: &'a [Stmt], fns: bool, bound: &mut Vec<String>, f: &mut dyn FnMut(Met<'a>, &[String])) {
+    for st in ss {
+        match st {
+            Stmt::Let(p, x, _) => {
+                each_free(x, fns, bound, f);
+                free_pattern(p, fns, bound, f);
+                bind_pattern(p, bound);
+            }
+            Stmt::State(n, x, _) => {
+                each_free(x, fns, bound, f);
+                bound.push(n.clone());
+            }
+            Stmt::Assign(n, _, x, _) => {
+                if !bound.iter().any(|b| b == n.as_str()) {
+                    f(Met::Assigned(n.as_str()), bound)
+                }
+                each_free(x, fns, bound, f)
+            }
+            Stmt::SetField(o, _, _, x, _) => {
+                each_free(o, fns, bound, f);
+                each_free(x, fns, bound, f)
+            }
+            Stmt::Expr(x) | Stmt::Return(Some(x), _) => each_free(x, fns, bound, f),
+            Stmt::Fn(d) => {
+                bound.push(d.name.clone());
+                if fns {
+                    free_fn(d, bound, f)
+                }
+            }
+            Stmt::Route(r) => each_free(&r.body, fns, bound, f),
+            Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) | Stmt::Return(None, _) => {}
+        }
+    }
+}
+
+/// A pattern's names, bound (`pattern_names` keeps one of each name in its list, which would take
+/// one from those bound outside).
+fn bind_pattern(p: &Pattern, bound: &mut Vec<String>) {
+    let mut names = Vec::new();
+    pattern_names(p, &mut names);
+    bound.extend(names);
+}
+
+/// A pattern's defaults, before its names are bound.
+fn free_pattern<'a>(p: &'a Pattern, fns: bool, bound: &mut Vec<String>, f: &mut dyn FnMut(Met<'a>, &[String])) {
+    match p {
+        Pattern::Record(fields) => {
+            for field in fields {
+                if let Some(d) = &field.default {
+                    each_free(d, fns, bound, f)
+                }
+                free_pattern(&field.pat, fns, bound, f)
+            }
+        }
+        Pattern::List(items, _) | Pattern::Alt(items) => items.iter().for_each(|q| free_pattern(q, fns, bound, f)),
+        Pattern::As(q, _) => free_pattern(q, fns, bound, f),
+        Pattern::Wild | Pattern::Bind(_) | Pattern::Lit(_) | Pattern::Type(_) => {}
+    }
+}
+
+fn free_html<'a>(el: &'a HtmlEl, fns: bool, bound: &mut Vec<String>, f: &mut dyn FnMut(Met<'a>, &[String])) {
+    f(Met::Tag(&el.tag), bound);
+    for x in el.id.iter().chain(el.classes.iter()) {
+        each_free(x, fns, bound, f)
+    }
+    for (_, v) in &el.attrs {
+        if let AttrVal::Expr(x) | AttrVal::Spread(x) = v {
+            each_free(x, fns, bound, f)
+        }
+    }
+    for c in &el.children {
+        match c {
+            HtmlChild::El(e) => free_html(e, fns, bound, f),
+            HtmlChild::Expr(x) => each_free(x, fns, bound, f),
+        }
+    }
+}
+
 /// Whether `e` is markup, or may give markup (a loop, a branch).
 fn has_markup(e: &Expr) -> bool {
     match e {
@@ -1946,14 +2153,20 @@ pub fn public_env<'a>(callee: &Expr, args: &'a [Expr]) -> Option<&'a str> {
 
 /// Builtins whose results may be private to the server: its environment,
 /// its files, its database, other services.
-const PRIVATE_SOURCES: &[&str] = &["env", "read_file", "file", "db", "http"];
+/// Also what reads the server's command line or input, makes a secret (`crypto`), runs another
+/// program's text (`run_script`) or calls a site (`site shop = ...` is `let shop = __site(...)`); and
+/// the program's plugin functions (`collect_private`'s `natives`). Their values went into the
+/// public bundle: a vault's or a `.env` file's through a plugin, a generated signing key, a secret
+/// on the command line (FEEDBACK75.md, Q-1063; branch feedback75).
+/// And `uuid`, which makes a session id or a token as `crypto` does (Q-1063, review).
+const PRIVATE_SOURCES: &[&str] = &["env", "read_file", "file", "db", "http", "args", "read_line", "stdin", "run_script", "crypto", "__site", "uuid"];
 
 /// Top-level variables whose value comes, directly or through other such
 /// variables, from `PRIVATE_SOURCES`, a service, or a function that uses
 /// any of them (`let CONFIG = load_config()`). Components get other
 /// globals' values written into the browser bundle, which anyone can
 /// download; these they must ask a `server fn` for.
-fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
+fn collect_private(program: &[Arc<Vec<Stmt>>], natives: &HashSet<String>) -> HashSet<String> {
     let mut services: HashSet<String> = HashSet::new();
     for stmts in program {
         for st in stmts.iter() {
@@ -1967,26 +2180,40 @@ fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
     // Functions that use what is private: calling one gives a private value.
     // They can be called as methods too (`"KEY".env`).
     let mut fns: HashSet<String> = ["env", "read_file"].iter().map(|s| s.to_string()).collect();
-    // Whether `e` uses a private name (other than the `shadowed` ones), its
-    // functions' bodies included when `inside` is set.
-    // `env("PUBLIC_...")` is not: each such call is one use of `env` that
-    // does not count.
+    // A source called as a method (`"40 + 2".run_script()`, a plugin's `x.sign()`), or on a value
+    // that is no map (`"KEY".env`): `x.file` alone may be a field (Q-1063, review).
+    let method = |x: &Expr, bound: &[String]| {
+        let n = match x {
+            Expr::Call(c, _, _) => match &**c {
+                Expr::Field(_, n, _) => n,
+                _ => return false,
+            },
+            Expr::Field(recv, n, _) if matches!(&**recv, Expr::Lit(_) | Expr::Template(_) | Expr::List(_)) => n,
+            _ => return false,
+        };
+        (sources.contains(n.as_str()) || natives.contains(n.as_str())) && !bound.iter().any(|b| b == n)
+    };
+    // Whether `e` uses a private name (other than those bound around it: its function's
+    // parameters, a lambda's, a `let`, a loop's), its functions' bodies included when `inside` is
+    // set. `env("PUBLIC_...")` is not: each such call is one use of `env` that does not count.
+    // A lambda's `args`, a local `crypto`, were the builtins of those names, and refused
+    // (FEEDBACK75.md, Q-1063, review; branch feedback75).
     let uses = |e: &Expr, inside: bool, shadowed: &[String], vars: &HashSet<String>, fns: &HashSet<String>| {
         let mut found = false;
         let (mut envs, mut public) = (0, 0);
-        each_expr_in(
-            e,
-            &mut |x| match x {
-                Expr::Ident(n, _) if n == "env" && !shadowed.contains(&n.to_string()) => envs += 1,
-                Expr::Ident(n, _) if !shadowed.contains(&n.to_string()) => {
-                    found |= sources.contains(n.as_str()) || services.contains(n.as_str()) || vars.contains(n.as_str()) || fns.contains(n.as_str())
+        each_free(e, inside, &mut shadowed.to_vec(), &mut |m, bound| {
+            let Met::Expr(x) = m else { return };
+            found |= method(x, bound);
+            match x {
+                Expr::Ident(n, _) if n == "env" => envs += 1,
+                Expr::Ident(n, _) => {
+                    found |= sources.contains(n.as_str()) || natives.contains(n.as_str()) || services.contains(n.as_str()) || vars.contains(n.as_str()) || fns.contains(n.as_str())
                 }
                 Expr::Field(_, n, _) => found |= fns.contains(n),
                 Expr::Call(f, args, _) if public_env(f, args).is_some() => public += 1,
                 _ => {}
-            },
-            inside,
-        );
+            }
+        });
         found || envs > public
     };
     // What a variable's functions use, as before: a function value is made
@@ -1995,11 +2222,15 @@ fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
     let uses_in_fns = |e: &Expr, vars: &HashSet<String>| {
         let mut found = false;
         let (mut envs, mut public) = (0, 0);
-        each_expr(e, &mut |x| match x {
-            Expr::Ident(n, _) if n == "env" => envs += 1,
-            Expr::Ident(n, _) => found |= sources.contains(n.as_str()) || vars.contains(n.as_str()),
-            Expr::Call(f, args, _) if public_env(f, args).is_some() => public += 1,
-            _ => {}
+        each_free(e, true, &mut Vec::new(), &mut |m, bound| {
+            let Met::Expr(x) = m else { return };
+            found |= method(x, bound);
+            match x {
+                Expr::Ident(n, _) if n == "env" => envs += 1,
+                Expr::Ident(n, _) => found |= sources.contains(n.as_str()) || natives.contains(n.as_str()) || vars.contains(n.as_str()),
+                Expr::Call(f, args, _) if public_env(f, args).is_some() => public += 1,
+                _ => {}
+            }
         });
         found || envs > public
     };
@@ -2028,6 +2259,18 @@ fn collect_private(program: &[Arc<Vec<Stmt>>]) -> HashSet<String> {
             return vars;
         }
     }
+}
+
+/// The names of the program's plugin functions (`use "x.qwer"`, `.rs` files, the catalog's
+/// plugins), as it names them: what they give is the server's (see `PRIVATE_SOURCES`).
+/// One whose file says it does nothing (`//! effects: none`) gives what it is given, and is not
+/// (Q-1063, review).
+fn native_names(it: &Interp) -> HashSet<String> {
+    crate::value::scope_vars(&it.globals)
+        .into_iter()
+        .filter(|(_, v)| matches!(v, Value::Builtin(b, _) if b.starts_with("native:") && crate::native::effects_of(b) != 0))
+        .map(|(n, _)| n.to_string())
+        .collect()
 }
 
 fn html_assigned(el: &HtmlEl, out: &mut HashSet<String>) {
@@ -2237,9 +2480,10 @@ impl<'a> Compiler<'a> {
         }
         Compiler {
             t_keys: Some(Vec::new()),
+            states: Vec::new(),
             it,
             assigned,
-            private: collect_private(&it.program),
+            private: collect_private(&it.program, &native_names(it)),
             defs: Vec::new(),
             blocks: Vec::new(),
             mutable: HashSet::new(),
@@ -2520,6 +2764,7 @@ impl<'a> Compiler<'a> {
             return Ok(Some(js));
         }
         self.globals.insert(name.to_string(), (js.clone(), false));
+        self.states.push(name.to_string());
         let init = self.it.page_states.iter().find(|(n, _)| n.as_str() == name).map(|(_, e)| e.clone());
         let code = match init {
             Some(e) => {
@@ -2686,8 +2931,9 @@ impl<'a> Compiler<'a> {
                 }
                 if self.private.contains(name) {
                     return self.err(format!(
-                        "`{}` is read from the server's environment, files, database or a service, and would be \
-                         sent to every browser; pass what the page needs as a prop or read it with a `server fn`",
+                        "`{}` is read from the server's environment, files, database, a service, a plugin, its \
+                         command line or input, a site or `crypto`, and would be sent to every browser; pass \
+                         what the page needs as a prop or read it with a `server fn`",
                         name
                     ));
                 }
@@ -3925,6 +4171,9 @@ impl<'a> Compiler<'a> {
                 };
                 match args.as_slice() {
                     [Expr::Call(inner, targs, _)] if is(self, callee, "raw")? && is(self, inner, "t")? => {
+                        // Its key in the page's file as `t`'s is: the page showed the key once its
+                        // components took over (FEEDBACK75.md, Q-1121; branch feedback75).
+                        self.note_t_key(targs);
                         let vs = targs.iter().map(|a| self.expr(a)).collect::<Result<Vec<_>, _>>()?;
                         format!("B.t_html({})", vs.join(", "))
                     }
@@ -4271,21 +4520,28 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// A translation's key the bundle's code asks for, from `t(key, ...)`'s arguments, for the file
+    /// of the page's keys (`t_keys`): a key not written out (a template's rest, a variable) takes
+    /// the whole locale.
+    fn note_t_key(&mut self, args: &[Expr]) {
+        let key = match args.first() {
+            Some(Expr::Lit(Lit::Str(k))) => Some(k.to_string()),
+            Some(Expr::Template(parts)) => match parts.first() {
+                Some(TPart::Lit(start)) if !start.is_empty() => Some(format!("{}*", start)),
+                _ => None,
+            },
+            _ => None,
+        };
+        match (key, self.t_keys.as_mut()) {
+            (Some(k), Some(keys)) => keys.push(k),
+            (None, _) => self.t_keys = None,
+            _ => {}
+        }
+    }
+
     fn call(&mut self, callee: &Expr, args: &[Expr], pre: Option<String>) -> Result<String, QuilloError> {
         if matches!(callee, Expr::Ident(n, _) if (n == "t" || n == "t_html") && lookup(&self.it.globals, n).is_some_and(|v| matches!(v, Value::Builtin(..)))) {
-            let key = match args.first() {
-                Some(Expr::Lit(Lit::Str(k))) => Some(k.to_string()),
-                Some(Expr::Template(parts)) => match parts.first() {
-                    Some(TPart::Lit(start)) if !start.is_empty() => Some(format!("{}*", start)),
-                    _ => None,
-                },
-                _ => None,
-            };
-            match (key, self.t_keys.as_mut()) {
-                (Some(k), Some(keys)) => keys.push(k),
-                (None, _) => self.t_keys = None,
-                _ => {}
-            }
+            self.note_t_key(args);
         }
         if let Some(path) = self.lib_path(callee)? {
             return self.lib_call(&path, args, pre);

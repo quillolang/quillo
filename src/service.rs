@@ -1270,6 +1270,87 @@ pub(crate) fn scheme_of_word(word: &str) -> Option<&'static str> {
     shared_signed(sig, |k| scheme_sig(k, scheme, t)).map(|_| scheme)
 }
 
+/// The header a request an app passes on to a service carries the visitor's address in, as the
+/// app took it (with its own `--trust-proxy`), signed as `SCHEME_WORD` is: `ip;t=<seconds>;sig=<hex>`.
+/// A service `--split` starts is given no `--trust-proxy`, and every visitor was 127.0.0.1 there,
+/// so a "this machine only" check let everyone in and per-address limits put everyone in one
+/// place; the visitor's own `X-Forwarded-For`, passed on beside it, it must not believe. Only such
+/// a service takes it, from a peer on this machine, as httpd reads the request (`httpd::from_app`);
+/// one a client sends the app is dropped, never believed, and never signed again (FEEDBACK75.md,
+/// Q-1064 and its review; branch feedback75).
+pub const CLIENT_WORD: &str = "x-quillo-client";
+
+fn client_sig(key: &str, ip: &str, t: u64) -> String {
+    crate::crypto::hex(&crate::crypto::hmac_sha256(key.as_bytes(), format!("quillo-client-1\n{}\n{}", ip, t).as_bytes()))
+}
+
+/// The app's word on a visitor's address, signed now; none without a shared secret, or for what
+/// is no address.
+pub(crate) fn client_word(remote: &str) -> Option<String> {
+    let ip = remote.parse::<std::net::IpAddr>().ok()?.to_string();
+    let key = secret()?;
+    let t = now_secs();
+    Some(format!("{};t={};sig={}", ip, t, client_sig(&key, &ip, t)))
+}
+
+/// The address in an app's word (`client_word`), when it is one: signed with a shared secret,
+/// within `WINDOW`. A word replayed says only the address of the visitor it was made for.
+pub(crate) fn client_of_word(word: &str) -> Option<std::net::IpAddr> {
+    let mut parts = word.split(';');
+    let ip_text = parts.next()?;
+    let ip = ip_text.parse::<std::net::IpAddr>().ok()?;
+    let t = parts.next()?.strip_prefix("t=")?.parse::<u64>().ok()?;
+    let sig = parts.next()?.strip_prefix("sig=")?;
+    if parts.next().is_some() || now_secs().abs_diff(t) > WINDOW {
+        return None;
+    }
+    shared_signed(sig, |k| client_sig(k, ip_text, t)).map(|_| ip)
+}
+
+/// The header a request an app passes on to a service carries the app's `site_headers` policies
+/// for the path in (`Content-Security-Policy` and its `-Report-Only`), as
+/// `t=<seconds>;sig=<hex>;<base64url of [[name, value], ...]>`, signed as `CLIENT_WORD` is: the
+/// service takes them below its own rules before it writes the page, so that the policy the visitor
+/// gets lets Quillo's scripts through, where the app's, added after, blocked the page's own
+/// components (FEEDBACK75.md, Q-1087, review; branch feedback75). Only such a service takes it,
+/// on a request httpd took as its app's (`httpd::from_app`); one a client sends is dropped.
+pub const POLICY_WORD: &str = "x-quillo-policy";
+
+/// What a service's answer says when it took its app's policies (`POLICY_WORD`): the app then adds
+/// none, and takes the mark off.
+pub const POLICY_TAKEN: &str = "x-quillo-policy-taken";
+
+fn policy_sig(key: &str, text: &str, t: u64) -> String {
+    crate::crypto::hex(&crate::crypto::hmac_sha256(key.as_bytes(), format!("quillo-policy-1\n{}\n{}", text, t).as_bytes()))
+}
+
+/// The app's word on its policies, signed now; none without a shared secret or policies.
+pub(crate) fn policy_word(policies: &[(String, String)]) -> Option<String> {
+    if policies.is_empty() {
+        return None;
+    }
+    let key = secret()?;
+    let t = now_secs();
+    let text = crate::crypto::b64url(serde_json::to_string(policies).ok()?.as_bytes());
+    Some(format!("t={};sig={};{}", t, policy_sig(&key, &text, t), text))
+}
+
+/// The policies in an app's word (`policy_word`), when it is one: signed with a shared secret,
+/// within `WINDOW`, and of the two names only.
+pub(crate) fn policies_of_word(word: &str) -> Option<Vec<(String, String)>> {
+    let mut parts = word.splitn(3, ';');
+    let t = parts.next()?.strip_prefix("t=")?.parse::<u64>().ok()?;
+    let sig = parts.next()?.strip_prefix("sig=")?;
+    let text = parts.next()?;
+    if now_secs().abs_diff(t) > WINDOW {
+        return None;
+    }
+    shared_signed(sig, |k| policy_sig(k, text, t))?;
+    let policies: Vec<(String, String)> = serde_json::from_slice(&crate::crypto::unb64url(text)?).ok()?;
+    let policy = |k: &str| k == "content-security-policy" || k == "content-security-policy-report-only";
+    policies.iter().all(|(k, _)| policy(k)).then_some(policies)
+}
+
 // ---- channels across processes (FEEDBACK12.md, Q-087; branch open-fixes) ----
 
 /// Under `--split`, where the app listens, for its services' processes: what
@@ -2328,7 +2409,7 @@ const NOT_PASSED_ON: &[&str] = &["rpc", "service", "job", "tick", "later", "chan
 
 /// A request under a service's prefix, when the service runs elsewhere:
 /// passed on to it, without the prefix (as a mounted program sees it).
-pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest) -> HttpResponse {
+pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest, policy: Option<&str>) -> HttpResponse {
     let rest = &req.url[prefix.len()..];
     let path = rest.split('?').next().unwrap_or("");
     if let Some(inner) = path.trim_start_matches('/').strip_prefix("_quillo/") {
@@ -2339,41 +2420,147 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest) -> H
     let target = format!("{}{}", url, if rest.is_empty() || rest.starts_with('?') { format!("/{}", rest) } else { rest.to_string() });
     const HOP: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer", "proxy-authorization"];
     // The app's verdict on the scheme goes signed, in place of any word a client sent
-    // (FEEDBACK70.md, Q-986, review; branch security).
-    let headers: Vec<(String, String)> = req.headers.iter().filter(|(k, _)| !HOP.iter().any(|h| k.eq_ignore_ascii_case(h)) && !k.eq_ignore_ascii_case(SCHEME_WORD)).cloned().collect();
+    // (FEEDBACK70.md, Q-986, review; branch security); so does the visitor's address (Q-1064).
+    // The `Cookie` line goes without the app's own session cookies, which the service never reads
+    // and which crossed to it, on whatever network `--service-url` names (FEEDBACK75.md, Q-1081;
+    // branch feedback75).
+    // The service's answer comes as it is, not gzipped: the agent decoded a gzipped one and dropped
+    // its length, which then went to the visitor unsized and as it came, uncompressed; the app
+    // compresses what it sends, as before (FEEDBACK75.md, Q-1071, review; branch feedback75).
+    let headers: Vec<(String, String)> = req
+        .headers
+        .iter()
+        .filter(|(k, _)| !HOP.iter().any(|h| k.eq_ignore_ascii_case(h)) && !APPS_OWN.iter().any(|h| k.eq_ignore_ascii_case(h)) && !k.eq_ignore_ascii_case("accept-encoding"))
+        .filter_map(|(k, v)| if k.eq_ignore_ascii_case("cookie") { without_apps_sessions(v).map(|v| (k.clone(), v)) } else { Some((k.clone(), v.clone())) })
+        .collect();
     let word = crate::server::known_scheme(req).and_then(scheme_word);
+    let client = client_word(&req.remote);
+    let policy = policy.map(str::to_string);
     let (method, body, remote) = (req.method.clone(), req.body.clone(), req.remote.clone());
     let host = req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("host")).map(|(_, v)| v.clone()).unwrap_or_default();
     let prefix = prefix.to_string();
-    let res = it.unlocked(move || -> Result<HttpResponse, String> {
-        let mut rq = agent().request(&method, &target);
+    // Streamed to the visitor as it comes, where the server sends the answer itself: a body read
+    // whole first took up to 256 MB of the app a request, outside `--max-memory`, and a service's
+    // `stream` came all at once at its end (FEEDBACK75.md, Q-1071; branch feedback75).
+    let streams = it.streams_direct;
+    let gzip = crate::server::accepts_gzip(req);
+    let res = it.unlocked(move || -> Result<(u16, Vec<(String, String)>, Passed), String> {
+        let mut rq = pass_agent().request(&method, &target);
         for (k, v) in &headers {
             rq = rq.set(k, v);
         }
-        rq = rq.set("x-forwarded-for", &remote).set("x-forwarded-host", &host).set("x-forwarded-prefix", &prefix);
+        rq = rq.set("x-forwarded-for", &remote).set("x-forwarded-host", &host).set("x-forwarded-prefix", &prefix).set("accept-encoding", "identity");
         if let Some(w) = &word {
             rq = rq.set(SCHEME_WORD, w);
+        }
+        if let Some(c) = &client {
+            rq = rq.set(CLIENT_WORD, c);
+        }
+        if let Some(p) = &policy {
+            rq = rq.set(POLICY_WORD, p);
         }
         let resp = match if body.is_empty() { rq.call() } else { rq.send_bytes(&body) } {
             Ok(r) | Err(ureq::Error::Status(_, r)) => r,
             Err(e) => return Err(e.to_string()),
         };
         let status = resp.status();
-        let headers = resp
-            .headers_names()
-            .into_iter()
-            .filter(|n| !HOP.iter().any(|h| n.eq_ignore_ascii_case(h)))
-            .flat_map(|n| resp.all(&n).into_iter().map(|v| (n.to_ascii_lowercase(), v.to_string())).collect::<Vec<_>>())
-            .collect();
+        // Each name once, with all its lines: `headers_names` names a header once for each of
+        // its lines, and each `Set-Cookie` went out once for each (Q-1071). Not the server's own
+        // mark of a streamed answer, which a service's answer must not set here.
+        let mut seen = std::collections::HashSet::new();
+        let mut headers = Vec::new();
+        for n in resp.headers_names() {
+            let lower = n.to_ascii_lowercase();
+            if HOP.contains(&lower.as_str()) || lower == crate::stream::MARK || !seen.insert(lower.clone()) {
+                continue;
+            }
+            headers.extend(resp.all(&n).into_iter().map(|v| (lower.clone(), v.to_string())));
+        }
+        let length = resp.header("content-length").and_then(|n| n.trim().parse::<u64>().ok());
+        let bodyless = method == "HEAD" || crate::stream::bodyless(i64::from(status));
+        if streams && !bodyless && length.is_none_or(|n| n > PASSED_WHOLE) {
+            return Ok((status, headers, Passed::Reader(Box::new(resp.into_reader()), length.is_some())));
+        }
+        // Read whole (a short answer, or no server to stream it), and no larger than one value may
+        // be (`--max-memory`), 256 MiB at most.
+        let most = (256u64 << 20).min(crate::httpd::value_most());
         let mut bytes = Vec::new();
-        resp.into_reader().take(256 << 20).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        Ok(HttpResponse { status, headers, body: bytes })
+        resp.into_reader().take(most + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > most {
+            return Err(format!("its answer is larger than {} bytes", most));
+        }
+        Ok((status, headers, Passed::Bytes(bytes)))
     });
-    res.unwrap_or_else(|e| HttpResponse {
-        status: 502,
-        headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
-        body: format!("this part of the site is not answering ({})\n", e).into_bytes(),
+    match res {
+        Ok((status, headers, Passed::Bytes(body))) => HttpResponse { status, headers, body },
+        Ok((status, headers, Passed::Reader(reader, sized))) => {
+            let mut resp = HttpResponse { status, headers, body: Vec::new() };
+            // A large file is gzipped as it goes, as the app gzips what it reads whole; a stream (no
+            // length) goes as it comes, as the app's own does (FEEDBACK75.md, Q-1071, review).
+            let reader: Box<dyn std::io::Read + Send + Sync> = if sized && crate::server::gzipped_as_it_goes(gzip, &mut resp) {
+                Box::new(flate2::read::GzEncoder::new(reader, flate2::Compression::default()))
+            } else {
+                reader
+            };
+            resp.headers.push((crate::stream::MARK.into(), "1".into()));
+            it.pending_stream = Some(crate::stream::Pending { f: Value::Nil, events: false, page: None, reader: Some(reader) });
+            resp
+        }
+        Err(e) => HttpResponse {
+            status: 502,
+            headers: vec![("content-type".into(), "text/plain; charset=utf-8".into())],
+            body: format!("this part of the site is not answering ({})\n", e).into_bytes(),
+        },
+    }
+}
+
+/// The headers only an app sends its service, which a client's request loses here: the app's words
+/// and the mark a service puts on a request from its app (FEEDBACK70.md, Q-986; FEEDBACK75.md,
+/// Q-1064, Q-1087).
+const APPS_OWN: &[&str] = &[SCHEME_WORD, CLIENT_WORD, POLICY_WORD, crate::server::FROM_APP];
+
+/// A service's answer, passed on: read whole, or to be streamed through (`pass_on`).
+enum Passed {
+    Bytes(Vec<u8>),
+    /// With whether its length was said: a file's, where a stream has none.
+    Reader(Box<dyn std::io::Read + Send + Sync>, bool),
+}
+
+/// The longest answer of a known length `pass_on` reads whole before sending: a longer one, or one
+/// of no stated length (a stream), goes through as it comes (FEEDBACK75.md, Q-1071).
+const PASSED_WHOLE: u64 = 1 << 20;
+
+/// The agent answers are passed on with: no time for the whole answer, which may be a long
+/// download or a stream, but 60 s at most between its bytes, as the whole had (FEEDBACK75.md,
+/// Q-1071; branch feedback75).
+fn pass_agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(5))
+            .timeout_read(Duration::from_secs(60))
+            .timeout_write(Duration::from_secs(60))
+            .redirects(0)
+            .user_agent(concat!("quillo/", env!("CARGO_PKG_VERSION")))
+            .build()
     })
+}
+
+/// A `Cookie` line without the app's session cookies (`__Host-quillo_session`, and a mounted
+/// program's `__Host-<mount>.quillo_session`): a service under a prefix runs with `--base` and
+/// reads its own `quillo_session` only, which stays, as every other cookie does. None when nothing
+/// is left (FEEDBACK75.md, Q-1081; branch feedback75). Where the app's own is `quillo_session` too
+/// (plain HTTP, `--base`), the two are not told apart and both are passed on, as before.
+fn without_apps_sessions(line: &str) -> Option<String> {
+    let app_session = |part: &str| {
+        let name = part.split('=').next().unwrap_or("").trim();
+        name != crate::session::COOKIE && crate::session::is_session_cookie(name)
+    };
+    if !line.split(';').any(app_session) {
+        return Some(line.to_string());
+    }
+    let kept: Vec<&str> = line.split(';').map(str::trim).filter(|p| !p.is_empty() && !app_session(p)).collect();
+    (!kept.is_empty()).then(|| kept.join("; "))
 }
 
 // ---- loading -------------------------------------------------------------------------------

@@ -520,6 +520,15 @@ pub struct Interp {
     /// Set by the server: `handle` leaves a streamed answer's function to it,
     /// rather than make the whole answer first.
     pub(crate) streams_direct: bool,
+    /// For a mounted program, set by the program mounting it for each request: the headers that
+    /// program's `site_headers` give the path, below its own rules, so that its page lets Quillo's
+    /// scripts through the mounting program's policy too (FEEDBACK75.md, Q-1087, review; branch
+    /// feedback75).
+    pub(crate) parent_rules: Option<Arc<Vec<(String, Option<String>)>>>,
+    /// What each program it mounts is given (`parent_rules`), kept by its prefix where no rule of
+    /// this program's lies deeper than the prefix, so the same for every path under it: made once,
+    /// not for each request (FEEDBACK75.md, Q-1087, review; branch feedback75).
+    pub(crate) mount_rules: Vec<(String, Arc<Vec<(String, Option<String>)>>)>,
     /// The program's own types (`type User = { ... }`: src/record.rs).
     pub(crate) types: Arc<crate::record::Types>,
     /// Browser libraries, by the name the program calls each: `client
@@ -2475,6 +2484,8 @@ impl Interp {
             stream_out: None,
             pending_stream: None,
             streams_direct: false,
+            parent_rules: None,
+            mount_rules: Vec::new(),
             rendered_island: false,
             island_names: Vec::new(),
             styles_used: Vec::new(),
@@ -2609,6 +2620,8 @@ impl Interp {
             stream_out: None,
             pending_stream: None,
             streams_direct: false,
+            parent_rules: None,
+            mount_rules: Vec::new(),
             rendered_island: false,
             island_names: Vec::new(),
             styles_used: Vec::new(),
@@ -3241,8 +3254,10 @@ impl Interp {
             }
             b.runtime.clone()
         };
-        let made = crate::client::bundle_for(self, &sorted, runtime.as_deref()).ok()?;
-        Some(self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keep(key, made))
+        // With the page states its code reads, the only ones its page carries (FEEDBACK75.md,
+        // Q-1058; branch feedback75).
+        let (made, states) = crate::client::bundle_for_states(self, &sorted, runtime.as_deref()).ok()?;
+        Some(self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keep_with(key, made, states))
     }
 
     pub fn bundle_by_hash(&self, hash: &str) -> Option<Arc<String>> {

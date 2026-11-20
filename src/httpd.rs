@@ -2510,6 +2510,33 @@ fn client_of(peer: &str, headers: &[(String, String)]) -> String {
     client
 }
 
+/// In a service its app started: the visitor a request from the app is for, by the app's signed
+/// word (`service::CLIENT_WORD`), from a peer on this machine, where every visitor was the app's
+/// 127.0.0.1, so that `request.ip`, a "this machine only" check, the limits by client and the log
+/// are the visitor's from the start. The request then carries the mark `server::FROM_APP`, which
+/// says its peer was this machine's after all, for the app's word on its scheme
+/// (`server::scheme_by`) and its policies (`service::POLICY_WORD`); a client's own word and mark go,
+/// and so does a policy word that did not come from the app (FEEDBACK75.md, Q-1064 and its review;
+/// branch feedback75). The connections the app holds are not one client's: loopback holds no place
+/// of `CONNECTIONS_PER_CLIENT`'s (`place_for`).
+fn from_app(peer: &str, hs: &mut Vec<(String, String)>) -> Option<String> {
+    use crate::service::{CLIENT_WORD, POLICY_WORD};
+    let named = |k: &str| k.eq_ignore_ascii_case(CLIENT_WORD) || k.eq_ignore_ascii_case(crate::server::FROM_APP) || k.eq_ignore_ascii_case(POLICY_WORD);
+    if !hs.iter().any(|(k, _)| named(k)) {
+        return None;
+    }
+    let local = match peer.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(a)) => a.is_loopback() || a.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()),
+        Ok(a) => a.is_loopback(),
+        Err(_) => false,
+    };
+    let visitor = if local { hs.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(CLIENT_WORD)).and_then(|(_, v)| crate::service::client_of_word(v)) } else { None };
+    hs.retain(|(k, _)| !named(k) || (visitor.is_some() && k.eq_ignore_ascii_case(POLICY_WORD)));
+    let visitor = visitor?;
+    hs.push((crate::server::FROM_APP.into(), "1".into()));
+    Some(visitor.to_string())
+}
+
 #[cfg(unix)]
 fn into_std(s: TcpStream) -> Option<std::net::TcpStream> {
     use std::os::fd::{FromRawFd, IntoRawFd};
@@ -2710,7 +2737,12 @@ fn parse(buf: &[u8], peer: &str, max_body: usize, chunked_so_far: &mut Option<De
     if TRUSTED.get().is_some_and(|nets| peer.parse().is_ok_and(|ip| trusted(ip, nets))) {
         hs.push((PROXIED.into(), "1".into()));
     }
-    let remote = client_of(peer, &hs);
+    let mut remote = client_of(peer, &hs);
+    if takes_app_word() {
+        if let Some(visitor) = from_app(peer, &mut hs) {
+            remote = visitor;
+        }
+    }
     Parsed::Done {
         req: HttpRequest {
             method: method.to_string(),

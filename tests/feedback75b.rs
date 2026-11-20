@@ -967,3 +967,718 @@ fn the_markdown_door_answers_as_before() {
         assert_eq!(md(bad), (400, r#"{"error":"the body must be a JSON array: [text, options]"}"#.to_string()), "{:?}", bad);
     }
 }
+
+// ==== Wave 2: FEEDBACK75's Q-1058, Q-1063, Q-1064, Q-1068, Q-1071, Q-1081, Q-1086, Q-1087,
+// Q-1121, and FEEDBACK78's Q-1158 and Q-1159 =====================================================
+
+/// `quillo check` of a program, its output (stdout and stderr) and whether it passed.
+fn check_said(d: &Path, file: &str) -> (bool, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["check", file]).current_dir(d).output().unwrap();
+    (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+}
+
+/// The page states a page carries (its `.g=` script, as JSON), or none.
+fn states_of(page: &str) -> Option<serde_json::Value> {
+    let at = page.find(".g=")? + 3;
+    let text = &page[at..at + page[at..].find("</script>")?];
+    let json: String = serde_json::from_str(text).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+const PAGE_STATES: &str = "fn load_me() {\n    return { id: 1, name: \"Ana\", password_hash: \"$argon2id$HASH\", totp_secret: \"JBSWY3DP\" }\n}\nstate me = load_me()\nstate api = env(\"SECRET_API_KEY\") ?? \"none\"\nstate total = 3\nstate label = \"ünï ✓\"\nfn shown() {\n    return label\n}\ncomponent Counter() {\n    state n = 0\n    <button onclick={() => { n = n + 1 }}>Clicked {n}</button>\n}\ncomponent Shows() {\n    <p>{total} {shown()}</p>\n}\nroute GET / = <html><body><h1>Hello {me.name}</h1><Counter/></body></html>\nroute GET /shows = <html><body><h1>Hello {me.name}</h1><Shows/></body></html>\nroute GET /plain = <html><body><h1>Hello {me.name}</h1></body></html>\nroute GET /whole = <html><head><script src=\"/_quillo/quillo.js\"></script></head><body><Counter/></body></html>\n";
+
+/// A page carries only the page states its components read: none for a component that reads none
+/// (a user row with its password hash and an `env` secret went to every page with a component),
+/// those a component reads, through a function too, and with the whole program's bundle those any
+/// component reads; a page with no component nothing, as before (FEEDBACK75.md, Q-1058, the user's
+/// choice; branch feedback75)
+#[test]
+fn a_page_carries_only_the_states_its_components_read() {
+    let d = dir("page-states", &[("main.qwe", PAGE_STATES)]);
+    let _gone = Gone(d.clone());
+    checked(&d, "main.qwe");
+    let (_g, port) = serve(&d, "main.qwe", &[], &[("SECRET_API_KEY", "sk_live_PAGESTATE77")], "states.log");
+    let page = support::send(port, "GET", "/", &[], "").body;
+    assert!(page.contains("<h1>Hello Ana</h1>") && page.contains("Clicked"), "{}", page);
+    assert_eq!(states_of(&page), None, "{}", page);
+    for secret in ["HASH", "JBSWY3DP", "sk_live_PAGESTATE77"] {
+        assert!(!page.contains(secret), "{}: {}", secret, page);
+    }
+    let page = support::send(port, "GET", "/shows", &[], "").body;
+    assert_eq!(states_of(&page), Some(serde_json::json!({ "total": 3, "label": "ünï ✓" })), "{}", page);
+    assert!(!page.contains("HASH") && !page.contains("sk_live"), "{}", page);
+    let page = support::send(port, "GET", "/whole", &[], "").body;
+    assert_eq!(states_of(&page), Some(serde_json::json!({ "total": 3, "label": "ünï ✓" })), "{}", page);
+    let page = support::send(port, "GET", "/plain", &[], "").body;
+    assert_eq!((states_of(&page), page.contains("Hello Ana")), (None, true), "{}", page);
+}
+
+/// `quillo check` warns of a page state a component reads that comes from `env`, a file or a
+/// `select *` row, through the program's functions on either side, at the state's line; not of
+/// one only the route's HTML reads, one from named columns, or one no component reads
+/// (FEEDBACK75.md, Q-1058, the user's choice: a warning; branch feedback75)
+#[test]
+fn check_warns_of_a_page_state_from_the_server_that_a_component_reads() {
+    let src = "fn load_me() with db {\n    return db.one(\"select * from users where id = ?\", 1)\n}\nfn named() with db {\n    return db.one(\"select id, name from users where id = ?\", 1)\n}\nfn key() {\n    return env(\"API_KEY\") ?? \"none\"\n}\nstate me = load_me()\nstate api = key()\nstate cfg = read_file(\"cfg.txt\") ?? \"\"\nstate row = named()\nstate secret = env(\"OTHER\") ?? \"\"\nstate theme = \"dark\"\nfn shown() {\n    return api\n}\ncomponent Badge() {\n    <p>{me.name} {theme} {row.name} {cfg}</p>\n}\ncomponent Other() {\n    <p>{shown()}</p>\n}\nroute GET / = <html><body><p>{secret}</p><Badge/><Other/></body></html>\n";
+    let d = dir("check-states", &[("main.qwe", src)]);
+    let _gone = Gone(d.clone());
+    let (ok, said) = check_said(&d, "main.qwe");
+    assert!(ok, "{}", said);
+    let warn = |line: u32, name: &str, c: &str, from: &str| format!("main.qwe:{}: warning: `{}` is a page state that <{}> reads, so its whole value is written into each page that shows <{}>, and it comes from {}: give the component what it shows, as a prop or a state of those fields alone", line, name, c, c, from);
+    assert!(said.contains(&warn(10, "me", "Badge", "a `select *` row")), "{}", said);
+    assert!(said.contains(&warn(11, "api", "Other", "`env`")), "{}", said);
+    assert!(said.contains(&warn(12, "cfg", "Badge", "a file (`read_file`)")), "{}", said);
+    assert!(!said.contains("`row` is a page state") && !said.contains("`secret` is a page state") && !said.contains("`theme` is a page state"), "{}", said);
+    assert_eq!(said.matches("is a page state that").count(), 3, "{}", said);
+}
+
+/// A component reading a top-level constant made by `crypto`, `args`, `read_line`, `stdin`,
+/// `run_script` or a site's call is refused at load, as one from `env` is: their values went into
+/// the public bundle (a generated signing key, a command-line secret); a constant of plain values
+/// still goes (FEEDBACK75.md, Q-1063; branch feedback75)
+#[test]
+fn the_bundle_refuses_what_is_the_servers_own() {
+    let _one = serial();
+    let load = |head: &str| {
+        let src = format!("{}\ncomponent Pay() {{\n    state n = 0\n    <button onclick={{() => {{ n = n + 1 }}}}>Pay {{n}} {{K}}</button>\n}}\nroute GET / = <html><body><Pay/></body></html>\n", head);
+        let mut it = Interp::new(env!("CARGO_MANIFEST_DIR"));
+        match it.load_source(&src, "case.qwe") {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    };
+    let refused = "`K` is read from the server's environment, files, database, a service, a plugin, its command line or input, a site or `crypto`, and would be sent to every browser";
+    for head in [
+        "let K = crypto.token()",
+        "let K = crypto.sha256(\"x\")",
+        "let K = args()",
+        "let K = false ? read_line() : \"x\"",
+        "let K = false ? stdin() : \"x\"",
+        "let K = false ? run_script(\"1\") : \"x\"",
+        "site shop = \"https://shop.example.com\"\nlet K = shop",
+        "fn secret_of() {\n    return crypto.token()\n}\nlet K = secret_of()",
+    ] {
+        let said = load(head);
+        assert!(said.contains(refused), "{}: {}", head, said);
+    }
+    for head in ["let K = \"Shop\"", "let K = 3 + 4", "let K = [\"ünï\", 1]"] {
+        assert_eq!(load(head), "", "{}", head);
+    }
+}
+
+/// A stream's and an event stream's `send` write a builtin's error as `internal error`, its text
+/// (an internal address with its key) to the log, as a route's answer does; an error the program
+/// wrote, and plain values, go as before (FEEDBACK75.md, Q-1068; branch feedback75)
+#[test]
+fn streams_hide_a_builtins_error() {
+    let src = "server fn fetch_report() with http {\n    return http.get(\"http://127.0.0.1:1/internal/report?api_key=sk_live_SECRET123\")\n}\nroute GET /plain = { result: fetch_report() }\nroute GET /ev = events((send) => {\n    send({ step: 1, result: fetch_report() })\n    send({ step: 2, mine: err(\"out of stock\"), name: \"ünï\" })\n})\nroute GET /st = stream((send) => {\n    send({ step: 1, result: fetch_report() })\n})\n";
+    let d = dir("stream-errors", &[("main.qwe", src)]);
+    let _gone = Gone(d.clone());
+    checked(&d, "main.qwe");
+    let (_g, port) = serve(&d, "main.qwe", &["--no-wt"], &[], "stream.log");
+    assert_eq!(support::send(port, "GET", "/plain", &[], "").body, r#"{"result":{"error":"internal error"}}"#);
+    let ev = support::send(port, "GET", "/ev", &[], "").body;
+    assert!(ev.contains(r#"data: {"step":1,"result":{"error":"internal error"}}"#), "{}", ev);
+    assert!(ev.contains(r#"data: {"step":2,"mine":{"error":"out of stock"},"name":"ünï"}"#), "{}", ev);
+    assert!(!ev.contains("sk_live"), "{}", ev);
+    let st = support::send(port, "GET", "/st", &[], "").body;
+    assert!(st.contains(r#"{"step":1,"result":{"error":"internal error"}}"#) && !st.contains("sk_live"), "{}", st);
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut log = String::new();
+    while log.matches("sk_live_SECRET123").count() < 3 && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+        log = std::fs::read_to_string(d.join("stream.log")).unwrap_or_default();
+    }
+    assert!(log.matches("sk_live_SECRET123").count() >= 3, "the log has each error: {}", log);
+}
+
+/// A server fn's argument that fails as it is made (a record's default) answers 500 `internal
+/// error in f`, its file, line and message to the log, as a body's failure does, where the 400 told
+/// any caller; a `for [...]` function is `no server fn` to a page, naming no service; a default that
+/// replies, and plain calls, answer as before (FEEDBACK75.md, Q-1086; branch feedback75)
+#[test]
+fn a_server_fns_internals_stay_in_the_log() {
+    let _one = serial();
+    let mut it = app("fn fee() -> int {\n    return 100 - int(\"x\")\n}\ntype Fee = { amount: int, fee: int = fee() }\nserver fn with_fee(f: Fee) = f.amount\nfn stop() {\n    reply 418 \"no\"\n}\ntype Thing = { a: int = stop() }\nserver fn thing(t: Thing) = 1\nserver fn admin_only() for [\"billing\"] = \"secret\"\nserver fn open_fn(n: int) = n + 1\n");
+    let r = send_bytes(&mut it, "POST", "/_quillo/rpc/with_fee", &[("Content-Type", "application/json")], br#"[{"amount":5}]"#.to_vec());
+    assert_eq!((r.status, r.text()), (500, r#"{"error":"internal error in `with_fee`"}"#.to_string()));
+    assert!(r.headers.iter().any(|(k, v)| k == "x-quillo-answer" && v == "failed"), "{:?}", r.headers);
+    assert_eq!(rpc(&mut it, "admin_only", "[]"), (404, r#"{"error":"no server fn `admin_only`"}"#.to_string()));
+    assert_eq!(rpc(&mut it, "nothing", "[]"), (404, r#"{"error":"no server fn `nothing`"}"#.to_string()));
+    assert_eq!(rpc(&mut it, "thing", "[{}]"), (400, r#"{"error":"argument `t` of `thing` could not be made"}"#.to_string()));
+    assert_eq!(rpc(&mut it, "open_fn", "[1]"), (200, r#"{"ok":2}"#.to_string()));
+    assert_eq!(rpc(&mut it, "with_fee", r#"[{"amount":5,"fee":1}]"#), (200, r#"{"ok":5}"#.to_string()));
+    assert_eq!(rpc(&mut it, "open_fn", r#"["x"]"#).0, 400);
+}
+
+/// A program's `site_headers` reach the answers of a program it mounts, each header the answer
+/// lacks; the mount's own rule and the route's own header win (FEEDBACK75.md, Q-1087; branch
+/// feedback75)
+#[test]
+fn site_headers_reach_a_mounted_program() {
+    let app = "site_headers({ \"content-security-policy\": \"default-src 'self'\", \"strict-transport-security\": \"max-age=31536000\", \"referrer-policy\": \"same-origin\" })\nmount /notes = \"notes.qwe\"\nroute GET / = \"app\"\n";
+    let notes = "site_headers({ \"referrer-policy\": \"no-referrer\" })\nroute GET / = \"notes\"\nroute GET /own = respond(200, \"own\", { \"content-security-policy\": \"default-src 'none'\" })\n";
+    let d = dir("mount-headers", &[("app.qwe", app), ("notes.qwe", notes)]);
+    let _gone = Gone(d.clone());
+    checked(&d, "app.qwe");
+    let (_g, port) = serve(&d, "app.qwe", &[], &[], "mount.log");
+    let h = |p: &str, k: &str| support::send(port, "GET", p, &[], "").header(k).map(str::to_string);
+    for p in ["/", "/notes/", "/notes/own"] {
+        assert_eq!(h(p, "strict-transport-security").as_deref(), Some("max-age=31536000"), "{}", p);
+    }
+    assert_eq!(h("/notes/", "content-security-policy").as_deref(), Some("default-src 'self'"));
+    assert_eq!(h("/notes/own", "content-security-policy").as_deref(), Some("default-src 'none'"));
+    assert_eq!(h("/notes/", "referrer-policy").as_deref(), Some("no-referrer"));
+    assert_eq!(h("/", "referrer-policy").as_deref(), Some("same-origin"));
+    assert_eq!(support::send(port, "GET", "/notes/", &[], "").body, "notes");
+}
+
+/// Under `--split`, a service under a prefix: the app's `site_headers` on its answers (Q-1087); the
+/// visitor's address, as the app took it, its `request.ip`, so a "this machine only" check refuses
+/// them, and a client's own word for it is not believed (Q-1064); the app's session cookie not
+/// passed to it, its own and other cookies kept (Q-1081); a large file streamed through, the app no
+/// larger for it, a stream as it comes, and each `Set-Cookie` once (Q-1071) (FEEDBACK75.md; branch
+/// feedback75)
+#[test]
+fn a_split_service_gets_the_visitor_and_streams_through() {
+    let app = "site_headers({ \"content-security-policy\": \"default-src 'self'\", \"referrer-policy\": \"same-origin\" })\nservice /shop = \"shop.qwe\"\nroute GET / = \"app\"\nroute GET /whoami = { ip: request.ip }\nroute GET /setc {\n    set_session({ user: \"rootuser\" })\n    return \"set\"\n}\n";
+    let shop = "route GET / = \"shop\"\nroute GET /whoami = { ip: request.ip, word: request.headers[\"x-quillo-client\"] }\nroute GET /admin {\n    if request.ip != \"127.0.0.1\" {\n        reply 403 \"local only\"\n    }\n    return \"admin panel\"\n}\nroute GET /in {\n    set_session({ user: \"shopper\" })\n    return \"in\"\n}\nroute GET /me = { user: session().user, cookies: keys(request.cookies) }\nroute GET /big = file(\"big.bin\")\nroute GET /small = file(\"small.txt\")\nroute GET /setc {\n    set_cookie(\"a\", \"1\")\n    set_cookie(\"b\", \"2\")\n    set_cookie(\"c\", \"3\")\n    return \"ok\"\n}\nroute GET /st = stream((send) => {\n    send(\"one\\n\")\n    sleep(800)\n    send(\"two\\n\")\n})\n";
+    let d = dir("split-through", &[("app.qwe", app), ("shop.qwe", shop), ("small.txt", "ünï small\n")]);
+    let _gone = Gone(d.clone());
+    std::fs::write(d.join("big.bin"), vec![7u8; 24 << 20]).unwrap();
+    checked(&d, "app.qwe");
+    let (g, port) = serve(&d, "app.qwe", &["--split", "--trust-proxy", "127.0.0.1"], &[], "split2.log");
+    let end = Instant::now() + Duration::from_secs(20);
+    while support::send(port, "GET", "/shop/", &[], "").body != "shop" {
+        assert!(Instant::now() < end, "the service did not start: {}", std::fs::read_to_string(d.join("split2.log")).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    // Q-1087
+    let a = support::send(port, "GET", "/shop/", &[], "");
+    assert_eq!((a.header("content-security-policy"), a.header("referrer-policy")), (Some("default-src 'self'"), Some("same-origin")));
+    // Q-1064
+    let xff = [("X-Forwarded-For", "203.0.113.9")];
+    assert_eq!(support::send(port, "GET", "/whoami", &xff, "").body, r#"{"ip":"203.0.113.9"}"#);
+    assert_eq!(support::send(port, "GET", "/shop/whoami", &xff, "").body, r#"{"ip":"203.0.113.9","word":null}"#);
+    let a = support::send(port, "GET", "/shop/admin", &xff, "");
+    assert_eq!((a.status, a.body.as_str()), (403, "local only"));
+    let forged = [("X-Forwarded-For", "203.0.113.9"), ("x-quillo-client", "127.0.0.1;t=1;sig=00")];
+    assert_eq!(support::send(port, "GET", "/shop/whoami", &forged, "").body, r#"{"ip":"203.0.113.9","word":null}"#);
+    assert_eq!(support::send(port, "GET", "/shop/admin", &[], "").body, "admin panel");
+    // Q-1081
+    let cookie_of = |a: &support::Answer| a.headers.iter().filter(|(k, _)| k == "set-cookie").map(|(_, v)| v.split(';').next().unwrap().to_string()).collect::<Vec<_>>();
+    let root = cookie_of(&support::send(port, "GET", "/setc", &[], ""));
+    let own = cookie_of(&support::send(port, "GET", "/shop/in", &[], ""));
+    assert!(root.len() == 1 && root[0].starts_with("__Host-quillo_session="), "{:?}", root);
+    assert!(own.len() == 1 && own[0].starts_with("quillo_session="), "{:?}", own);
+    let line = format!("{}; {}; other=1", own[0], root[0]);
+    assert_eq!(support::send(port, "GET", "/shop/me", &[("Cookie", &line)], "").body, r#"{"user":"shopper","cookies":["quillo_session","other"]}"#);
+    assert_eq!(support::send(port, "GET", "/shop/me", &[("Cookie", &root[0])], "").body, r#"{"user":null,"cookies":[]}"#);
+    // Q-1071
+    let a = support::send(port, "GET", "/shop/setc", &[], "");
+    assert_eq!(cookie_of(&a), vec!["a=1", "b=2", "c=3"]);
+    assert_eq!(support::send(port, "GET", "/shop/small", &[], "").body, "ünï small\n");
+    let ((status, len), grew) = rss_growth(g.0.id(), || {
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        s.write_all(b"GET /shop/big HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out);
+        let head_end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        (String::from_utf8_lossy(&out[..12]).to_string(), out.len() - head_end - 4)
+    });
+    assert!(status.ends_with("200") && len >= 24 << 20, "{} {}", status, len);
+    assert!(grew < 12 * 1024, "24 MB through the app grew it by {} KB", grew);
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(b"GET /shop/st HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+    let t = Instant::now();
+    let mut got = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut first_at = None;
+    while let Ok(n) = s.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        got.extend_from_slice(&buf[..n]);
+        if first_at.is_none() && String::from_utf8_lossy(&got).contains("one") {
+            first_at = Some(t.elapsed());
+        }
+    }
+    let text = String::from_utf8_lossy(&got);
+    assert!(text.contains("one") && text.contains("two"), "{}", text);
+    assert!(first_at.unwrap() < Duration::from_millis(600) && t.elapsed() >= Duration::from_millis(700), "{:?} {:?}", first_at, t.elapsed());
+}
+
+/// A component's `raw(t("key"))` puts its key in the page's translations as `t` does: the page
+/// showed the key once its components took over (FEEDBACK75.md, Q-1121; branch feedback75)
+#[test]
+fn raw_t_in_a_component_carries_its_key() {
+    let src = "translations(\"locales\")\ncomponent Greet() {\n    state n = 0\n    <div><p>{raw(t(\"hello\", { name: \"Ana\" }))}</p><p>{t(\"plain\")}</p><button onclick={() => { n = n + 1 }}>{n}</button></div>\n}\nroute GET / = <html><body><Greet/></body></html>\n";
+    let d = dir("raw-t", &[("main.qwe", src)]);
+    let _gone = Gone(d.clone());
+    std::fs::create_dir_all(d.join("locales")).unwrap();
+    std::fs::write(d.join("locales/en.json"), r#"{"hello": "Hello <b>{name}</b> ü", "plain": "Plain", "other": "Other"}"#).unwrap();
+    checked(&d, "main.qwe");
+    let (_g, port) = serve(&d, "main.qwe", &[], &[], "raw-t.log");
+    let page = support::send(port, "GET", "/", &[], "").body;
+    assert!(page.contains("Hello <b>Ana</b> ü"), "{}", page);
+    let at = page.find("/_quillo/t/").unwrap_or_else(|| panic!("{}", page));
+    let path = &page[at..at + page[at..].find(".js").unwrap() + 3];
+    let file = support::send(port, "GET", path, &[], "").body;
+    assert!(file.contains("\"hello\":\"Hello \\u003cb>{name}\\u003c/b> ü\"") && file.contains("\"plain\":\"Plain\"") && !file.contains("\"other\""), "{}", file);
+}
+
+// ---- Wave 2's review: Q-1064 (with httpd's part), Q-1087, Q-1071, Q-1063, Q-1058 -------------------
+
+/// A request read whole off the wire: its status, its headers (names in lower case) and its body,
+/// unchunked, as bytes.
+fn wire(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    let mut head = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n", path);
+    for (k, v) in headers {
+        head.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    head.push_str("\r\n");
+    s.write_all(head.as_bytes()).unwrap();
+    let mut out = Vec::new();
+    let _ = s.read_to_end(&mut out);
+    let end = out.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let text = String::from_utf8_lossy(&out[..end]).to_string();
+    let mut lines = text.split("\r\n");
+    let status = lines.next().and_then(|l| l.split(' ').nth(1)).and_then(|c| c.parse().ok()).unwrap_or(0);
+    let hs: Vec<(String, String)> = lines.filter_map(|l| l.split_once(':')).map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string())).collect();
+    let mut body = out[end + 4..].to_vec();
+    if hs.iter().any(|(k, v)| k == "transfer-encoding" && v.contains("chunked")) {
+        let (mut raw, mut plain) = (&body[..], Vec::new());
+        loop {
+            let at = raw.windows(2).position(|w| w == b"\r\n").unwrap();
+            let n = usize::from_str_radix(String::from_utf8_lossy(&raw[..at]).trim(), 16).unwrap();
+            if n == 0 {
+                break;
+            }
+            plain.extend_from_slice(&raw[at + 2..at + 2 + n]);
+            raw = &raw[at + 4 + n..];
+        }
+        body = plain;
+    }
+    (status, hs, body)
+}
+
+fn named<'a>(hs: &'a [(String, String)], name: &str) -> Vec<&'a str> {
+    hs.iter().filter(|(k, _)| k == name).map(|(_, v)| v.as_str()).collect()
+}
+
+/// `'sha256-...'` of a script's text, as a policy names it.
+fn csp_hash(text: &[u8]) -> String {
+    use sha2::Digest;
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let d = sha2::Sha256::digest(text);
+    let mut out = String::from("'sha256-");
+    for c in d.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            out.push(if i <= c.len() { A[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Whether the page's policy names the hash of each of its inline scripts, and of each of its
+/// `<style>` elements, and how many scripts there were.
+fn policy_lets_through(policy: &str, page: &[u8]) -> (bool, usize) {
+    let text = String::from_utf8_lossy(page);
+    let inline = |open: &str, close: &str| -> Vec<String> {
+        let mut out = Vec::new();
+        let mut rest = &*text;
+        while let Some(i) = rest.find(open) {
+            let after = &rest[i + open.len()..];
+            let Some(end) = after.find(close) else { break };
+            out.push(after[..end].to_string());
+            rest = &after[end + close.len()..];
+        }
+        out
+    };
+    let scripts = inline("<script>", "</script>");
+    let styles = inline("<style>", "</style>");
+    let all = scripts.iter().chain(styles.iter()).all(|t| policy.contains(&csp_hash(t.as_bytes())));
+    (all, scripts.len())
+}
+
+const SPLIT_APP: &str = "site_headers({ \"content-security-policy\": \"default-src 'self'\", \"referrer-policy\": \"same-origin\" })\nservice /shop = \"shop.qwe\"\nroute GET / = \"app\"\n";
+const SPLIT_SHOP: &str = "state label = \"ünï\"\ncomponent Count() {\n    state n = 0\n    <button id=\"b\" onclick={() => { n = n + 1 }}>{label} {n}</button>\n}\nroute GET / = \"shop\"\nroute GET /del {\n    delete_cookie(\"x\")\n    return \"deleted\"\n}\nroute GET /page = <html><body><Count/></body></html>\nroute GET /bare = respond(200, <html><body><Count/></body></html>, { \"content-security-policy\": \"script-src 'self'\" })\nroute GET /text = \"a\".repeat(24000)\nroute GET /json = { rows: range(500) }\nroute GET /big = \"b\".repeat(3600000)\nroute GET /bin = file(\"big.bin\")\n";
+
+/// Starts the app of `SPLIT_APP` with `--split --trust-proxy 127.0.0.1`, once its service answers.
+fn split_shop(name: &str) -> (Gone, support::Guard, u16) {
+    let d = dir(name, &[("app.qwe", SPLIT_APP), ("shop.qwe", SPLIT_SHOP)]);
+    std::fs::write(d.join("big.bin"), vec![7u8; 3 << 20]).unwrap();
+    checked(&d, "app.qwe");
+    let (g, port) = serve(&d, "app.qwe", &["--split", "--trust-proxy", "127.0.0.1"], &[], "split.log");
+    let end = Instant::now() + Duration::from_secs(20);
+    while support::send(port, "GET", "/shop/", &[], "").body != "shop" {
+        assert!(Instant::now() < end, "the service did not start: {}", std::fs::read_to_string(d.join("split.log")).unwrap_or_default());
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    (Gone(d), g, port)
+}
+
+/// Under `--split`, a visitor not on this machine: the service takes its address from the app's word
+/// as the request is read, and the app's word on the scheme is still believed, from the peer the
+/// request came from, so a deletion behind an `https` proxy is `Secure`, as in 0.8.8 and for a
+/// visitor on this machine, where it was not; a visitor's own words and mark are not believed
+/// (FEEDBACK75.md, Q-1064 and its review; branch feedback75)
+#[test]
+fn a_split_service_keeps_the_scheme_of_a_visitor_elsewhere() {
+    let (_gone, _g, port) = split_shop("split-scheme");
+    let deletion = |hs: &[(&str, &str)]| support::send(port, "GET", "/shop/del", hs, "").header("set-cookie").map(str::to_string).unwrap_or_default();
+    let https = ("X-Forwarded-Proto", "https");
+    let visitor = ("X-Forwarded-For", "203.0.113.9");
+    assert!(deletion(&[https, visitor]).contains("; Secure"), "{}", deletion(&[https, visitor]));
+    assert!(deletion(&[https]).contains("; Secure"));
+    assert!(deletion(&[https, ("X-Forwarded-For", "2001:db8::7")]).contains("; Secure"));
+    assert!(!deletion(&[("X-Forwarded-Proto", "http"), visitor]).contains("Secure"));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string();
+    let forged_scheme = format!("https;t={};sig={}", now, "0".repeat(64));
+    let forged = [("X-Forwarded-Proto", "http"), visitor, ("x-quillo-from-app", "1"), ("x-quillo-scheme", forged_scheme.as_str())];
+    assert!(!deletion(&forged).contains("Secure"), "{}", deletion(&forged));
+    assert!(!deletion(&[visitor, ("x-quillo-from-app", "1")]).contains("Secure"));
+}
+
+/// A program's `site_headers` policy reaches a mounted program's page and a split service's with
+/// Quillo's scripts let through it: their hashes are in the policy the visitor gets, every inline
+/// script's and the islands' style's, where the bare policy blocked the page's components; the
+/// mount's own policy wins, its scripts let through too; a visitor's own policy word is not
+/// taken; and in Chrome the component runs (FEEDBACK75.md, Q-1087, review; branch feedback75)
+#[test]
+fn a_parents_policy_lets_a_mounted_pages_scripts_through() {
+    let app = "site_headers({ \"content-security-policy\": \"default-src 'self'\", \"strict-transport-security\": \"max-age=60\" })\nmount /notes = \"notes.qwe\"\nroute GET / = \"app\"\n";
+    let notes = "site_headers(\"/own\", { \"content-security-policy\": \"script-src 'self'\" })\nsite_headers(\"/none\", { \"content-security-policy\": null })\nstate label = \"ünï\"\ncomponent Count() {\n    state n = 0\n    <button id=\"b\" onclick={() => { n = n + 1 }}>{label} {n}</button>\n}\nroute GET / = <html><body><Count/></body></html>\nroute GET /own = <html><body><Count/></body></html>\nroute GET /none = <html><body><Count/></body></html>\nroute GET /text = \"plain\"\n";
+    let d = dir("mount-policy", &[("app.qwe", app), ("notes.qwe", notes)]);
+    let _gone = Gone(d.clone());
+    checked(&d, "app.qwe");
+    let (_g, port) = serve(&d, "app.qwe", &[], &[], "mount-policy.log");
+    let (status, hs, page) = wire(port, "/notes/", &[]);
+    let policy = named(&hs, "content-security-policy");
+    assert_eq!((status, policy.len()), (200, 1), "{:?}", hs);
+    assert!(policy[0].starts_with("default-src 'self'; script-src 'self' 'sha256-"), "{}", policy[0]);
+    assert_eq!(policy_lets_through(policy[0], &page), (true, 3), "{}\n{}", policy[0], String::from_utf8_lossy(&page));
+    assert_eq!(named(&hs, "strict-transport-security"), ["max-age=60"]);
+    let (_, hs, page) = wire(port, "/notes/own", &[]);
+    let policy = named(&hs, "content-security-policy");
+    assert!(policy.len() == 1 && policy[0].starts_with("script-src 'self' 'sha256-") && policy_lets_through(policy[0], &page).0, "{:?}", policy);
+    let (_, hs, _) = wire(port, "/notes/none", &[]);
+    assert!(named(&hs, "content-security-policy").is_empty(), "{:?}", hs);
+    assert_eq!(named(&wire(port, "/notes/text", &[]).1, "content-security-policy"), ["default-src 'self'"]);
+    // A split service's page, the same.
+    let (_shop_gone, _sg, shop) = split_shop("split-policy");
+    let (_, hs, page) = wire(shop, "/shop/page", &[]);
+    let policy = named(&hs, "content-security-policy");
+    assert!(policy.len() == 1 && policy[0].starts_with("default-src 'self'; script-src 'self' 'sha256-"), "{:?}", hs);
+    assert_eq!(policy_lets_through(policy[0], &page), (true, 3), "{}", policy[0]);
+    let (_, hs, page) = wire(shop, "/shop/bare", &[]);
+    let policy = named(&hs, "content-security-policy");
+    assert!(policy.len() == 1 && policy[0].starts_with("script-src 'self' 'sha256-") && policy_lets_through(policy[0], &page).0, "{:?}", policy);
+    let mine = format!("t={};sig={};{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(), "0".repeat(64), "W1siY29udGVudC1zZWN1cml0eS1wb2xpY3kiLCJyZXBvcnQtdXJpIGh0dHBzOi8vZXZpbC5leGFtcGxlIl1d");
+    let (_, hs, _) = wire(shop, "/shop/text", &[("x-quillo-policy", &mine)]);
+    assert_eq!(named(&hs, "content-security-policy"), ["default-src 'self'"], "{:?}", hs);
+    assert!(named(&hs, "x-quillo-policy-taken").is_empty(), "{:?}", hs);
+    // A service run apart (`--service-url`) takes no word of its app's: its page keeps the policy
+    // it came with (none, as in 0.8.8), which the app's would block; its other answers get the
+    // app's.
+    let apart = dir("apart-policy", &[("app.qwe", SPLIT_APP), ("shop.qwe", SPLIT_SHOP)]);
+    let _apart_gone = Gone(apart.clone());
+    std::fs::write(apart.join("big.bin"), b"x").unwrap();
+    let secret = [("QUILLO_SERVICE_SECRET", "a shared secret for the apart test, long enough")];
+    let (_svc, svc_port) = serve(&apart, "shop.qwe", &["--base", "/shop"], &secret, "svc.log");
+    let url = format!("shop=http://127.0.0.1:{}", svc_port);
+    let (_app, app_port) = serve(&apart, "app.qwe", &["--service-url", &url], &secret, "app.log");
+    let (status, hs, _) = wire(app_port, "/shop/page", &[]);
+    assert_eq!((status, named(&hs, "content-security-policy").len(), named(&hs, "x-quillo-policy-taken").len()), (200, 0, 0), "{:?}", hs);
+    assert_eq!(named(&wire(app_port, "/shop/text", &[]).1, "content-security-policy"), ["default-src 'self'"]);
+    let Some(chrome) = chrome_path() else {
+        eprintln!("skipping the browser half: no Chrome");
+        return;
+    };
+    let script = r#"(async () => {
+  const tick = (ms) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 300 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(30);
+  document.getElementById("b").click();
+  await tick(300);
+  document.body.dataset.result = JSON.stringify({ text: document.getElementById("b").textContent });
+})();"#;
+    for url in [format!("http://127.0.0.1:{}/notes/", port), format!("http://127.0.0.1:{}/shop/page", shop)] {
+        let r = in_chrome(&chrome, &url, script);
+        assert_eq!(r["text"].as_str(), Some("ünï 1"), "{}: {}", url, r);
+    }
+}
+
+fn chrome_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("QUILLO_CHROME") {
+        return Some(PathBuf::from(p));
+    }
+    ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium", "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.exists())
+}
+
+/// `url` in headless Chrome, with `script` run in the page: what it stored in `data-result`.
+fn in_chrome(chrome: &Path, url: &str, script: &str) -> serde_json::Value {
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let d = support::temp_dir("feedback75b-chrome");
+    std::fs::write(d.join("t.js"), script).unwrap();
+    let out = Command::new("node").arg(root.join("browser/run.js")).arg(chrome).arg(url).arg(d.join("profile")).arg("30000").arg(d.join("t.js")).output().expect("node");
+    let _ = std::fs::remove_dir_all(&d);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{}: {}", e, String::from_utf8_lossy(&out.stdout)))
+}
+
+/// A split service's answers reach a visitor compressed as in 0.8.8: what the app reads whole
+/// gzipped with its length (24 KB of text 58 bytes, 1,900 of JSON 931), a text past a megabyte
+/// gzipped as it goes, a file past it as it comes; plain for a visitor that takes no gzip, `Vary`
+/// saying so. They went out uncompressed and chunked, 24,000 and 3.6 MB (FEEDBACK75.md, Q-1071,
+/// review; branch feedback75)
+#[test]
+fn a_split_services_answers_are_compressed_as_before() {
+    use std::io::Read as _;
+    let (_gone, _g, port) = split_shop("split-gzip");
+    let gz = [("Accept-Encoding", "gzip")];
+    let unzip = |b: &[u8]| {
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(b).read_to_end(&mut out).unwrap();
+        out
+    };
+    let (status, hs, body) = wire(port, "/shop/text", &gz);
+    assert_eq!((status, named(&hs, "content-encoding"), named(&hs, "content-length"), body.len()), (200, vec!["gzip"], vec!["58"], 58), "{:?}", hs);
+    assert_eq!(unzip(&body), vec![b'a'; 24000]);
+    let (_, hs, body) = wire(port, "/shop/json", &gz);
+    assert_eq!((named(&hs, "content-encoding"), named(&hs, "content-length"), body.len()), (vec!["gzip"], vec!["931"], 931), "{:?}", hs);
+    assert!(String::from_utf8(unzip(&body)).unwrap().starts_with("{\"rows\":[0,1,2"));
+    let (status, hs, body) = wire(port, "/shop/big", &gz);
+    assert_eq!((status, named(&hs, "content-encoding"), named(&hs, "content-length")), (200, vec!["gzip"], Vec::<&str>::new()), "{:?}", hs);
+    assert!(body.len() < 10_000 && named(&hs, "vary").iter().any(|v| v.contains("accept-encoding")), "{} {:?}", body.len(), hs);
+    assert_eq!(unzip(&body), vec![b'b'; 3_600_000]);
+    let (_, hs, body) = wire(port, "/shop/big", &[]);
+    assert_eq!((named(&hs, "content-encoding"), body.len()), (Vec::<&str>::new(), 3_600_000), "{:?}", hs);
+    assert!(named(&hs, "vary").iter().any(|v| v.contains("accept-encoding")), "{:?}", hs);
+    let (_, hs, body) = wire(port, "/shop/text", &[]);
+    assert_eq!((named(&hs, "content-encoding"), body.len()), (Vec::<&str>::new(), 24000));
+    let (_, hs, body) = wire(port, "/shop/bin", &gz);
+    assert_eq!((named(&hs, "content-encoding"), body.len()), (Vec::<&str>::new(), 3 << 20), "{:?}", hs);
+}
+
+/// The bundle's guard reads a name as the program binds it: a lambda's parameter, a function's
+/// local, a loop's variable named `args` or `crypto` is not the builtin, and a component reading
+/// a constant made with them loads, as in 0.8.8; a source called as a method (`"40 + 2"
+/// .run_script()`) and `uuid()` are the server's own and refused (FEEDBACK75.md, Q-1063, review;
+/// branch feedback75)
+#[test]
+fn the_bundle_guard_reads_names_as_the_program_binds_them() {
+    let _one = serial();
+    let load = |head: &str| {
+        let src = format!("{}\ncomponent Pay() {{\n    state n = 0\n    <button onclick={{() => {{ n = n + 1 }}}}>Pay {{n}} {{K}}</button>\n}}\nroute GET / = <html><body><Pay/></body></html>\n", head);
+        let mut it = Interp::new(env!("CARGO_MANIFEST_DIR"));
+        match it.load_source(&src, "case.qwe") {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    };
+    let refused = "`K` is read from the server's environment, files, database, a service, a plugin, its command line or input, a site or `crypto`, and would be sent to every browser";
+    for head in [
+        "let K = [1, 2].map((args) => args * 2)",
+        "let FMT = { sum: (args) => args.a + args.b }\nlet K = FMT.sum({ a: 1, b: 2 })",
+        "fn helper(xs) {\n    let args = xs\n    return len(args)\n}\nlet K = helper([1])",
+        "let K = { run: (crypto) => crypto }",
+        "fn each_arg(xs) = xs.map((args) => args + 1)\nlet K = each_arg([1])",
+        "fn total(xs) {\n    let t = 0\n    for args in xs {\n        t += args\n    }\n    return t\n}\nlet K = total([1, 2])",
+        "fn pick(x) {\n    return match x {\n        { file } => file,\n        _ => \"none\",\n    }\n}\nlet K = pick({ file: \"a\" })",
+        "let K = { file: \"ünï\" }.file",
+    ] {
+        assert_eq!(load(head), "", "{}", head);
+    }
+    for head in [
+        "let K = \"40 + 2\".run_script()",
+        "let K = false ? \"x\".read_file() : \"y\"",
+        "let K = uuid()",
+        "fn token_of() {\n    return uuid()\n}\nlet K = token_of()",
+        "fn helper(xs) {\n    let n = xs\n    return args()\n}\nlet K = helper([1])",
+        "let K = [1].map((x) => crypto.token())",
+    ] {
+        let said = load(head);
+        assert!(said.contains(refused), "{}: {}", head, said);
+    }
+}
+
+/// A plugin function whose file says it does nothing (`//! effects: none`) gives the page what it
+/// is given, and a component may show a constant made with it; one that may read the environment
+/// is the server's own, called or as a method (FEEDBACK75.md, Q-1063, review; branch feedback75)
+#[test]
+fn a_plugin_that_does_nothing_is_not_the_servers_own() {
+    let comp = "component Pay() {\n    state n = 0\n    <button onclick={() => { n = n + 1 }}>Pay {n} {K}</button>\n}\nroute GET / = <html><body><Pay/></body></html>\n";
+    let d = dir("plugin-effects", &[
+        ("hi.qwer", "//! effects: none\npub fn hi(name: &str) -> String { format!(\"hi {}\", name) }\n"),
+        ("home.qwer", "//! effects: env\npub fn home(name: &str) -> String { format!(\"{}{}\", name, std::env::var(\"HOME\").unwrap_or_default()) }\n"),
+    ]);
+    let _gone = Gone(d.clone());
+    // What the server says as it starts: where it listens, or why it did not load.
+    let run = |head: &str| {
+        std::fs::write(d.join("main.qwe"), format!("use \"hi.qwer\"\nuse \"home.qwer\"\n{}\n{}", head, comp)).unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["build", "main.qwe"]).current_dir(&d).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let log = std::fs::File::create(d.join("start.log")).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "main.qwe", "--no-build", "--port", "0"]).current_dir(&d).stdin(Stdio::null()).stdout(log.try_clone().unwrap()).stderr(log).spawn().unwrap();
+        let mut g = support::Guard::new(child);
+        let end = Instant::now() + Duration::from_secs(60);
+        loop {
+            let said = std::fs::read_to_string(d.join("start.log")).unwrap_or_default();
+            if said.contains("listening") || g.0.try_wait().ok().flatten().is_some() || Instant::now() > end {
+                return std::fs::read_to_string(d.join("start.log")).unwrap_or_default();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let said = run("let K = hi(\"ünï\")");
+    assert!(said.contains("listening"), "{}", said);
+    let refused = "`K` is read from the server's environment, files, database, a service, a plugin, its command line or input, a site or `crypto`, and would be sent to every browser";
+    assert!(run("let K = home(\"x\")").contains(refused));
+    assert!(run("let K = \"x\".home()").contains(refused));
+}
+
+/// `quillo check`'s page-state warning follows a view a component shows (`<Shows/>`), and not a
+/// loop's variable of the state's name; the server fn error does not either; a chain of 8,000
+/// calls under one state checks in about the time it takes without the state, where a fixpoint
+/// over every function took seconds (FEEDBACK75.md, Q-1058, review; branch feedback75)
+#[test]
+fn check_follows_page_states_through_views_and_scopes() {
+    let src = "state secret = env(\"SECRET\") ?? \"\"\nstate me = env(\"ME\") ?? \"\"\nstate key = read_file(\"k.txt\") ?? \"\"\nview Shows() {\n    <i>{secret}</i>\n}\ncomponent Box() {\n    state n = 0\n    <div><Shows/><button onclick={() => { n = n + 1 }}>{n}</button></div>\n}\ncomponent People() {\n    state people = [\"a\", \"b\"]\n    <ul>{for me in people { <li>{me}</li> }}</ul>\n}\ncomponent Keys() {\n    <p>{[1, 2].map((key) => key + 1)}</p>\n}\nserver fn count(people: list) {\n    let t = 0\n    for me in people {\n        t += 1\n    }\n    return t\n}\nroute GET / = <html><body><Box/><People/><Keys/></body></html>\n";
+    let d = dir("check-views", &[("main.qwe", src)]);
+    let _gone = Gone(d.clone());
+    let (ok, said) = check_said(&d, "main.qwe");
+    assert!(ok, "{}", said);
+    assert!(said.contains("main.qwe:1: warning: `secret` is a page state that <Box> reads"), "{}", said);
+    assert_eq!(said.matches("is a page state that").count(), 1, "{}", said);
+    assert!(!said.contains("runs for no page"), "{}", said);
+    let chain = |state: bool| {
+        let mut src = String::from(if state { "state top = 1\n" } else { "let top = 1\n" });
+        for i in 0..8000 {
+            src.push_str(&format!("fn f{}() {{\n    return f{}()\n}}\n", i, i + 1));
+        }
+        src.push_str("fn f8000() {\n    return top\n}\nroute GET / = f0()\n");
+        std::fs::write(d.join("chain.qwe"), src).unwrap();
+        let t = Instant::now();
+        let (ok, said) = check_said(&d, "chain.qwe");
+        assert!(ok, "{}", said);
+        t.elapsed()
+    };
+    let plain = chain(false);
+    let with_state = chain(true);
+    assert!(with_state < plain * 3 + Duration::from_millis(500), "with a state {:?}, without {:?}", with_state, plain);
+}
+
+// ---- FEEDBACK78 (Q-1158, Q-1159): kept apart from FEEDBACK75's above ---------------------------
+
+/// The request log writes `[hidden]` for the values of query parameters whose names mark a secret,
+/// as words of a longer name too, and percent-encoded; others, empty values and URLs with no query
+/// as they were; the desktop window's launch token as before (FEEDBACK78.md, Q-1158; branch
+/// feedback75)
+#[test]
+fn the_log_hides_secrets_in_a_query() {
+    use quillo::server::log_url;
+    for (url, logged) in [
+        ("/a", "/a"),
+        ("/a?", "/a?"),
+        ("/a?page=2&q=ünï", "/a?page=2&q=ünï"),
+        ("/sign-in?user=nobody&password=guess", "/sign-in?user=nobody&password=[hidden]"),
+        ("/cb?code=abc&state=xyz&scope=openid", "/cb?code=[hidden]&state=[hidden]&scope=openid"),
+        ("/r?token=t1&access_token=t2&refresh-token=t3&idToken=t4&user.password=p", "/r?token=[hidden]&access_token=[hidden]&refresh-token=[hidden]&idToken=[hidden]&user.password=[hidden]"),
+        ("/s?SAMLRequest=x&SAMLResponse=y&RelayState=z&ticket=t", "/s?SAMLRequest=[hidden]&SAMLResponse=[hidden]&RelayState=[hidden]&ticket=[hidden]"),
+        ("/k?key=1&api_key=2&apiKey=3&client_secret=4&otp=5&pass=6&pwd=7&passwd=8", "/k?key=[hidden]&api_key=[hidden]&apiKey=[hidden]&client_secret=[hidden]&otp=[hidden]&pass=[hidden]&pwd=[hidden]&passwd=[hidden]"),
+        ("/e?p%61ssword=x&PASSWORD=y&password=&token", "/e?p%61ssword=[hidden]&PASSWORD=[hidden]&password=&token"),
+        ("/l?_quillo_launch=abc&x=1", "/l?_quillo_launch=[hidden]&x=1"),
+        // `monkey` ends with `key`, as `apikey` does: hidden since the review's rule for words run
+        // together (Q-1158, review), where it was written out.
+        ("/n?keyword=a&passage=b&monkey=c", "/n?keyword=a&passage=b&monkey=[hidden]"),
+    ] {
+        assert_eq!(log_url(url), logged, "{}", url);
+    }
+}
+
+/// The log hides a secret's value whatever the case of its name (`API_KEY`), in brackets
+/// (`user[password]`), with its words run together (`apikey`), or with a word that marks one
+/// anywhere in it (`id_token_hint`, `code_verifier`), and signatures and credentials (`X-Amz-
+/// Signature`, `sig`, `jwt`, `auth`); names that only look alike stay (FEEDBACK78.md, Q-1158, review;
+/// branch feedback75)
+#[test]
+fn the_log_hides_secrets_named_any_way() {
+    use quillo::server::log_url;
+    for name in [
+        "API_KEY", "ACCESS_TOKEN", "CLIENT_SECRET", "apikey", "accesstoken", "clientsecret", "user%5Bpassword%5D", "user[password]", "id_token_hint", "code_verifier", "X-Amz-Signature",
+        "X-Amz-Credential", "sig", "signature", "jwt", "auth", "APIKey", "newPassword", "password_confirm", "oauth_token", "RelayState", "x.Credentials", "AUTH", "Api-Key",
+    ] {
+        assert_eq!(log_url(&format!("/cb?page=2&{}=s3cr3t&q=ünï", name)), format!("/cb?page=2&{}=[hidden]&q=ünï", name), "{}", name);
+    }
+    for name in ["page", "q", "keyword", "passage", "author", "authority", "sort_by", "tokens_left", "signed", "id", "user[name]", "PAGE_SIZE", "statement"] {
+        let url = format!("/cb?{}=v", name);
+        assert_eq!(log_url(&url), url, "{}", name);
+    }
+}
+
+/// The request log, as a server writes it: a password in the query is `[hidden]` (FEEDBACK78.md,
+/// Q-1158; branch feedback75)
+#[test]
+fn a_servers_log_hides_a_password_in_the_query() {
+    let d = dir("log-hidden", &[("main.qwe", "route POST /sign-in ? { user: str, password: str } = \"ok\"\n")]);
+    let _gone = Gone(d.clone());
+    checked(&d, "main.qwe");
+    let (_g, port) = serve(&d, "main.qwe", &["--log", "text"], &[], "log.log");
+    assert_eq!(support::send(port, "POST", "/sign-in?user=nobody&password=guess", &[], "").status, 200);
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut log = String::new();
+    while !log.contains("/sign-in") && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(50));
+        log = std::fs::read_to_string(d.join("log.log")).unwrap_or_default();
+    }
+    assert!(log.contains("POST /sign-in?user=nobody&password=[hidden] -> 200") && !log.contains("guess"), "{}", log);
+}
+
+fn node_available() -> bool {
+    Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// `__t`'s value in Node, with `prelude` run first.
+fn in_node(prelude: &str, src: &str) -> String {
+    let mut it = Interp::new(".");
+    it.load_source(&format!("{}\nfn __t() {{\n{}\n}}\n", src, "return run()"), "case.qwe").unwrap_or_else(|e| panic!("{}", e));
+    let js = format!("{}\n{}", prelude, quillo::client::test_script(&it, "__t").unwrap_or_else(|e| panic!("{}", e)));
+    let out = support::node(&js).expect("node");
+    assert!(out.status.success(), "node failed: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// A page's object made of getters with a `toJSON` (a passkey's credential, a push subscription, a
+/// position) reaches a server fn as its `toJSON` gives it, where it arrived as `{}`; `json.stringify`
+/// writes it so too; one whose `toJSON` gives such an object again is `{}`, not a loop; a `Date` is
+/// its text; plain maps, lists and unicode as before (FEEDBACK78.md, Q-1159; branch feedback75)
+#[test]
+fn a_page_objects_to_json_reaches_a_server_fn() {
+    if !node_available() {
+        return;
+    }
+    let prelude = r#"
+class Cred { get id() { return "Ab_c"; } get type() { return "public-key"; } toJSON() { return { id: this.id, type: this.type, response: { clientDataJSON: "eyJ9", n: 2 } }; } }
+class Loop { toJSON() { return new Loop(); } }
+globalThis.mkCred = () => new Cred();
+globalThis.mkLoop = () => new Loop();
+globalThis.mkDate = () => new Date(Date.UTC(2026, 10, 20, 1, 2, 3));
+globalThis.fetch = async (url, o) => ({ ok: true, text: async () => JSON.stringify({ ok: JSON.parse(o.body) }) });
+"#;
+    let src = "server fn echo(a, b, c, d) = [a, b, c, d]\nfn run() {\n    let cred = js(\"mkCred\")\n    return [echo(cred, js(\"mkLoop\"), js(\"mkDate\"), { k: \"ünï\", l: [1, 2] }), json.stringify(cred)]\n}";
+    assert_eq!(
+        in_node(prelude, src),
+        r#"[[{ id: "Ab_c", type: "public-key", response: { clientDataJSON: "eyJ9", n: 2 } }, {}, "2026-11-20T01:02:03.000Z", { k: "ünï", l: [1, 2] }], "{\"id\":\"Ab_c\",\"type\":\"public-key\",\"response\":{\"clientDataJSON\":\"eyJ9\",\"n\":2}}"]"#
+    );
+}

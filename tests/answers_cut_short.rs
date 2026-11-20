@@ -67,7 +67,9 @@ fn a_page_passed_on_and_answered_in_part_says_the_part_of_the_site_is_not_answer
     let mut it = Interp::new(&d);
     let url = peer(CUT);
     let req = HttpRequest { method: "GET".into(), url: "/shop/page".into(), headers: vec![("Host".into(), "site.test".into())], body: Vec::new(), remote: "127.0.0.1".into() };
-    let r = service::pass_on(&mut it, &url, "/shop", &req);
+    // No parent policy to pass on, as before `pass_on` took one (FEEDBACK75.md, Q-1087; branch
+    // feedback75).
+    let r = service::pass_on(&mut it, &url, "/shop", &req, None);
     assert_eq!(r.status, 502);
     let text = r.text();
     assert!(text.starts_with("this part of the site is not answering ("), "{}", text);
