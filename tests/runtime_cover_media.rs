@@ -308,10 +308,14 @@ fn an_encoder_that_fails_reaches_the_page_as_no_error() {
 
 /// A sender that sends what it should not: a frame said to be a keyframe
 /// that is not one is dropped (the player has no decoder, and nothing is
-/// reported), and the next real keyframe plays. 700 frames at once while
-/// the player's page is busy are more than it keeps up with: it starts
-/// again (no decoder, `waiting`), skips frames until the next keyframe, and
-/// plays from it.
+/// reported), and the next real keyframe plays. Frames that find the
+/// player's decoder more than 600 behind (its own limit; the page queues
+/// 2,000 on it at once, as a page busy while hundreds come leaves it) are
+/// more than it keeps up with: it starts again (no decoder, `waiting`),
+/// skips frames until the next keyframe, and plays from it. 700 frames sent
+/// while the page was busy fell behind only where the server kept up (it
+/// holds 240 for a page, then skips it to the next keyframe itself), and
+/// failed 2 of 4 CI runs on 2026-11-19 (branch feedback75).
 #[test]
 fn a_player_drops_a_false_keyframe_and_catches_up_from_the_next() {
     let Some(chrome) = browser() else { return };
@@ -320,6 +324,7 @@ fn a_player_drops_a_false_keyframe_and_catches_up_from_the_next() {
     let not_key = &r["notKey"];
     assert_eq!((&not_key["decoder"], &not_key["video"], &not_key["then"]), (&json!(null), &json!(0), &json!(true)), "{}", r);
     assert_ne!(not_key["state"], "playing", "{}", r);
+    assert!(r["queued"].as_u64().unwrap_or(0) > 600, "{}", r);
     assert_eq!(r["behind"], json!({ "state": "waiting", "decoder": null, "shown": 0, "skipped": true, "then": true }), "{}", r);
     no_errors(&r);
 }

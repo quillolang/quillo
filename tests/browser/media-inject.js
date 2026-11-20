@@ -1,8 +1,8 @@
 // Drives tests/browser/media-publish.qwe at /page, whose player plays stream
 // inj. A worker sends inj as a page would (its own channel connection, a
 // WebSocket), frames encoded here: a frame said to be a keyframe that is not
-// one, then more frames at once than a player keeps up with (the page busy
-// while they come), each time followed by a real keyframe.
+// one, then frames that find the player's decoder further behind than it
+// keeps up with, each time followed by a real keyframe.
 (async () => {
   const t = (ms) => new Promise((r) => setTimeout(r, ms));
   const until = async (f, ms) => { for (const end = Date.now() + ms; Date.now() < end && !f(); ) await t(25); return f(); };
@@ -65,14 +65,27 @@
   await tell({ frames: [[true, key], [false, d1], [false, d2]] });
   out.notKey.then = await playing(3);
 
-  // 700 frames at once, while the page is busy: more than the player keeps
-  // up with, so it starts again at the next keyframe.
-  const shown = v.mediaStats.video;
+  // More than the player keeps up with: its decoder more than 600 frames behind (the player's
+  // own limit) when frames come. The decoder is put that far behind here, in one go, as a page
+  // busy while hundreds of frames come leaves it. 700 frames sent while the page was busy got
+  // through only where the server kept up: it holds 240 for a page and past them skips that page
+  // to the next keyframe itself, so on a slower machine the player never fell behind (CI, 2 runs
+  // of 4 on 2026-11-19). Then frames come, a keyframe and 50 more, while the page is busy so that
+  // they find the queue as it was left: the first makes the player start again, and the rest
+  // wait for the next keyframe.
+  const vd = v.mediaStats.vd;
+  let at = 1e10;
+  for (let i = 0; i < 2000; i++) vd.decode(new EncodedVideoChunk({ type: "delta", timestamp: (at += 33333), data: i % 2 ? d2 : d1 }));
+  out.queued = vd.decodeQueueSize;
   const burst = [[true, key]];
-  for (let i = 0; i < 700; i++) burst.push([false, i % 2 ? d2 : d1]);
+  for (let i = 0; i < 50; i++) burst.push([false, i % 2 ? d2 : d1]);
   const sent = tell({ frames: burst });
-  for (const end = performance.now() + 2500; performance.now() < end; ) {}
+  for (const end = performance.now() + 1000; performance.now() < end; ) {}
   await sent;
+  await until(() => v.mediaStats.vd === null, 5000);
+  // From here on, what the player shows is the burst's: the frames queued here went with the
+  // decoder it closed.
+  const shown = v.mediaStats.video;
   await t(1000);
   out.behind = { state: v.dataset.state, decoder: v.mediaStats.vd, shown: v.mediaStats.video - shown };
   // Frames until the next keyframe are skipped.

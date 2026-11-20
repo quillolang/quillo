@@ -378,6 +378,38 @@ fn frames_from_a_page_reach_those_watching_and_a_stream_can_be_closed() {
     assert!(!figures(name).contains(name));
 }
 
+/// A page on WebTransport gets its frames on a queue of its own (240 in the server): a frame
+/// that queue cannot take makes the page skip video until the next keyframe, audio aside, as one
+/// past a WebSocket page's queue does (src/wt.rs `Viewer::take`). Only runtime_cover_media's
+/// burst of 700 frames reached this, and only when the server fell behind; that test now puts the
+/// player behind by its own limit (branch feedback75).
+#[test]
+fn a_webtransport_page_whose_frame_queue_is_full_waits_for_a_keyframe() {
+    let name = "wt-queue";
+    let exp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() + 100;
+    let sealed = quillo::session::seal("quillo channel ticket", &serde_json::json!({ "s": "{}", "t": null, "e": exp }).to_string());
+    let ticket = quillo::wt::ticket_of(&format!("t={}", sealed)).unwrap();
+    let (tx, mut queue) = tokio::sync::mpsc::channel(4);
+    let (p, _rx) = quillo::wt::connect(ticket, Some(tx));
+    quillo::wt::let_watch(&p, name);
+    let key = media::key(name, None);
+    let mut taken = || std::iter::from_fn(|| queue.try_recv().ok()).map(|f| (f.kind, f.key)).collect::<Vec<_>>();
+    // A keyframe and five more: four fit its queue, and the two it cannot take put it behind.
+    for i in 0..6 {
+        media::from_page(&key, wire(name, media::VIDEO, i == 0, b"f"));
+    }
+    assert_eq!(taken(), [(media::VIDEO, true), (media::VIDEO, false), (media::VIDEO, false), (media::VIDEO, false)]);
+    // Room again, but behind: video waits for a keyframe, audio goes.
+    media::from_page(&key, wire(name, media::VIDEO, false, b"d"));
+    media::from_page(&key, wire(name, media::AUDIO, true, b"a"));
+    assert_eq!(taken(), [(media::AUDIO, true)]);
+    media::from_page(&key, wire(name, media::VIDEO, true, b"k"));
+    media::from_page(&key, wire(name, media::VIDEO, false, b"d"));
+    assert_eq!(taken(), [(media::VIDEO, true), (media::VIDEO, false)]);
+    quillo::wt::disconnect(&p);
+    assert_eq!(ev(&format!("media.close({:?})", name)), "false");
+}
+
 #[test]
 fn a_keyframe_that_never_comes_lets_go_of_what_is_kept() {
     let name = "long-gop";
