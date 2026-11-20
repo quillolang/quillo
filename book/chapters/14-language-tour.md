@@ -329,6 +329,18 @@ match v {
   What the program builds itself (`Node(v)`, an annotation, a `match`) is checked 64 levels
   deep, as before *(since 0.8.9: a request's value was checked 64 levels deep too, and what
   was below went unchecked)*.
+- **A record in a request is made, however it is reached.** A `server fn`'s parameter of a
+  map shape that holds one (`fn f(x: { owner: Account })`), a list of such shapes, or a record
+  behind any number of types naming types, gets the record as `f(a: Account)` would: fields
+  it does not have left out, defaults put in. A whole number where a float goes, however the
+  float is reached (`x: { p: float }` given `{"p": 1}`), comes as a float, and a `dec` or
+  `money` in a shape, a list or behind a type's name takes what the parameter of its type
+  takes (`"1.50"`, `1.5`, `3` for a `dec`); an int stays an int where the union names `int`,
+  itself or through types naming it (`int | float`, `Num | int` with `type Num = float`,
+  `float | Cnt` with `type Cnt = int`). MCP tools and calls to services take
+  their arguments the same way
+  *(since 0.8.9: a record inside a map shape, or behind eight or more types naming types, was
+  checked but not made, so `is_admin` reached the function and a default was refused)*.
 - `date` is text that is a calendar date (`YYYY-MM-DD`, a real day): `type Leave = {
   start: date, end: date }` refuses `"2026-02-30"` and a date-time, in a record, an
   annotation (`fn next(d: date)`), a pattern (`match x { date => ... }`, a query's `?

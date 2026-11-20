@@ -1138,7 +1138,16 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             }
             // Who the visitor is to a proxy that ended mTLS or signed them in, from the header the
             // operator names (FEEDBACK78.md, A.13 and A.14, the user's decision; branch feedback75).
-            ("--client-cert-header", Some(v)) => cert_header = Some(v.to_string()),
+            // Once, as `--user-header` is: given twice, the last was taken and a first that named
+            // no header was dropped without a word (FEEDBACK75.md follow-up found by 0.8.9's
+            // coverage, Q-1128; branch feedback75).
+            ("--client-cert-header", Some(v)) => {
+                if cert_header.is_some() {
+                    eprintln!("quillo: --client-cert-header needs a header's name, as x-forwarded-client-cert, once");
+                    return Err(2);
+                }
+                cert_header = Some(v.to_string())
+            }
             ("--user-header", Some(v)) => {
                 if !quillo::httpd::user_header(v) {
                     eprintln!("quillo: --user-header needs a header's name, as x-remote-user, once");

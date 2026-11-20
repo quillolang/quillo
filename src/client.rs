@@ -1963,15 +1963,99 @@ pub(crate) enum Met<'a> {
     Tag(&'a str),
 }
 
+/// The names bound around an expression as `each_free` walks it: in the order bound, so that a
+/// scope's are let go of at its end, and, past a few, kept by their hashes, so that whether a name
+/// is bound is one look-up. Each name used was looked for among all those bound: a function of
+/// 100,000 `let`s took 7.5 s to check or load, where 0.8.8 took 0.14 s, and a confined check of
+/// 850 KB 23.7 s past its 2 s (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1127; branch
+/// feedback75).
+#[derive(Default)]
+pub(crate) struct Bound {
+    names: Vec<String>,
+    /// Past `BOUND_LISTED` names: the last bound of each hash of a name, and for each name the one
+    /// bound before it with its hash (`NONE` for none), so that a name is looked for among those of
+    /// its hash alone, and no name is kept twice.
+    last: Option<HashMap<u64, u32, crate::value::BuildFx>>,
+    before: Vec<u32>,
+}
+
+/// How many names `Bound` looks through one by one before it keeps them by their hashes.
+const BOUND_LISTED: usize = 16;
+const NONE: u32 = u32::MAX;
+
+fn name_hash(n: &str) -> u64 {
+    use std::hash::BuildHasher;
+    crate::value::BuildFx::default().hash_one(n)
+}
+
+impl Bound {
+    pub(crate) fn new() -> Bound {
+        Bound::default()
+    }
+
+    /// These names bound, in order.
+    pub(crate) fn of(names: impl IntoIterator<Item = String>) -> Bound {
+        let mut b = Bound::default();
+        names.into_iter().for_each(|n| b.push(n));
+        b
+    }
+
+    /// Whether `n` is bound.
+    pub(crate) fn has(&self, n: &str) -> bool {
+        let Some(last) = &self.last else { return self.names.iter().any(|b| b == n) };
+        let mut i = last.get(&name_hash(n)).copied().unwrap_or(NONE);
+        while i != NONE {
+            if self.names[i as usize] == n {
+                return true;
+            }
+            i = self.before[i as usize];
+        }
+        false
+    }
+
+    fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    fn push(&mut self, n: String) {
+        if self.last.is_none() && self.names.len() >= BOUND_LISTED {
+            let mut last: HashMap<u64, u32, crate::value::BuildFx> = HashMap::default();
+            self.before = self.names.iter().enumerate().map(|(i, m)| last.insert(name_hash(m), i as u32).unwrap_or(NONE)).collect();
+            self.last = Some(last);
+        }
+        if let Some(last) = &mut self.last {
+            self.before.push(last.insert(name_hash(&n), self.names.len() as u32).unwrap_or(NONE));
+        }
+        self.names.push(n);
+    }
+
+    /// The names bound since there were `at`, let go of: the last of each hash is always the one
+    /// let go of first.
+    fn truncate(&mut self, at: usize) {
+        if let Some(last) = &mut self.last {
+            while self.names.len() > at {
+                let n = self.names.pop().expect("a name");
+                let h = name_hash(&n);
+                match self.before.pop().expect("its place") {
+                    NONE => last.remove(&h),
+                    i => last.insert(h, i),
+                };
+            }
+        } else {
+            self.names.truncate(at);
+        }
+    }
+}
+
 /// As `each_expr_in`, with the names bound around each expression: a function's and a lambda's
 /// parameters, a `let`, a `state` or a `fn` in a block, a loop's and an arm's pattern. An identifier
 /// one of them binds is not met, so a lambda's `args` or a loop's `me` is not the builtin or the
 /// global of that name (FEEDBACK75.md, Q-1063 and Q-1058, review; branch feedback75). `bound` is
 /// as it was when it returns.
-pub(crate) fn each_free<'a>(e: &'a Expr, fns: bool, bound: &mut Vec<String>, f: &mut dyn FnMut(Met<'a>, &[String])) {
+pub(crate) fn each_free<'a>(e: &'a Expr, fns: bool, bound: &mut Bound, f: &mut dyn FnMut(Met<'a>, &Bound)) {
     match e {
         Expr::Ident(n, _) => {
-            if !bound.iter().any(|b| b == n.as_str()) {
+            if !bound.has(n.as_str()) {
                 f(Met::Expr(e), bound)
             }
             return;
@@ -2041,7 +2125,7 @@ pub(crate) fn each_free<'a>(e: &'a Expr, fns: bool, bound: &mut Vec<String>, f: 
 }
 
 /// A function's body with its parameters bound, their defaults first, as `each_free` does.
-pub(crate) fn free_fn<'a>(d: &'a FnDef, bound: &mut Vec<String>, f: &mut dyn FnMut(Met<'a>, &[String])) {
+pub(crate) fn free_fn<'a>(d: &'a FnDef, bound: &mut Bound, f: &mut dyn FnMut(Met<'a>, &Bound)) {
     let at = bound.len();
     for p in &d.params {
         if let Some(x) = &p.default {
@@ -2053,7 +2137,7 @@ pub(crate) fn free_fn<'a>(d: &'a FnDef, bound: &mut Vec<String>, f: &mut dyn FnM
     bound.truncate(at);
 }
 
-fn free_stmts<'a>(ss: &'a [Stmt], fns: bool, bound: &mut Vec<String>, f: &mut dyn FnMut(Met<'a>, &[String])) {
+fn free_stmts<'a>(ss: &'a [Stmt], fns: bool, bound: &mut Bound, f: &mut dyn FnMut(Met<'a>, &Bound)) {
     for st in ss {
         match st {
             Stmt::Let(p, x, _) => {
@@ -2066,7 +2150,7 @@ fn free_stmts<'a>(ss: &'a [Stmt], fns: bool, bound: &mut Vec<String>, f: &mut dy
                 bound.push(n.clone());
             }
             Stmt::Assign(n, _, x, _) => {
-                if !bound.iter().any(|b| b == n.as_str()) {
+                if !bound.has(n.as_str()) {
                     f(Met::Assigned(n.as_str()), bound)
                 }
                 each_free(x, fns, bound, f)
@@ -2090,14 +2174,20 @@ fn free_stmts<'a>(ss: &'a [Stmt], fns: bool, bound: &mut Vec<String>, f: &mut dy
 
 /// A pattern's names, bound (`pattern_names` keeps one of each name in its list, which would take
 /// one from those bound outside).
-fn bind_pattern(p: &Pattern, bound: &mut Vec<String>) {
+fn bind_pattern(p: &Pattern, bound: &mut Bound) {
+    // A `let`'s one name, bound as it is: its list and the set that keeps one of each were made
+    // for every `let` (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1127; branch
+    // feedback75).
+    if let Pattern::Bind(n) = p {
+        return bound.push(n.to_string());
+    }
     let mut names = Vec::new();
     pattern_names(p, &mut names);
-    bound.extend(names);
+    names.into_iter().for_each(|n| bound.push(n));
 }
 
 /// A pattern's defaults, before its names are bound.
-fn free_pattern<'a>(p: &'a Pattern, fns: bool, bound: &mut Vec<String>, f: &mut dyn FnMut(Met<'a>, &[String])) {
+fn free_pattern<'a>(p: &'a Pattern, fns: bool, bound: &mut Bound, f: &mut dyn FnMut(Met<'a>, &Bound)) {
     match p {
         Pattern::Record(fields) => {
             for field in fields {
@@ -2113,7 +2203,7 @@ fn free_pattern<'a>(p: &'a Pattern, fns: bool, bound: &mut Vec<String>, f: &mut 
     }
 }
 
-fn free_html<'a>(el: &'a HtmlEl, fns: bool, bound: &mut Vec<String>, f: &mut dyn FnMut(Met<'a>, &[String])) {
+fn free_html<'a>(el: &'a HtmlEl, fns: bool, bound: &mut Bound, f: &mut dyn FnMut(Met<'a>, &Bound)) {
     f(Met::Tag(&el.tag), bound);
     for x in el.id.iter().chain(el.classes.iter()) {
         each_free(x, fns, bound, f)
@@ -2203,7 +2293,7 @@ fn collect_private(program: &[Arc<Vec<Stmt>>], natives: &HashSet<String>) -> Has
     let mut fns: HashSet<String> = ["env", "read_file"].iter().filter(|s| !own.contains(**s)).map(|s| s.to_string()).collect();
     // A source called as a method (`"40 + 2".run_script()`, a plugin's `x.sign()`), or on a value
     // that is no map (`"KEY".env`): `x.file` alone may be a field (Q-1063, review).
-    let method = |x: &Expr, bound: &[String]| {
+    let method = |x: &Expr, bound: &Bound| {
         let n = match x {
             Expr::Call(c, _, _) => match &**c {
                 Expr::Field(_, n, _) => n,
@@ -2212,7 +2302,7 @@ fn collect_private(program: &[Arc<Vec<Stmt>>], natives: &HashSet<String>) -> Has
             Expr::Field(recv, n, _) if matches!(&**recv, Expr::Lit(_) | Expr::Template(_) | Expr::List(_)) => n,
             _ => return false,
         };
-        (sources.contains(n.as_str()) || natives.contains(n.as_str())) && !bound.iter().any(|b| b == n)
+        (sources.contains(n.as_str()) || natives.contains(n.as_str())) && !bound.has(n)
     };
     // Whether `e` uses a private name (other than those bound around it: its function's
     // parameters, a lambda's, a `let`, a loop's), its functions' bodies included when `inside` is
@@ -2222,7 +2312,7 @@ fn collect_private(program: &[Arc<Vec<Stmt>>], natives: &HashSet<String>) -> Has
     let uses = |e: &Expr, inside: bool, shadowed: &[String], vars: &HashSet<String>, fns: &HashSet<String>| {
         let mut found = false;
         let (mut envs, mut public) = (0, 0);
-        each_free(e, inside, &mut shadowed.to_vec(), &mut |m, bound| {
+        each_free(e, inside, &mut Bound::of(shadowed.iter().cloned()), &mut |m, bound| {
             let Met::Expr(x) = m else { return };
             found |= method(x, bound);
             match x {
@@ -2243,7 +2333,7 @@ fn collect_private(program: &[Arc<Vec<Stmt>>], natives: &HashSet<String>) -> Has
     let uses_in_fns = |e: &Expr, vars: &HashSet<String>| {
         let mut found = false;
         let (mut envs, mut public) = (0, 0);
-        each_free(e, true, &mut Vec::new(), &mut |m, bound| {
+        each_free(e, true, &mut Bound::new(), &mut |m, bound| {
             let Met::Expr(x) = m else { return };
             found |= method(x, bound);
             match x {

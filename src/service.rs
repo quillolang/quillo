@@ -215,7 +215,9 @@ pub fn join_here(it: &Interp, req: &HttpRequest) -> HttpResponse {
     }
     let theirs = it.accept.as_ref().and_then(|a| a.keys.get(&service)).cloned();
     let ok = match (&theirs, sig.kid) {
-        (_, kid) if !kid.is_empty() && kid != service => return refused(401, &format!("a copy joins with its own service's key: this one is `{}`, not `{}`", kid, service)),
+        // The key it names is not written back: it is the caller's header, as yet unsigned
+        // (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1174; branch feedback75).
+        (_, kid) if !kid.is_empty() && kid != service => return refused(401, &format!("a copy joins with its own service's key: the one this join names is not `{}`'s", service)),
         (Some(keys), kid) if !kid.is_empty() => keys.iter().any(|k| crate::crypto::same(crate::svcauth::sign3(k, t, "_join", &service, "", nonce, kid, "", "", "", &req.body).as_bytes(), given.as_bytes())),
         (Some(_), _) => return refused(401, &format!("this app takes copies of `{}` signed with its key (QUILLO_SERVICE_KEY on the copy)", service)),
         (None, kid) if !kid.is_empty() => return refused(401, &format!("this app has no key for `{}` (accept_calls {{ keys }})", service)),
@@ -1394,6 +1396,14 @@ static APP_URL: OnceLock<String> = OnceLock::new();
 /// A signed POST between the app and a service's process, for channels:
 /// `to` the service (or "" for the app), `f` what it is for. The answer's body.
 pub fn signed_post(base: &str, path: &str, to: &str, f: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+    signed_post_as(base, path, to, f, body, "application/json")
+}
+
+/// `signed_post` of a body of type `ctype`: a channel's batch goes as bytes, as its handing over
+/// within the app does (`jobs::post_self`); sent as JSON, a service read it as JSON first and refused
+/// it past `--max-memory`, every message in it lost and none counted (FEEDBACK75.md follow-up found
+/// by 0.8.9's review of Q-1172; branch feedback75).
+pub fn signed_post_as(base: &str, path: &str, to: &str, f: &str, body: &[u8], ctype: &str) -> Result<Vec<u8>, String> {
     let secret = secret().ok_or("QUILLO_SERVICE_SECRET is not set")?;
     let t = now_secs();
     let nonce = new_id(16);
@@ -1401,7 +1411,7 @@ pub fn signed_post(base: &str, path: &str, to: &str, f: &str, body: &[u8]) -> Re
     let r = agent()
         .post(&format!("{}{}", base.trim_end_matches('/'), path))
         .timeout(Duration::from_secs(10))
-        .set("content-type", "application/json")
+        .set("content-type", ctype)
         .set("x-quillo-service", &format!("t={},sig={}", t, sig))
         .set("x-quillo-call", &nonce)
         .set("x-quillo-to", to)
@@ -2464,9 +2474,18 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest, poli
     let headers: Vec<(String, String)> = req
         .headers
         .iter()
-        .filter(|(k, _)| !HOP.iter().any(|h| k.eq_ignore_ascii_case(h)) && !APPS_OWN.iter().any(|h| k.eq_ignore_ascii_case(h)) && !k.eq_ignore_ascii_case("accept-encoding"))
+        .filter(|(k, _)| !HOP.iter().any(|h| k.eq_ignore_ascii_case(h)) && !APPS_OWN.iter().any(|h| k.eq_ignore_ascii_case(h)) && !SET_HERE.iter().any(|h| k.eq_ignore_ascii_case(h)))
         .filter_map(|(k, v)| if k.eq_ignore_ascii_case("cookie") { without_apps_sessions(v).map(|v| (k.clone(), v)) } else { Some((k.clone(), v.clone())) })
         .collect();
+    // A value ureq will not send, one with a byte past ASCII (obs-text, which RFC 9110 §5.5 allows:
+    // a UTF-8 cookie a page's script set, `X-Note: café`), made every page of the service a 502
+    // that wrote the header back, the service's HttpOnly session with it. The headers of such a
+    // name go in the app's signed word `HEADERS_WORD`, which the service puts back as they came
+    // (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1174; branch feedback75). The names
+    // the app sets itself (`SET_HERE`) are the app's alone: a visitor's copy past ASCII, carried and
+    // put back after the app's, was the last and the one a service read (Q-1174's review).
+    // The word is bound to this request (Q-1174's recheck): made only where there is one to make.
+    let (headers, carried) = sendable(headers, || headers_bound(prefix, &req.method, &sent_path(&target)?));
     let word = crate::server::known_scheme(req).and_then(scheme_word);
     let client = client_word(&req.remote);
     let policy = policy.map(str::to_string);
@@ -2481,8 +2500,9 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest, poli
     // `stream` came all at once at its end (FEEDBACK75.md, Q-1071; branch feedback75).
     let streams = it.streams_direct;
     let gzip = crate::server::accepts_gzip(req);
+    let agent = pass_agent(url);
     let res = it.unlocked(move || -> Result<(u16, Vec<(String, String)>, Passed), String> {
-        let mut rq = pass_agent().request(&method, &target);
+        let mut rq = agent.request(&method, &target);
         for (k, v) in &headers {
             rq = rq.set(k, v);
         }
@@ -2499,9 +2519,12 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest, poli
         if let Some(w) = &identity {
             rq = rq.set(IDENTITY_WORD, w);
         }
+        if let Some(c) = &carried {
+            rq = rq.set(HEADERS_WORD, c);
+        }
         let resp = match if body.is_empty() { rq.call() } else { rq.send_bytes(&body) } {
             Ok(r) | Err(ureq::Error::Status(_, r)) => r,
-            Err(e) => return Err(e.to_string()),
+            Err(e) => return Err(unanswered(&e)),
         };
         let status = resp.status();
         // Each name once, with all its lines: `headers_names` names a header once for each of
@@ -2518,12 +2541,15 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest, poli
         }
         let length = resp.header("content-length").and_then(|n| n.trim().parse::<u64>().ok());
         let bodyless = method == "HEAD" || crate::stream::bodyless(i64::from(status));
-        if streams && !bodyless && length.is_none_or(|n| n > PASSED_WHOLE) {
-            return Ok((status, headers, Passed::Reader(Box::new(resp.into_reader()), length.is_some())));
-        }
         // Read whole (a short answer, or no server to stream it), and no larger than one value may
         // be (`--max-memory`), 256 MiB at most.
         let most = (256u64 << 20).min(crate::httpd::value_most());
+        // Streamed past what one value may be too: under a `--max-memory` below 1 MiB, an answer
+        // between the two was read whole and refused, a 502, where a larger one streamed through
+        // (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1175; branch feedback75).
+        if streams && !bodyless && length.is_none_or(|n| n > PASSED_WHOLE.min(most)) {
+            return Ok((status, headers, Passed::Reader(Box::new(resp.into_reader()), length.is_some())));
+        }
         let mut bytes = Vec::new();
         resp.into_reader().take(most + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
         if bytes.len() as u64 > most {
@@ -2557,7 +2583,139 @@ pub fn pass_on(it: &mut Interp, url: &str, prefix: &str, req: &HttpRequest, poli
 /// The headers only an app sends its service, which a client's request loses here: the app's words
 /// and the mark a service puts on a request from its app (FEEDBACK70.md, Q-986; FEEDBACK75.md,
 /// Q-1064, Q-1087).
-const APPS_OWN: &[&str] = &[SCHEME_WORD, CLIENT_WORD, POLICY_WORD, IDENTITY_WORD, crate::server::FROM_APP, crate::server::IDENTITY_MARK];
+const APPS_OWN: &[&str] = &[SCHEME_WORD, CLIENT_WORD, POLICY_WORD, IDENTITY_WORD, HEADERS_WORD, crate::server::FROM_APP, crate::server::IDENTITY_MARK];
+
+/// The headers `pass_on` sets on a request it passes on, beside the app's words: a visitor's own
+/// copy goes, in ASCII or not, and a word that names one is not taken (FEEDBACK75.md follow-up found
+/// by 0.8.9's coverage, Q-1174's review; branch feedback75).
+const SET_HERE: &[&str] = &["x-forwarded-for", "x-forwarded-host", "x-forwarded-prefix", "accept-encoding"];
+
+/// The header a request an app passes on to a service carries the visitor's headers in that ureq
+/// does not send as they are (a value with a byte past ASCII), as `t=<seconds>;sig=<hex>;<base64url
+/// of [[name, value], ...]>`, signed as `POLICY_WORD` is: a service its app started puts them back on
+/// a request from its app (`server::apps_headers`, the mark `FROM_APP`), and a service run apart that
+/// shares the secret (`--as-service`) on a word it checks; one a client sends the app is dropped
+/// (`APPS_OWN`) (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1174 and its review; branch
+/// feedback75).
+pub const HEADERS_WORD: &str = "x-quillo-headers";
+
+/// `headers` as ureq sends them, and the word of those it does not (`HEADERS_WORD`): every line of
+/// a name one of whose values has a byte past ASCII, in their order, and of a `Cookie` line only its
+/// cookies past ASCII, so that the others, the service's session among them, stay in the line ureq
+/// sends. A header HTTP does not allow at all (a control character in its value, or, beside one,
+/// its name not a token, which only a FastCGI web server could hand on) is left out, said once by its
+/// name, never its value; so are those past ASCII where there is no secret to sign the word with.
+/// Most requests have no such header and are given back as they came, after one look at their
+/// values' bytes, made with no branch to stop early, a word at a time: looked at byte by byte, names
+/// too, it cost a request passed on 0.5% more instructions (measured). A name that is not a token
+/// alone, ureq refuses as it did: a 502 that names no header (Q-1174).
+fn sendable(headers: Vec<(String, String)>, bound: impl FnOnce() -> Option<String>) -> (Vec<(String, String)>, Option<String>) {
+    let token = |k: &str| !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+    let sent = |v: &str| v.bytes().fold(true, |ok, b| ok & ((b.wrapping_sub(0x20) < 0x5f) | (b == b'\t')));
+    if headers.iter().all(|(_, v)| sent(v)) {
+        return (headers, None);
+    }
+    let lawful = |v: &str| v.bytes().all(|b| b == b'\t' || (0x20..0x7f).contains(&b) || b >= 0x80);
+    let cookie = |k: &str| k.eq_ignore_ascii_case("cookie");
+    let wide: Vec<String> = headers.iter().filter(|(k, v)| token(k) && !cookie(k) && lawful(v) && !sent(v)).map(|(k, _)| k.to_ascii_lowercase()).collect();
+    let (mut kept, mut carried) = (Vec::new(), Vec::new());
+    for (k, v) in headers {
+        if !token(&k) || !lawful(&v) {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                let name = if token(&k) { format!("`{}`", k) } else { "a header whose name is not a token".to_string() };
+                eprintln!("quillo: {} of a request is not one HTTP allows (a control character), so it is not passed on to the service (said once)", name);
+            }
+        } else if cookie(&k) && !sent(&v) {
+            let (ascii, past): (Vec<&str>, Vec<&str>) = v.split(';').map(str::trim).filter(|p| !p.is_empty()).partition(|p| sent(p));
+            if !ascii.is_empty() {
+                kept.push((k.clone(), ascii.join("; ")));
+            }
+            carried.push((k, past.join("; ")));
+        } else if wide.iter().any(|w| k.eq_ignore_ascii_case(w)) {
+            carried.push((k, v));
+        } else {
+            kept.push((k, v));
+        }
+    }
+    if carried.is_empty() {
+        return (kept, None);
+    }
+    let word = bound().and_then(|b| headers_word(&carried, &b));
+    if word.is_none() {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            let names: Vec<&str> = carried.iter().map(|(k, _)| k.as_str()).collect();
+            eprintln!("quillo: a request's {} past ASCII cannot go to the service as it came: there is no QUILLO_SERVICE_SECRET to sign it with, so it is left out (said once)", names.join(", "));
+        }
+    }
+    (kept, word)
+}
+
+/// The app's word on the headers it could not send (`HEADERS_WORD`), signed now with the request it
+/// is for (`headers_bound`); none without a shared secret (Q-1174's review). Signed with its text and
+/// time alone, a word sent with one request was taken on another path, by another method, at another
+/// service sharing the secret, as often as it was sent within its five minutes (FEEDBACK75.md
+/// follow-up found by 0.8.9's coverage, Q-1174's recheck; branch feedback75).
+fn headers_word(hs: &[(String, String)], bound: &str) -> Option<String> {
+    let key = secret()?;
+    let t = now_secs();
+    let text = crate::crypto::b64url(serde_json::to_string(hs).ok()?.as_bytes());
+    Some(format!("t={};sig={};{}", t, signed_text(&key, "quillo-headers-2", &format!("{}\n{}", bound, text), t), text))
+}
+
+/// What a `HEADERS_WORD` is signed with beside its text: the service's prefix (`--base` there), the
+/// request's method, and its path and query as the service gets them; the app's word on the
+/// visitor's address, the request's other word, carries no nonce, and httpd takes it off before the
+/// service could compare it (Q-1174's recheck).
+pub(crate) fn headers_bound(prefix: &str, method: &str, path: &str) -> Option<String> {
+    Some(format!("{}\n{}\n{}", prefix, method, path))
+}
+
+/// The path and query a request to `target` goes with, as ureq writes them in its request line
+/// (`Url::path`, `?` and a query that is not empty).
+fn sent_path(target: &str) -> Option<String> {
+    let u = url::Url::parse(target).ok()?;
+    Some(match u.query().filter(|q| !q.is_empty()) {
+        Some(q) => format!("{}?{}", u.path(), q),
+        None => u.path().to_string(),
+    })
+}
+
+/// The headers in an app's `HEADERS_WORD`, those a service puts back: the word signed with a shared
+/// secret, within `WINDOW`, for this request (`bound`, `headers_bound`); tokens for names, values HTTP allows (no control character but a tab),
+/// and never a hop's header, one the app sets itself (`SET_HERE`) or one of Quillo's own
+/// (`x-quillo-`), which only the app and the server set; none where the word is not one (Q-1174 and
+/// its review).
+pub(crate) fn headers_of_word(word: &str, bound: &str) -> Option<Vec<(String, String)>> {
+    let mut parts = word.splitn(3, ';');
+    let t = parts.next()?.strip_prefix("t=")?.parse::<u64>().ok()?;
+    let sig = parts.next()?.strip_prefix("sig=")?;
+    let text = parts.next()?;
+    if now_secs().abs_diff(t) > WINDOW {
+        return None;
+    }
+    shared_signed(sig, |k| signed_text(k, "quillo-headers-2", &format!("{}\n{}", bound, text), t))?;
+    let hs: Vec<(String, String)> = serde_json::from_slice(&crate::crypto::unb64url(text)?).ok()?;
+    const HOP: &[&str] = &["host", "connection", "content-length", "transfer-encoding", "keep-alive", "upgrade", "te", "trailer", "proxy-authorization"];
+    let token = |k: &str| !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+    let lawful = |v: &str| v.bytes().all(|b| b == b'\t' || (0x20..0x7f).contains(&b) || b >= 0x80);
+    let own = |k: &str| k.as_bytes().get(..9).is_some_and(|p| p.eq_ignore_ascii_case(b"x-quillo-")) || HOP.iter().chain(SET_HERE).any(|h| k.eq_ignore_ascii_case(h));
+    Some(hs.into_iter().filter(|(k, v)| token(k) && lawful(v) && !own(k)).collect())
+}
+
+/// Why a service's answer did not come, as the visitor is told it: ureq's kind of failure and an
+/// error the system gave, never ureq's message, which wrote back the header line it refused
+/// (`invalid header 'Cookie: ...'`) or a status line the service sent (Q-1174).
+fn unanswered(e: &ureq::Error) -> String {
+    match e {
+        ureq::Error::Transport(t) => match std::error::Error::source(t).and_then(|s| s.downcast_ref::<std::io::Error>()) {
+            Some(io) => format!("{}: {}", t.kind(), io),
+            None => t.kind().to_string(),
+        },
+        ureq::Error::Status(code, _) => format!("status {}", code),
+    }
+}
 
 /// A service's answer, passed on: read whole, or to be streamed through (`pass_on`).
 enum Passed {
@@ -2570,12 +2728,22 @@ enum Passed {
 /// of no stated length (a stream), goes through as it comes (FEEDBACK75.md, Q-1071).
 const PASSED_WHOLE: u64 = 1 << 20;
 
-/// The agent answers are passed on with: no time for the whole answer, which may be a long
-/// download or a stream, but 60 s at most between its bytes, as the whole had (FEEDBACK75.md,
-/// Q-1071; branch feedback75).
-fn pass_agent() -> &'static ureq::Agent {
-    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
+/// The agent answers from the service at `base` are passed on with: no time for the whole answer,
+/// which may be a long download or a stream, but 60 s at most between its bytes, as the whole had
+/// (FEEDBACK75.md, Q-1071; branch feedback75).
+/// One for each service's address, made again when its last request began longer ago than
+/// `pass_idle`: its pool keeps one connection to the service (ureq's default for a host), the one
+/// returned last, which is never older than the last request's start, as that request took the one
+/// before. The service closes a connection idle for 60 s, and ureq took the one it kept, its peer
+/// gone, after 2 minutes: the first request after was a 502, "Connection reset by peer"
+/// (FEEDBACK75.md follow-up found by 0.8.9's review, Q-1097, in 0.8.8 too; branch feedback75).
+/// Kept by each thread that answers requests (an instance's loop), with no lock to take: a lock
+/// for each request passed on cost it more instructions than the rest of this check.
+fn pass_agent(base: &str) -> ureq::Agent {
+    thread_local! {
+        static AGENTS: std::cell::RefCell<Vec<(String, ureq::Agent, Instant)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let made = || {
         ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(5))
             .timeout_read(Duration::from_secs(60))
@@ -2583,6 +2751,36 @@ fn pass_agent() -> &'static ureq::Agent {
             .redirects(0)
             .user_agent(concat!("quillo/", env!("CARGO_PKG_VERSION")))
             .build()
+    };
+    let now = Instant::now();
+    AGENTS.with(|agents| {
+        let mut agents = agents.borrow_mut();
+        match agents.iter_mut().find(|(b, _, _)| b == base) {
+            Some((_, agent, at)) => {
+                if now.duration_since(*at) > pass_idle() {
+                    *agent = made();
+                }
+                *at = now;
+                agent.clone()
+            }
+            None => {
+                let agent = made();
+                agents.push((base.to_string(), agent.clone(), now));
+                agent
+            }
+        }
+    })
+}
+
+/// Half the time a Quillo server keeps an idle connection (httpd's `IDLE`, 60 s, or the shorter
+/// time QUILLO_IDLE_MS_FOR_TESTS gives, which a service `--split` started inherits): past it, a
+/// service's pooled connection is not used again (Q-1097).
+fn pass_idle() -> Duration {
+    static IDLE: OnceLock<Duration> = OnceLock::new();
+    *IDLE.get_or_init(|| {
+        let ms = std::env::var("QUILLO_IDLE_MS_FOR_TESTS").ok().and_then(|v| v.parse::<u64>().ok());
+        let idle = ms.map(Duration::from_millis).filter(|d| *d >= Duration::from_secs(1) && *d < Duration::from_secs(60)).unwrap_or(Duration::from_secs(60));
+        idle / 2
     })
 }
 

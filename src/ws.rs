@@ -959,21 +959,23 @@ impl Hold {
         true
     }
 
-    /// `n` bytes `client` held given back.
+    /// `n` bytes `client` held given back: no more than it holds. The total was lowered by `n`
+    /// whatever the client held, and from a hold of nothing wrapped past `usize::MAX`, after which
+    /// a take's sum wrapped too and passed (FEEDBACK75.md follow-up found by 0.8.9's coverage,
+    /// Q-1173; branch feedback75).
     pub fn give(&self, n: usize, client: &str) {
         if n == 0 {
             return;
         }
-        self.held.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
         let mut g = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(m) = g.as_mut() {
-            if let Some(c) = m.get_mut(client) {
-                *c = c.saturating_sub(n);
-                if *c == 0 {
-                    m.remove(client);
-                }
-            }
+        let Some(m) = g.as_mut() else { return };
+        let Some(c) = m.get_mut(client) else { return };
+        let n = n.min(*c);
+        *c -= n;
+        if *c == 0 {
+            m.remove(client);
         }
+        self.held.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// When a message begun at `since`, of which `got` bytes have come, must have come on by:

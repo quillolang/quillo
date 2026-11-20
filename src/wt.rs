@@ -515,7 +515,22 @@ fn take_from_page(p: &Arc<Peer>, text: &str, can_wait: bool) -> Option<Pending> 
     // As deep as every reader takes (FEEDBACK55.md, Q-875's second review; branch feedback55), and
     // past `PLAIN_JSON` within what a page's JSON may make: one message of 1 MiB made 75 MB, outside
     // `--max-memory` (FEEDBACK75.md, Q-1052; branch feedback75).
-    let read = if text.len() > PLAIN_JSON { crate::value::json_from_page(text.as_bytes()) } else { crate::value::json_value(text.as_bytes()) };
+    let read = if text.len() > PLAIN_JSON {
+        match crate::value::json_from_page_why(text.as_bytes()) {
+            Ok(j) => Ok(j),
+            // JSON a page may send, past what `--max-memory` lets it make: dropped and counted, as
+            // a message past a page's share is, where it was lost uncounted; bad JSON is ignored,
+            // as before (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1172; branch
+            // feedback75).
+            Err(e) if e.memory => {
+                DROPPED.fetch_add(1, Relaxed);
+                return None;
+            }
+            Err(e) => Err(e.why),
+        }
+    } else {
+        crate::value::json_value(text.as_bytes())
+    };
     let Ok(serde_json::Value::Array(a)) = read else { return None };
     let (Some(kind), Some(ch)) = (a.first().and_then(|k| k.as_str()), a.get(1).and_then(|c| c.as_str())) else { return None };
     if !name_ok(ch) {
@@ -936,9 +951,20 @@ fn deliver_loop(addr: SocketAddr, ch: String, i: Arc<Inbox>) {
         // (FEEDBACK75.md, Q-1061's review, measured; branch feedback75). The same lines: `k`, `p`,
         // `s`, `t`, `v`, and `b`, whose page, where it is not the root program's (its session is
         // that program's; Q-1061).
+        let mut batch = batch;
         let mut body: Vec<u8> = Vec::with_capacity(batch.iter().map(|e| e.value.len() + e.peer.session.len() + 64).sum());
-        for e in &batch {
+        // A batch's body within what the server reads of a request's (`--max-memory`, `--max-body`;
+        // none without them): one of 1,024 lines and 1 MiB of values, each line with its page's
+        // session and its value written again as a JSON string, was refused whole past either,
+        // every message in it lost and none counted. The lines past it go back to the front of the
+        // queue, for the next batch; a message whose line alone is past it can never be handed
+        // over, and is dropped and counted, as one past a page's share is (FEEDBACK75.md follow-up
+        // found by 0.8.9's coverage, Q-1172; branch feedback75).
+        let most = crate::httpd::most_bytes().min(crate::httpd::body_most());
+        let (mut at, mut dropped) = (0, false);
+        while at < batch.len() {
             use std::io::Write as _;
+            let (e, start) = (&batch[at], body.len());
             let _ = write!(body, "{{\"k\":\"{}\",\"p\":\"{:012x}\",\"s\":", e.kind, e.peer.id);
             let _ = serde_json::to_writer(&mut body, &e.peer.session);
             body.extend_from_slice(b",\"t\":");
@@ -950,6 +976,33 @@ fn deliver_loop(addr: SocketAddr, ch: String, i: Arc<Inbox>) {
             body.extend_from_slice(b",\"v\":");
             let _ = serde_json::to_writer(&mut body, &e.value);
             body.extend_from_slice(b"}\n");
+            if body.len() > most {
+                if start > 0 {
+                    body.truncate(start);
+                    let rest: Vec<Event> = batch.drain(at..).collect();
+                    let mut q = lock(&i.queue);
+                    for e in rest.into_iter().rev() {
+                        q.push_front(e);
+                    }
+                    break;
+                }
+                // A join, a leave or a watch alone is handed over as it was: refused, a join is
+                // answered no.
+                if e.kind == 'm' {
+                    body.truncate(start);
+                    release(&batch.remove(at), &i);
+                    DROPPED.fetch_add(1, Relaxed);
+                    dropped = true;
+                    continue;
+                }
+            }
+            at += 1;
+        }
+        if dropped {
+            room_freed();
+        }
+        if batch.is_empty() {
+            continue;
         }
         let mut answer: Option<Vec<u8>> = None;
         for _ in 0..50 {
@@ -1085,8 +1138,10 @@ fn forward(it: &mut Interp, service: &str, name: &str, body: &[u8]) -> crate::se
     // The service is this program's: a page of another program it mounts is sent with no session,
     // as that program's session is no session here (FEEDBACK75.md, Q-1061; branch feedback75).
     let mut sent = Vec::with_capacity(body.len());
+    let mut messages = 0u64;
     for line in text.lines() {
         let Ok(mut e) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        messages += u64::from(e["k"] == "m");
         if e["k"] == "j" {
             joins += 1;
             if let Some(id) = e["p"].as_str().and_then(|p| u64::from_str_radix(p, 16).ok()) {
@@ -1105,12 +1160,16 @@ fn forward(it: &mut Interp, service: &str, name: &str, body: &[u8]) -> crate::se
     let url = crate::service::first_url_of(&it.shared, service);
     let (to, ch) = (service.to_string(), name.to_string());
     let answer = it.unlocked(move || match url {
-        Some(u) => crate::service::signed_post(&u, &format!("/_quillo/service-channel/{}", ch), &to, &format!("_channel:{}", ch), &sent),
+        // As bytes, as the batch came here: as JSON, the service read it whole first and refused
+        // it past `--max-memory`; one still refused is counted, its messages dropped
+        // (FEEDBACK75.md follow-up found by 0.8.9's review of Q-1172; branch feedback75).
+        Some(u) => crate::service::signed_post_as(&u, &format!("/_quillo/service-channel/{}", ch), &to, &format!("_channel:{}", ch), &sent, "application/octet-stream"),
         None => Err(format!("service {} has no address", to)),
     });
     let body = match answer {
         Ok(b) => b,
         Err(e) => {
+            DROPPED.fetch_add(messages, Relaxed);
             eprintln!("quillo: channel {}: service {} did not take what pages sent: {}", name, service, e);
             serde_json::to_vec(&vec![false; joins]).unwrap_or_default()
         }

@@ -21,6 +21,7 @@ use crate::interp::{fail, Ctrl, Interp};
 use crate::value::*;
 use indexmap::IndexMap;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 type R = Result<Value, Ctrl>;
@@ -130,6 +131,21 @@ fn translations(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         let mut flat = HashMap::new();
         if let Err(e) = flatten("", &m, &mut flat) {
             return fail(line, format!("`translations` ({}): {}", name, e));
+        }
+        // A text with a value holds plain HTML only: what the browser reads otherwise (comments,
+        // raw text, SVG) could not be read alike for sure (FEEDBACK75.md follow-up found by 0.8.9's
+        // coverage, Q-1176's final review; branch feedback75).
+        let mut keys: Vec<&String> = flat.keys().collect();
+        keys.sort();
+        for k in keys {
+            let texts: Vec<&Arc<str>> = match &flat[k] {
+                Value::Str(t) => vec![t],
+                Value::Map(forms) => forms.values().filter_map(|v| if let Value::Str(t) = v { Some(t) } else { None }).collect(),
+                _ => Vec::new(),
+            };
+            if let Some(what) = texts.into_iter().find_map(|t| not_plain(t)) {
+                return fail(line, format!("translation `{}` ({}): a text with a value may hold plain HTML only, not `{}`: put that markup in the component around `t(...)`", k, name, what));
+            }
         }
         // `fr_FR.json`, as gettext and Java name them, is `fr-FR`, the form a request is
         // matched in, so it can be chosen (FEEDBACK30.md, Q-362; branch feedback27-35-fixes).
@@ -445,10 +461,17 @@ fn translate(it: &mut Interp, args: Vec<Value>, line: u32, html: bool) -> R {
         // written without quotes that holds a value is quoted, so that the value cannot end it
         // (`href={site}` with "x onfocus=alert(1)") (FEEDBACK75.md, Q-1083 and its reviews;
         // branch feedback75).
-        if let (Some(vars), true) = (&vars, table) {
-            if let Some(spans) = attr_spans(&text) {
-                return Ok(Value::html(interpolate_html(&text, vars, &spans)));
+        // The table's own text is read whether values are given or not, as the browser's runtime
+        // reads it, and put in with the same rules (Q-1176's final review).
+        if table {
+            let none = Map::new();
+            let vars = vars.as_deref().unwrap_or(&none);
+            let mut out = String::with_capacity(text.len() + 16);
+            match attr_spans(&text) {
+                Some(spans) => out = interpolate_html(&text, vars, &spans),
+                None => put_in(&text, vars, false, &mut out),
             }
+            return Ok(Value::html(out));
         }
         return Ok(Value::html(interpolate(&text, escaped_vars(vars).as_ref())));
     }
@@ -530,11 +553,19 @@ pub struct Span {
     pub kind: u8,
 }
 
-/// `Span::kind`s: not a URL; a URL (`interp::URL_ATTRS`); `srcset`'s list; `ping`'s list.
+/// `Span::kind`s: not a URL; a URL (`interp::URL_ATTRS`); `srcset`'s list; `ping`'s list; an SVG
+/// animation's values (`interp::anim_value_attr`); code or a page (`ast::code_attr`: `on*`,
+/// `srcdoc`), emptied; and a placeholder inside a tag that no reading placed (`find_attr_spans`).
 pub const OTHER: u8 = 0;
 pub const URL: u8 = 1;
 pub const SRCSET: u8 = 2;
 pub const PING: u8 = 3;
+pub const ANIM: u8 = 4;
+pub const CODE: u8 = 5;
+pub const LOOSE: u8 = 6;
+/// And a `<` the browser reads as text, with a placeholder after it before any `>`: `&lt;`, so that
+/// the value cannot make it a tag (`Press <{key}>`) (Q-1176, final review A).
+pub const LT: u8 = 7;
 
 thread_local! {
     /// `attr_spans` of each text of the translation table, by its address (the text kept, so
@@ -545,10 +576,10 @@ thread_local! {
 const SPANS_BYTES: usize = 4 << 20;
 
 /// The attribute values to take care of in `text`, a text of the translation table (see `Span`),
-/// none if none: read once for each text, and only for one with an attribute (`=`) and a
-/// placeholder (`{`) in it.
+/// none if none: read once for each text, and only for one with a tag (`<`) and a placeholder
+/// (`{`) in it: a placeholder inside a tag no reading placed needs care too (Q-1176, recheck A1).
 pub fn attr_spans(text: &Arc<str>) -> Option<Arc<[Span]>> {
-    if !text.contains('=') || !text.contains('{') {
+    if !text.contains('<') || !text.contains('{') {
         return None;
     }
     let at = text.as_ptr() as usize;
@@ -588,29 +619,151 @@ fn placeholder_end(b: &[u8], i: usize) -> Option<usize> {
     (j > i + 1 && b.get(j) == Some(&b'}')).then_some(j + 1)
 }
 
-/// `attr_spans`, read from the text as the browser reads its tags: a start tag's name ends at
-/// white space, `/` or `>`; attributes are split by white space and `/`; values quoted either way
-/// or not at all; comments skipped.
+/// `attr_spans`, read from the text as the browser reads plain HTML, which is all a text with a
+/// value may hold (`plain_only`, refused at load otherwise: four rounds of reading comments, raw
+/// text and SVG as the browser does still had gaps; FEEDBACK75.md follow-up found by 0.8.9's
+/// coverage, Q-1176's final review; branch feedback75): a start tag's name ends at white space, `/`
+/// or `>`; attributes are split by white space and `/`, a name may start with `=`; values quoted
+/// either way or not at all. Each value holding a placeholder is a span of its kind; a placeholder
+/// in a tag's or an attribute's name is `LOOSE`, and that attribute's value is emptied (`CODE`); a
+/// `<` that is text before a placeholder is `LT`.
+/// Last, a backstop that cannot lose its place: a placeholder inside a `<...>` (from a `<` and a
+/// letter, `/`, `!` or `?` to the next `>`, quotes not read) that no span holds is `LOOSE`, its value
+/// checked as a URL and written so that it can end nothing (Q-1176, recheck A1).
 pub fn find_attr_spans(text: &str) -> Vec<Span> {
+    let read = read_attr_spans(text);
+    let loose = loose_spans(text, &read);
+    if loose.is_empty() {
+        return read;
+    }
+    merged(&read, &loose)
+}
+
+/// `first`'s spans and those of `more` that overlap none of them, in order.
+fn merged(first: &[Span], more: &[Span]) -> Vec<Span> {
+    let mut out = Vec::with_capacity(first.len() + more.len());
+    let mut j = 0;
+    for s in more {
+        while j < first.len() && first[j].end <= s.start {
+            out.push(first[j]);
+            j += 1;
+        }
+        if j < first.len() && first[j].start < s.end {
+            continue;
+        }
+        out.push(*s);
+    }
+    out.extend_from_slice(&first[j..]);
+    out
+}
+
+/// The placeholders inside a `<...>` that none of `spans` holds (see `find_attr_spans`).
+fn loose_spans(text: &str, spans: &[Span]) -> Vec<Span> {
+    let b = text.as_bytes();
+    let (mut out, mut i, mut s, mut tag_end) = (Vec::new(), 0, 0, 0);
+    while i < b.len() {
+        if i >= tag_end && b[i] == b'<' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, b'/' | b'!' | b'?')) {
+            tag_end = text[i + 1..].find('>').map_or(b.len(), |e| i + 2 + e);
+        }
+        if let Some(end) = (b[i] == b'{').then(|| placeholder_end(b, i)).flatten() {
+            while s < spans.len() && spans[s].end <= i {
+                s += 1;
+            }
+            if i < tag_end && !(s < spans.len() && spans[s].start <= i) {
+                out.push(Span { start: i, end, quoted: true, kind: LOOSE });
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The placeholders of `text[from..to]`, each a `LOOSE` span; whether there was one.
+fn loose_in(text: &str, from: usize, to: usize, out: &mut Vec<Span>) -> bool {
+    let b = text.as_bytes();
+    let (mut i, mut any) = (from, false);
+    while i < to {
+        match (b[i] == b'{').then(|| placeholder_end(b, i)).flatten() {
+            Some(end) if end <= to => {
+                out.push(Span { start: i, end, quoted: true, kind: LOOSE });
+                any = true;
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    any
+}
+
+/// The constructs a text with a value may not hold, which the browser reads otherwise than plain
+/// HTML (see `find_attr_spans`); the first `text` holds, if it holds a placeholder.
+const NOT_PLAIN: &[&str] = &["script", "style", "xmp", "iframe", "noembed", "noframes", "noscript", "title", "textarea", "plaintext", "template", "svg", "math"];
+
+/// What makes `text` more than plain HTML, if it holds a placeholder: `<!--`, another `<!`, `<?`,
+/// `</` and no letter, or the start tag of a `NOT_PLAIN` element (Q-1176's final review).
+fn not_plain(text: &str) -> Option<String> {
+    let b = text.as_bytes();
+    if !(0..b.len()).any(|i| b[i] == b'{' && placeholder_end(b, i).is_some()) {
+        return None;
+    }
+    for (i, _) in text.match_indices('<') {
+        match b.get(i + 1) {
+            Some(b'!') if b[i..].starts_with(b"<!--") => return Some("<!--".into()),
+            Some(b'!') => return Some("<!".into()),
+            Some(b'?') => return Some("<?".into()),
+            Some(b'/') if !b.get(i + 2).is_some_and(|c| c.is_ascii_alphabetic()) => return Some("</".into()),
+            Some(c) if c.is_ascii_alphabetic() => {
+                let end = b[i + 1..].iter().position(|c| c.is_ascii_whitespace() || matches!(c, b'/' | b'>')).map_or(b.len(), |e| i + 1 + e);
+                if let Some(t) = NOT_PLAIN.iter().find(|t| t.as_bytes().eq_ignore_ascii_case(&b[i + 1..end])) {
+                    return Some(format!("<{}>", t));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// `find_attr_spans`' reading.
+fn read_attr_spans(text: &str) -> Vec<Span> {
     let b = text.as_bytes();
     let mut out = Vec::new();
+    // The next `>` and the next placeholder at or after where they were last looked for, so that
+    // each part of the text is looked through once (`LT`).
+    let (mut gt, mut ph) = (0, 0);
     let mut i = 0;
     while i < b.len() {
         if b[i] != b'<' {
             i += 1;
             continue;
         }
-        if b[i..].starts_with(b"<!--") {
-            i = text[i + 4..].find("-->").map_or(b.len(), |e| i + 4 + e + 3);
-            continue;
-        }
         if !b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
+            // A `<` the browser reads as text, with a placeholder after it before any `>`
+            // (Q-1176, final review A).
+            if !matches!(b.get(i + 1), Some(b'/' | b'!' | b'?')) {
+                if gt <= i {
+                    gt = text[i + 1..].find('>').map_or(b.len(), |e| i + 1 + e);
+                }
+                if ph <= i {
+                    ph = (i + 1..b.len()).find(|&j| b[j] == b'{' && placeholder_end(b, j).is_some()).unwrap_or(b.len());
+                }
+                if ph < gt {
+                    out.push(Span { start: i, end: i + 1, quoted: true, kind: LT });
+                }
+            }
             i += 1;
             continue;
         }
+        let tag_at = i + 1;
         while i < b.len() && !b[i].is_ascii_whitespace() && b[i] != b'>' && b[i] != b'/' {
             i += 1;
         }
+        let tag = &text[tag_at..i];
+        // A placeholder in the tag's name, and one in an attribute's name, is `LOOSE`, and that
+        // attribute's value emptied (Q-1176, final review B and E).
+        loose_in(text, tag_at, i, &mut out);
         loop {
             while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b'/') {
                 i += 1;
@@ -620,10 +773,15 @@ pub fn find_attr_spans(text: &str) -> Vec<Span> {
                 break;
             }
             let name_at = i;
+            // A name may start with `=`, as the browser reads one (Q-1176, final review D).
+            if b[i] == b'=' {
+                i += 1;
+            }
             while i < b.len() && !b[i].is_ascii_whitespace() && !matches!(b[i], b'=' | b'>' | b'/') {
                 i += 1;
             }
             let name = &text[name_at..i];
+            let named = loose_in(text, name_at, i, &mut out);
             while i < b.len() && b[i].is_ascii_whitespace() {
                 i += 1;
             }
@@ -641,7 +799,13 @@ pub fn find_attr_spans(text: &str) -> Vec<Span> {
                 }
                 _ => None,
             };
-            let kind = if name.eq_ignore_ascii_case("srcset") {
+            // An animation's values and code as templates take them (FEEDBACK75.md follow-up found
+            // by 0.8.9's coverage, Q-1083, recheck A2; branch feedback75).
+            let kind = if named || crate::ast::code_attr(name) {
+                CODE
+            } else if crate::interp::anim_value_attr(tag, name) {
+                ANIM
+            } else if name.eq_ignore_ascii_case("srcset") {
                 SRCSET
             } else if name.eq_ignore_ascii_case("ping") {
                 PING
@@ -665,7 +829,9 @@ pub fn find_attr_spans(text: &str) -> Vec<Span> {
                 }
                 i += 1;
             }
-            if holds && (kind != OTHER || quote.is_none()) {
+            // Every value holding a placeholder, so that the backstop knows it placed (one of
+            // another kind, quoted, is written as before); and the value of a name that holds one.
+            if holds || named {
                 out.push(Span { start, end: i, quoted: quote.is_some(), kind });
             }
             if quote.is_some() && i < b.len() {
@@ -701,10 +867,18 @@ fn put_in(text: &str, vars: &Map, raw: bool, out: &mut String) {
                 i += 1;
             }
             b'&' => {
+                // A `&` that a value put after it (`&{u}`, `&#{u}`) would make a character
+                // reference is `&amp;` (Q-1176, final review F).
+                let run = b[i + 1..].iter().position(|c| !(c.is_ascii_alphanumeric() || *c == b'#')).map_or(b.len(), |e| i + 1 + e);
+                let before_value = b.get(run) == Some(&b'{') && placeholder_end(b, run).is_some_and(|end| vars.get(&text[run + 1..end - 1]).is_some());
                 match char_ref(&text[i..]).filter(|_| raw) {
                     Some((c, len)) => {
                         out.push(c);
                         i += len;
+                    }
+                    None if before_value && !raw => {
+                        out.push_str("&amp;");
+                        i += 1;
                     }
                     None => {
                         out.push('&');
@@ -730,10 +904,15 @@ fn char_ref(t: &str) -> Option<(char, usize)> {
         let hex = matches!(b.get(2), Some(b'x' | b'X'));
         let from = if hex { 3 } else { 2 };
         let digits = b[from..].iter().take_while(|c| if hex { c.is_ascii_hexdigit() } else { c.is_ascii_digit() }).count();
-        if digits == 0 || digits > 8 {
+        if digits == 0 {
             return None;
         }
-        let n = u32::from_str_radix(&t[from..from + digits], if hex { 16 } else { 10 }).ok()?;
+        // Every digit, as the browser reads them: `&#000000058;` is `:`, where more than 8 digits
+        // were left as text and a `javascript:` link the values made went through; one past
+        // U+10FFFF is U+FFFD (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1177; branch
+        // feedback75).
+        let radix = if hex { 16 } else { 10 };
+        let n = b[from..from + digits].iter().fold(0u32, |n, c| n.saturating_mul(radix).saturating_add((*c as char).to_digit(radix).unwrap_or(0)).min(0x11_0000));
         let len = from + digits + (b.get(from + digits) == Some(&b';')) as usize;
         return Some((char::from_u32(n).unwrap_or('\u{FFFD}'), len));
     }
@@ -754,6 +933,8 @@ fn runs_script(text: &str, vars: &Map, kind: u8) -> bool {
     match kind {
         SRCSET => value.split(',').any(|c| crate::interp::script_url(c.trim_start_matches(|c: char| c.is_ascii_whitespace()).split(|c: char| c.is_ascii_whitespace()).next().unwrap_or(""))),
         PING => value.split(|c: char| c.is_ascii_whitespace()).any(crate::interp::script_url),
+        ANIM => value.split(';').any(crate::interp::script_url),
+        LOOSE => crate::interp::script_url(&value) || value.split(|c: char| c.is_ascii_whitespace() || c == ',' || c == ';').any(crate::interp::script_url),
         _ => crate::interp::script_url(&value),
     }
 }
@@ -766,21 +947,71 @@ fn interpolate_html(text: &str, vars: &Map, spans: &[Span]) -> String {
     for sp in spans {
         put_in(&text[pos..sp.start], vars, false, &mut out);
         let value = &text[sp.start..sp.end];
-        if !sp.quoted {
-            out.push('"');
-        }
-        if sp.kind != OTHER && runs_script(value, vars, sp.kind) {
-            out.push_str(crate::interp::BLOCKED_URL);
-        } else {
-            put_in(value, vars, false, &mut out);
-        }
-        if !sp.quoted {
-            out.push('"');
-        }
         pos = sp.end;
+        match sp.kind {
+            LOOSE => {
+                put_loose(value, vars, &mut out);
+                continue;
+            }
+            LT => {
+                out.push_str("&lt;");
+                continue;
+            }
+            _ => {}
+        }
+        if !sp.quoted {
+            out.push('"');
+        }
+        // Code and a page a value is in (`onclick`, `srcdoc`) are emptied, as templates refuse
+        // them (Q-1083, recheck A2). A value written without quotes is quoted, a `"` of the text in
+        // it written `&quot;` (Q-1176, final review D).
+        if sp.kind != CODE {
+            if sp.kind != OTHER && runs_script(value, vars, sp.kind) {
+                out.push_str(crate::interp::BLOCKED_URL);
+            } else if sp.quoted {
+                put_in(value, vars, false, &mut out);
+            } else {
+                let mut v = String::new();
+                put_in(value, vars, false, &mut v);
+                out.push_str(&v.replace('"', "&quot;"));
+            }
+        }
+        if !sp.quoted {
+            out.push('"');
+        }
     }
     put_in(&text[pos..], vars, false, &mut out);
     out
+}
+
+/// `text` with each placeholder no reading placed for sure put in: blocked as a script URL (alone,
+/// or one of a list split by white space, `,` or `;`), else with each character a character
+/// reference, so that it ends no quote, attribute or tag, names nothing, and means what it says in
+/// a value; one with no value as written (Q-1176, recheck A1 and final review).
+fn put_loose(text: &str, vars: &Map, out: &mut String) {
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let Some(end) = (b[i] == b'{').then(|| placeholder_end(b, i)).flatten() else {
+            let next = text[i + 1..].find('{').map_or(b.len(), |n| i + 1 + n);
+            out.push_str(&text[i..next]);
+            i = next;
+            continue;
+        };
+        match vars.get(&text[i + 1..end - 1]) {
+            Some(_) if runs_script(&text[i..end], vars, LOOSE) => out.push_str(crate::interp::BLOCKED_URL),
+            // Every character, letters too: in a tag's or an attribute's name, where references
+            // are not read, a value named the element or the attribute (`<s{u}>` with "cript")
+            // (Q-1176's final review).
+            Some(v) => {
+                for c in v.display().chars() {
+                    let _ = write!(out, "&#{};", c as u32);
+                }
+            }
+            None => out.push_str(&text[i..end]),
+        }
+        i = end;
+    }
 }
 
 /// `{name}` replaced by the value's text; other braces are left alone.

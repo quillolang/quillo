@@ -34,7 +34,11 @@
   [`--max-memory`](#concurrency-and-reloading); the call is then an error value (`` `re.test`:
   the pattern is too costly for this text: ...; repeat less, or search a shorter text ``), in
   every `re.*` call *(since 0.8.9: one search held an instance for seconds to minutes, past
-  `--max-compute`)*. Ordinary patterns, a long one on a long text too, answer as before.
+  `--max-compute`)*. Ordinary patterns, a long one on a long text too, answer as before, and
+  a pattern of literals alone (`cat|dog`, `\d`, a list of 5,000 words) is searched as
+  before, as fast, and past a length its longest literal sets it is held to the same time,
+  in windows, giving `too costly` past it. A pattern too big to compile is `the pattern is too big`
+  whatever text it first meets, and `re.valid` says false for it.
   Finding every match (`find_all`, `replace`, `split`) searches again after each one, and
   a pattern whose searches read on past their match (`[a-z]+X|[a-z]` on letters) reads the
   text once per match: once its searches have read the text 64 times over and computed for

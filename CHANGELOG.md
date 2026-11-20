@@ -3,8 +3,9 @@
 ## Unreleased (0.8.9)
 
 Found by the security audit of 0.8.7 (FEEDBACK75.md, Q-1050 to Q-1095, and Q-1120 and Q-1121
-found in review), and by the study of authentication (FEEDBACK78.md, Q-1158, Q-1159, Q-1168,
-Q-1169 and Q-1170, and its A.13 and A.14).
+found in review), by the study of authentication (FEEDBACK78.md, Q-1158, Q-1159, Q-1168,
+Q-1169 and Q-1170, and its A.13 and A.14), and by the tests written for the lines of 0.8.9 no
+test ran (Q-1097, Q-1125 to Q-1128, Q-1171 to Q-1177 and Q-1180).
 
 ### Security
 
@@ -86,7 +87,8 @@ Q-1169 and Q-1170, and its A.13 and A.14).
   type to 10,000 parts and 16 levels, taking what grows past them as unknown, and past 2 s, or
   about a million parts kept in all, gives one error, `the code is too complex to check`.
   `quillo check` and `quillo run` take a type past 1,000,000 parts or 64 levels as unknown and
-  say what 0.8.8 said (FEEDBACK75.md, Q-1053). A confined check quotes no `.rs` file's text
+  say what 0.8.8 said (FEEDBACK75.md, Q-1053); the 2 s holds for a function of 100,000 `let`s
+  too, which a check and a load read as fast as 0.8.8 did (Q-1127). A confined check quotes no `.rs` file's text
   (Q-1095).
 - **`run_script` no longer holds its instance.** A 143-byte script held an instance for 13 s,
   as a step was one call however much it read. A builtin or a comparison costs a step for each
@@ -113,7 +115,15 @@ Q-1169 and Q-1170, and its A.13 and A.14).
   translation's own character references read, makes a `javascript:` or `vbscript:` URL; an
   attribute written without quotes that holds a value is quoted, so the value cannot end it.
   The same value as text (`<i>{title}</i>`) is shown as written; the browser does the same
-  (FEEDBACK75.md, Q-1083).
+  (FEEDBACK75.md, Q-1083). A text that holds a value may hold plain HTML only: `translations`
+  refuses one with a comment, `<!...>`, `<?...>`, `<script>`, `<style>`, `<title>`,
+  `<textarea>`, `<iframe>`, `<template>`, `<svg>`, `<math>` and the like, whose reading let a
+  value through in ways four rounds of tests kept finding (Q-1176, the reviews of 0.8.9's
+  coverage). In plain HTML a value makes no tag after a `<` that starts none (`Must be
+  <{max}`), no character reference after a `&`, and no attribute in a name; a character
+  reference is read whatever its leading zeros (Q-1177); an SVG animation's values are checked
+  as in templates, and an `on...` attribute or `srcdoc` holding a value is written empty; on
+  the server and in the page alike.
 - **A PostgreSQL session change by other words is caught.** `update pg_settings set setting =
   ...` changed the shared connection's session for every later visitor; it is refused outside
   a transaction, as `set` is. `query_to_xml` and its kin (`cursor_to_xml`, `table_to_xml`,
@@ -169,7 +179,8 @@ Q-1169 and Q-1170, and its A.13 and A.14).
   database's error or an internal URL with its key went to the visitor (FEEDBACK75.md,
   Q-1068).
 - **A split service's answer is not held whole in the app.** It was read into the app's
-  memory, up to 256 MB a request, outside `--max-memory`. One over 1 MiB, or with no length,
+  memory, up to 256 MB a request, outside `--max-memory`. One over 1 MiB (or over
+  `--max-memory`, where that is less: Q-1175), or with no length,
   goes through to the visitor as it comes (5 s to connect, 60 s between its bytes), so a
   service's `stream` arrives as it is sent; a shorter one is read within 256 MiB or
   `--max-memory`, else the visitor gets 502 (FEEDBACK75.md, Q-1071).
@@ -199,7 +210,10 @@ Q-1169 and Q-1170, and its A.13 and A.14).
   search whose work would pass a quarter of a second runs on Quillo's own counted engine,
   which stops at 0.1 s plus 0.15 µs a byte, within `--max-compute`, and before its work takes
   256 MiB or `--max-memory`, giving the error value `the pattern is too costly for this text`.
-  Ordinary patterns give the answers 0.8.8 gave, long texts faster (FEEDBACK75.md, Q-1075).
+  Ordinary patterns give the answers 0.8.8 gave, long texts faster (FEEDBACK75.md, Q-1075). A
+  pattern of literals alone (`cat|dog`, a list of 5,000 words) is searched as 0.8.8 searched
+  it, on any text and as fast, and a pattern too big to compile is `the pattern is too big`
+  whatever text it first meets, `re.valid` false (Q-1125, Q-1126).
 - **A PNG's colour profile is read to 4 MiB**: a 146 KB PNG made `image.info` allocate 264 MiB,
   and a 486 KB one 512 MiB, outside every image and memory limit. A larger profile is an error
   value, and headers are read eight at a time (FEEDBACK75.md, Q-1051).
@@ -233,6 +247,19 @@ Q-1169 and Q-1170, and its A.13 and A.14).
   client that keeps up gets the whole answer (a 20 MB export) and the transaction commits.
   `quillo check` warns of `send` inside `db.transaction` or `db.atomic` (FEEDBACK75.md,
   Q-1067).
+- **A service `--split` starts gets a visitor's header that is not ASCII, and its errors
+  repeat no header.** One byte past ASCII in any header (a cookie a page's script set to
+  `ünï`, `X-Note: café`) gave every page of the service a 502 whose text repeated the header,
+  the service's HttpOnly session cookie with it, for the page's script to read. The app
+  passes such headers on, signed, and the service reads them as sent; the 502 says only what
+  failed (`Connection refused`). A visitor's own `X-Forwarded-For`, `-Host` and `-Prefix` reach
+  no service: it sees the app's (FEEDBACK75.md follow-up, Q-1174; in 0.8.8 too).
+- **A record a `server fn` takes inside a map shape is made as a parameter of its type.**
+  `server fn f(x: { owner: Account })`, a list of such shapes, or a record behind eight or more
+  types naming types, was checked but not made: fields `Account` does not have (`is_admin`)
+  reached the function, and a left-out field with a default was refused. They are left out
+  and the defaults put in, as for `f(a: Account)` and a route's `{ json: ... }`; MCP tools and
+  service calls alike (FEEDBACK75.md follow-up, Q-1171; in 0.8.8 too).
 
 ### Added
 
@@ -245,8 +272,9 @@ Q-1169 and Q-1170, and its A.13 and A.14).
   each is believed only on a request from a `--trust-proxy` address, and is null for a missing
   header, several elements, several lines or (the user's header) a comma-joined value, the log saying why once. A
   service `--split` starts gets both from its app, signed. Where neither option is given,
-  `request` has neither field (FEEDBACK78.md, A.13 and A.14, the user's choice of a small
-  reading in core; the options' names are on the list for the user).
+  `request` has neither field. Each option is given once (Q-1128) (FEEDBACK78.md, A.13 and
+  A.14, the user's choice of a small reading in core; the options' names are on the list for
+  the user).
 
 ### Fixed
 
@@ -285,6 +313,20 @@ Q-1169 and Q-1170, and its A.13 and A.14).
 - **A passkey's credential reaches a `server fn`**: an object of the browser's made of getters,
   with a `toJSON` (a `PublicKeyCredential`, a push subscription, a position), went as `{}`; it
   goes as its `toJSON` gives (FEEDBACK78.md, Q-1159).
+- **A channel loses no message under `--max-memory` or `--max-body`.** Messages waiting for a
+  slow handler went to it in batches of up to 1 MiB, which a smaller limit refused whole: of
+  1,040 messages at `--max-memory 1MB`, 16 were handled and the rest lost, uncounted. Batches
+  stay within both limits; a message too large to hand over within them, or for the page's own
+  read, is dropped and counted in `quillo_channel_dropped_total`; the same for a service
+  `--split` starts (FEEDBACK75.md follow-up, Q-1172; in 0.8.8 too).
+- **A service `--split` starts answers after a quiet spell**: the first request passed on to
+  it after about two minutes idle was a 502 (`Connection reset by peer`), as the app used a
+  connection the service had closed (FEEDBACK75.md follow-up, Q-1097; in 0.8.8 too).
+- **A whole number is taken for a float however the float is reached**: behind eight or more
+  types naming types, or in a map shape's field (`x: { p: float }` given `{"p": 1}`), it was
+  refused where `x: float` took it; a `dec` in a shape (`{ a: dec }` given `"1.50"`) was
+  refused, and `money` in one stayed a plain map (FEEDBACK75.md follow-up, Q-1180; in 0.8.8
+  too).
 
 ### Changed
 
@@ -343,6 +385,19 @@ What a program may notice:
   (Q-1067).
 - **`http.*` drops a program's `content-length`, `transfer-encoding`, `connection`,
   `keep-alive`, `te`, `trailer` and `upgrade` headers**; `host` is sent as given (Q-1089).
+- **A `server fn`'s record inside a map shape, or behind eight or more types naming types, has
+  only its own fields and its defaults** (Q-1171); a whole number where such a float goes comes
+  as a float, and `n: Num | int` (with `type Num = float`) or `n: float | Cnt` (with `type Cnt =
+  int`) given `1` keeps the int, where 0.8.8 gave `1.0`: an int stays an int where the union
+  names `int`, itself or through types naming it (Q-1180).
+- **A service sees the app's `X-Forwarded-For`, `-Host` and `-Prefix` alone**, never the
+  visitor's own, and a service run apart reads a visitor's headers that are not ASCII from the
+  app's signed `x-quillo-headers` with `QUILLO_SERVICE_SECRET` (Q-1174).
+- **A translation text that holds a value and a comment, `<script>`, `<style>`, `<title>`,
+  `<textarea>`, `<svg>`, `<math>` or the like is refused at start**; put that markup in the
+  component around `t(...)` (Q-1176).
+- **`quillo_channel_dropped_total` counts messages too large to hand over** under `--max-memory`
+  or `--max-body`, which were lost uncounted (Q-1172).
 - **Loops that `let` a value or change a list or a map are as fast as 0.8.8's or faster**: the
   release's benchmark found a `let` in a loop 17 instructions dearer each time and a loop counting
   into a map 3% slower, as the compiler had stopped inlining two helpers; now against 0.8.8 a

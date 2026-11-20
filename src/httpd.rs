@@ -246,6 +246,16 @@ pub fn memory_limit() -> u64 {
     MAX_MEMORY.load(SeqCst)
 }
 
+/// The largest request body the server takes (`--max-body`, or a policy's), for what it sends
+/// itself: a channel's batch past it was refused whole, 413, and every message in it lost (see
+/// `wt::deliver_loop`; FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1172; branch
+/// feedback75). None until the server serves.
+static BODY_MOST: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+pub fn body_most() -> usize {
+    BODY_MOST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The limit `--max-memory` set, if a policy did not set a smaller one: what a `--split`
 /// service is given.
 pub fn memory_limit_of_option() -> Option<u64> {
@@ -1211,6 +1221,8 @@ pub fn serve_instances(apps: Vec<Arc<App>>, listener: std::net::TcpListener, max
 
 /// `serve_instances`, with connections from `listener`.
 pub fn serve_on(apps: Vec<Arc<App>>, listener: Listener, max_waiting: usize) -> Result<(), String> {
+    // What a channel's batch may be (Q-1172).
+    BODY_MOST.store(apps.iter().map(|a| a.max_body).min().unwrap_or(usize::MAX), SeqCst);
     let mut polls = Vec::new();
     let mut inboxes = Vec::new();
     for _ in &apps {

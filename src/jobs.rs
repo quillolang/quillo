@@ -476,14 +476,22 @@ pub fn dial(addr: std::net::SocketAddr, timeout: std::time::Duration) -> std::io
     std::net::TcpStream::connect_timeout(&addr, timeout)
 }
 
-/// A POST to this process's own server, with the token only it has: its status and body.
+/// A POST to this process's own server, with the token only it has: its status and body. Its body
+/// is bytes, as `udp::Loopback::post_for` says of its own: with no type, a channel's batch of one
+/// line in a program inside an app was read as JSON, and past `--max-memory` refused, the message
+/// lost uncounted (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1172; branch feedback75).
 pub fn post_self(addr: std::net::SocketAddr, path: &str, body: &[u8]) -> std::io::Result<(u16, Vec<u8>)> {
     use std::io::{Read, Write};
     if let Some(f) = LOCAL.get() {
         let req = crate::server::HttpRequest {
             method: "POST".into(),
             url: path.to_string(),
-            headers: vec![("host".into(), "localhost".into()), ("x-quillo-job".into(), token().to_string()), ("content-length".into(), body.len().to_string())],
+            headers: vec![
+                ("host".into(), "localhost".into()),
+                ("x-quillo-job".into(), token().to_string()),
+                ("content-type".into(), "application/octet-stream".into()),
+                ("content-length".into(), body.len().to_string()),
+            ],
             body: body.to_vec(),
             remote: "127.0.0.1".into(),
         };
@@ -493,7 +501,7 @@ pub fn post_self(addr: std::net::SocketAddr, path: &str, body: &[u8]) -> std::io
     let mut s = dial(addr, std::time::Duration::from_secs(5))?;
     write!(
         s,
-        "POST {} HTTP/1.1\r\nHost: localhost\r\nX-Quillo-Job: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "POST {} HTTP/1.1\r\nHost: localhost\r\nX-Quillo-Job: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         path,
         token(),
         body.len()

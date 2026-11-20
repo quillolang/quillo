@@ -510,7 +510,8 @@ budget: a type is kept to 10,000 parts and 16 levels, what grows past them taken
 (which says less, never wrongly), and past 2 s, or about a million parts kept in all, the
 check gives one error in place of all else, `the code is too complex to check: its types
 grew past what a check keeps, or the check took too long` *(since 0.8.9: a 699-byte program
-whose types doubled on each line took the server's memory)*. `quillo check` itself keeps a
+whose types doubled on each line took the server's memory)*; it holds for a function of
+100,000 `let`s too, which a check and a load read in about 0.15 s. `quillo check` itself keeps a
 type to 1,000,000 parts and 64 levels, and never gives that error. `delete_file(path)`
 removes a file or folder inside the program's folder, but not a folder that holds a database
 the program has open.
@@ -839,6 +840,8 @@ route GET /intranet {
   fool.
 - `request.remote_user` is the user as the proxy wrote it, trimmed (`ada@CORP.EXAMPLE`,
   `CORP\ada`).
+- Each option is given once (a second `--client-cert-header` or `--user-header` stops the
+  program at start).
 - Each is believed only on a request from an address [`--trust-proxy`](#options-of-quillo-run)
   names, and either option stops the program at start without it (`quillo:
   --client-cert-header and --user-header read a proxy's header, believed only from the
@@ -1667,7 +1670,11 @@ How messages travel:
 - Broadcasts reach the pages connected to this server (its [`--instances`](#options-of-quillo-run) share them;
   servers behind limer do not relay them, see [Several servers](#several-servers)).
   With [`--metrics`](#options-of-quillo-run), `quillo_channel_pages` counts them and `quillo_channel_dropped_total`
-  the messages dropped because a queue was full. The server keeps channels in memory:
+  the messages dropped because a queue was full, or because a message was too large to hand
+  to the handler within [`--max-memory`](#concurrency-and-reloading) or `--max-body`, or for
+  the page's own read under `--max-memory`; messages waiting for a slow handler reach it in
+  batches within those limits, none lost, a service `--split` starts included *(since 0.8.9:
+  a batch past them was refused whole, its messages lost and not counted)*. The server keeps channels in memory:
   after a restart, pages reconnect and join again, with new ids, and queued messages are
   what each page kept.
 - There is no WebSocket or WebRTC of your own: pages talk to the server, never to each
@@ -2136,7 +2143,20 @@ view Header(user) = <header>
   "JavaScript: The Good Parts") shows as written. An attribute written without quotes that
   holds a value (`<a href={url}>`) is quoted, so the value cannot end it *(since 0.8.9:
   `raw(t("site", { url }))` took a visitor's `javascript:` link as it was)*. The browser
-  does the same.
+  does the same. A translation text that holds a value (`{name}`) may hold plain HTML only:
+  no comment, `<!...>`, `<?...>`, `</` without a tag name, or `<script>`, `<style>`, `<xmp>`,
+  `<iframe>`, `<noembed>`, `<noframes>`, `<noscript>`, `<title>`, `<textarea>`,
+  `<plaintext>`, `<template>`, `<svg>` or `<math>`; `translations` refuses such a text at
+  start (``translation `k` (de): a text with a value may hold plain HTML only, not `<svg>`:
+  put that markup in the component around `t(...)` ``), and a text without a value is as
+  before. In what is left, a value is put where the browser would read it: after a `<` that
+  starts no tag (`Must be <{max}`) the `<` is written `&lt;`, after a `&` the `&` is written
+  `&amp;`, so a value makes no tag and no character reference; a value in a tag's or an
+  attribute's name is written as character references, its attribute's value empty; a
+  character reference is read whatever its leading zeros (`&#000000058;` is a colon). As in
+  templates, an SVG animation's `to`, `from`, `by` and `values` are checked, and an `on...`
+  attribute or `srcdoc` that holds a value is written empty (`onclick=""`), on the server and
+  in the page alike *(since 0.8.9)*.
 - `with_locale("de", () => ...)` runs code in another locale (an email in the
   recipient's language).
 - `translations({ en: {...}, fr: {...} })` takes the text directly instead of a folder.
@@ -2249,13 +2269,24 @@ answers the same, with billing in a process of its own.
   which the service never reads; its own `quillo_session` and every other cookie go as
   before *(since 0.8.9: the app's session cookie went to whatever address `--service-url`
   names)*. The service's answer is asked for as it is (`Accept-Encoding: identity`) and the
-  app compresses what it sends, as for its own; one over 1 MiB, or with no length (a
+  app compresses what it sends, as for its own; one over 1 MiB (or over `--max-memory`,
+  where that is less), or with no length (a
   `stream`), goes through to the visitor as it comes, held to 5 s to connect and 60 s
   between its bytes, a large text gzipped on the way; a shorter one is read whole, within
   256 MiB or [`--max-memory`](#concurrency-and-reloading), and past it the visitor gets
   502; each header once, and the connection's own left out *(since 0.8.9: every answer was
   read whole into the app first, up to 256 MB a request, so a service's `stream` came all at
-  once at its end)*. Run alone, a service is a program served as one:
+  once at its end)*. A visitor's header that is not ASCII (a cookie a page's script set to
+  `ünï`, `X-Note: café`) reaches the service as sent, the other cookies staying in the
+  `Cookie` line; a service run apart (`--service-url`) that shares `QUILLO_SERVICE_SECRET`
+  reads them back too, from the app's signed `x-quillo-headers`. A visitor's own
+  `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Prefix` and `Accept-Encoding` are not
+  passed on: the service sees the app's. A service idle for minutes answers its next request
+  as any other *(since 0.8.9: the first request after about two minutes idle was a 502)*.
+  When the service does not answer, the visitor's 502 says only what failed
+  (`this part of the site is not answering (Connection Failed: Connection refused)`), never
+  a header or what the service sent *(since 0.8.9: such a header gave a 502 that repeated
+  it, the service's HttpOnly session cookie with it)*. Run alone, a service is a program served as one:
   `quillo run billing.qwe --base /billing --as-service` ([`--base`](#options-of-quillo-run): the path it is
   served under, which its links and redirects carry; [`--as-service`](#options-of-quillo-run): see below).
 - `quillo run app.qwe --split` runs each service the app declares (and those they

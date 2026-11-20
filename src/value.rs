@@ -1209,9 +1209,25 @@ pub fn json_value(b: &[u8]) -> Result<serde_json::Value, String> {
 /// past the limit in all an error that says it. It had neither: one channel message of 1 MiB made
 /// 75 MB, and a join with no valid signature 100 MB (FEEDBACK75.md, Q-1052; branch feedback75).
 pub fn json_from_page(b: &[u8]) -> Result<serde_json::Value, String> {
+    json_from_page_why(b).map_err(|e| e.why)
+}
+
+/// Why `json_from_page_why` read no value.
+pub struct NotRead {
+    /// What was wrong, as `json_from_page` says it.
+    pub why: String,
+    /// `--max-memory` stopped it: JSON a page may send, past what the server lets one value make,
+    /// which a channel drops and counts where it ignores bad JSON. Both were ignored alike, and a
+    /// page's message refused so was lost uncounted (FEEDBACK75.md follow-up found by 0.8.9's
+    /// coverage, Q-1172; branch feedback75).
+    pub memory: bool,
+}
+
+/// `json_from_page`, saying whether `--max-memory` stopped it (see `NotRead`).
+pub fn json_from_page_why(b: &[u8]) -> Result<serde_json::Value, NotRead> {
     use serde::Deserialize;
     if json_depth(b) > JSON_NESTING {
-        return Err(json_too_deep());
+        return Err(NotRead { why: json_too_deep(), memory: false });
     }
     let outer = JSON.with(|j| j.enter((b.len() / 8).max(JSON_VALUES)));
     let mut de = serde_json::Deserializer::from_slice(b);
@@ -1225,8 +1241,8 @@ pub fn json_from_page(b: &[u8]) -> Result<serde_json::Value, String> {
             r
         }
     };
-    JSON.with(|j| j.leave(outer));
-    r.map_err(|e| e.to_string())
+    let (_, over) = JSON.with(|j| j.leave(outer));
+    r.map_err(|e| NotRead { why: e.to_string(), memory: over })
 }
 
 /// Bytes a serde list's place for each value takes, and a serde map's for each entry (its key and
@@ -4641,6 +4657,9 @@ mod tests {
         fn none(_: &mut Interp, _: Vec<Value>, _: u32) -> Result<Value, Ctrl> {
             Ok(Value::Nil)
         }
+        // The builtin a scope holds below gives nothing when called (coverage of 0.8.9; branch
+        // feedback75).
+        assert!(matches!(none(&mut Interp::new(std::env::temp_dir()), Vec::new(), 0), Ok(Value::Nil)));
         let text: Arc<str> = Arc::from("held");
         let small = Arc::new(vec![Value::Int(1)]);
         let small_map = Arc::new(Map::default());
@@ -4832,6 +4851,24 @@ mod tests {
         m.insert("empty".into(), Value::map(Map::new()));
         let v = Value::list(vec![Value::map(m), Value::list(vec![]), Value::Int(i64::MIN), Value::str("")]);
         assert_eq!(v.json_text(), v.to_json().to_string());
+    }
+
+    /// The readers of a visitor's JSON as serde's tree (`json_from_page`) say what they expect when
+    /// given what JSON never gives them, a key that is no text and bytes: serde_json gives a key as
+    /// text and every value as one of the kinds they read, so only another reader reaches these
+    /// (coverage of 0.8.9; branch feedback75).
+    #[test]
+    fn a_trees_readers_say_what_they_expect() {
+        use serde::Deserialize;
+        let e = TreeKey::deserialize(serde_json::Value::Bool(true)).err().expect("a bool is no key");
+        assert_eq!(e.to_string(), "invalid type: boolean `true`, expected a key");
+        let e = Tree::<false>::deserialize(serde::de::value::BytesDeserializer::<serde_json::Error>::new(b"x")).err().expect("bytes are no JSON value");
+        assert_eq!(e.to_string(), "invalid type: byte array, expected JSON");
+        let e = Tree::<true>::deserialize(serde::de::value::BytesDeserializer::<serde_json::Error>::new(b"")).err().expect("bytes are no JSON value");
+        assert!(e.to_string().ends_with("expected JSON"), "{}", e);
+        // What they read, they read.
+        assert_eq!(TreeKey::deserialize(serde_json::Value::String("ключ".into())).ok().map(|k| k.0).as_deref(), Some("ключ"));
+        assert_eq!(Tree::<false>::deserialize(serde_json::json!([1, "a", null])).ok().map(|t| t.0), Some(serde_json::json!([1, "a", null])));
     }
 }
 

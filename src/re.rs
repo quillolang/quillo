@@ -434,7 +434,19 @@ const NFA_FIRST: usize = 64 << 10;
 /// holds the text, else the NFA alone for the guard, the Regex `unused()` until a call needs it
 /// (`guard_past_room`). None where it cannot be compiled so, which the crate's compile then says.
 fn nfa_first(key: &(String, String), len: usize, caps: bool) -> Option<Pat> {
+    // A pattern the crate searches with literals alone is the crate's, as in 0.8.8 (`Room::literal`:
+    // past its room, in windows), and its NFA is never made: 5,000 hashes of 40 characters, whose NFA is past
+    // the 10 MiB a guard may compile, were "too costly" on 68 KB, and word lists of 10,000 and 50,000
+    // on 1 MB took 5.6 and 3.9 times 0.8.8's instructions by the guard; a list of 3,000 words or more
+    // is told from its text, as parsing it took half as long as the crate's whole compile
+    // (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1125; branch feedback75).
+    if let Some(longest) = many_literals(&key.0, &key.1) {
+        return crate_literal(key, Room::literal(longest, 1));
+    }
     let hir = regex_automata::util::syntax::parse(&full_pattern(&key.0, &key.1).ok()?).ok()?;
+    if let Some((longest, factor)) = crate_searches_literals(&hir) {
+        return crate_literal(key, Room::literal(longest, factor));
+    }
     let nfa = thompson::Compiler::new().configure(guard_nfa(false)).build_from_hir(&hir).ok()?;
     let room = room_of(&nfa);
     if room.fits(len, caps) {
@@ -442,12 +454,133 @@ fn nfa_first(key: &(String, String), len: usize, caps: bool) -> Option<Pat> {
         store(key, &r, step * 2, room);
         return Some(Pat { r, room });
     }
+    // Kept for the guard alone only where the crate would compile it too: the crate compiles its NFA
+    // back as well, within the same limit, and refuses the pattern where that one is past it, which
+    // `(?:\S{1000}){5}` is (forward 5.5 MB, back past 10 MiB). Kept unchecked, such a pattern first
+    // searched on a long text was searched, and then `re.valid` said true and calls on short texts
+    // answered, where in a new thread each was "the pattern is too big", as in 0.8.8. The NFA back
+    // goes to the guard, which compiled the same one the first time a match needed it (FEEDBACK75.md
+    // follow-up found by 0.8.9's coverage, Q-1126; branch feedback75).
+    let rev = thompson::Compiler::new().configure(guard_nfa(true)).build_from_hir(&hir).ok()?;
     // Counted as the crate's would be (twice the step its program fits, forward and back).
     let room = room.with_crate(false);
     let r = unused();
     store(key, &r, 2 * step_for(nfa.memory_usage()), room);
-    MADE.with(|m| *m.borrow_mut() = Some((key.clone(), Made { nfa })));
+    MADE.with(|m| *m.borrow_mut() = Some((key.clone(), Made { nfa, rev: Some(rev) })));
     Some(Pat { r, room })
+}
+
+/// `key` compiled by the crate and kept with `room`, a `Room::literal` (Q-1125); None where the crate
+/// refuses it, which its compile then says.
+fn crate_literal(key: &(String, String), room: Room) -> Option<Pat> {
+    let (r, step) = compile_stepped(&key.0, &key.1).ok()?;
+    store(key, &r, step * 2, room);
+    Some(Pat { r, room })
+}
+
+/// Whether the crate searches `hir` with literals alone, building no NFA: regex-automata 0.4.18's two
+/// "Pre" strategies, which `meta::strategy::new` takes before any regex engine, where the pattern has
+/// no group and no assertion: a prefilter of its prefixes where they are exact (`Pre::from_prefixes`:
+/// `\d`, `[;{}]`, `cat|dog`, the prefixes as `build_guard` takes them), and Aho-Corasick for an
+/// alternation of 3,000 literals or more (`Pre::from_alternation_literals`). Where it does, its
+/// longest literal in bytes and its factor (`LITERAL_PS`) (Q-1125).
+fn crate_searches_literals(hir: &regex_syntax::hir::Hir) -> Option<(usize, usize)> {
+    let props = hir.properties();
+    if props.explicit_captures_len() != 0 || !props.look_set().is_empty() {
+        return None;
+    }
+    if let (true, regex_syntax::hir::HirKind::Alternation(alts)) = (props.is_alternation_literal(), hir.kind()) {
+        if alts.len() >= LITERALS_FOR_AC {
+            return Some((alts.iter().filter_map(|a| a.properties().maximum_len()).max().unwrap_or(0), 1));
+        }
+    }
+    let mut extractor = regex_syntax::hir::literal::Extractor::new();
+    extractor.kind(regex_syntax::hir::literal::ExtractKind::Prefix);
+    let mut seq = regex_syntax::hir::literal::Seq::empty();
+    seq.union(&mut extractor.extract(hir));
+    seq.optimize_for_prefix_by_preference();
+    let lits = seq.literals().filter(|_| seq.is_exact())?;
+    Prefilter::new(MatchKind::LeftmostFirst, lits)?;
+    let longest = seq.max_literal_len().unwrap_or(0);
+    // Teddy, or Rabin-Karp under it, checks each literal a candidate may be, 128 at the most, and a
+    // literal of one byte is checked once.
+    Some((longest, if longest <= 1 { 1 } else { lits.len().min(128) }))
+}
+
+/// What the crate's search with literals alone costs at its worst, in picoseconds a byte of the text
+/// for each byte of the longest literal and one, times its factor: from each place a literal may
+/// start, the search may read the longest one through before it knows (a list of 3,000 with one of
+/// 20,001 bytes read them after each of 2 MB of `a`, past 8 s in `re.replace`), and each literal
+/// that may start there may be read, the factor (`crate_searches_literals`: 64 literals of 100 bytes
+/// that share 98 took 450 ns a byte of `a`, 0.07 ns a byte for each). 5 times what was measured, as
+/// a text within the room is searched with no clock (FEEDBACK75.md follow-up found by 0.8.9's
+/// coverage, Q-1125, review; branch feedback75).
+const LITERAL_PS: u128 = 5_000;
+
+/// How many literals an alternation has for the crate to search it by Aho-Corasick
+/// (regex-automata's `meta::literal::alternation_literals`).
+const LITERALS_FOR_AC: usize = 3000;
+
+/// Whether `p` with `flags` is, from its text alone, an alternation of `LITERALS_FOR_AC` literals or
+/// more, which the crate searches by Aho-Corasick (`crate_searches_literals`), and the bytes of its
+/// longest part where it is: each part plain
+/// characters and the escapes `translate` writes as a character, no part empty (an empty one is no
+/// literal), not every part one character (which the parser makes a class of), and no `i` (which
+/// makes classes of letters). Read without parsing it, which took 31 ms for 50,000 words, more than
+/// half the crate's own compile of them, and in passes the machine makes wide, as reading it a
+/// character at a time took 1% of that compile (Q-1125). None for a list that escapes `|` or `\`,
+/// or whose parts are 4 bytes or fewer on average, whose parse then tells.
+fn many_literals(p: &str, flags: &str) -> Option<usize> {
+    let bytes = p.as_bytes();
+    // The parts' number and the longest's bytes, more than its literal's where it has an escape.
+    let (mut bars, mut longest, mut from) = (0, 0, 0);
+    for at in memchr::memchr_iter(b'|', bytes) {
+        bars += 1;
+        longest = longest.max(at - from);
+        from = at + 1;
+    }
+    let longest = longest.max(bytes.len() - from);
+    if flags.contains('i') || bars + 1 < LITERALS_FOR_AC {
+        return None;
+    }
+    // No part empty: no `|` first, last or after another (no escape is one, below).
+    if bytes.first() == Some(&b'|') || bytes.last() == Some(&b'|') || memchr::memmem::find(bytes, b"||").is_some() {
+        return None;
+    }
+    // Each escape a character: a metacharacter after `\` (`\.`) as it is, the rest as `translate`
+    // reads them. The metacharacters are then the escapes' alone, and each escape of `n` characters
+    // (one byte each) is `n - 1` bytes more than the one character it is.
+    let (mut escaped, mut fewer, mut past) = (0, 0, 0);
+    for at in memchr::memchr_iter(b'\\', bytes) {
+        if at < past {
+            continue; // the second half of `\uD83D\uDE00`
+        }
+        let n = match bytes.get(at + 1) {
+            Some(b'^' | b'$' | b'.' | b'*' | b'+' | b'?' | b'(' | b')' | b'[' | b']' | b'{' | b'}') => {
+                escaped += 1;
+                2
+            }
+            Some(b'/') => 2,
+            Some(b'|' | b'\\') | None => return None,
+            Some(_) => {
+                let cs: Vec<char> = p[at..].chars().take(12).collect();
+                match (cs[1], escape(&cs, 0, false)) {
+                    ('d' | 'D' | 'w' | 'W' | 's' | 'S', _) | (_, Err(_) | Ok((_, _, true))) => return None,
+                    (_, Ok((_, n, false))) => {
+                        // `\u{1F600}`'s braces.
+                        escaped += bytes[at..at + n].iter().filter(|b| b"[](){}.*+?^$".contains(b)).count();
+                        n
+                    }
+                }
+            }
+        };
+        fewer += n - 1;
+        past = at + n;
+    }
+    let metas: usize = [b"[](", b"){}", b".*+", b"?^$"].iter().map(|m| memchr::memchr3_iter(m[0], m[1], m[2], bytes).count()).sum();
+    // A character is 4 bytes at the most: parts of more than 4 bytes on average, each escape counted
+    // as one, have one of 2 characters or more (counting the characters took a third of the time).
+    (metas == escaped && bytes.len() - fewer - bars > 4 * (bars + 1)).then_some(longest)
 }
 
 /// The least of `STEPS` that `bytes` of compiled program fit.
@@ -494,6 +627,15 @@ fn unused() -> Regex {
 /// Whether this thread's cache keeps `p` with `flags`, and what it is counted at (for tests).
 pub fn kept(p: &str, flags: &str) -> Option<usize> {
     CACHE.with(|c| c.borrow().map.get(&(p.to_string(), flags.to_string())).map(|(_, n, _)| *n))
+}
+
+/// What `many_literals` and `crate_searches_literals` say of `p` with `flags` (for tests): the longest
+/// part's bytes where its text shows an alternation the crate searches by Aho-Corasick, and the
+/// longest literal and its factor where the crate searches it with literals alone (None where it
+/// does not parse) (Q-1125).
+pub fn literal_verdicts(p: &str, flags: &str) -> (Option<usize>, Option<(usize, usize)>) {
+    let hir = full_pattern(p, flags).ok().and_then(|full| regex_automata::util::syntax::parse(&full).ok());
+    (many_literals(p, flags), hir.as_ref().and_then(crate_searches_literals))
 }
 
 /// `compile` at each of `STEPS` in turn: the pattern, and the step it compiled within.
@@ -627,6 +769,10 @@ struct Room {
     test_ps: u64,
     caps_ps: u64,
     exact: bool,
+    /// For a pattern the crate searches with literals alone (`Room::literal`), the longest of them,
+    /// in bytes, which a call past the room reads the text in windows of (`windowed_matches`); 0 for
+    /// any other.
+    longest: usize,
 }
 
 impl Room {
@@ -634,12 +780,23 @@ impl Room {
         let test_ps = STATE_PS.saturating_mul(states).saturating_add(RANGE_PS.saturating_mul(ranges)).max(1);
         let caps_ps = test_ps.saturating_add(SLOT_PS.saturating_mul(states).saturating_mul(slots));
         let ps = |ps: u128| u64::try_from(ps).unwrap_or(u64::MAX);
-        Room { gate: (0, 0), test_ps: ps(test_ps), caps_ps: ps(caps_ps), exact }.with_crate(true)
+        Room { gate: (0, 0), test_ps: ps(test_ps), caps_ps: ps(caps_ps), exact, longest: 0 }.with_crate(true)
     }
 
     /// No room at all, for a pattern its NFA cannot be compiled of again.
     fn none() -> Room {
-        Room { gate: (0, 0), test_ps: u64::MAX, caps_ps: u64::MAX, exact: true }.with_crate(true)
+        Room { gate: (0, 0), test_ps: u64::MAX, caps_ps: u64::MAX, exact: true, longest: 0 }.with_crate(true)
+    }
+
+    /// The room of a pattern the crate searches with literals alone (`crate_searches_literals`),
+    /// building no NFA, whose `longest` literal is that many bytes, and of `factor` (see
+    /// `LITERAL_PS`); the crate's on any text within it, as 0.8.8 searched it, and in windows past it,
+    /// with the guard's clock (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1125; branch
+    /// feedback75).
+    fn literal(longest: usize, factor: usize) -> Room {
+        let ps = LITERAL_PS.saturating_mul(longest as u128 + 1).saturating_mul(factor.max(1) as u128);
+        let ps = u64::try_from(ps).unwrap_or(u64::MAX);
+        Room { gate: (0, 0), test_ps: ps, caps_ps: ps, exact: true, longest: longest.max(1) }.with_crate(true)
     }
 
     /// How long a text the crate may search, without groups and with them.
@@ -691,11 +848,20 @@ fn exact_room(pat: &mut Pat, key: &(String, String)) -> (Room, Option<Made>) {
         });
         return (pat.room, made);
     }
-    let made = full_pattern(&key.0, &key.1)
-        .ok()
-        .and_then(|full| regex_automata::util::syntax::parse(&full).ok())
-        .and_then(|hir| thompson::Compiler::new().configure(guard_nfa(false)).build_from_hir(&hir).ok().map(|nfa| Made { nfa }));
-    let room = made.as_ref().map_or_else(Room::none, |m| room_of(&m.nfa)).with_crate(pat.room.compiled());
+    let (room, made) = 'room: {
+        // A pattern the crate searches with literals alone (a room from size is only ever the
+        // crate's, compiled) has its own room, its NFA never made (FEEDBACK75.md follow-up found by
+        // 0.8.9's coverage, Q-1125; branch feedback75; see `nfa_first`).
+        if let Some(longest) = many_literals(&key.0, &key.1) {
+            break 'room (Room::literal(longest, 1), None);
+        }
+        let hir = full_pattern(&key.0, &key.1).ok().and_then(|full| regex_automata::util::syntax::parse(&full).ok());
+        if let Some((longest, factor)) = hir.as_ref().and_then(crate_searches_literals) {
+            break 'room (Room::literal(longest, factor), None);
+        }
+        let made = hir.and_then(|hir| thompson::Compiler::new().configure(guard_nfa(false)).build_from_hir(&hir).ok().map(|nfa| Made { nfa, rev: None }));
+        (made.as_ref().map_or_else(Room::none, |m| room_of(&m.nfa)).with_crate(pat.room.compiled()), made)
+    };
     pat.room = room;
     CACHE.with(|c| {
         if let Some(e) = c.borrow_mut().map.get_mut(key) {
@@ -719,9 +885,11 @@ fn room_of(nfa: &thompson::NFA) -> Room {
     Room::of(nfa.states().len() as u128, ranges, nfa.group_info().slot_len() as u128, true)
 }
 
-/// A pattern's NFA forward, as `guard_nfa(false)` compiles it.
+/// A pattern's NFA forward, as `guard_nfa(false)` compiles it, and back where `nfa_first` compiled
+/// it to know that the crate compiles the pattern (Q-1126), which the guard then takes.
 struct Made {
     nfa: thompson::NFA,
+    rev: Option<thompson::NFA>,
 }
 
 /// How a guard's NFAs are compiled, forward or back (back without groups, which it never finds).
@@ -752,9 +920,6 @@ struct Guard {
     forward: hybrid::dfa::DFA,
     /// The pattern as the crates take it, which the DFA back is compiled from.
     full: String,
-    /// Where the pattern is its literals and nothing else (`\d`, `[;{}]`, `cat|dog`): the
-    /// prefilter that finds them, the crate's whole search there (`Guarding::find_literal`).
-    literal: Option<Prefilter>,
     /// Whether each match ends where the text ends, and none must start where it starts (the
     /// crate's "reverse anchored" search).
     end_anchored: bool,
@@ -778,9 +943,7 @@ impl Guard {
         self.reverse
             .get_or_init(|| {
                 let hir = regex_automata::util::syntax::parse(&self.full).ok()?;
-                let rev = thompson::Compiler::new().configure(guard_nfa(true)).build_from_hir(&hir).ok()?;
-                let dfa = hybrid::dfa::Config::new().cache_capacity(GUARD_CACHE).skip_cache_capacity_check(true);
-                hybrid::dfa::Builder::new().configure(dfa.prefilter(None).specialize_start_states(false).match_kind(MatchKind::All)).build_from_nfa(rev).ok()
+                reverse_dfa(thompson::Compiler::new().configure(guard_nfa(true)).build_from_hir(&hir).ok()?)
             })
             .as_ref()
     }
@@ -801,6 +964,12 @@ impl Guard {
     }
 }
 
+/// The DFA back of a pattern's NFA back (`Guard::reverse`).
+fn reverse_dfa(rev: thompson::NFA) -> Option<hybrid::dfa::DFA> {
+    let dfa = hybrid::dfa::Config::new().cache_capacity(GUARD_CACHE).skip_cache_capacity_check(true);
+    hybrid::dfa::Builder::new().configure(dfa.prefilter(None).specialize_start_states(false).match_kind(MatchKind::All)).build_from_nfa(rev).ok()
+}
+
 /// What each lazy DFA of a guarded call may keep: twice the crate's, as states of large patterns
 /// are large (at least what one state needs, whatever this says).
 const GUARD_CACHE: usize = 2 << 20;
@@ -811,9 +980,9 @@ fn build_guard(p: &str, flags: &str, made: Option<Made>) -> Option<Guard> {
     // Parsed again (a small part of compiling).
     let full = full_pattern(p, flags).ok()?;
     let hir = regex_automata::util::syntax::parse(&full).ok()?;
-    let fwd = match made {
-        Some(Made { nfa }) => nfa,
-        None => thompson::Compiler::new().configure(guard_nfa(false)).build_from_hir(&hir).ok()?,
+    let (fwd, rev) = match made {
+        Some(Made { nfa, rev }) => (nfa, rev),
+        None => (thompson::Compiler::new().configure(guard_nfa(false)).build_from_hir(&hir).ok()?, None),
     };
     let props = hir.properties();
     let start_anchored = props.look_set_prefix().contains(regex_syntax::hir::Look::Start);
@@ -831,17 +1000,21 @@ fn build_guard(p: &str, flags: &str, made: Option<Made>) -> Option<Guard> {
     });
     let prefilter = prefixes.as_ref().and_then(|seq| seq.literals()).and_then(|lits| Prefilter::new(MatchKind::LeftmostFirst, lits));
     let fast_prefix = prefilter.as_ref().is_some_and(Prefilter::is_fast);
-    // Where those prefixes are exact, and the pattern has no group of its own nor look-around, the
-    // crate's search is that prefilter alone (its "Pre" strategy, `Pre::from_prefixes`).
-    let literal = prefilter.clone().filter(|_| prefixes.as_ref().is_some_and(|seq| seq.is_exact()) && props.explicit_captures_len() == 0 && props.look_set().is_empty());
+    // A pattern the crate searches with its prefilter alone (exact prefixes, no group, no
+    // assertion: `Pre::from_prefixes`) has no guard, being the crate's on any text (Q-1125, see
+    // `crate_searches_literals`); the guard's own search by that prefilter was taken out with it.
     let forward = hybrid::dfa::Builder::new().configure(dfa.prefilter(prefilter)).build_from_nfa(fwd.clone()).ok()?;
     // As the crate chooses: back from the end where every match ends there, else from a literal
     // inside where there is no fast one in front, else forward.
     let end_anchored = props.look_set_suffix().contains(regex_syntax::hir::Look::End) && !start_anchored;
-    let inner = if literal.is_some() || end_anchored || start_anchored || fast_prefix { None } else { inner_search(&hir) };
+    let inner = if end_anchored || start_anchored || fast_prefix { None } else { inner_search(&hir) };
     let track = thompson::backtrack::BoundedBacktracker::new_from_nfa(fwd.clone()).ok();
     let groups = thompson::pikevm::PikeVM::new_from_nfa(fwd).ok()?;
-    Some(Guard { forward, full, literal, end_anchored, reverse: std::cell::OnceCell::new(), inner, groups, track, onepass: std::cell::OnceCell::new() })
+    let reverse = std::cell::OnceCell::new();
+    if let Some(rev) = rev {
+        let _ = reverse.set(reverse_dfa(rev));
+    }
+    Some(Guard { forward, full, end_anchored, reverse, inner, groups, track, onepass: std::cell::OnceCell::new() })
 }
 
 /// The crate's "reverse inner" search for a pattern: the literal inside it, found by a prefilter,
@@ -1103,11 +1276,20 @@ fn guard_of(key: (String, String), made: Option<Made>) -> Option<Rc<Guard>> {
     g
 }
 
-/// The guard for a call of `pat` over `len` bytes (`caps`: one that asks for groups), with what a
-/// byte of a match's groups costs, where the crate's worst would not fit (`Room`): Ok(None) for the
-/// crate, Err where none can be made, which is the call's error value, never the crate.
+/// How a call past its pattern's room searches (`guard_for`): by the pattern's guard, with what a
+/// byte of a match's groups costs, or, for a pattern the crate searches with literals alone
+/// (`Room::literal`), by the crate in windows of the text, the longest literal's bytes being given
+/// (`windowed_matches`).
+enum Way {
+    Guard(Rc<Guard>, u64),
+    Windows(usize),
+}
+
+/// The guard for a call of `pat` over `len` bytes (`caps`: one that asks for groups), where the
+/// crate's worst would not fit (`Room`): Ok(None) for the crate, Err where none can be made, which is
+/// the call's error value, never the crate.
 #[inline]
-fn guard_for(pat: &mut Pat, key: Key, len: usize, caps: bool) -> Result<Option<(Rc<Guard>, u64)>, ()> {
+fn guard_for(pat: &mut Pat, key: Key, len: usize, caps: bool) -> Result<Option<Way>, ()> {
     if pat.room.holds(len, caps) {
         return Ok(None);
     }
@@ -1115,7 +1297,7 @@ fn guard_for(pat: &mut Pat, key: Key, len: usize, caps: bool) -> Result<Option<(
 }
 
 #[inline(never)]
-fn guard_past_room(pat: &mut Pat, key: Key, len: usize, caps: bool) -> Result<Option<(Rc<Guard>, u64)>, ()> {
+fn guard_past_room(pat: &mut Pat, key: Key, len: usize, caps: bool) -> Result<Option<Way>, ()> {
     let key = key.strings();
     let (room, made) = exact_room(pat, &key);
     if room.fits(len, caps) {
@@ -1132,7 +1314,14 @@ fn guard_past_room(pat: &mut Pat, key: Key, len: usize, caps: bool) -> Result<Op
             return Ok(None);
         }
     }
-    guard_of(key, made).map(|g| Some((g, room.caps_ps))).ok_or(())
+    // Past a literal pattern's room, its own search in windows, with the guard's clock: unclocked, a
+    // list with one literal of 20,001 bytes took 8 s in `re.replace` on 2 MB, and 64 literals of 100
+    // bytes 4.5 s on 10 MB, where the guard gives 0.4 and 1.6 s (FEEDBACK75.md follow-up found by
+    // 0.8.9's coverage, Q-1125, review; branch feedback75).
+    if room.longest > 0 {
+        return Ok(Some(Way::Windows(room.longest)));
+    }
+    guard_of(key, made).map(|g| Some(Way::Guard(g, room.caps_ps))).ok_or(())
 }
 
 /// A guarded call's caches, made once for all its searches.
@@ -1577,9 +1766,6 @@ impl<'g> Guarding<'g> {
     /// could take longer to find than `GUARD_BUDGET_PS`.
     #[inline]
     fn find(&mut self, s: &str, from: usize, earliest: bool) -> Result<Option<Found>, Halt> {
-        if let Some(pre) = &self.g.literal {
-            return self.find_literal(pre, s, from, earliest);
-        }
         if self.g.end_anchored {
             return self.find_at_end(s, from, earliest);
         }
@@ -1587,22 +1773,6 @@ impl<'g> Guarding<'g> {
             return self.find_inner(s, from, earliest);
         }
         self.find_forward(s, from, earliest)
-    }
-
-    /// `find` for a pattern that is its literals and nothing else (`Guard::literal`): the next one the
-    /// prefilter finds, as regex-automata's "Pre" search (`Pre::search`) answers, with what it read
-    /// counted. Each step of the guard's search took twice as long as the crate's memchr-like
-    /// reading where a match is on almost every byte: `\d` and `[ ]` on 10 MB 55% slower than
-    /// 0.8.8 (found measuring). One reading takes at most a few nanoseconds a byte, under what a
-    /// call may compute a byte (`GUARD_PER_BYTE`), so the clock looked at after it bounds it.
-    #[inline(always)]
-    fn find_literal(&mut self, pre: &Prefilter, s: &str, from: usize, earliest: bool) -> Result<Option<Found>, Halt> {
-        if from > s.len() {
-            return Ok(None);
-        }
-        let found = pre.find(s.as_bytes(), regex_automata::Span::from(from..s.len()));
-        self.clock.bytes(found.map_or(s.len(), |sp| sp.end) - from)?;
-        Ok(found.map(|sp| Found { start: if earliest { sp.end } else { sp.start }, end: sp.end, groups: Vec::new() }))
     }
 
     /// `find` from the pattern's inner literal (`Inner`), as regex-automata's "reverse inner"
@@ -2045,6 +2215,102 @@ fn guarded_matches(s: &str, most: usize, g: &Guard, caps_ps: u64) -> Result<Vec<
     Ok(out)
 }
 
+/// What a windowed search reads at once past where it starts (`windowed_matches`).
+const WINDOW: usize = 64 << 10;
+
+/// The end of the window a search from `pos` reads: `WINDOW` bytes and the longest literal less one
+/// past `pos`, so that each literal that starts in the first `WINDOW` bytes is whole in it; the
+/// text's end at the most, and never inside a character.
+fn window_end(s: &str, pos: usize, longest: usize) -> usize {
+    let mut end = pos.saturating_add(WINDOW).saturating_add(longest.saturating_sub(1)).min(s.len());
+    while !s.is_char_boundary(end) {
+        end += 1;
+    }
+    end
+}
+
+/// Where the window after the one from `pos` starts: `WINDOW` bytes on, at a character.
+fn next_window(s: &str, pos: usize) -> usize {
+    let mut at = pos + WINDOW;
+    while !s.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
+/// `matches` for a pattern the crate searches with literals alone, past its room (`Room::literal`):
+/// each search the crate's, on a window of the text (`window_end`), its match kept where it starts in
+/// the window's first `WINDOW` bytes, where every literal is whole and it is the match the whole text
+/// gives, else the next window searched; and what each search may have read, its match and the
+/// longest literal past it within the window, counted on the guard's clock (`Clock`), past which the
+/// call is the error value, as a guarded call's is (FEEDBACK75.md follow-up found by 0.8.9's
+/// coverage, Q-1125, review; branch feedback75).
+#[inline(never)]
+fn windowed_matches(r: &Regex, longest: usize, s: &str, most: usize) -> Result<Vec<Found>, Stop> {
+    let mut clock = Clock::new(s.len());
+    let mut out = Vec::new();
+    let mut pos = 0;
+    let mut may_read: u64;
+    let mut timed: Option<(Duration, Duration)> = None;
+    let halt = |h: Halt| match h {
+        Halt::Time => Stop::GaveUp,
+        Halt::Compute => Stop::Compute,
+    };
+    'all: while pos <= s.len() && out.len() < most {
+        let until = if most == 1 {
+            1
+        } else {
+            // A literal pattern has no group of its own: a match takes its `Found` alone. The time is
+            // the clock's: what `look` counts of readings (each to the text's end) is cleared, its
+            // limit of them, which a debug build does not lengthen as the clock is, otherwise first
+            // there (found running the tests).
+            may_read = 0;
+            look(&mut out, s, pos, most, std::mem::size_of::<Found>(), &mut may_read, &mut timed)?;
+            (out.len() + 64).min(most)
+        };
+        while pos <= s.len() && out.len() < until {
+            let end = window_end(s, pos, longest);
+            // `find_at`, not `captures_read_at`: a literal pattern has no group, and a second caller of
+            // `captures_read_at` left it out of line in `matches` too, 30 instructions a match on every
+            // pattern (the 0.8.9 benchmark after Q-1125; branch feedback75).
+            match r.find_at(&s[..end], pos).map(|m| (m.start(), m.end())) {
+                Some((start, stop)) if start < pos + WINDOW || end == s.len() => {
+                    clock.bytes((stop + longest).min(end) - pos).map_err(halt)?;
+                    out.push(Found { start, end: stop, groups: Vec::new() });
+                    pos = if stop > start { stop } else { stop + s[stop..].chars().next().map_or(1, char::len_utf8) };
+                }
+                _ if end == s.len() => break 'all,
+                _ => {
+                    clock.bytes(end - pos).map_err(halt)?;
+                    pos = next_window(s, pos);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `re.test` in windows (see `windowed_matches`): a match anywhere in a window is one in the text.
+#[inline(never)]
+fn windowed_test(r: &Regex, longest: usize, s: &str, line: u32) -> R {
+    let mut clock = Clock::new(s.len());
+    let mut pos = 0;
+    loop {
+        let end = window_end(s, pos, longest);
+        if r.is_match_at(&s[..end], pos) {
+            return Ok(Value::Bool(true));
+        }
+        if end == s.len() {
+            return Ok(Value::Bool(false));
+        }
+        match clock.bytes(end - pos) {
+            Ok(()) => pos = next_window(s, pos),
+            Err(Halt::Time) => return Ok(gave_up("re.test", s.len())),
+            Err(Halt::Compute) => return fail(line, crate::httpd::over_compute()),
+        }
+    }
+}
+
 /// What `matches` looks at before each 64 searches: the compute limit, the time the searches
 /// take once they may have read `SCANS` times the text (each of the 64 counted as reading from
 /// here to the end), and room for 64 more, made as the list would grow and asked about first
@@ -2074,16 +2340,20 @@ fn look(out: &mut Vec<Found>, s: &str, pos: usize, most: usize, each: usize, may
 /// request; too many readings of the text is an error value (Q-976).
 /// The guard's searches where one is given, out of line, so that the crate's path is 0.8.8's (found
 /// measuring: in line, 77 instructions more a `re.find` of a short text).
-fn all_matches(r: &Regex, s: &str, most: usize, f: &str, line: u32, guard: Option<(&Guard, u64)>) -> Result<Result<Vec<Found>, Value>, Ctrl> {
+fn all_matches(r: &Regex, s: &str, most: usize, f: &str, line: u32, guard: Option<&Way>) -> Result<Result<Vec<Found>, Value>, Ctrl> {
     match guard {
         None => stopped(matches(r, s, most), s, f, line),
-        Some((g, caps_ps)) => all_guarded(g, caps_ps, s, most, f, line),
+        Some(way) => all_guarded(r, way, s, most, f, line),
     }
 }
 
 #[inline(never)]
-fn all_guarded(g: &Guard, caps_ps: u64, s: &str, most: usize, f: &str, line: u32) -> Result<Result<Vec<Found>, Value>, Ctrl> {
-    stopped(guarded_matches(s, most, g, caps_ps), s, f, line)
+fn all_guarded(r: &Regex, way: &Way, s: &str, most: usize, f: &str, line: u32) -> Result<Result<Vec<Found>, Value>, Ctrl> {
+    let found = match way {
+        Way::Guard(g, caps_ps) => guarded_matches(s, most, g, *caps_ps),
+        Way::Windows(longest) => windowed_matches(r, *longest, s, most),
+    };
+    stopped(found, s, f, line)
 }
 
 /// What `all_matches` gives for what the searches found or why they stopped.
@@ -2123,10 +2393,10 @@ enum Names<'a> {
 }
 
 impl<'a> Names<'a> {
-    fn of(r: &'a Regex, guard: Option<&'a (Rc<Guard>, u64)>) -> Names<'a> {
+    fn of(r: &'a Regex, guard: Option<&'a Way>) -> Names<'a> {
         match guard {
-            Some((g, _)) => Names::Guard(g),
-            None => Names::Crate(r),
+            Some(Way::Guard(g, _)) => Names::Guard(g),
+            _ => Names::Crate(r),
         }
     }
 
@@ -2197,8 +2467,10 @@ fn test(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let mut pat = pattern(&args, 2, "re.test", line, s.len(), false)?;
     // By its guard where the crate could take too long (FEEDBACK75.md, Q-1075; branch feedback75).
     let Ok(guard) = guard_for(&mut pat, Key { args: &args, flags_at: 2 }, s.len(), false) else { return Ok(gave_up("re.test", s.len())) };
-    if let Some((g, caps_ps)) = guard {
-        return guarded_test(&g, caps_ps, &s, line);
+    match guard {
+        Some(Way::Guard(g, caps_ps)) => return guarded_test(&g, caps_ps, &s, line),
+        Some(Way::Windows(longest)) => return windowed_test(&pat.r, longest, &s, line),
+        None => {}
     }
     Ok(Value::Bool(pat.r.is_match(&s)))
 }
@@ -2209,7 +2481,7 @@ fn find(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let mut pat = pattern(&args, 2, "re.find", line, s.len(), true)?;
     let Ok(guard) = guard_for(&mut pat, Key { args: &args, flags_at: 2 }, s.len(), true) else { return Ok(gave_up("re.find", s.len())) };
     let r = &pat.r;
-    let found = match all_matches(r, &s, 1, "re.find", line, guard.as_ref().map(|(g, n)| (&**g, *n)))? {
+    let found = match all_matches(r, &s, 1, "re.find", line, guard.as_ref())? {
         Ok(found) => found,
         Err(e) => return Ok(e),
     };
@@ -2224,7 +2496,7 @@ fn find_all(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // feedback75).
     let Ok(guard) = guard_for(&mut pat, Key { args: &args, flags_at: 2 }, s.len(), true) else { return Ok(gave_up("re.find_all", s.len())) };
     let r = &pat.r;
-    let found = match all_matches(r, &s, usize::MAX, "re.find_all", line, guard.as_ref().map(|(g, n)| (&**g, *n)))? {
+    let found = match all_matches(r, &s, usize::MAX, "re.find_all", line, guard.as_ref())? {
         Ok(found) => found,
         Err(e) => return Ok(e),
     };
@@ -2251,7 +2523,7 @@ fn replace(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return fail(line, format!("`re.replace` expects what to put in (a str or a function) as argument 3, got {}", with.type_name()));
     }
     let names: Vec<Option<&str>> = Names::of(r, guard.as_ref()).list();
-    let found = match all_matches(r, &s, usize::MAX, "re.replace", line, guard.as_ref().map(|(g, n)| (&**g, *n)))? {
+    let found = match all_matches(r, &s, usize::MAX, "re.replace", line, guard.as_ref())? {
         Ok(found) => found,
         Err(e) => return Ok(e),
     };
@@ -2334,7 +2606,7 @@ fn split(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let r = &pat.r;
     let mut out = Vec::new();
     let mut last = 0;
-    let found = match all_matches(r, &s, usize::MAX, "re.split", line, guard.as_ref().map(|(g, n)| (&**g, *n)))? {
+    let found = match all_matches(r, &s, usize::MAX, "re.split", line, guard.as_ref())? {
         Ok(found) => found,
         Err(e) => return Ok(e),
     };

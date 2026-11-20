@@ -425,6 +425,34 @@ fn apps_identity(req: &mut HttpRequest) {
     }
 }
 
+/// In a service, the visitor's headers its app could not send as they came (`service::HEADERS_WORD`:
+/// a value with a byte past ASCII, a UTF-8 cookie or `X-Note: café`), from the app's signed word:
+/// put back, so that the program reads them as the visitor sent them; in a service its app started,
+/// on a request from the app alone (`FROM_APP`, `marked`). A cookie carried joins the `Cookie` line
+/// the others came in. The word goes either way; it is taken only for the request it was signed for
+/// (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1174, its review and recheck; branch
+/// feedback75).
+fn apps_headers(req: &mut HttpRequest, marked: bool, base: &str) {
+    let Some(i) = req.headers.iter().rposition(|(k, _)| k.eq_ignore_ascii_case(crate::service::HEADERS_WORD)) else { return };
+    let from_app = !marked || req.headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(FROM_APP));
+    // For this request: the service's `--base`, the method, the path and query (Q-1174's recheck).
+    let bound = crate::service::headers_bound(base, &req.method, &req.url);
+    let carried = match (from_app, bound) {
+        (true, Some(b)) => crate::service::headers_of_word(&req.headers[i].1, &b),
+        _ => None,
+    };
+    req.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(crate::service::HEADERS_WORD));
+    for (k, v) in carried.into_iter().flatten() {
+        match req.headers.iter_mut().find(|(n, _)| k.eq_ignore_ascii_case("cookie") && n.eq_ignore_ascii_case("cookie")) {
+            Some((_, line)) => {
+                line.push_str("; ");
+                line.push_str(&v);
+            }
+            None => req.headers.push((k, v)),
+        }
+    }
+}
+
 /// In a service its app started, the app's policies for the request's path (`service::POLICY_WORD`),
 /// on a request from the app (the mark `FROM_APP`, which httpd's parser puts on it alone): below the
 /// program's own `site_headers` rules, before its page is written, so that the policy the visitor
@@ -5313,9 +5341,15 @@ impl Worker {
     /// is made. The caller holds the interpreter lock.
     pub(crate) fn answer(&mut self, app: &Arc<App>, mut req: HttpRequest, sink: Option<&mut dyn crate::stream::Sink>) -> Answer {
         let mut app_rules = if crate::httpd::takes_app_word() {
+            apps_headers(&mut req, true, &app.base);
             apps_identity(&mut req);
             apps_policies(&mut req)
         } else {
+            // A service run apart (`--service-url`) that shares the secret: the word is checked
+            // (Q-1174's review).
+            if app.is_service {
+                apps_headers(&mut req, false, &app.base);
+            }
             Vec::new()
         };
         let took_policies = !app_rules.is_empty();

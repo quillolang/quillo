@@ -713,6 +713,14 @@ fn req_make_union<C: Chain, M: Mode>(it: &mut Interp, ty: &Ty, v: &Value, lenien
 
 #[inline(always)]
 fn req_make_names<C: Chain, M: Mode>(it: &mut Interp, ty: &Ty, v: &Value, lenient: bool, depth: usize, chain: C) -> Result<Result<Value, Why>, Ctrl> {
+    // An int stays an int where the union names `int`, itself or through types naming types
+    // (`type Cnt = int`), whichever name comes first: through `Num | int` (`type Num = float`) or
+    // `float | Cnt` the float took it first and widened it, in a parameter, a list and a map
+    // shape's field (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1180's reviews; branch
+    // feedback75).
+    if matches!(v, Value::Int(_)) && names_int(&it.types, ty) {
+        return Ok(Ok(v.clone()));
+    }
     let mut best = Why::default();
     for n in &ty.names {
         let r = req_make_name::<C, M>(it, n, ty, v, lenient, depth, chain)?;
@@ -739,7 +747,10 @@ fn req_make_name<C: Chain, M: Mode>(it: &mut Interp, n: &str, ty: &Ty, v: &Value
         return req_make_record::<M>(it, &td, m, lenient, depth);
     }
     match (n, v) {
-        ("list", Value::List(items)) if ty.elem.as_deref().map_or(false, |e| has_record(&it.types, e, 0) || has_float(&it.types, e, 0)) => {
+        // A record, a float, a decimal or money behind any number of types naming types, or in a
+        // map shape, is made too (`req_to_make`; FEEDBACK75.md follow-ups found by 0.8.9's
+        // coverage, Q-1171 and Q-1180; branch feedback75).
+        ("list", Value::List(items)) if ty.elem.as_deref().map_or(false, |e| req_to_make(&it.types, e) != 0) => {
             if deepens::<M>(depth) {
                 return req_make_deep(it, n, ty, v, lenient, depth, chain);
             }
@@ -752,6 +763,13 @@ fn req_make_name<C: Chain, M: Mode>(it: &mut Interp, n: &str, ty: &Ty, v: &Value
                 }
             }
             Ok(Ok(Value::list(out)))
+        }
+        // Every map shape, each field looked at once (`req_make_shape`).
+        ("map", Value::Map(m)) if ty.fields.is_some() => {
+            if deepens::<M>(depth) {
+                return req_make_deep(it, n, ty, v, lenient, depth, chain);
+            }
+            req_make_shape::<M>(it, ty, v, m, lenient, depth)
         }
         // A float takes a whole number: JSON, and a browser's JavaScript, have
         // one kind of number, so 5.0 arrives as 5. Only data made into a type
@@ -776,6 +794,167 @@ fn req_make_name<C: Chain, M: Mode>(it: &mut Interp, n: &str, ty: &Ty, v: &Value
         // which took the answer kept for the first (`KEPT`; FEEDBACK75.md, Q-1080's review; branch
         // feedback75). The program's own values from the top, as 0.8.8 checked them.
         _ => Ok(req_fits_name::<C, M>(&it.types, n, ty, v, true, depth, chain).map(|_| v.clone())),
+    }
+}
+
+/// Whether a request's value of type `ty` is made, not only checked, and why: `MADE_FLOAT` where
+/// it may hold a float, `MADE_OTHER` a record, a decimal or money (what a parameter of the type
+/// makes), through types naming types however many in a row, list items and map shapes' fields,
+/// each type followed once; 0 for neither. `has_record` and `has_float`, the program's walk's,
+/// stop at 8 types in a row and pass over map shapes: a record behind them was only checked, so
+/// what was sent kept fields the record does not have (`is_admin`) and a field left out was
+/// refused where its default goes in (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1171;
+/// branch feedback75); and a whole number was refused where a float goes, and `"1.50"` where a
+/// decimal goes, and money was left a map, where `x: float`, `x: dec` and `x: money` make them
+/// (Q-1180 and its review, the same).
+fn req_to_make(types: &Types, ty: &Ty) -> u8 {
+    // A scalar's field, most of them, is told at once.
+    if ty.elem.is_none() && ty.fields.is_none() && !ty.names.iter().any(|n| capital(n) || made_scalar(n) != 0) {
+        return 0;
+    }
+    let mut seen = Seen { few: [std::ptr::null(); 8], n: 0, more: Vec::new() };
+    reaches_made(types, ty, &mut seen)
+}
+
+/// Whether a union names `int`, itself or through types naming types however many (`type Cnt =
+/// int`, `type Id = int | str`), each followed once; a list or a map shape of ints is no int.
+fn names_int(types: &Types, ty: &Ty) -> bool {
+    if ty.names.iter().any(|n| n == "int") {
+        return true;
+    }
+    if !ty.names.iter().any(|n| capital(n)) {
+        return false;
+    }
+    let mut seen = Seen { few: [std::ptr::null(); 8], n: 0, more: Vec::new() };
+    alias_int(types, ty, &mut seen)
+}
+
+fn alias_int(types: &Types, ty: &Ty, seen: &mut Seen) -> bool {
+    ty.names.iter().any(|n| {
+        n == "int" || (capital(n) && types.get(n).is_some_and(|td| !td.is_record() && seen.first(td) && alias_int(types, &td.ty, seen)))
+    })
+}
+
+/// What `req_to_make` says: a float may be in it; a record, a decimal or money may be.
+const MADE_FLOAT: u8 = 1;
+const MADE_OTHER: u8 = 2;
+
+/// What a scalar's name makes of a value from a request (`req_make_name`).
+#[inline(always)]
+fn made_scalar(n: &str) -> u8 {
+    match n {
+        "float" => MADE_FLOAT,
+        "dec" | "money" => MADE_OTHER,
+        _ => 0,
+    }
+}
+
+/// Whether a type's name may be the program's: those are named with a capital (`User`, as the
+/// parser holds them); `str`, `list` and a set's strings are not, and cost no lookup.
+#[inline(always)]
+fn capital(n: &str) -> bool {
+    n.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+}
+
+/// The types `reaches_made` has followed: the first few in place, the rest in a list.
+struct Seen {
+    few: [*const TypeDef; 8],
+    n: usize,
+    more: Vec<*const TypeDef>,
+}
+
+impl Seen {
+    /// Whether `t` is followed for the first time (and is now seen).
+    fn first(&mut self, t: &TypeDef) -> bool {
+        let t = t as *const TypeDef;
+        if self.few[..self.n.min(8)].contains(&t) || self.more.contains(&t) {
+            return false;
+        }
+        if self.n < 8 {
+            self.few[self.n] = t;
+        } else {
+            self.more.push(t);
+        }
+        self.n += 1;
+        true
+    }
+}
+
+fn reaches_made(types: &Types, ty: &Ty, seen: &mut Seen) -> u8 {
+    const ALL: u8 = MADE_FLOAT | MADE_OTHER;
+    let mut made = 0;
+    for n in &ty.names {
+        made |= made_scalar(n);
+        if !capital(n) {
+            continue;
+        }
+        if let Some(td) = types.get(n) {
+            if td.is_record() {
+                made |= MADE_OTHER;
+            } else if seen.first(td) {
+                made |= reaches_made(types, &td.ty, seen);
+            }
+        }
+        if made == ALL {
+            return made;
+        }
+    }
+    if let Some(e) = ty.elem.as_deref() {
+        made |= reaches_made(types, e, seen);
+    }
+    for (_, f) in ty.fields.as_deref().unwrap_or_default() {
+        if made == ALL {
+            break;
+        }
+        made |= reaches_made(types, f, seen);
+    }
+    made
+}
+
+/// A map shape (`{ owner: Account }`, `{ p: float, a: dec }`): a copy of the map with each field
+/// that may hold what a parameter makes (`req_to_make`) made as `req_make_at` makes it, the
+/// shape's other fields checked as they are, and what else the map holds kept, as a shape keeps
+/// it; `v` itself where nothing made is new (all checked, or floats sent as floats), as the check
+/// shared it (FEEDBACK75.md follow-ups found by 0.8.9's coverage, Q-1171 and Q-1180; branch
+/// feedback75).
+fn req_make_shape<M: Mode>(it: &mut Interp, ty: &Ty, v: &Value, m: &Map, lenient: bool, depth: usize) -> Result<Result<Value, Why>, Ctrl> {
+    let mut out: Option<Map> = None;
+    for (k, fty) in ty.fields.as_deref().unwrap_or_default() {
+        let Some(x) = m.get(k.as_str()).filter(|x| !matches!(x, Value::Nil)) else {
+            if fty.optional {
+                continue;
+            }
+            return Ok(Err(Why::missing(k)));
+        };
+        // A float sent where only a float is made, most of them, is checked as it is: making would
+        // give it back.
+        let made = req_to_make(&it.types, fty);
+        if made != 0 && !(made == MADE_FLOAT && matches!(x, Value::Float(_))) {
+            match req_make_at::<_, M>(it, fty, x, lenient, depth + 1, Unnamed)? {
+                Ok(y) if !same(x, &y) => {
+                    out.get_or_insert_with(|| m.clone()).insert(k.as_str().into(), y);
+                }
+                Ok(_) => {}
+                Err(w) => return Ok(Err(w.here(fty, x).inside(k))),
+            }
+        } else if let Err(w) = req_fits_at::<_, M>(&it.types, fty, x, true, depth + 1, Unnamed) {
+            return Ok(Err(w.here(fty, x).inside(k)));
+        }
+    }
+    Ok(Ok(out.map_or_else(|| v.clone(), Value::map)))
+}
+
+/// Whether making `x` gave it back as it was: the same float, int, decimal (its digits after the
+/// point too) or text, list or map.
+fn same(x: &Value, y: &Value) -> bool {
+    match (x, y) {
+        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+        (Value::Dec(a), Value::Dec(b)) => a == b && a.scale() == b.scale(),
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Str(a), Value::Str(b)) => Arc::ptr_eq(a, b),
+        (Value::List(a), Value::List(b)) => Arc::ptr_eq(a, b),
+        (Value::Map(a), Value::Map(b)) => Arc::ptr_eq(a, b),
+        _ => false,
     }
 }
 

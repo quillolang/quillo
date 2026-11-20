@@ -219,6 +219,15 @@ fn room_for(tables: &mut Tables, cells: usize) -> bool {
     true
 }
 
+/// Whether a confined check's budget is spent, its clock read when `k` is a multiple of 64
+/// (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1127; branch feedback75).
+fn budget_spent(k: usize) -> bool {
+    if k % 64 == 0 && DEADLINE.with(|d| d.get()).is_some_and(|d| std::time::Instant::now() >= d) {
+        OVER_BUDGET.with(|o| o.set(true));
+    }
+    OVER_BUDGET.with(|o| o.get())
+}
+
 thread_local! {
     /// Service programs being checked: one using another that uses it is not checked twice over.
     static SERVICE_CHECKS: std::cell::RefCell<HashSet<PathBuf>> = std::cell::RefCell::new(HashSet::new());
@@ -4870,9 +4879,15 @@ impl Checker {
     /// (FEEDBACK75.md, Q-1067; branch feedback75). Written out: `send` itself, by the name the
     /// stream's function gives it, where nothing in between binds that name again.
     fn stream_sends_in_transactions(&mut self, order: &[Item]) {
-        use crate::client::{each_free, Met};
+        use crate::client::{each_free, Bound, Met};
         let mut found: Vec<(Arc<str>, u32, String, &'static str)> = Vec::new();
-        for it in order {
+        for (k, it) in order.iter().enumerate() {
+            // A confined check past its budget says nothing more: its clock is read every 64th item,
+            // and none is read once it is spent. This pass read on, 23.7 s past a 2 s budget
+            // (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1127; branch feedback75).
+            if budget_spent(k) {
+                return;
+            }
             let roots: Vec<&Expr> = match &it.stmt {
                 Stmt::Route(r) => vec![&r.body],
                 Stmt::Fn(d) => vec![&d.body],
@@ -4880,27 +4895,37 @@ impl Checker {
                 _ => continue,
             };
             for root in roots {
-                each_free(root, true, &mut Vec::new(), &mut |m, bound| {
+                // Only code that starts a stream is read with what it binds: a plain walk finds it,
+                // and a function of 100,000 `let`s keeps none of their names (FEEDBACK75.md
+                // follow-up found by 0.8.9's coverage, Q-1127; branch feedback75).
+                let mut starts = false;
+                walk_expr(root, &mut |x| {
+                    starts |= matches!(x, Expr::Call(c, args, _) if matches!(&**c, Expr::Ident(n, _) if n == "stream" || n == "events") && matches!(args.first(), Some(Expr::Lambda(_))))
+                });
+                if !starts {
+                    continue;
+                }
+                each_free(root, true, &mut Bound::new(), &mut |m, bound| {
                     let Met::Expr(Expr::Call(c, args, _)) = m else { return };
-                    let streams = matches!(&**c, Expr::Ident(n, _) if (n == "stream" || n == "events") && !bound.iter().any(|b| b == n.as_str()));
+                    let streams = matches!(&**c, Expr::Ident(n, _) if (n == "stream" || n == "events") && !bound.has(n.as_str()));
                     let Some(Expr::Lambda(f)) = args.first().filter(|_| streams) else { return };
                     let Some(send) = f.params.first().map(|p| p.name.to_string()) else { return };
-                    each_free(&f.body, true, &mut f.params.iter().skip(1).map(|p| p.name.to_string()).collect(), &mut |m, bound| {
+                    each_free(&f.body, true, &mut Bound::of(f.params.iter().skip(1).map(|p| p.name.to_string())), &mut |m, bound| {
                         let Met::Expr(Expr::Call(c, targs, _)) = m else { return };
                         let tx = match &**c {
-                            Expr::Field(o, name, _) if matches!(&**o, Expr::Ident(db, _) if db == "db" && !bound.iter().any(|b| b == "db")) => match name.as_str() {
+                            Expr::Field(o, name, _) if matches!(&**o, Expr::Ident(db, _) if db == "db" && !bound.has("db")) => match name.as_str() {
                                 "transaction" => "db.transaction",
                                 "atomic" => "db.atomic",
                                 _ => return,
                             },
                             _ => return,
                         };
-                        if bound.iter().any(|b| *b == send) {
+                        if bound.has(&send) {
                             return;
                         }
                         for t in targs {
                             if let Expr::Lambda(g) = t {
-                                each_free(&g.body, true, &mut g.params.iter().map(|p| p.name.to_string()).collect(), &mut |m, _| {
+                                each_free(&g.body, true, &mut Bound::of(g.params.iter().map(|p| p.name.to_string())), &mut |m, _| {
                                     if let Met::Expr(Expr::Ident(n, line)) = m {
                                         if *n == send.as_str() {
                                             found.push((it.file.clone(), *line, send.clone(), tx));
@@ -6956,6 +6981,13 @@ impl Checker {
                 let mut t = T::of(NIL);
                 let mut never = false;
                 for (i, s) in stmts.iter().enumerate() {
+                    // Past its budget a check reads no further statement: each `let` still read what
+                    // it holds (its SQL, its URL) among all before it, and 85,000 of them went on
+                    // 15 s past a 2 s budget (FEEDBACK75.md follow-up found by 0.8.9's coverage,
+                    // Q-1127; branch feedback75).
+                    if self.over_budget {
+                        break;
+                    }
                     if i + 1 < stmts.len() {
                         self.answer_dropped(s, true);
                         self.op_dropped(s);
@@ -11256,7 +11288,14 @@ impl<'a, 'c> GetWalk<'a, 'c> {
 
     fn block(&mut self, stmts: &[Stmt]) {
         let mark = self.scope.len();
-        for s in stmts {
+        for (k, s) in stmts.iter().enumerate() {
+            // A confined check past its budget reads no further: each name was looked for among
+            // all those bound before it, and a route calling a function of 85,000 `let`s went on
+            // 8 s past the budget (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1127; branch
+            // feedback75).
+            if budget_spent(k) {
+                break;
+            }
             match s {
                 Stmt::Let(Pattern::Bind(n), Expr::Lambda(d), _) => {
                     self.held.push(d.clone());
@@ -11615,7 +11654,7 @@ impl<'a> CallGraph<'a> {
             let mut first_read: Option<String> = None;
             let mut calls = Vec::new();
             called_names(&d.body, &mut calls);
-            crate::client::free_fn(d, &mut Vec::new(), &mut |m, _| {
+            crate::client::free_fn(d, &mut crate::client::Bound::new(), &mut |m, _| {
                 let (n, reading) = match m {
                     Met::Expr(Expr::Ident(n, _)) => (n.as_str(), true),
                     Met::Assigned(n) => (n, false),

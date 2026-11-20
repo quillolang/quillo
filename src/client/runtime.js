@@ -2997,7 +2997,8 @@ const translate = (k, vars, html) => {
   // The values put in, escaped (`raw` false), or as the browser reads the attribute value they are
   // in (values as they are, character references of the text decoded).
   const putIn = (t, raw) => {
-    if (!raw) return t.replace(PLACEHOLDER, (m, name) => hasOwn(vars, name) ? escText(val(name)) : m);
+    // A `&` a value put after it would make a character reference is `&amp;` (Q-1176's final review).
+    if (!raw) return t.replace(/&(?=[A-Za-z0-9#]*\{(\w+)\})/g, (m, name) => hasOwn(vars, name) ? "&amp;" : m).replace(PLACEHOLDER, (m, name) => hasOwn(vars, name) ? escText(val(name)) : m);
     let out = "", i = 0;
     while (i < t.length) {
       if (t[i] === "{") {
@@ -3019,13 +3020,20 @@ const translate = (k, vars, html) => {
   // about:blank#blocked where what is written there makes a javascript: or vbscript: URL, as in
   // markup; one written without quotes that holds a value is quoted (FEEDBACK75.md, Q-1083 and
   // its reviews; branch feedback75).
+  // A placeholder no reading placed (kind 6) is blocked as a script URL, else written with each
+  // character a character reference; code and a page (`onclick`, `srcdoc`,
+  // an attribute whose name holds a value: kind 5) are emptied; a `<` that is text before a value
+  // (kind 7) is &lt;; a value written without quotes is quoted, a " of the text in it &quot;; as on
+  // the server (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1176's and Q-1083's reviews;
+  // branch feedback75).
   const spans = table ? attrSpans(text) : null;
   if (!spans) return putIn(text, false);
+  const loose = (t) => t.replace(PLACEHOLDER, (m, name) => !hasOwn(vars, name) ? m : runsScript(val(name), 6) ? "about:blank#blocked" : Array.from(val(name), (c) => "&#" + c.codePointAt(0) + ";").join(""));
   let out = "", pos = 0;
   for (const sp of spans) {
     out += putIn(text.slice(pos, sp.start), false);
-    const value = text.slice(sp.start, sp.end), q = sp.quoted ? "" : '"';
-    out += q + (sp.kind !== 0 && runsScript(putIn(value, true), sp.kind) ? "about:blank#blocked" : putIn(value, false)) + q;
+    const value = text.slice(sp.start, sp.end), q = sp.quoted ? "" : '"', k = sp.kind;
+    out += k === 6 ? loose(value) : k === 7 ? "&lt;" : q + (k === 5 ? "" : k && runsScript(putIn(value, true), k) ? "about:blank#blocked" : q ? putIn(value, false).replace(/"/g, "&quot;") : putIn(value, false)) + q;
     pos = sp.end;
   }
   return out + putIn(text.slice(pos), false);
@@ -3047,7 +3055,9 @@ function charRef(t, i) {
   const hex = t[i + 2] === "x" || t[i + 2] === "X", from = i + (hex ? 3 : 2);
   let j = from;
   while (j < t.length && (hex ? /[0-9a-fA-F]/ : /[0-9]/).test(t[j])) j++;
-  if (j === from || j - from > 8) return null;
+  // Every digit, as the browser reads them (FEEDBACK75.md follow-up found by 0.8.9's coverage,
+  // Q-1177; branch feedback75).
+  if (j === from) return null;
   const n = parseInt(t.slice(from, j), hex ? 16 : 10);
   return [n <= 0x10ffff && (n < 0xd800 || n > 0xdfff) ? String.fromCodePoint(n) : "\ufffd", j - i + (t[j] === ";" ? 1 : 0)];
 }
@@ -3055,7 +3065,8 @@ function charRef(t, i) {
 function runsScript(v, kind) {
   if (kind === 2) return v.split(",").some((c) => scriptURL(c.replace(/^[\t\n\f\r ]+/, "").split(/[\t\n\f\r ]/)[0]));
   if (kind === 3) return v.split(/[\t\n\f\r ]/).some(scriptURL);
-  return scriptURL(v);
+  if (kind === 4) return v.split(";").some(scriptURL);
+  return scriptURL(v) || (kind === 6 && v.split(/[\t\n\f\r ,;]/).some(scriptURL));
 }
 // The attribute values of a translation's text to take care of, as the server reads them
 // (i18n.rs, `Span`): [{ start, end, quoted, kind }], null if none. Read once for each text, up to
@@ -3063,7 +3074,7 @@ function runsScript(v, kind) {
 const attrSpansKept = new Map();
 let attrSpansBytes = 0;
 function attrSpans(t) {
-  if (!t.includes("=") || !t.includes("{")) return null;
+  if (!t.includes("<") || !t.includes("{")) return null;
   let s = attrSpansKept.get(t);
   if (s === undefined) {
     s = findAttrSpans(t);
@@ -3072,28 +3083,88 @@ function attrSpans(t) {
   }
   return s;
 }
-// As `find_attr_spans`: a start tag's name ends at white space, / or >; attributes split by white
-// space and /; values quoted either way or not at all; comments skipped.
+// As `find_attr_spans`: the reading of plain HTML, all a text with a value may hold (the server
+// refuses others as it loads them), then each placeholder inside a <...> that it did not place
+// (kind 6) (FEEDBACK75.md follow-up found by 0.8.9's coverage, Q-1176's final review; branch
+// feedback75).
 function findAttrSpans(t) {
+  const read = readAttrSpans(t), out = merged(read, looseSpans(t, read));
+  return out.length ? out : null;
+}
+// As `merged`: `a`'s spans and those of `b` that overlap none of them, in order.
+function merged(a, b) {
+  const out = [];
+  let j = 0;
+  for (const s of b) {
+    while (j < a.length && a[j].end <= s.start) out.push(a[j++]);
+    if (j >= a.length || a[j].start >= s.end) out.push(s);
+  }
+  out.push(...a.slice(j));
+  return out;
+}
+// As `loose_spans`: the placeholders inside a <...> (quotes not read) that none of `spans` holds.
+function looseSpans(t, spans) {
+  const out = [];
+  let s = 0, end = 0;
+  for (let i = 0; i < t.length; i++) {
+    if (i >= end && t[i] === "<" && /[A-Za-z/!?]/.test(t[i + 1] || "")) end = found(t, />/g, i + 1, 1);
+    const e = t[i] === "{" ? placeholderEnd(t, i) : -1;
+    if (e < 0) continue;
+    while (s < spans.length && spans[s].end <= i) s++;
+    if (i < end && !(s < spans.length && spans[s].start <= i)) out.push({ start: i, end: e, quoted: true, kind: 6 });
+    i = e - 1;
+  }
+  return out;
+}
+// Where the first match of `re` (global) in `t` from `k` starts, or with `end` ends; t.length if none.
+function found(t, re, k, end) {
+  re.lastIndex = k;
+  const m = re.exec(t);
+  return m ? m.index + (end ? m[0].length : 0) : t.length;
+}
+// As `read_attr_spans`: a start tag's name ends at white space, / or >; attributes split by white
+// space and /, a name may start with =; values quoted either way or not at all. A placeholder in a
+// tag's or an attribute's name is kind 6 and that value kind 5; a < that is text before a
+// placeholder ahead of any > is kind 7 (`gt` and `ph`, the next > and placeholder, looked for once).
+function readAttrSpans(t) {
   const out = [], n = t.length, ws = (c) => c === " " || c === "\t" || c === "\n" || c === "\f" || c === "\r";
-  let i = 0;
+  const loose = (a, b) => {
+    let any = false;
+    for (let j = a; j < b; j++) {
+      const e = t[j] === "{" ? placeholderEnd(t, j) : -1;
+      if (e >= 0 && e <= b) { out.push({ start: j, end: e, quoted: true, kind: 6 }); any = true; j = e - 1; }
+    }
+    return any;
+  };
+  let i = 0, gt = 0, ph = 0;
   while (i < n) {
     if (t[i] !== "<") { i++; continue; }
-    if (t.startsWith("<!--", i)) { const e = t.indexOf("-->", i + 4); i = e < 0 ? n : e + 3; continue; }
-    if (!/[A-Za-z]/.test(t[i + 1] || "")) { i++; continue; }
+    const c = t[i + 1];
+    if (!/[A-Za-z]/.test(c || "")) {
+      if (c !== "/" && c !== "!" && c !== "?") {
+        if (gt <= i) gt = found(t, />/g, i + 1);
+        if (ph <= i) ph = found(t, /\{\w+\}/g, i + 1);
+        if (ph < gt) out.push({ start: i, end: i + 1, quoted: true, kind: 7 });
+      }
+      i++; continue;
+    }
+    const tagAt = i + 1;
     while (i < n && !ws(t[i]) && t[i] !== ">" && t[i] !== "/") i++;
+    const tag = t.slice(tagAt, i).toLowerCase();
+    loose(tagAt, i);
     for (;;) {
       while (i < n && (ws(t[i]) || t[i] === "/")) i++;
       if (i >= n || t[i] === ">") { i++; break; }
       const at = i;
+      if (t[i] === "=") i++;
       while (i < n && !ws(t[i]) && t[i] !== "=" && t[i] !== ">" && t[i] !== "/") i++;
-      const name = t.slice(at, i).toLowerCase();
+      const name = t.slice(at, i).toLowerCase(), named = loose(at, i);
       while (i < n && ws(t[i])) i++;
       if (t[i] !== "=") continue;
       i++;
       while (i < n && ws(t[i])) i++;
       const q = t[i] === '"' || t[i] === "'" ? t[i++] : null;
-      const kind = name === "srcset" ? 2 : name === "ping" ? 3 : URL_ATTRS.includes(name) ? 1 : 0;
+      const kind = named || /^(bind:)?(on|srcdoc$)/.test(name) ? 5 : /^(set|animate)$/.test(tag) && /^(to|from|by|values)$/.test(name) ? 4 : name === "srcset" ? 2 : name === "ping" ? 3 : URL_ATTRS.includes(name) ? 1 : 0;
       const start = i;
       let holds = false;
       while (i < n) {
@@ -3105,11 +3176,11 @@ function findAttrSpans(t) {
         }
         i++;
       }
-      if (holds && (kind !== 0 || q === null)) out.push({ start, end: i, quoted: q !== null, kind });
+      if (holds || named) out.push({ start, end: i, quoted: q !== null, kind });
       if (q !== null && i < n) i++;
     }
   }
-  return out.length ? out : null;
+  return out;
 }
 B.t = meta((k, vars) => translate(k, vars, false), "t", null);
 // raw(t(key, vars)): the translation's markup, with the values put in escaped.
