@@ -343,6 +343,12 @@ What a program may notice:
   (Q-1067).
 - **`http.*` drops a program's `content-length`, `transfer-encoding`, `connection`,
   `keep-alive`, `te`, `trailer` and `upgrade` headers**; `host` is sent as given (Q-1089).
+- **Loops that `let` a value or change a list or a map are as fast as 0.8.8's or faster**: the
+  release's benchmark found a `let` in a loop 17 instructions dearer each time and a loop counting
+  into a map 3% slower, as the compiler had stopped inlining two helpers; now against 0.8.8 a
+  sieve of 2,000,000 takes 65.4 ms where it took 71.0, counting into a map 25.3 ms (25.7), a map
+  of lists 22.0 ms (22.5), and growing a list a million times 14.2 ms (14.4) (the 0.8.9
+  benchmark).
 
 ## 0.8.8 (2026-11-19)
 

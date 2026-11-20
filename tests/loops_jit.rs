@@ -163,6 +163,38 @@ fn compiled_loops() {
     assert_eq!(quillo::jitloop::compiled(), before);
 }
 
+/// A list or a map another variable holds too is copied before a loop changes it where it is, and
+/// the other holder's stays as it was: changed from the first round, the copy is the
+/// interpreter's, in the rounds before the loop is compiled (`set`, `push`, the counted map, `+=`);
+/// changed from round 1,000 only, it is the compiled code's (`set1`, `set2`, `push1`,
+/// `map_count`); and held again at every round. Each change is now made by `value::sole`, which
+/// copies only what is shared (FEEDBACK75.md, the 0.8.9 release benchmark, and its review: the
+/// compiled copy was not reached; branch feedback75).
+#[test]
+fn what_another_variable_holds_is_copied_before_a_loop_changes_it() {
+    let cases = [
+        ("shared-set", "fn f() {\n    let xs = range(0, 10) | map((i) => 0)\n    let keep = xs\n    for i in 0..5000 {\n        xs = xs | set(i % 10, i)\n    }\n    print(sum(xs), sum(keep))\n}\nf()\n", "49945 0\n", true),
+        ("shared-count", "fn f() {\n    let m = {}\n    let mkeep = m\n    for i in 0..5000 {\n        m = m | set(i % 7, get(m, i % 7, 0) + 1)\n    }\n    print(len(m), len(mkeep), get(m, 0, -1), get(m, 6, -1))\n}\nf()\n", "7 0 715 714\n", true),
+        ("shared-push", "fn f() {\n    let ys = []\n    let ykeep = ys\n    for i in 0..5000 {\n        ys = ys | push(i)\n    }\n    print(len(ys), len(ykeep))\n}\nf()\n", "5000 0\n", true),
+        ("shared-grid", "fn f() {\n    let g = [[0, 0], [0, 0]]\n    let gkeep = g\n    for i in 0..5000 {\n        g = set(g, i % 2, set(g[i % 2], i % 2, i))\n    }\n    print(g, gkeep)\n}\nf()\n", "[[4998, 0], [0, 4999]] [[0, 0], [0, 0]]\n", true),
+        ("late-set", "fn f() {\n    let xs = range(0, 10) | map((i) => 0)\n    let keep = xs\n    for i in 0..5000 {\n        if i >= 1000 {\n            xs = xs | set(i % 10, i)\n        }\n    }\n    print(sum(xs), sum(keep))\n}\nf()\n", "49945 0\n", true),
+        ("late-count", "fn f() {\n    let m = {}\n    let mkeep = m\n    for i in 0..5000 {\n        if i >= 1000 {\n            m = m | set(i % 7, get(m, i % 7, 0) + 1)\n        }\n    }\n    print(len(m), len(mkeep), get(m, 0, -1), get(m, 2, -1), get(m, 6, -1))\n}\nf()\n", "7 0 572 571 572\n", true),
+        ("late-push", "fn f() {\n    let ys = []\n    let ykeep = ys\n    for i in 0..5000 {\n        if i >= 1000 {\n            ys = ys | push(i)\n        }\n    }\n    print(len(ys), len(ykeep), ys[0])\n}\nf()\n", "4000 0 1000\n", true),
+        ("late-grid", "fn f() {\n    let g = [[0, 0], [0, 0]]\n    let gkeep = g\n    for i in 0..5000 {\n        if i >= 1000 {\n            g = set(g, i % 2, set(g[i % 2], i % 2, i))\n        }\n    }\n    print(g, gkeep)\n}\nf()\n", "[[4998, 0], [0, 4999]] [[0, 0], [0, 0]]\n", true),
+        ("shared-extend", "fn f() {\n    let zs = [1]\n    let zkeep = zs\n    for i in 0..5000 {\n        zs += [i]\n    }\n    print(len(zs), zkeep)\n}\nf()\n", "5001 [1]\n", false),
+        ("shared-each-round", "fn f() {\n    let snaps = []\n    let s = [0, 0, 0]\n    for i in 0..3000 {\n        s = s | set(i % 3, i)\n        snaps = snaps | push(s)\n    }\n    print(snaps[0], snaps[1], snaps[2999], len(snaps))\n}\nf()\n", "[0, 0, 0] [0, 1, 0] [2997, 2998, 2999] 3000\n", false),
+    ];
+    for (name, src, want, compiled) in cases {
+        same(name, src, want);
+        if compiled {
+            let before = quillo::jitloop::compiled();
+            let mut it = quillo::Interp::new(".");
+            it.load_source(src, "main.qwe").unwrap();
+            assert!(quillo::jitloop::compiled() > before, "{}: not compiled", name);
+        }
+    }
+}
+
 #[test]
 fn a_loop_that_cannot_be_compiled_runs_as_before() {
     same("calls", "fn g(x) = x * 2\nfn f() {\n    let t = 0\n    let s = \"\"\n    for i in 0..1000 {\n        t += g(i)\n        if i % 100 == 0 {\n            s += \"x\"\n        }\n    }\n    print(t, s)\n}\nf()\n", "999000 xxxxxxxxxx\n");

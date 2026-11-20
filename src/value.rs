@@ -2516,7 +2516,48 @@ pub fn deferred_drops() -> Vec<Value> {
     LATER.with(|l| l.borrow_mut().as_mut().map(std::mem::take).unwrap_or_default())
 }
 
+/// A variable's value as its scope is used again (`Vars::clear`): one that holds nothing to free
+/// (the first five kinds, so one comparison) let go as it is, inline, the rest by `drop_held`, one
+/// call. 0.8.9's build had stopped inlining this, and each `let` in an interpreted loop paid a call
+/// and Value's drop glue for an `int`, +17 instructions a time, `int histogram` +2.9%; telling
+/// lists and maps apart here too cost a lambda's call +10 (FEEDBACK75.md, the 0.8.9 release
+/// benchmark against 0.8.8; branch feedback75).
+#[inline(always)]
 fn drop_value(v: Value) {
+    const _: () = assert!(!std::mem::needs_drop::<crate::decimal::Dec>());
+    if matches!(v, Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_)) {
+        std::mem::forget(v);
+    } else {
+        drop_held(v);
+    }
+}
+
+/// `Arc::make_mut` for a list or a map changed where it is: its usual case, one owner, inline
+/// wherever it is called, and the copy for a shared one apart. The generic `make_mut` was a call or
+/// not as the build's code units fell, and 0.8.9's made it one in a compiled loop's
+/// `m = set(m, k, get(m, k, 0) + 1)`, +18 instructions a time, `int histogram` +2.9%
+/// (FEEDBACK75.md, the 0.8.9 release benchmark against 0.8.8; branch feedback75).
+#[inline(always)]
+pub(crate) fn sole<T: Clone>(a: &mut Arc<T>) -> &mut T {
+    let p: *mut Arc<T> = a;
+    // SAFETY: `p` is `a`, borrowed for the whole call. `get_mut`'s borrow of it ends where it gives
+    // `None`, which the borrow checker does not yet see of a borrow returned on one path only.
+    if let Some(v) = Arc::get_mut(unsafe { &mut *p }) {
+        return v;
+    }
+    unshare(unsafe { &mut *p })
+}
+
+/// `sole` of a shared one: copied (`Arc::make_mut`).
+#[cold]
+#[inline(never)]
+fn unshare<T: Clone>(a: &mut Arc<T>) -> &mut T {
+    Arc::make_mut(a)
+}
+
+/// A value that may hold something to free let go (`drop_value`).
+#[inline(never)]
+fn drop_held(v: Value) {
     // Large: freed elsewhere it takes the loop no time. A small one is freed here: sent to another
     // thread, its blocks were freed there as another thread's, mimalloc's slow way, and a page
     // of 13 rows from SQLite (made on this thread) paid that each request (2026-11-09, the server
@@ -3985,7 +4026,7 @@ pub fn append_text_as(s: &mut Arc<str>, t: &str, ask: bool) -> bool {
 pub fn update(slot: &mut Value, vals: &mut [Value]) -> bool {
     match (slot, &mut *vals) {
         (Value::List(l), [_, x]) => {
-            let l = Arc::make_mut(l);
+            let l = sole(l);
             // A list with no room left grows out of the way (`pushed_growing`), so the push here
             // is the one `push` makes, its own check of the room known by then (FEEDBACK71.md,
             // Q-977, found in review: asked here, a push cost one instruction more).
@@ -4000,13 +4041,13 @@ pub fn update(slot: &mut Value, vals: &mut [Value]) -> bool {
             if i < 0 || i >= n {
                 return false;
             }
-            Arc::make_mut(l)[i as usize] = std::mem::replace(x, Value::Nil);
+            sole(l)[i as usize] = std::mem::replace(x, Value::Nil);
         }
         (Value::Map(m), [_, Value::Str(k), x]) => {
             if !map_may_grow(m, k) {
                 return false;
             }
-            Arc::make_mut(m).insert(Key::new(k), std::mem::replace(x, Value::Nil));
+            sole(m).insert(Key::new(k), std::mem::replace(x, Value::Nil));
         }
         // Any other key as `set` reads it, its text, but an error, which is no key and `set`
         // gives back (found in review of FEEDBACK55.md, string speed; branch feedback55).
@@ -4025,7 +4066,7 @@ fn set_by_text(m: &mut Arc<Map>, k: &Value, x: &mut Value) -> bool {
     if !map_may_grow(m, &k) {
         return false;
     }
-    Arc::make_mut(m).insert(Key::from(k), std::mem::replace(x, Value::Nil));
+    sole(m).insert(Key::from(k), std::mem::replace(x, Value::Nil));
     true
 }
 
@@ -4441,7 +4482,7 @@ pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut v
     let change = |x: &mut Value, last: Value, inner: Option<&Value>| -> bool {
         match (x, inner) {
             (Value::List(l), None) => {
-                let l = Arc::make_mut(l);
+                let l = sole(l);
                 if l.len() == l.capacity() {
                     let mut last = last;
                     return pushed_growing(l, &mut last);
@@ -4450,7 +4491,7 @@ pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut v
             }
             (Value::List(l), Some(Value::Int(i))) => {
                 let Some(i) = at(l, *i) else { return false };
-                Arc::make_mut(l)[i] = last;
+                sole(l)[i] = last;
             }
             // An error is no key: the long way gives it back (FEEDBACK55.md, Q-784; found in
             // review).
@@ -4463,7 +4504,7 @@ pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut v
                 if !map_may_grow(m, &k) {
                     return false;
                 }
-                Arc::make_mut(m).insert(k.into(), last);
+                sole(m).insert(k.into(), last);
             }
             _ => return false,
         }
@@ -4473,7 +4514,7 @@ pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut v
     match (whole, key) {
         (Value::List(l), Value::Int(i)) => {
             let Some(i) = at(l, *i) else { return false };
-            change(&mut Arc::make_mut(l)[i], last, inner)
+            change(&mut sole(l)[i], last, inner)
         }
         (Value::Map(_), Value::Err(..)) => false,
         (Value::Map(m), k) => {
@@ -4486,7 +4527,7 @@ pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut v
                     &text
                 }
             };
-            let m = Arc::make_mut(m);
+            let m = sole(m);
             if let Some(x) = m.get_mut(k) {
                 return change(x, last, inner);
             }
@@ -4588,6 +4629,104 @@ mod tests {
         let huge: Vec<Value> = vec![Value::list((0..1_000_000).map(Value::Int).collect())];
         let w = weight(huge.iter(), 0);
         assert!((DEFER_AT..=DEFER_AT + 1).contains(&w), "{}", w);
+    }
+
+    /// A scope used again lets go of each kind of value as before `drop_value` let go of those
+    /// that hold nothing to free inline: a text's, a function's, a small list's and a small map's
+    /// last holders freed then, in the slots and past them, a large list kept for another thread
+    /// where one frees them, freed at once where none does, and a scope of more names than few
+    /// let go of whole (FEEDBACK75.md, the 0.8.9 release benchmark; branch feedback75).
+    #[test]
+    fn a_scope_used_again_lets_go_of_each_kind_of_value() {
+        fn none(_: &mut Interp, _: Vec<Value>, _: u32) -> Result<Value, Ctrl> {
+            Ok(Value::Nil)
+        }
+        let text: Arc<str> = Arc::from("held");
+        let small = Arc::new(vec![Value::Int(1)]);
+        let small_map = Arc::new(Map::default());
+        let html: Arc<str> = Arc::from("<b>held</b>");
+        // Each time a large list the scope alone holds, followed by a weak holder.
+        let fill = |vars: &mut Vars| {
+            let big = Arc::new((0..300).map(Value::Int).collect::<Vec<_>>());
+            let weak = Arc::downgrade(&big);
+            let all = [
+                Value::Nil,
+                Value::Bool(true),
+                Value::Int(-1),
+                Value::Float(0.5),
+                // Past the four slots: in `more`.
+                Value::Dec(crate::decimal::Dec::from_i64(7)),
+                Value::Builtin("none", none),
+                Value::Str(text.clone()),
+                Value::List(small.clone()),
+                Value::Map(small_map.clone()),
+                Value::Html(html.clone()),
+                Value::List(big),
+            ];
+            for (i, v) in all.into_iter().enumerate() {
+                vars.insert(Sym::new(&format!("v{}", i)), v);
+            }
+            weak
+        };
+        let held = || (Arc::strong_count(&text), Arc::strong_count(&small), Arc::strong_count(&small_map), Arc::strong_count(&html));
+        // Freed at once where no thread frees them.
+        let mut vars = Vars::few();
+        let big = fill(&mut vars);
+        assert_eq!(held(), (2, 2, 2, 2));
+        assert!(big.upgrade().is_some());
+        vars.clear();
+        assert_eq!(held(), (1, 1, 1, 1));
+        assert!(big.upgrade().is_none(), "freed at once");
+        assert!(vars.get(Sym::new("v0")).is_none() && vars.get(Sym::new("v10")).is_none());
+        // Used again, with the large list kept for another thread.
+        defer_drops();
+        let big = fill(&mut vars);
+        vars.clear();
+        assert_eq!(held(), (1, 1, 1, 1));
+        let later = deferred_drops();
+        assert!(matches!(&later[..], [Value::List(l)] if l.len() == 300), "only the large list is kept");
+        assert!(big.upgrade().is_some());
+        drop(later);
+        assert!(big.upgrade().is_none());
+        // One another variable holds too is not the scope's to free: let go of, not kept.
+        let mut other = Vars::few();
+        let shared = Arc::new((0..300).map(Value::Int).collect::<Vec<_>>());
+        other.insert(Sym::new("s"), Value::List(shared.clone()));
+        other.clear();
+        assert!(deferred_drops().is_empty());
+        assert_eq!(Arc::strong_count(&shared), 1);
+        LATER.with(|l| *l.borrow_mut() = None);
+        // More names than few: a map, let go of whole.
+        let big = fill(&mut vars);
+        for i in 0..FEW {
+            vars.insert(Sym::new(&format!("w{}", i)), Value::Str(text.clone()));
+        }
+        assert!(matches!(vars, Vars::Many(_)));
+        vars.clear();
+        assert_eq!(held(), (1, 1, 1, 1));
+        assert!(big.upgrade().is_none());
+        assert!(matches!(vars, Vars::Few(..)));
+    }
+
+    /// `sole` changes a list or a map where it is when one holds it, copies it first when it is
+    /// shared, leaving the other holder's as it was, and parts it from a weak holder as
+    /// `Arc::make_mut` does (FEEDBACK75.md, the 0.8.9 release benchmark; branch feedback75).
+    #[test]
+    fn sole_changes_in_place_only_what_one_holds() {
+        let mut one = Arc::new(vec![Value::Int(1)]);
+        let at = Arc::as_ptr(&one);
+        sole(&mut one).push(Value::Int(2));
+        assert_eq!(Arc::as_ptr(&one), at, "changed where it is");
+        assert_eq!(one.len(), 2);
+        let other = one.clone();
+        sole(&mut one).push(Value::Int(3));
+        assert_ne!(Arc::as_ptr(&one), Arc::as_ptr(&other), "copied");
+        assert_eq!((one.len(), other.len(), Arc::strong_count(&other)), (3, 2, 1));
+        let mut m: Arc<Map> = Arc::new(Map::default());
+        let weak = Arc::downgrade(&m);
+        sole(&mut m).insert(Key::from("k"), Value::Int(1));
+        assert!(weak.upgrade().is_none(), "parted from the weak holder");
+        assert_eq!(m.len(), 1);
     }
 
     use super::*;

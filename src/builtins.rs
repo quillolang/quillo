@@ -894,7 +894,7 @@ fn push(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // room left grows out of the way, the room it grows to compared with `--max-memory` first
     // (`value::pushed_growing`), so a push with room is the one it was (FEEDBACK71.md, Q-977,
     // found in review: asked before `make_mut`, a push cost an instruction more).
-    let v = Arc::make_mut(&mut l);
+    let v = crate::value::sole(&mut l);
     if v.len() == v.capacity() {
         let mut item = item;
         if !crate::value::pushed_growing(v, &mut item) {
@@ -996,7 +996,7 @@ pub(crate) fn set_of(args: Vec<Value>, line: u32) -> R {
         if at < 0 || at >= n {
             return fail(line, format!("`set`: index {} is outside a list of {}", i, n));
         }
-        Arc::make_mut(&mut l)[at as usize] = v;
+        crate::value::sole(&mut l)[at as usize] = v;
         return Ok(Value::List(l));
     }
     let mut m = m_arg(&args, 0, "set", line)?;
@@ -1013,7 +1013,7 @@ pub(crate) fn set_of(args: Vec<Value>, line: u32) -> R {
     // A map with no room for a new key grows: the room it grows to compared with `--max-memory`
     // first, out of the way (FEEDBACK71.md, Q-977; branch security). One another holds is copied
     // as it was.
-    let mm = Arc::make_mut(&mut m);
+    let mm = crate::value::sole(&mut m);
     if mm.len() == mm.capacity() && !crate::value::map_may_grow_to(mm, &k) {
         return Err(crate::httpd::OverMemory.at(line));
     }

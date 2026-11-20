@@ -4344,7 +4344,7 @@ impl Interp {
                     return false;
                 }
                 let Some(Value::List(items)) = more.take() else { unreachable!("looked at above") };
-                let l = Arc::make_mut(l);
+                let l = crate::value::sole(l);
                 match Arc::try_unwrap(items) {
                     Ok(items) => l.extend(items),
                     Err(shared) => l.extend_from_slice(&shared),
@@ -4580,7 +4580,7 @@ impl Interp {
                 None => start,
             };
             let now = binop(op, old, more, line)?;
-            let m = Arc::make_mut(m);
+            let m = crate::value::sole(m);
             match at {
                 Some(i) => m[i] = now,
                 // A new key where the map has no room left: the room it grows to compared with

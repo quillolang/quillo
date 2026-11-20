@@ -649,7 +649,7 @@ unsafe extern "C" fn set1(list: *mut Value, i: i64, t: u64, bits: u64, line: u64
     let slot = unsafe { &mut *list };
     if let Value::List(l) = slot {
         if let Some(i) = at(l.len(), i) {
-            Arc::make_mut(l)[i] = v;
+            value::sole(l)[i] = v;
             return 0;
         }
     }
@@ -691,7 +691,7 @@ unsafe extern "C" fn set2(list: *mut Value, y: i64, x: i64, t: u64, bits: u64, l
 unsafe extern "C" fn push1(list: *mut Value, t: u64, bits: u64) {
     // SAFETY: as `set1`.
     if let Value::List(l) = unsafe { &mut *list } {
-        Arc::make_mut(l).push(value_of(of_tag(t), bits));
+        value::sole(l).push(value_of(of_tag(t), bits));
     }
 }
 
@@ -701,7 +701,7 @@ unsafe extern "C" fn push1(list: *mut Value, t: u64, bits: u64) {
 unsafe extern "C" fn push1_asked(list: *mut Value, t: u64, bits: u64, line: u64, cx: *mut Cx) -> u64 {
     // SAFETY: as `set1`.
     if let Value::List(l) = unsafe { &mut *list } {
-        let l = Arc::make_mut(l);
+        let l = value::sole(l);
         let mut x = value_of(of_tag(t), bits);
         if l.len() == l.capacity() {
             if !value::pushed_growing(l, &mut x) {
@@ -845,7 +845,7 @@ unsafe extern "C" fn map_count(map: *mut Value, key: i64, op: u64, st: u64, sb: 
     }
     match binop(OPS[op as usize], old, value_of(of_tag(mt), mb), line as u32) {
         Ok(now) => {
-            let m = Arc::make_mut(m);
+            let m = value::sole(m);
             match at {
                 Some(i) => m[i] = now,
                 None => {
