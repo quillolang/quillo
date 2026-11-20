@@ -74,6 +74,16 @@ fn heavy() -> std::sync::MutexGuard<'static, ()> {
     HEAVY.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// The test thread's own CPU time: what a call on this thread computed, which a loaded machine
+/// does not stretch as it does a wall clock (CI's runner is many times slower than a local build,
+/// and shared). A slow call computes, so it still counts here.
+fn thread_cpu() -> Duration {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `t` lives through the call, which only writes it.
+    unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+    Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
+}
+
 /// The mimalloc caps the audit's memory repros ran under: the process may take 256 MiB in all, and
 /// an allocation past that is refused (which aborts it).
 const CAPPED: &[(&str, &str)] = &[("MIMALLOC_RESERVE_OS_MEMORY", "256MiB"), ("MIMALLOC_ARENA_RESERVE", "256MiB"), ("MIMALLOC_DISALLOW_OS_ALLOC", "1")];
@@ -292,12 +302,6 @@ fn zeros_gzip(mib: usize, first: usize) -> (Vec<u8>, Vec<u8>) {
     (a, b)
 }
 
-/// The resident memory of a process, in KB (`ps`, on macOS and Linux).
-fn rss_kb(pid: u32) -> u64 {
-    let out = Command::new("ps").args(["-o", "rss=", "-p", &pid.to_string()]).output().unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
-}
-
 /// A server on a port of its own that answers each of `n` connections with `head`, then `a`, then
 /// waits until `go` says, then `b`, and closes: its port, and how many have had `a`.
 fn held_upstream(n: usize, head: &'static str, a: Vec<u8>, b: Vec<u8>, go: std::sync::Arc<std::sync::atomic::AtomicBool>) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
@@ -352,10 +356,138 @@ fn peak_kb(pid: u32) -> Option<u64> {
     }
 }
 
+/// What a process takes now, in KB, as `peak_kb` counts its height: Linux's VmRSS, macOS's
+/// physical footprint.
+fn now_kb(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+        s.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: as in `peak_kb`.
+        let mut ri: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::proc_pid_rusage(pid as i32, libc::RUSAGE_INFO_V4, &mut ri as *mut _ as *mut libc::rusage_info_t) };
+        (r == 0).then_some(ri.ri_phys_footprint / 1024)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// What a script waits with, after reading what it needs and saying so: until the test, having
+/// taken the process's own size, writes the file "go" (`Measured`).
+const READY: &str = "print(\"ready\")\nwhile is_err(read_file(\"go\")) {\n    sleep(10)\n}\n";
+
+/// `quillo run s.qwe` (with `args`) in `d`, whose output is read as it comes, so that what its work
+/// adds to what the process takes can be measured: the size once it says "ready" (`READY`) is its
+/// own, from the binary, the interpreter and what it read, which an instrumented Linux build has
+/// much more of than a local one (CI's 201 MB at the height of a test this file once held to an
+/// absolute 192 MiB). mimalloc gives back what is freed at once (`MIMALLOC_PURGE_DELAY=0`), so the
+/// height is what the work held, not what the allocator had yet to give back (the backtracker's
+/// stack, as it grows, frees each buffer it outgrew: 370 MiB at the height with mimalloc's 10 ms,
+/// 225 MiB without). Killed when dropped.
+struct Measured {
+    child: std::process::Child,
+    rx: std::sync::mpsc::Receiver<String>,
+    out: String,
+    base: Option<u64>,
+}
+
+impl Measured {
+    fn start(d: &Path, args: &[&str]) -> Measured {
+        let _ = std::fs::remove_file(d.join("go"));
+        let mut child = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "s.qwe"]).args(args).current_dir(d).env("MIMALLOC_PURGE_DELAY", "0").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        support::stop_with_tests(&child);
+        let mut stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 || tx.send(String::from_utf8_lossy(&buf[..n]).into_owned()).is_err() {
+                    break;
+                }
+            }
+        });
+        Measured { child, rx, out: String::new(), base: None }
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The output once it holds `marker`, or what there was after `secs`.
+    fn wait_for(&mut self, marker: &str, secs: u64) -> &str {
+        let until = Instant::now() + Duration::from_secs(secs);
+        while !self.out.contains(marker) && Instant::now() < until {
+            if let Ok(more) = self.rx.recv_timeout(Duration::from_millis(50)) {
+                self.out.push_str(&more);
+            }
+        }
+        &self.out
+    }
+
+    /// Once it is ready: its own size taken, then told to go.
+    fn go(&mut self, d: &Path) {
+        let out = self.wait_for("ready\n", 600).to_string();
+        assert!(out.contains("ready\n"), "{}", out);
+        // Twice, a moment apart, the larger kept: what it read may still be settling.
+        let first = now_kb(self.pid());
+        std::thread::sleep(Duration::from_millis(100));
+        self.base = first.max(now_kb(self.pid()));
+        std::fs::write(d.join("go"), "").unwrap();
+    }
+
+    /// Its exit code (None past `secs`, when it is killed), stdout and stderr.
+    fn finish(mut self, secs: u64) -> (Option<i32>, String, String) {
+        let until = Instant::now() + Duration::from_secs(secs);
+        let code = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status.code();
+            }
+            if Instant::now() > until {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        while let Ok(more) = self.rx.recv_timeout(Duration::from_millis(200)) {
+            self.out.push_str(&more);
+        }
+        let mut err = String::new();
+        if let Some(mut e) = self.child.stderr.take() {
+            let _ = e.read_to_string(&mut err);
+        }
+        (code, std::mem::take(&mut self.out), err)
+    }
+
+    /// What it takes now over its own size, in KB (all of it where its own size could not be read).
+    fn grown_now_kb(&self) -> u64 {
+        now_kb(self.pid()).unwrap_or(0).saturating_sub(self.base.unwrap_or(0))
+    }
+
+    /// What its height came to over its own size, in KB, where both can be read.
+    fn grew_kb(&self) -> Option<u64> {
+        Some(peak_kb(self.pid())?.saturating_sub(self.base?))
+    }
+}
+
+impl Drop for Measured {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// The repro: two calls at once to an answer of 200 KB of gzip that inflates to 200 MiB, each
 /// held after 33 MiB, took about 470 MB between them (each buffer doubled to 128 MiB and the old one
 /// was copied in), 230 MB for one; now each holds no more than its 64 MiB, and the error is said as
-/// before (FEEDBACK75.md, Q-1072; branch feedback75).
+/// before, the growth over the process's own size measured (changed for CI's instrumented build,
+/// whose own size passed the absolute bound; FEEDBACK75.md, Q-1072; branch feedback75).
 #[test]
 fn a_gzip_answer_bomb_takes_no_more_than_its_limit() {
     let _heavy = heavy();
@@ -365,63 +497,27 @@ fn a_gzip_answer_bomb_takes_no_more_than_its_limit() {
     assert!(a.len() + b.len() < 300_000, "{} bytes", a.len() + b.len());
     let go = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (port, had) = held_upstream(2, GZIP_HEAD, a, b, go.clone());
-    let src = format!("let u = \"http://127.0.0.1:{}/bomb\"\nfor r in parallel(() => http.get(u), () => http.get(u)) {{ print(r) }}\nprint(\"done\")\nsleep(5000)\n", port);
+    let src = format!("{}let u = \"http://127.0.0.1:{}/bomb\"\nfor r in parallel(() => http.get(u), () => http.get(u)) {{ print(r) }}\nprint(\"done\")\nsleep(5000)\n", READY, port);
     std::fs::write(d.join("s.qwe"), &src).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "s.qwe"]).current_dir(&d).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    support::stop_with_tests(&child);
-    let pid = child.id();
-    let mut stdout = child.stdout.take().unwrap();
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    std::thread::spawn(move || {
-        let mut all = String::new();
-        let mut buf = [0u8; 4096];
-        while let Ok(n) = stdout.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            all.push_str(&String::from_utf8_lossy(&buf[..n]));
-            if all.contains("done\n") {
-                let _ = tx.send(all.clone());
-            }
-        }
-        let _ = tx.send(all);
-    });
+    let mut run = Measured::start(&d, &[]);
+    run.go(&d);
+    let pid = run.pid();
     // Released once both hold 33 MiB each, or after a while.
-    let until = Instant::now() + Duration::from_secs(if cfg!(debug_assertions) { 60 } else { 15 });
-    while (had.load(SeqCst) < 2 || rss_kb(pid) < 2 * 33 * 1024) && Instant::now() < until && child.try_wait().unwrap().is_none() {
+    let until = Instant::now() + Duration::from_secs(if cfg!(debug_assertions) { 120 } else { 30 });
+    let held = |pid| now_kb(pid).map_or(true, |kb| kb.saturating_sub(run.base.unwrap_or(0)) >= 2 * 33 * 1024);
+    while (had.load(SeqCst) < 2 || !held(pid)) && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(20));
     }
     go.store(true, SeqCst);
-    let out = rx.recv_timeout(Duration::from_secs(if cfg!(debug_assertions) { 300 } else { 60 })).unwrap_or_default();
-    let peak = peak_kb(pid);
-    let _ = child.kill();
-    let _ = child.wait();
+    let out = run.wait_for("done\n", if cfg!(debug_assertions) { 300 } else { 60 }).to_string();
     assert_eq!(out.matches("the answer is longer than 64 MiB, the most that is read whole").count(), 2, "{}", out);
-    // Two of 64 MiB and the process's own; each was 192 MiB at its height.
-    if let Some(kb) = peak {
-        assert!(kb < 2 * 64 * 1024 + 64 * 1024, "{} KB at the most", kb);
+    // Two of 64 MiB over the process's own size, and 48 MiB for the allocator (the pieces' slack)
+    // and the code first run after it was measured; each was 192 MiB at its height, 470 MB in all.
+    if let Some(kb) = run.grew_kb() {
+        assert!(kb < 2 * 64 * 1024 + 48 * 1024, "{} KB over its own {:?} KB", kb, run.base);
     }
+    drop(run);
     let _ = std::fs::remove_dir_all(&d);
-}
-
-/// `quillo run` of `src` as a script in `d`, whose output is read once it ends: the child, to wait
-/// for while the test does its part.
-fn spawn_script(d: &Path, src: &str) -> std::process::Child {
-    std::fs::write(d.join("s.qwe"), src).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "s.qwe"]).current_dir(d).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    support::stop_with_tests(&child);
-    child
-}
-
-/// Its exit and output, within `secs` (killed past them).
-fn finish(mut child: std::process::Child, secs: u64) -> (Option<i32>, String, String) {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    let _ = child.kill();
-    let out = child.wait_with_output().unwrap();
-    (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
 /// A server on a port of its own that answers one connection with 4 MiB of text once `ready` says.
@@ -456,23 +552,25 @@ fn stalled_answers_hold_only_what_has_arrived() {
     let ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (port, had) = held_upstream(5, GZIP_HEAD, a, b, go.clone());
     let small = ready_upstream(ready.clone());
-    let child = spawn_script(
-        &d,
-        &format!(
-            "let f = (u) => {{ let r = http.get(u)\n return is_err(r) ? str(r) : `${{r.status}} ${{len(r.body)}}` }}\nlet big = () => f(\"http://127.0.0.1:{}/big\")\nfor r in parallel(big, big, big, big, big, () => f(\"http://127.0.0.1:{}/small\")) {{ print(r) }}\n",
-            port, small
-        ),
+    let src = format!(
+        "{}let f = (u) => {{ let r = http.get(u)\n return is_err(r) ? str(r) : `${{r.status}} ${{len(r.body)}}` }}\nlet big = () => f(\"http://127.0.0.1:{}/big\")\nfor r in parallel(big, big, big, big, big, () => f(\"http://127.0.0.1:{}/small\")) {{ print(r) }}\n",
+        READY, port, small
     );
+    std::fs::write(d.join("s.qwe"), src).unwrap();
+    let mut run = Measured::start(&d, &[]);
+    run.go(&d);
+    // Held once the five hold what they were sent, over the process's own size (an absolute size
+    // is reached sooner by a build larger of its own).
     let until = Instant::now() + Duration::from_secs(if cfg!(debug_assertions) { 120 } else { 30 });
-    while (had.load(SeqCst) < 5 || rss_kb(child.id()) < 5 * 31 * 1024) && Instant::now() < until {
+    while (had.load(SeqCst) < 5 || run.grown_now_kb() < 5 * 31 * 1024) && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(20));
     }
     ready.store(true, SeqCst);
     std::thread::sleep(Duration::from_millis(if cfg!(debug_assertions) { 5000 } else { 1000 }));
     go.store(true, SeqCst);
-    let (code, out, err) = finish(child, if cfg!(debug_assertions) { 300 } else { 60 });
+    let (code, out, err) = run.finish(if cfg!(debug_assertions) { 300 } else { 60 });
     assert_eq!(code, Some(0), "stdout: {}\nstderr: {}", out, err);
-    let lines: Vec<&str> = out.lines().collect();
+    let lines: Vec<&str> = out.lines().filter(|l| *l != "ready").collect();
     let mut want = vec![format!("200 {}", 32 << 20); 5];
     want.push(format!("200 {}", 4 << 20));
     assert_eq!(lines, want, "{}", out);
@@ -491,18 +589,19 @@ fn answers_read_at_once_are_held_to_a_budget() {
     let (a, b) = (vec![b'z'; (32 << 20) - 1], vec![b'z'; 1]);
     let go = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (port, had) = held_upstream(9, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 33554432\r\nConnection: close\r\n\r\n", a, b, go.clone());
-    let child = spawn_script(
-        &d,
-        &format!("let u = \"http://127.0.0.1:{}/big\"\nlet f = () => {{ let r = http.get(u)\n return is_err(r) ? str(r) : `${{r.status}} ${{len(r.body)}}` }}\nfor r in parallel(f, f, f, f, f, f, f, f, f) {{ print(r) }}\n", port),
-    );
+    let src = format!("{}let u = \"http://127.0.0.1:{}/big\"\nlet f = () => {{ let r = http.get(u)\n return is_err(r) ? str(r) : `${{r.status}} ${{len(r.body)}}` }}\nfor r in parallel(f, f, f, f, f, f, f, f, f) {{ print(r) }}\n", READY, port);
+    std::fs::write(d.join("s.qwe"), src).unwrap();
+    let mut run = Measured::start(&d, &[]);
+    run.go(&d);
     // Released once each call holds all it was sent (or was refused): the memory has stopped
     // growing, past what six such answers take (one or two are refused, as they cross the budget
-    // at once). A debug build reads slower, and has more of its own (found running it there).
-    // Released before the client's own 60 s at the latest.
+    // at once), over the process's own size (an absolute one is reached sooner by a build larger
+    // of its own). A debug build reads slower (found running it there). Released before the
+    // client's own 60 s at the latest.
     let until = Instant::now() + Duration::from_secs(40);
     let mut last = (0u64, Instant::now());
     while Instant::now() < until {
-        let now = rss_kb(child.id());
+        let now = run.grown_now_kb();
         if now > last.0 + 1024 {
             last = (now, Instant::now());
         } else if had.load(SeqCst) == 9 && now >= 6 * 31 * 1024 && last.1.elapsed() > Duration::from_secs(if cfg!(debug_assertions) { 5 } else { 1 }) {
@@ -511,9 +610,9 @@ fn answers_read_at_once_are_held_to_a_budget() {
         std::thread::sleep(Duration::from_millis(100));
     }
     go.store(true, SeqCst);
-    let (code, out, err) = finish(child, if cfg!(debug_assertions) { 300 } else { 60 });
+    let (code, out, err) = run.finish(if cfg!(debug_assertions) { 300 } else { 60 });
     assert_eq!(code, Some(0), "stdout: {}\nstderr: {}", out, err);
-    let lines: Vec<&str> = out.lines().collect();
+    let lines: Vec<&str> = out.lines().filter(|l| *l != "ready").collect();
     assert_eq!(lines.len(), 9, "{}", out);
     let whole = format!("200 {}", 32 << 20);
     let busy = lines.iter().filter(|l| l.contains("the answers being read at once would take more than the 256 MiB read at once")).count();
@@ -768,11 +867,11 @@ fn a_costly_search_gives_its_error_quickly() {
     let p4 = "[ab]*a[ab]{900}c|[ab]*b[ab]{900}d|[ab]*a[ab]{900}e|[ab]*b[ab]{900}f";
     for p in ["[ab]*a[ab]{900}c", p4] {
         for (f, rest) in [("re.test", ""), ("re.find", ""), ("re.find_all", ""), ("re.replace", ", \"-\""), ("re.split", "")] {
-            let t = Instant::now();
+            let t = thread_cpu();
             let got = run(&d, &format!("{}(read_file(\"t.txt\"), {:?}{})", f, p, rest));
             // The guard gives up at its time, a tenth of a second and half a microsecond a byte of
             // its thread's own: 0.2 s here.
-            assert!(t.elapsed() < Duration::from_millis(if cfg!(debug_assertions) { 20_000 } else { 2_000 }), "{} {}: {:?}", f, p, t.elapsed());
+            assert!((thread_cpu() - t) < Duration::from_millis(if cfg!(debug_assertions) { 20_000 } else { 2_000 }), "{} {}: {:?}", f, p, (thread_cpu() - t));
             let want = format!("`{}`: the pattern is too costly for this text", f);
             assert!(got.starts_with("err(") && got.contains(&want) && got.contains("these 200000 bytes"), "{}", got);
         }
@@ -844,9 +943,9 @@ fn the_guard_finds_groups_only_where_they_are_and_in_time() {
     std::fs::write(d.join("ab1m.txt"), ab_text(1_000_000)).unwrap();
     let quick = Duration::from_millis(if cfg!(debug_assertions) { 30_000 } else { 3_000 });
     let timed = |src: &str| {
-        let t = Instant::now();
+        let t = thread_cpu();
         let got = run(&d, src);
-        assert!(t.elapsed() < quick, "{}: {:?}", src, t.elapsed());
+        assert!((thread_cpu() - t) < quick, "{}: {:?}", src, (thread_cpu() - t));
         got
     };
     assert_eq!(timed(r#"re.find(read_file("a1m.txt"), "(?:a*){900}").end"#), "1000000");
@@ -953,17 +1052,17 @@ fn every_shape_the_review_found_is_bounded() {
     for (p, file, flags) in &cases {
         std::fs::write(d.join("p.txt"), p).unwrap();
         for f in ["re.test", "re.find"] {
-            let t = Instant::now();
+            let t = thread_cpu();
             let got = run(&d, &format!("{}(read_file({:?}), read_file(\"p.txt\"), {:?})", f, file, flags));
-            assert!(t.elapsed() < quick, "{} {:.60} on {}: {:?}", f, p, file, t.elapsed());
+            assert!((thread_cpu() - t) < quick, "{} {:.60} on {}: {:?}", f, p, file, (thread_cpu() - t));
             assert!(got == "false" || got == "null" || got.contains("the pattern is too costly for this text"), "{} {:.60}: {}", f, p, got);
         }
     }
     // Nested 124 deep, 100 KB: read, not scored.
     std::fs::write(d.join("n.txt"), format!("{}{}{}", "(?:".repeat(124), "ab".repeat(50_000), ")?".repeat(124))).unwrap();
-    let t = Instant::now();
+    let t = thread_cpu();
     assert_eq!(run(&d, r#"re.valid(read_file("n.txt"))"#), "true");
-    assert!(t.elapsed() < quick * 2, "{:?}", t.elapsed());
+    assert!((thread_cpu() - t) < quick * 2, "{:?}", (thread_cpu() - t));
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -1017,9 +1116,9 @@ fn groups_and_wide_classes_count_in_the_crates_worst() {
         (r#"re.test(read_file("a20784.txt"), read_file("p1000.txt"))"#, Some("true")),
         (r#"re.find("aab", read_file("p1000b.txt")).end"#, Some("3")),
     ] {
-        let t = Instant::now();
+        let t = thread_cpu();
         let got = run(&d, call);
-        assert!(t.elapsed() < quick, "{}: {:?}", call, t.elapsed());
+        assert!((thread_cpu() - t) < quick, "{}: {:?}", call, (thread_cpu() - t));
         match want {
             Some(w) => assert_eq!(got, w, "{}", call),
             None => assert!(got.starts_with("err(") && got.contains("the pattern is too costly for this text"), "{}: {}", call, got),
@@ -1119,10 +1218,10 @@ fn the_inner_literal_search_finds_what_the_crate_finds() {
                 (Some(a), Some(b)) => format!("[true, {}, {}, {}, {}, {}]", all.len(), a.start(), a.end(), b.start(), b.end()),
                 _ => "[false, 0]".to_string(),
             };
-            let t = Instant::now();
+            let t = thread_cpu();
             let got = run(&d, &format!("map([re.find_all(read_file(\"t.txt\"), {p:?})], (a) => len(a) > 0 ? [re.test(read_file(\"t.txt\"), {p:?}), len(a), a[0].start, a[0].end, a[len(a) - 1].start, a[len(a) - 1].end] : [re.test(read_file(\"t.txt\"), {p:?}), 0])[0]"));
             assert_eq!(got, want, "{} {}", name, p);
-            assert!(t.elapsed() < quick, "{} {}: {:?}", name, p, t.elapsed());
+            assert!((thread_cpu() - t) < quick, "{} {}: {:?}", name, p, (thread_cpu() - t));
         }
     }
     // Groups and their names, by the guard: `named` and `$<name>` read the guard's NFA, the crate's
@@ -1205,17 +1304,17 @@ fn a_long_match_finds_its_groups() {
         let c = regex::Regex::new(p).unwrap().captures(&text).unwrap();
         let (m, g1, g2) = (c.get(0).unwrap(), c.get(1).unwrap(), c.get(2).unwrap());
         let want = format!("[{}, {}, {}, {}]", m.start(), m.end(), g1.len(), g2.len());
-        let t = Instant::now();
+        let t = thread_cpu();
         let got = run(&d, &format!("map([re.find(read_file(\"t.txt\"), {:?})], (m) => [m.start, m.end, len(m.groups[0]), len(m.groups[1])])[0]", p));
         assert_eq!(got, want, "{}", p);
-        assert!(t.elapsed() < Duration::from_millis(if cfg!(debug_assertions) { 30_000 } else { 3_000 }), "{}: {:?}", p, t.elapsed());
+        assert!((thread_cpu() - t) < Duration::from_millis(if cfg!(debug_assertions) { 30_000 } else { 3_000 }), "{}: {:?}", p, (thread_cpu() - t));
     }
     std::fs::write(d.join("t.txt"), words_line(10_000_000)).unwrap();
     for p in pats {
-        let t = Instant::now();
+        let t = thread_cpu();
         let got = run(&d, &format!("re.find(read_file(\"t.txt\"), {:?})", p));
         assert!(got.starts_with("err(") && got.contains("the pattern is too costly for this text"), "{}: {}", p, got);
-        assert!(t.elapsed() < Duration::from_millis(if cfg!(debug_assertions) { 30_000 } else { 3_000 }), "{}: {:?}", p, t.elapsed());
+        assert!((thread_cpu() - t) < Duration::from_millis(if cfg!(debug_assertions) { 30_000 } else { 3_000 }), "{}: {:?}", p, (thread_cpu() - t));
     }
     let _ = std::fs::remove_dir_all(&d);
 }
@@ -1245,18 +1344,19 @@ fn a_long_line_with_groups_answers_as_before() {
         let c = re.captures(text).unwrap();
         let (m, g1, g2) = (c.get(0).unwrap(), c.get(1).unwrap(), c.get(2).unwrap());
         let want = format!("[{}, {}, {}, {}]", m.start(), m.end(), g1.len(), g2.len());
-        let t = Instant::now();
+        let t = thread_cpu();
         let got = run(&d, &format!("map([re.find(read_file(\"t.txt\"), {:?})], (m) => [m.start, m.end, len(m.groups[0]), len(m.groups[1])])[0]", p));
         assert_eq!(got, want, "{} bytes", text.len());
-        assert!(t.elapsed() < Duration::from_millis(if cfg!(debug_assertions) { 60_000 } else { 3_000 }), "{} bytes: {:?}", text.len(), t.elapsed());
+        assert!((thread_cpu() - t) < Duration::from_millis(if cfg!(debug_assertions) { 60_000 } else { 3_000 }), "{} bytes: {:?}", text.len(), (thread_cpu() - t));
     }
     let _ = std::fs::remove_dir_all(&d);
 }
 
 /// Where the backtracker's stack does grow past its room, it is refused within it: the 4 MB line
 /// above, whose visits (25 MB) and time fit `--max-memory 64MB` but whose stack does not, is the
-/// error value under that limit, the process staying under 120 MB in all; without the limit it is
-/// the groups (FEEDBACK75.md, Q-1075, last check; branch feedback75).
+/// error value under that limit, the process growing by no more than that and the allocator's
+/// margin over its own size; without the limit it is the groups (FEEDBACK75.md, Q-1075, last check;
+/// branch feedback75).
 #[test]
 fn a_stack_past_its_room_is_refused_within_it() {
     let _heavy = heavy();
@@ -1265,37 +1365,19 @@ fn a_stack_past_its_room_is_refused_within_it() {
     let c = regex::Regex::new(r"^(\S+)\s*(.*)$").unwrap().captures(&text).unwrap();
     let want = format!("[{}, {}, {}]", c.get(0).unwrap().start(), c.get(0).unwrap().end(), c.get(1).unwrap().len());
     std::fs::write(d.join("t.txt"), &text).unwrap();
-    let src = "let m = re.find(read_file(\"t.txt\"), \"^(\\\\S+)\\\\s*(.*)$\")\nprint(is_err(m) ? str(m) : str([m.start, m.end, len(m.groups[0])]))\nprint(\"done\")\nsleep(60000)\n";
+    let src = format!("let t = read_file(\"t.txt\")\n{}let m = re.find(t, \"^(\\\\S+)\\\\s*(.*)$\")\nprint(is_err(m) ? str(m) : str([m.start, m.end, len(m.groups[0])]))\nprint(\"done\")\nsleep(60000)\n", READY);
     std::fs::write(d.join("s.qwe"), src).unwrap();
     for (args, limited) in [(&["--max-memory", "64MB"][..], true), (&[][..], false)] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "s.qwe"]).args(args).current_dir(&d).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        support::stop_with_tests(&child);
-        let pid = child.id();
-        let mut stdout = child.stdout.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let mut all = String::new();
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = stdout.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                all.push_str(&String::from_utf8_lossy(&buf[..n]));
-                if all.contains("done\n") {
-                    let _ = tx.send(all.clone());
-                }
-            }
-            let _ = tx.send(all);
-        });
-        let out = rx.recv_timeout(Duration::from_secs(if cfg!(debug_assertions) { 120 } else { 30 })).unwrap_or_default();
-        let peak = peak_kb(pid);
-        let _ = child.kill();
-        let _ = child.wait();
-        let first = out.lines().next().unwrap_or_default();
+        let mut run = Measured::start(&d, args);
+        run.go(&d);
+        let out = run.wait_for("done\n", if cfg!(debug_assertions) { 300 } else { 60 }).to_string();
+        let first = out.lines().find(|l| *l != "ready").unwrap_or_default();
         if limited {
             assert!(first.starts_with("err(") && first.contains("the pattern is too costly for this text"), "{}", out);
-            if let Some(kb) = peak {
-                assert!(kb < 120 * 1024, "{} KB at the most", kb);
+            // Its 64 MiB, and 32 MiB for the allocator and the call's own; its stack alone would be
+            // over 100 MB.
+            if let Some(kb) = run.grew_kb() {
+                assert!(kb < (64 + 32) * 1024, "{} KB over its own {:?} KB", kb, run.base);
             }
         } else {
             assert_eq!(first, want, "{}", out);
@@ -1309,11 +1391,12 @@ fn a_stack_past_its_room_is_refused_within_it() {
 /// PikeVM's cache is made only where the PikeVM runs (a `re.test` of `(?:(a)|…×3000)*` on 10 KB made
 /// 785 MB for it and never used it), and the bounded backtracker's set of visits and its stack at
 /// their worst are asked for first (a thousand groups on 20 KB took 974 MB, the 10 MB line 521 MB).
-/// Each answer is the same with the limit and without, and the process stays within what it may
-/// make: under the limit, 160 MB in all; without it, the backtracker's stack grows to the 256 MiB
-/// room before it is refused (changed with the reviewer's last check, which found a 1 MB line
-/// refused on the stack's worst), so 400 MB with the text and what the allocator keeps of the
-/// buffers it grew from (FEEDBACK75.md, Q-1075, final and last checks; branch feedback75).
+/// Each answer is the same with the limit and without, and the process grows over its own size by
+/// no more than it may make: 64 MiB under the limit; without it, the 256 MiB room, which the
+/// backtracker's stack grows to before it is refused (changed with the reviewer's last check, which
+/// found a 1 MB line refused on the stack's worst), each with the allocator's margin; measured as
+/// growth since CI's instrumented build is much larger of its own (FEEDBACK75.md, Q-1075, final
+/// and last checks; branch feedback75).
 #[test]
 fn a_guarded_search_makes_no_more_than_it_may() {
     let _heavy = heavy();
@@ -1324,43 +1407,25 @@ fn a_guarded_search_makes_no_more_than_it_may() {
     std::fs::write(d.join("b10k.txt"), "b".repeat(10_000)).unwrap();
     std::fs::write(d.join("a20kb.txt"), "a".repeat(20_000) + "b" + &"c".repeat(40_000)).unwrap();
     std::fs::write(d.join("line.txt"), words_line(10_000_000)).unwrap();
-    let src = "print(re.test(read_file(\"b10k.txt\"), read_file(\"p3000.txt\")))\nlet m = re.find(read_file(\"b10k.txt\"), read_file(\"p3000.txt\"))\nprint(str([m.start, m.end, len(m.groups)]))\nprint(re.find(read_file(\"a20kb.txt\"), read_file(\"p1000b.txt\")))\nprint(re.find(read_file(\"line.txt\"), \"^(\\\\S+)\\\\s*(.*)$\"))\nprint(\"done\")\nsleep(60000)\n";
-    std::fs::write(d.join("s.qwe"), src).unwrap();
+    let read = "let b10k = read_file(\"b10k.txt\")\nlet p3000 = read_file(\"p3000.txt\")\nlet a20kb = read_file(\"a20kb.txt\")\nlet p1000b = read_file(\"p1000b.txt\")\nlet line = read_file(\"line.txt\")\n";
+    let work = "print(re.test(b10k, p3000))\nlet m = re.find(b10k, p3000)\nprint(str([m.start, m.end, len(m.groups)]))\nprint(re.find(a20kb, p1000b))\nprint(re.find(line, \"^(\\\\S+)\\\\s*(.*)$\"))\nprint(\"done\")\nsleep(60000)\n";
+    std::fs::write(d.join("s.qwe"), format!("{}{}{}", read, READY, work)).unwrap();
     for args in [&[][..], &["--max-memory", "64MB"][..]] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_quillo")).args(["run", "s.qwe"]).args(args).current_dir(&d).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        support::stop_with_tests(&child);
-        let pid = child.id();
-        let mut stdout = child.stdout.take().unwrap();
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
-        std::thread::spawn(move || {
-            let mut all = String::new();
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = stdout.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                all.push_str(&String::from_utf8_lossy(&buf[..n]));
-                if all.contains("done\n") {
-                    let _ = tx.send(all.clone());
-                }
-            }
-            let _ = tx.send(all);
-        });
-        let out = rx.recv_timeout(Duration::from_secs(if cfg!(debug_assertions) { 120 } else { 30 })).unwrap_or_default();
-        let peak = peak_kb(pid);
-        let _ = child.kill();
-        let _ = child.wait();
-        let lines: Vec<&str> = out.lines().collect();
+        let mut run = Measured::start(&d, args);
+        run.go(&d);
+        let out = run.wait_for("done\n", if cfg!(debug_assertions) { 300 } else { 60 }).to_string();
+        let lines: Vec<&str> = out.lines().filter(|l| *l != "ready").collect();
         assert_eq!(lines.len(), 5, "{:?}: {}", args, out);
         assert_eq!(lines[0], "true", "{:?}", args);
         assert_eq!(lines[1], "[0, 0, 3000]", "{:?}", args);
         for l in &lines[2..4] {
             assert!(l.starts_with("err(") && l.contains("the pattern is too costly for this text"), "{:?}: {}", args, l);
         }
-        // The 10 MB text read twice and the process's own: each was 521 MB or more at its height.
-        if let Some(kb) = peak {
-            let most = if args.is_empty() { 400 } else { 160 };
-            assert!(kb < most * 1024, "{:?}: {} KB at the most", args, kb);
+        // Over the process's own size (the texts read): the room, and a margin for the allocator
+        // and the call's own; each was 521 MB or more at its height.
+        if let Some(kb) = run.grew_kb() {
+            let most = if args.is_empty() { 256 + 64 } else { 64 + 32 };
+            assert!(kb < most * 1024, "{:?}: {} KB over its own {:?} KB", args, kb, run.base);
         }
     }
     let _ = std::fs::remove_dir_all(&d);
@@ -1405,9 +1470,9 @@ fn crafted_numbers_do_not_slow_stats_mode() {
     std::fs::write(d.join("hf.json"), format!("[{},\"x\"]", list.join(","))).unwrap();
     let mut it = quillo::Interp::new(&d);
     it.load_source("let l = json.parse(read_file(\"hf.json\"))\n", "t.qwe").unwrap();
-    let t = Instant::now();
+    let t = thread_cpu();
     it.load_source("let m = stats.mode(l)\nlet mm = len(stats.multimode(l))\n", "u.qwe").unwrap();
-    let took = t.elapsed();
+    let took = thread_cpu() - t;
     assert_eq!(quillo::value::lookup(&it.globals, "m").unwrap().repr(), format!("{:?}", floats[0]));
     assert_eq!(quillo::value::lookup(&it.globals, "mm").unwrap().repr(), "160001");
     assert!(took < Duration::from_millis(if cfg!(debug_assertions) { 10_000 } else { 1_000 }), "{:?}", took);
@@ -1544,8 +1609,14 @@ fn a_gzip_body_bomb_is_refused() {
     assert!(bomb.len() < 20_000, "{}", bomb.len());
     let (status, body) = post_gzip(srv.port, "/len", &bomb);
     assert_eq!(status, 413, "{}", body);
+    // The line is written after the answer: waited for (CI read the log before it came).
+    let line = "request body too large for what was sent (once decompressed, more than 100 times its size)";
+    let until = Instant::now() + Duration::from_secs(60);
+    while !srv.log().contains(line) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let log = srv.log();
-    assert!(log.contains("request body too large for what was sent (once decompressed, more than 100 times its size)"), "{}", log);
+    assert!(log.contains(line), "{}", log);
     assert_eq!(post_gzip(srv.port, "/len", &gzip_padded(b"still here", 0)), (200, "10".into()));
     let _ = std::fs::remove_dir_all(&d);
 }
