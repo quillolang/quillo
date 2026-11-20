@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (0.8.9)
+## 0.8.9 (2026-11-20)
 
 Found by the security audit of 0.8.7 (FEEDBACK75.md, Q-1050 to Q-1095, and Q-1120 and Q-1121
 found in review), by the study of authentication (FEEDBACK78.md, Q-1158, Q-1159, Q-1168,
