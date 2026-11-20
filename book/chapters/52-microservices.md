@@ -91,8 +91,28 @@ options](#running-quillo) lists them all.
   the services are told the port the app was given. Each service takes the request's
   scheme from the app, signed with the shared secret, and believes no visitor's
   `X-Forwarded-Proto` *(since 0.8.7)*: its cookie deletions are `Secure` and its writes
-  compared by scheme as the app's are. It is the quickest
+  compared by scheme as the app's are. The visitor's address comes the same way, as the
+  app took it with its own `--trust-proxy`, so in such a service `request.ip`, a "this
+  machine only" check, the limits by client and the log are the visitor's *(since 0.8.9:
+  every visitor was the app's `127.0.0.1` there, so a check that refused others let
+  everyone in)*, and so are `request.client_cert` and `request.remote_user` where the app
+  is given `--client-cert-header` or `--user-header` *(since 0.8.9)*. It is the quickest
   way to see an app as it would run split, on one machine.
+- **What the app passes on** of a visitor's request to a service leaves out the app's own
+  session cookies (`__Host-quillo_session`, a mounted program's
+  `__Host-<mount>.quillo_session`), which the service never reads; its own
+  `quillo_session` and every other cookie go as before *(since 0.8.9: the app's session
+  cookie went to whatever address `--service-url` names)*. The service's answer is asked
+  for as it is (`Accept-Encoding: identity`) and the app compresses what it sends, as for
+  its own. One over 1 MiB, or with no length (a `stream`), goes through to the visitor as
+  it comes, held to 5 s to connect and 60 s between its bytes; a shorter one is read
+  whole, within 256 MiB or `--max-memory`, and past it the visitor gets 502 *(since 0.8.9:
+  every answer was read whole into the app first, up to 256 MB a request, so a service's
+  `stream` came all at once at its end)*. The app's `site_headers` reach a service's
+  answers under its prefix, below the service's own rules, and its page is written with
+  the app's policy *(since 0.8.9)*. While a service does not answer (it is starting again,
+  or down), a page cannot join a channel no program claims, as it may be that service's
+  *(since 0.8.9)*.
 - **Checked once.** Before `--split` starts any service, the app checks the whole tree,
   its own files and every service's, and says each warning once. An error in a service
   stops it there, before anything waits. A service that ends as it starts is said at
@@ -219,8 +239,9 @@ known, or a `url` that does not lead to where the copy joined from, 401 for a ba
 signature, a key of another service's, a join under the shared secret where the app
 wants the service's key, or no nonce, 403 when the app takes no copies (started with `--no-join`,
 or an `--allow-join` that does not name the service) or has neither `QUILLO_SERVICE_SECRET` nor keys in `accept_calls`, 404 when the app declares no such
-service, 405 for a method other than POST, and 409 for a nonce sent before. Only copies call it, so a proxy in
-front of the app need not pass it from outside.
+service, 405 for a method other than POST, 409 for a nonce sent before, and 413 for a body
+over 4 KB, refused before it is read *(since 0.8.9: it was read whole first)*. Only copies
+call it, so a proxy in front of the app need not pass it from outside.
 
 ## A chain of calls
 
@@ -701,6 +722,9 @@ server fn whoami() -> map = { caller: request.caller, user: request.user, forwar
   checked. `audience` is required. A token a user signed in for, whose `sub` is the user
   and not the client, is refused *(since 0.7)*: a page passing its visitor's token on
   called as the shop. A service calls with its own, from the client-credentials grant.
+  The client is named by `client_id`, `azp`, `cid` (Okta's) or `appid` (Entra ID v1's),
+  else by `sub` *(since 0.8.9: Okta's and Entra ID v1's user tokens, which name the client
+  in `cid` and `appid`, were taken as the client's own, named by the user's login)*.
 - `client_cert` takes the identity of a certificate a proxy checked, as Envoy and
   Istio pass it on: Quillo does not end TLS itself. The header is believed only on a
   request from an address `--trust-proxy` names. A SPIFFE id names the caller whole, as
@@ -724,7 +748,9 @@ server fn whoami() -> map = { caller: request.caller, user: request.user, forwar
   value refuses with its text, and `reply` answers the call.
 - `for ["shop"]` takes calls from those callers only; others get 403, before their
   arguments are read. Pages cannot call it at `/_quillo/rpc/refund`, which answers 404,
-  and their script has no `server.refund` *(since 0.7: anyone could)*.
+  and their script has no `server.refund` *(since 0.7: anyone could)*. The 404 says what
+  it says of a name that is no `server fn`, `` no server fn `refund` `` *(since 0.8.9: it
+  named the callers it takes, to anyone)*.
 
 `request.caller` is who called: `{ name, by }`, with `by` one of `"quillo"`, `"key"`,
 `"jwt"` and `"mtls"`; a token adds its `scopes` and `claims`, a certificate its
@@ -773,8 +799,8 @@ deadlines, `.later`), so prefer `accept_calls` where the caller can send a token
   signature, the file and line of every route, and the version: keep it private at the
   proxy, as `/_quillo/metrics` is, or leave `--describe` off in production.
 - `/_quillo/join` takes only signed joins, each nonce once: with the service's own key
-  where the app has one for it, else under `QUILLO_SERVICE_SECRET`. `--no-join` turns it
-  off.
+  where the app has one for it, else under `QUILLO_SERVICE_SECRET`, and refuses a body
+  over 4 KB before reading it *(since 0.8.9)*. `--no-join` turns it off.
 
 ## The example
 

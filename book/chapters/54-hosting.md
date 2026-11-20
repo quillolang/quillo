@@ -36,8 +36,8 @@ options](#running-quillo) lists every one, `--watch` and `--split` included.
 | `--instances N` | the program N times over, a core each (see [several cores](#several-cores-several-servers)) |
 | `--log json` | a JSON line per request, for log collectors |
 | `--reload` | reload when the program's files change, without dropping requests (see [new versions](#new-versions)); with `--instances`, each instance loads the change, and `--split` passes it to its services |
-| `--max-body 50MB` | the largest request body (default 10 MiB): raise it for big uploads. Past its first 30 s a body must keep coming at 1 KiB/s *(since 0.7)*, and one that sends nothing for 30 s is answered `408`, with a line in the log. A gzipped body (`Content-Encoding: gzip`) is decoded, and the limit counts what it decodes to |
-| `--max-memory 512MB` | no one value a request makes (a text, a list, a body or file read, a fetched answer) may be bigger: a request that would make one ends with a 500 and a line in the log, while the others go on; at least `64KB`, and unset, nothing is checked *(since 0.8.7)* |
+| `--max-body 50MB` | the largest request body (default 10 MiB): raise it for big uploads. Past its first 30 s a body must keep coming at 1 KiB/s *(since 0.7)*, and one that sends nothing for 30 s is answered `408`, with a line in the log. A gzipped body (`Content-Encoding: gzip`) is decoded, and the limit counts what it decodes to; it may decode to no more than 100 times what was sent, plus 64 KB (and never past `--max-body`), else `413` *(since 0.8.9: 10 KB sent could carry 10 MB to the route)* |
+| `--max-memory 512MB` | no one value a request makes (a text, a list, a body or file read, a fetched answer) may be bigger: a request that would make one ends with a 500 and a line in the log, while the others go on; at least `64KB`, and unset, nothing is checked *(since 0.8.7)*. A visitor's JSON (`request.json`, a form's JSON, a `server fn`'s arguments, a channel message over 1 KiB) is counted as it is made, each text, list and map at its size, so a small body that would make many empty lists stops at the limit *(since 0.8.9: it was counted in values, at least 1,000,000 whatever the limit)* |
 | `--max-connections N` | connections open at once (default: what the file descriptors allow, less 4,608); past it one more is closed as it comes *(since 0.7)* |
 | `--connections-per-client N` | connections one client (an address, or an IPv6 /64) may hold open (default 512); this machine and `--trust-proxy`'s proxies are not held to it *(since 0.7)* |
 | `--base /shop` | when the program is served under a path rather than at the root: its links, redirects, scripts and cookies carry the prefix, and the proxy strips it from requests (Quillo routes the path it is given) |
@@ -159,6 +159,12 @@ server {
   visitor counts as one: only 256 pages then get live updates. `--trust-proxy 127.0.0.1`
   names the proxy, and `request.ip` and each client's limits are the visitor's, from the
   `X-Forwarded-For` it adds. It is read from no other address, as a client can write it.
+- **Who the proxy says the visitor is.** A proxy that checks a client certificate, or signs
+  people in with Kerberos, says who in a header: `--client-cert-header NAME` and
+  `--user-header NAME` read it as `request.client_cert` and `request.remote_user`, only on
+  a request from an address `--trust-proxy` names, and the program does not start with
+  either and without `--trust-proxy` *(since 0.8.9)*. See [Client certificates and
+  Kerberos](#client-certificates-and-kerberos).
 - **The scheme.** The same goes for `X-Forwarded-Proto` *(since 0.8.7: anyone's decided
   `delete_cookie`'s `Secure` and a push subscription's origin)*: from a proxy
   `--trust-proxy` names, it is the request's scheme, so a form's `Origin` is compared with
@@ -196,7 +202,9 @@ site_headers("/embed", { "x-frame-options": null })
 
   A policy like this one needs nothing added for Quillo's own scripts *(since 0.8.6: it
   stopped every component)*: they are named by their hashes in it, and the islands' style
-  is a hashed rule.
+  is a hashed rule. The rules reach the answers of a program it mounts, and of a service it
+  serves under a prefix, below their own rules *(since 0.8.9: a program's CSP, HSTS and
+  `Referrer-Policy` never reached `/shop/*` or a service's pages)*.
 
 - **What `site_headers` takes.** Names are checked and values are one line.
   `content-length`, `transfer-encoding`, `connection`, `set-cookie` and `content-type`
@@ -237,8 +245,11 @@ WantedBy=multi-user.target
 
 On `SIGTERM` (what `systemctl stop` and `docker stop` send), Quillo stops taking
 connections, answers every request in progress however long it takes, so a transaction
-under way commits whole, and exits with status 0. The service manager gives up on its own
-after its time (systemd's `TimeoutStopSec`, 90 s unless set) and kills the process without a
+under way commits whole, and exits with status 0. A request still arriving 30 s after the
+stop (its head, or a body not yet whole) has had no work done, and is answered `503` (`the
+server is stopping`) and closed, the log saying why *(since 0.8.9: a body trickled at a
+little over 1 KiB a second held the stop for as long as it kept coming)*. The service
+manager gives up on its own after its time (systemd's `TimeoutStopSec`, 90 s unless set) and kills the process without a
 word, so give Quillo a little less: with `--drain 60s` a request still running at 60 s is
 cut off and said in the log, before `TimeoutStopSec=75` would. Services started with
 `--split` stop after the app, once its requests are answered, though systemd signals every
@@ -327,6 +338,17 @@ about 170 MB, most of it Debian; `quillo` needs only the C library from it.
   container's log collects it. A malformed request is an object of its own,
   `{"time", "status", "error", "line"}`. `ip` is the proxy's, behind one, unless
   `--trust-proxy` names it.
+- A query value whose name says a secret is written `[hidden]`, in the text line and the
+  JSON one: `/reset?token=[hidden]&page=2`. The names are `password`, `passwd`, `pwd`,
+  `pass`, `token`, `tokens`, `code`, `secret`, `key`, `otp`, `state`, `ticket`, `sig`,
+  `signature`, `credential`, `verifier`, `jwt`, `auth`, `authorization`, session ids
+  (`session`, `sessionid`, `sid`), and SAML's `SAMLRequest` and `SAMLResponse`, in any
+  case and as the last word of a longer name (`access_token`, `api-key`, `clientSecret`,
+  `user[password]`, `API_KEY`, `JSESSIONID`, `PHPSESSID`), and `password`, `token`,
+  `secret`, `signature`, `credential`, `verifier`, `jwt`, `authorization` and `session`
+  anywhere in one (`id_token_hint`, `session_id`) *(since 0.8.9: a sign-in or reset
+  link's token, OAuth's `code` and `state`, a session id and a password in a URL went to
+  the log as they were)*.
 - Quillo's own notices (`listening on`, warnings, `stopping`) and errors are text lines
   on stderr (`quillo: ...`), with `--log json` or without. In a text line, line breaks
   and control characters inside an error's text are written as `\n` and `\x1b`, so one

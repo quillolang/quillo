@@ -435,10 +435,13 @@ cookie.
 
 **The cookie itself.** In production the session cookie is `__Host-quillo_session`:
 browsers take a cookie with that prefix only from the very host, over HTTPS, so a
-sibling subdomain (another tenant's site) cannot plant one. With `--watch`,
-`--plain-http` or in a mounted program it is `quillo_session`. The signature covers the
-expiry, the tenant and the program's mount point, so a session is no session past its
-time, for another tenant, or in another mounted program. A request with two session
+sibling subdomain (another tenant's site) cannot plant one. A program mounted under a path
+has one of its own, with the path in its name and `Path=/`: `__Host-shop.quillo_session`
+for `mount /shop` *(since 0.8.9: it was `quillo_session` at `Path=/shop`, which a sibling
+subdomain could plant)*. With `--watch`, `--plain-http` or under `--base` it is
+`quillo_session`, with the program's path. The signature covers the expiry, the tenant and
+the program's mount point, so a session is no session past its time, for another tenant, or
+in another mounted program, its channels' handlers included. A request with two session
 cookies that are both valid here has no session: one of them was planted.
 
 ## Requests from other sites
@@ -467,6 +470,10 @@ visitor:
   through. A request pattern reads them when any of its `|` alternatives takes the
   headers or cookies, or one under `as`, so `route GET /seen { query: { who: str } } |
   { cookies: { who: str } } { ... }` that writes is warned of *(since 0.8.8: it was not)*.
+  A write is followed through `http.stream` with a `method` that writes or a `body`,
+  `http.request` whose method a `let` holds, `udp.send`, `udp.reply`, `channel.send` and
+  `channel.broadcast`, SQL a `let` holds, and a function a `let` holds (`let w =
+  save_visit`, then `w(session().user)`) *(since 0.8.9: these were not seen)*.
 
 The renewal of a session above, written without `writes`, is warned of so:
 

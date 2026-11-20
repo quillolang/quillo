@@ -94,7 +94,7 @@ for every plugin in this chapter:
 | LDAP and Active Directory | Plugin: [ldap](/plugins/ldap/) | [LDAP and Active Directory](#ldap-and-active-directory) |
 | RADIUS | Plugin: [radius](/plugins/radius/) | [RADIUS](#radius) |
 | Calls between services | Core: `service ... { auth }` and `accept_calls` | [Calls between services](#calls-between-services) |
-| Client certificates (mTLS), Kerberos | A recipe: a proxy in front checks them | [Client certificates and Kerberos](#client-certificates-and-kerberos) |
+| Client certificates (mTLS), Kerberos | Core: a proxy in front checks them, and `--client-cert-header` and `--user-header` read what it says *(since 0.8.9)* | [Client certificates and Kerberos](#client-certificates-and-kerberos) |
 | An OAuth 2.0 authorization server | Not available yet: planned as a plugin | [An OAuth authorization server](#an-oauth-authorization-server) |
 
 Core has no TOTP and no rate limit of its own: `crypto.totp_*` and `rate_limit` were
@@ -541,9 +541,11 @@ route GET /passkeys = <html><body><PasskeyButtons/></body></html>
 ```
 
 - **The credential goes back through `JSON.stringify`.** A browser's credential keeps its
-  fields on its prototype, and on 0.8.8 a page's object passes to a `server fn` by its own
-  keys, so it would arrive empty (`the credential's type is null`). `JSON.stringify` calls
-  its `toJSON()`, which is what the plugin reads.
+  fields on its prototype, and on 0.8.8 a page's object passed to a `server fn` by its own
+  keys, so it arrived empty (`the credential's type is null`). `JSON.stringify` calls its
+  `toJSON()`, which is what the plugin reads. Since 0.8.9 an object with a `toJSON`, passed
+  as it is, goes as its `toJSON()` gives, as `JSON.stringify` writes it; the round trip
+  here works on both.
 - **`origin` and `rp_id` are exact.** The origin is the page's (`https://shop.example`, a
   list for several), the `rp_id` its host or a parent of it. While developing, both are
   `localhost`'s (`http://localhost:8080` and `localhost`): browsers allow passkeys there
@@ -1144,8 +1146,9 @@ route POST /sign-in { form: { user: str, password: str } } {
   a few wrong passwords, so anyone could lock out your staff from the sign-in page. Count
   tries per address and per account with [login_limits](#limits-on-guessing), the account
   keyed by the entry a search finds (the plugin's example does), under AD's threshold.
-- Take the password from a form posted, never a query string, which the request log
-  prints.
+- Take the password from a form posted, never a query string, which proxies and the
+  browser's history keep; Quillo's own request log writes a `password` there `[hidden]`
+  *(since 0.8.9: it printed it)*.
 - `{user}` is escaped for the filter (`ad*` stays three letters), an empty password is
   refused before any bind, and a name that matches two entries signs no one in.
   `ldap_groups(name, dn, base, { nested: true })` gives a user's groups, nested ones by
@@ -1208,7 +1211,9 @@ server fn refund(account: int, cents: int) for ["shop"] {
   call it at all.
 - `jwt` takes OAuth 2.0 access tokens from an identity provider, for callers that are not
   Quillo services. Its check is core's: `audience` and `exp` required, `iss` and `nbf`
-  checked, `alg: none` and HS256 keyed with the public key refused.
+  checked, `alg: none` and HS256 keyed with the public key refused. The token must be the
+  caller's own: a user's token from Okta or Entra ID v1, whose client is in `cid` or
+  `appid`, is refused *(since 0.8.9: it passed as the service's own)*.
 - `client_cert` takes the identity of a certificate a proxy checked (Envoy's
   `x-forwarded-client-cert`, a SPIFFE id), believed only from an address `--trust-proxy`
   names.
@@ -1218,14 +1223,40 @@ each option, rotating keys, and signed answers.
 
 ## Client certificates and Kerberos
 
-Quillo ends no TLS itself, and speaks no Kerberos. Both are done by a proxy in front,
-which tells the program who the visitor is in a header. Core reads a client certificate's
-identity from a trusted proxy for calls between services (`accept_calls { client_cert }`);
-for routes, reading these from a trusted proxy header in core is planned. Today the program
-reads the header itself, and must make sure of two things: **the proxy sets the header in
-place of any the visitor sent**, and **Quillo listens only on 127.0.0.1**, its default
-`--host`, so nothing reaches it but the proxy. On a machine others share, `--listen
-unix:app.sock` with `--socket-mode 660` keeps out other users' programs too.
+Quillo ends no TLS itself, and speaks no Kerberos. Both are done by a proxy in front, which
+tells the program who the visitor is in a header. Name that header when the program starts,
+with the proxy, and the routes read it as `request.client_cert` and `request.remote_user`
+*(since 0.8.9: the program read the header itself)*:
+
+```sh
+quillo run main.qwe --trust-proxy 127.0.0.1 \
+  --client-cert-header x-client-dn --client-cert-subject --user-header x-remote-user
+```
+
+- **`--client-cert-header NAME`**: the header a proxy that ended mutual TLS sets.
+  `request.client_cert` is then `{ name, subject, uri }`: `name` the certificate's SPIFFE id
+  where it has one, else its subject's CN; `subject` the subject as the proxy wrote it; `uri`
+  its URI, where it has one. The header is read as `accept_calls { client_cert }` reads it
+  for calls between services: Envoy's `x-forwarded-client-cert`, one proxy's element, unless
+  `--client-cert-subject` says it holds the subject alone, in RFC 2253's form (nginx's
+  `$ssl_client_s_dn`).
+- **`--user-header NAME`**: the header a proxy that signed the person in sets (Kerberos by
+  SPNEGO: Apache's mod_auth_gssapi, IIS). `request.remote_user` is the user as the proxy wrote
+  it, trimmed (`ada@CORP.EXAMPLE`, `CORP\ada`).
+- **Believed from the proxy alone.** Each is read only on a request from an address
+  `--trust-proxy` names, and either option stops the program at start without it (`quillo:
+  --client-cert-header and --user-header read a proxy's header, believed only from the
+  addresses --trust-proxy names: give --trust-proxy too (any visitor can send that
+  header)`). The proxy must set the header in place of any the visitor sent: each field is
+  null where its header is missing, came from another address, or is not one value the proxy
+  set (several elements of a certificate's header, several lines, or, for `--user-header`, a
+  value with a comma in it, as a proxy that appends puts the visitor's first; a subject's own
+  commas, `CN=Ada,OU=Staff`, are its parts). The log says why, once. Keep Quillo
+  where only the proxy reaches it: on its default `--host`, 127.0.0.1. On a machine others
+  share, `--listen unix:app.sock --socket-mode 660 --trust-proxy 127.0.0.1` keeps out other
+  users' programs too.
+- Where neither option names a header, `request` has neither field. A service `--split`
+  starts gets both from its app, signed.
 
 nginx, asking for a certificate from the company's CA:
 
@@ -1251,27 +1282,28 @@ Apache with mod_auth_gssapi, for Kerberos (SPNEGO, Windows' integrated sign-in):
 ProxyPass / http://127.0.0.1:8080/
 ```
 
-The program then reads the header, and compares it whole with what its table holds:
+The routes then read the fields, and compare them whole with what the program's table holds:
 
 ```quillo
 db.open("app.db")
 db.exec("create table if not exists staff (id integer primary key, cert_dn text unique, principal text unique)")
 
 route GET /staff {
-    let who = request.headers["x-client-dn"] ?? reply 401 "A staff certificate is needed"
-    let row = db.one("select id from staff where cert_dn = ?", who) ?? reply 403 "Not on the staff list"
-    <html><body><p>Staff member {row.id}</p></body></html>
+    let cert = request.client_cert ?? reply 401 "A staff certificate is needed"
+    let row = db.one("select id from staff where cert_dn = ?", cert.subject) ?? reply 403 "Not on the staff list"
+    <html><body><p>Staff member {row.id}: {cert.name}</p></body></html>
 }
 
 route GET /intranet {
-    let who = request.headers["x-remote-user"] ?? reply 401 "Sign in to Windows first"   // ada@CORP.EXAMPLE
+    let who = request.remote_user ?? reply 401 "Sign in to Windows first"      // ada@CORP.EXAMPLE
     let row = db.one("select id from staff where principal = ?", lower(who)) ?? reply 403 "Not on the staff list"
     <html><body><p>Hello, {who}: staff member {row.id}</p></body></html>
 }
 ```
 
-Compare the whole subject, as the proxy wrote it, rather than picking a CN out of it: a
-subject's escapes (`CN=Acme\, Inc.`) make a hand-written parser easy to fool.
+Compare the whole subject, or `name`, rather than picking a CN out of the subject by hand: a
+subject's escapes (`CN=Acme\, Inc.`) make a hand-written parser easy to fool. Before 0.8.9,
+read the header yourself (`request.headers["x-client-dn"]`), as this guide showed then.
 
 ## An OAuth authorization server
 

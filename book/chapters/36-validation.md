@@ -28,6 +28,9 @@ type Signup = {
 `` Signup: `plan` must be "free" | "pro", got str "gold" ``. It is the same function in
 the browser and on the server, with the same message, and it keeps only the fields
 `Signup` has. See [Records](#records) for everything a record checks.
+A record may name itself (`type Node = { value: int, kids: list<Node> = [] }`); a type
+that names itself with nothing between (`type Ab = Ab | int`) is an error, as a value of
+it could be anything *(since 0.8.9)*.
 
 ## The rules: plain functions
 
@@ -182,6 +185,14 @@ get back:
 
 A call may leave out fields with defaults (`plan`, `seats`): they are filled in as
 `Signup(...)` fills them. Fields without one (`name`, `email`) must be there.
+
+A value from a request (a `server fn`'s arguments, a route pattern's `json`, `form` and
+query records) is checked to its end, up to 512 levels, each type named on the way
+counting one, and refused past them (`... is nested more than 512 deep`, a 400) *(since
+0.8.9: it was checked 64 levels deep, and what was below went unchecked)*. A record's
+default that fails as an argument is made is the function's own failure, a 500 `internal
+error in sign_up`, the details in the server's log *(since 0.8.9: a 400 that gave any
+caller its file, line and message)*.
 
 ## Keeping rules pure
 

@@ -192,7 +192,10 @@ quillo.policy (workers 8)`. A request the policy's `max_compute` ends is a 500, 
 and the log names whichever is the tighter (`this request computed for longer than the
 policy p.toml allows (max_compute)`, or `... than --max-compute allows`). No `??` takes
 that stop, `highlight(x) ?? x` included. A page is told `the server's policy`, with no
-path of the server's.
+path of the server's. None of the files is served: a file named `quillo.policy`, and each
+policy file the program runs under, by its name or a hard link's, is a miss for `files()`
+and `quillo serve` *(since 0.8.9: `quillo serve DIR` served the folder's own, which names
+the secrets' variables, inner hosts and limits)*.
 
 `quillo check --policy policy.toml main.qwe`, run before uploading, says what the
 program would be refused. The sections and what each does are in [The

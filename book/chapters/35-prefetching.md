@@ -40,8 +40,11 @@ These links are left alone:
 
 A route asked for ahead of a click may read (the database, files, other servers) but not
 write. Writing to the database, assigning a global variable, setting cookies or the
-session, writing files, `publish`, `notification.send`, `http.post` and the like, and
-calls to services stop it, and the server answers "not prefetched" (`503`, `cache-control: no-store`), which the
+session, writing files, `publish`, `notification.send`, `http.post` and the like,
+`http.request` with a method other than `GET`, `HEAD` or `OPTIONS`, `http.stream` with one
+or a `body`, `udp.send`, `udp.reply`, `channel.send` and `channel.broadcast` *(since 0.8.9:
+these were sent, as the visitor)*, and calls to services stop it, and the server answers
+"not prefetched" (`503`, `cache-control: no-store`), which the
 browser drops; a `204` would leave it where it was. The page is then made as usual when
 the link is followed.
 

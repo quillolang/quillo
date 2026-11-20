@@ -162,7 +162,7 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
   the `Content-Length` the `GET` would. A body sent with `Content-Encoding: gzip` reaches
   the route decoded, [`--max-body`](#options-of-quillo-run) (`quillo run main.qwe --max-body 50MB`; 10MB unless
   given) counting what it decodes to (more is 413), and it may decode to no more than 100
-  times what was sent and 64 KB (more is 413 too, `request body too large for what was sent
+  times what was sent, plus 64 KB (more is 413 too, `request body too large for what was sent
   (once decompressed, more than 100 times its size)`; real uploads compress 3 to 20 times)
   *(since 0.8.9: 10 KB sent could carry 10 MB to the route)*; one in
   another coding gets 415, and one that is not the gzip it says, 400. An `Expect` other
@@ -234,7 +234,7 @@ The statuses the server answers by itself:
 | 408 | a request head not whole after 30 s, or a body of which nothing came for 30 s (logged: `POST /up HTTP/1.1 -> 408 (nothing of the body came for 30 s)`) |
 | 409, 422 | an [idempotent request](#idempotent-requests) running, or sent again with another body |
 | 412 | a file whose `If-Match` or `If-Unmodified-Since` it does not meet |
-| 413 | a body larger than `--max-body`, sent or once decoded; a gzip body that decodes to more than 100 times its size and 64 KB *(since 0.8.9)* |
+| 413 | a body larger than `--max-body`, sent or once decoded; a gzip body that decodes to more than 100 times its size plus 64 KB *(since 0.8.9)* |
 | 414 | a request line over 64 KiB |
 | 415 | a body in a coding other than gzip; a `server fn` call without `content-type: application/json` |
 | 416 | a `Range` past the end of a file |
@@ -844,9 +844,10 @@ route GET /intranet {
   --client-cert-header and --user-header read a proxy's header, believed only from the
   addresses --trust-proxy names: give --trust-proxy too (any visitor can send that
   header)`). Each is null where its header is missing, comes from another address, or is not
-  one value the proxy set: several elements of a certificate's header, several lines, a
-  value with a comma in it (two joined: a proxy that appends put the visitor's first). The
-  log says why, once. Keep Quillo where only the proxy reaches it, on its default
+  one value the proxy set: several elements of a certificate's header, several lines, or,
+  for `--user-header`, a value with a comma in it (two joined: a proxy that appends put the
+  visitor's first; a subject's own commas, `CN=Ada,OU=Staff`, are its parts). The log says
+  why, once. Keep Quillo where only the proxy reaches it, on its default
   `--host`, 127.0.0.1.
 - Where neither option names a header, `request` has neither field. A service
   [`--split`](#options-of-quillo-run) starts gets both from its app, signed.

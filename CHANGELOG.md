@@ -213,7 +213,7 @@ Q-1169 and Q-1170, and its A.13 and A.14).
   them smuggle a second request to the upstream. `content-length`, `transfer-encoding`,
   `connection`, `keep-alive`, `te`, `trailer` and `upgrade` are left out of a program's
   headers, as `fetch` leaves them out (FEEDBACK75.md, Q-1089).
-- **A gzip request body decodes to 100 times its size at most**, and 64 KB: 10 KB on the wire
+- **A gzip request body decodes to 100 times its size at most**, plus 64 KB: 10 KB on the wire
   carried 10 MB to the route and every limit after it. More is 413 (FEEDBACK75.md, Q-1090).
 - **A body trickled in cannot hold a graceful stop**: with no `--drain`, a body arriving a
   little over 1 KiB a second held the stop for as long as it kept coming. A request still
@@ -243,7 +243,7 @@ Q-1169 and Q-1170, and its A.13 and A.14).
   NAME` gives `request.remote_user`, the user a proxy signed in (Kerberos by SPNEGO: Apache's
   mod_auth_gssapi, IIS). Each needs `--trust-proxy`, and the program does not start without it;
   each is believed only on a request from a `--trust-proxy` address, and is null for a missing
-  header, several elements, several lines or a comma-joined value, the log saying why once. A
+  header, several elements, several lines or (the user's header) a comma-joined value, the log saying why once. A
   service `--split` starts gets both from its app, signed. Where neither option is given,
   `request` has neither field (FEEDBACK78.md, A.13 and A.14, the user's choice of a small
   reading in core; the options' names are on the list for the user).

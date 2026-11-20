@@ -137,7 +137,13 @@ fn recent(limit: int) -> list with db = db.query(sql`
 
 Statements are prepared and values are sent apart from the SQL, so a value can never
 change what a query does. `quillo check` warns where SQL is put together from values
-(`${x}` or `+`): pass them as `?` parameters instead.
+(`${x}` or `+`): pass them as `?` parameters instead. It follows such SQL through a
+function of the program's that builds and returns it (`db.query(build(request.query.n))`,
+the function written before or after), through `str`, `trim`, `lower`, `upper` and
+`replace`, through a map's field or a list's item it was put in, `s = s + n` and a loop
+that builds an `IN (...)` list, and out of a `return` inside an `if`; a map's other
+fields, a list's other items and a helper given only safe text are not said *(since
+0.8.9: SQL built in a helper or passed through these was not seen)*.
 
 Names cannot be parameters. When a table or a column comes from a choice (a column to
 sort by, say), put it in with `sql_name`, which takes only letters and digits of any
@@ -212,6 +218,18 @@ fn transfer(from: int, to: int, amount: int) -> map with db =
 - On PostgreSQL and MySQL a transaction keeps one connection until it ends, so other
   requests never see its changes early. On SQLite, `sleep` and `http` calls inside a
   transaction hold up other requests rather than let them write into it.
+- A stream's `send` inside a SQLite transaction does not wait for its client: what the
+  client has not read yet is kept, up to 4 MiB (less under `--max-memory`); past that the
+  transaction waits a second in all, then `send` fails as for a client gone, and the
+  transaction rolls back. Read the rows inside the transaction and send them after it;
+  `quillo check` warns of a `send` inside `db.transaction` or `db.atomic` *(since 0.8.9: a
+  client that read nothing held every request of the instance for up to 30 s at each
+  `send`)*.
+- Transactions on one row at once all end, on PostgreSQL and MySQL: a statement of a
+  transaction goes before other waits, and takes a thread past `--workers` when all are
+  taken, so the transaction that holds the row's lock always finishes, however many
+  requests wait on that row *(since 0.8.9: with every thread waiting on the lock,
+  PostgreSQL waited for good, and MariaDB 50 s, then error 1205)*.
 - `parallel` inside a transaction runs its functions one after another, since queries
   on other threads would not be part of it.
 - Live pages hear of its changes to tables when it commits, and not at all if it rolls
@@ -560,6 +578,13 @@ wait, writers take turns, for up to 5 seconds before a write fails as a conflict
 - Connections come from a pool, 8 unless the URL says `?pool_size=N`, and queries outside
   transactions share a second set, pipelined: plan for about twice `pool_size` per
   server. A query lets other requests run while it waits.
+- A statement that would change the shared connection's session for later visitors
+  (`set` without `local`, `set_config(..., false)`, `update pg_settings set setting =
+  ...`) is refused outside a transaction, which resets its connection as it ends;
+  `query_to_xml` and its kin (`cursor_to_xml`, `table_to_xml`, `schema_to_xml`,
+  `database_to_xml`), `ts_stat` and `ts_rewrite`, which run SQL Quillo cannot read, run on
+  a connection of their own, reset after them, as a `do` block does *(since 0.8.9: `update
+  pg_settings` was not seen, and those functions ran on the shared connection)*.
 - TLS is required for a server on another machine, with its certificate and name
   checked (`sslmode=verify-full`); on this machine it is used when the server offers it.
   A hosted database with a CA of its own (Amazon RDS, Cloud SQL) names it with
@@ -584,7 +609,15 @@ wait, writers take turns, for up to 5 seconds before a write fails as a conflict
 - A statement larger than the server's `max_allowed_packet`, its values included, is
   refused, saying so and how big it is.
 - Connections come from the driver's pool, and a query lets other requests run while it
-  waits. `pool_size` is PostgreSQL's: in a MySQL URL it stops the database from opening.
+  waits. `pool_size` is PostgreSQL's: in a MySQL URL it stops the database from opening;
+  the driver's own `pool_min` and `pool_max` set the pool. An idle connection is kept a
+  minute, and `inactive_connection_ttl` (seconds) sets that *(since 0.8.9: the driver
+  closed every connection handed back past ten idle ones, so a busy program opened
+  thousands a second and ran out of ports)*.
+- A transaction waits up to 30 s for a connection when all of the pool's are in use,
+  holding no thread meanwhile, then gets `` no MySQL connection free after 30 s: all the
+  pool's are in use (`?pool_max=N` in the URL allows more) `` *(since 0.8.9: it waited on a
+  thread with no limit, taking the threads other requests needed)*.
 - TLS is required for a server on another machine, as for PostgreSQL; `?ssl_ca=` names a
   CA of its own.
 - Built in by default as the `mysql` feature; `cargo build --no-default-features`

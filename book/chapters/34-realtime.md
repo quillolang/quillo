@@ -44,7 +44,10 @@ curl 127.0.0.1:8080/readings                                      # [{"id":"boil
   globals, so a page following `readings` with [`live`](#live-data)
   shows each packet as it lands. An error is logged, and the next packet goes on.
 - **Packets wait their turn**, up to 10,000 (`{ queue: 50000 }` for more). A full queue
-  drops its oldest packet, as UDP itself would.
+  drops its oldest packet, as UDP itself would. A sender holding more than half of a full
+  queue, of its packets or of its bytes, while others wait, has its new packet dropped
+  instead, and IPv6 senders count by their /64 *(since 0.8.9: by bytes alone, so a sender
+  of empty packets filled the queue)*.
 - **The port is taken when the program starts**, so one already in use is an error at
   once, not when the first packet comes. It stays open when the program reloads
   (started with `quillo run main.qwe --watch` or `--reload`, options of `quillo run`; see
@@ -132,8 +135,9 @@ one shows in both, after its sender's name.
 ### Who may join
 
 Anyone who can open a page can ask to join any channel, so a channel whose messages are
-not for everyone needs `join`. It gets the peer and says yes or no; above, only pages
-whose session has a name are let in. A page turned away says so in its console:
+not for everyone needs `join`. It gets the peer, and the channel's name second when it
+takes two (`(peer, name) =>`) *(since 0.8.9)*, and says yes or no; above, only pages whose
+session has a name are let in. A page turned away says so in its console:
 
 ```
 quillo: the server did not let this page join channel chat
@@ -253,6 +257,12 @@ ffmpeg -re -f lavfi -i testsrc=size=1280x720:rate=30 -f lavfi -i sine=frequency=
 On a laptop, the picture shows about 0.3 seconds after the page opens, at the stream's
 30 frames a second.
 
+The ports are on this machine alone, 127.0.0.1, unless `host` names another address
+(`media.rtp("cam", { video: 5004, host: "0.0.0.0" })` for a camera elsewhere on the
+network), and one sender is taken at a time: the first, until it has sent nothing for 2 s
+*(since 0.8.9: every address, and any sender's packets went between the camera's)*. There
+is no sign-in on RTP, so keep the ports to the camera's network.
+
 - **Nothing is decoded or encoded on the server.** Video is H.264 and audio Opus, each on
   a port of its own. The server puts the packets back in order, makes frames of them,
   and passes each frame on to every page watching. There are no HLS segments and no
@@ -270,8 +280,9 @@ On a laptop, the picture shows about 0.3 seconds after the page opens, at the st
 - **A dropped connection comes back.** The page opens it again (after half a second, then
   longer, up to 15 seconds) and goes on watching. With no frames for 3 seconds (the
   camera stopped, the connection is down), its `data-state` is `waiting`.
-- **Who may watch** is `media.on(name, { watch })`'s `watch(peer)`, asked as a channel's
-  `join` is, with the page's session. A stream no `watch` names is watched by no page
+- **Who may watch** is `media.on(name, { watch })`'s `watch(peer, name)`, asked as a
+  channel's `join` is, with the page's session; `name` is the stream the page asks for.
+  A stream no `watch` names is watched by no page
   *(since 0.7: any page could watch any stream)*. A camera not for everyone says who:
   `media.on("cam", { watch: (peer) => peer.session.user != null })`.
 - **How it is going**: `media.streams()` gives each stream's viewers and, per track,
@@ -300,7 +311,15 @@ for every `<quillo-media stream>` of that name to play. A video call is a stream
 person:
 
 ```quillo
-media.on("call:*", { publish: (peer) => session().user != null, watch: (peer) => session().user != null })
+// Streams are named call:<room>:<person>: a person sends only their own, and watches only
+// the rooms they are in.
+fn room_of(name: str) = split(name, ":")[1]
+fn in_room(room) = db.one("select 1 as yes from members where room = ? and user = ?", room, session().user) != null
+
+media.on("call:*", {
+    publish: (peer, name) => name == `call:${room_of(name)}:${session().user}` && in_room(room_of(name)),
+    watch: (peer, name) => in_room(room_of(name)),
+})
 
 component Call(room: str, me: str, others: list) {
     <div>
@@ -314,9 +333,16 @@ component Call(room: str, me: str, others: list) {
   (H.264 baseline and Opus, what the server passes on) and sends the frames on its
   channel connection. The server sends each person's picture on to everyone watching,
   decoding nothing, as it does a camera's RTP: what video services call an SFU.
-- **`publish(peer)` says who may send, and `watch(peer)` who may watch**, as a channel's
-  `join` does, with the page's `session()`. Without `publish`, no page sends; without
-  `watch`, no page watches *(since 0.7: any page could)*.
+- **`publish(peer, name)` says who may send, and `watch(peer, name)` who may watch**, as a
+  channel's `join` does, with the page's `session()`. Without `publish`, no page sends;
+  without `watch`, no page watches *(since 0.7: any page could)*.
+- **A rule for a name ending in `*` checks the name**, the stream asked for
+  (`call:42:ana`): one that does not lets a page it lets in for one stream watch, or send
+  into, every one the name starts. `quillo check` warns of such a rule
+  (`` `media.on("call:*")`'s `publish` never reads which stream is asked for ... ``). A rule
+  written with one parameter is called as before *(since 0.8.9: the rules were not told the
+  name, and this guide's call, written with `session().user != null`, let anyone signed in
+  watch every call and send video into anyone's)*.
 - **Each tenant has its own streams** of a name, as it has its own rooms of a channel:
   acme's `call:42` is not evil's. `tenants: "shared"` makes one stream for all.
 - **Not only the camera.** `no-video` or `no-audio` leaves one out. Given a MediaStream as
@@ -337,7 +363,9 @@ RTP, lets its ports go for another stream to take, and tells its pages, whose `d
 turns `ended`. It gives true if there was such a stream. Code run for a page or a
 request ends its tenant's stream; a job, a tick or the top level, every tenant's of that
 name. A room made while the program runs needs a `watch` too, for its name or a name
-ending in `*`: `media.on("room:*", { watch: (peer) => peer.session.user != null })`.
+ending in `*`, which checks the name and who asks:
+`media.on("room:*", { watch: (peer, name) => member(name, peer.session.user) })`, where
+`member` is the program's own function that looks the person up in the room's members.
 
 ## Which way a page connects
 
@@ -353,7 +381,9 @@ joins its channels again) when it drops:
   page that fell back keeps the WebSocket until it is loaded again.
 
 In the Network panel, the connection is the request to `/_quillo/wt`; if its type is
-**websocket**, the page fell back.
+**websocket**, the page fell back. A program that surely uses no channel or media (no
+`channel`, `media` or `js` in it, nothing mounted, no service and no plugin) answers
+`/_quillo/wt-ticket` with 404 *(since 0.8.9)*.
 
 On your own machine, open `http://127.0.0.1:8080` rather than `localhost`. `quillo run`
 listens on 127.0.0.1, and browsers try `localhost` over IPv6 first for UDP. They find
@@ -382,9 +412,20 @@ you would rather keep the name.
   it; when that fills, a plain message is dropped, and a `reliable` one closes the
   connection so the page joins again rather than miss it. Nothing is kept for a page
   while it is away.
+- **What pages send waits for the handler within bounds**, counted in bytes: 4 MiB a page,
+  an eighth of the total a client, a quarter a channel, 256 MiB in all (or `--max-memory`).
+  A page past its share is held back, its socket unread, and loses nothing; a WebTransport
+  datagram past it is dropped. A message sent in parts, or over 4 KiB, must be whole within
+  10 s and a second for each 16 KiB that came *(since 0.8.9)*.
+- **A WebTransport session counts as a WebSocket does**, among the 4,096 connections a
+  server keeps open (256 for one client); it opens at most 8 streams of media frames and 2
+  both ways, and may have 1 MiB a stream, and 4 MiB in all, on its way before the server
+  reads it *(since 0.8.9: it was not counted, and one session could hold about 100 MiB)*.
 - **A page's session is the one it connected with.** Someone who signs in afterwards is
-  seen so by `join` and `channel.on` once the page reconnects. A page that reconnects has
-  a new `peer.id`.
+  seen so by `join` and `channel.on` once the page reconnects. In a program that mounts
+  others, it is its own program's: another program's handlers see none for it *(since
+  0.8.9: a session a visitor set in one program was taken by another's `join`)*. A page
+  that reconnects has a new `peer.id`.
 - **No presence list** beyond `channel.peers(name)` and what `join` and `leave` record.
 - **So many names and streams.** Pages may ask of 4,096 channel names in all; past that,
   a page asking to join a new one is told no. Pages make at most 1,024 streams, 256 a
@@ -399,8 +440,9 @@ you would rather keep the name.
 - **No WebRTC and no TURN.** Pages talk to the server, never to each other directly; the
   server relays video. Streams are not recorded; have the encoder write a copy.
 - **UDP is plain**, IPv4 unless `host: "::"`, without multicast or DTLS. RTP has no
-  RTCP or SRTP, and any sender that reaches a port is taken: keep media ports to the
-  camera's network.
+  RTCP or SRTP: `media.rtp` listens on 127.0.0.1 unless `host` says, and takes one sender
+  at a time *(since 0.8.9: any sender that reached a port was taken)*, so keep media ports
+  to the camera's network.
 - **No WebSocket of your own.** Channels are the way a page's messages reach the
   program.
 
