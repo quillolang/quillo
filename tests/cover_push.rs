@@ -946,6 +946,7 @@ fn a_session_too_full_for_an_id_is_never_named() {
     let d = dir("full", OFFLINE);
     assert_eq!(check_lines(&d), (true, vec![]));
     let s = run(&d, &[], &[]);
+    let made = std::time::Instant::now();
     let named = support::send(s.port, "GET", "/fill/2800", &[], "");
     let tag = named.header("x-quillo-session").expect("named").to_string();
     assert_eq!(tag.len(), 16);
@@ -969,7 +970,16 @@ fn a_session_too_full_for_an_id_is_never_named() {
     let page = support::send(s.port, "GET", "/mine", &[("cookie", &format!("{}; quillo_tag=old", small))], "");
     assert!(page.body.contains("<h1>2800</h1>"), "{}", page.body);
     assert_eq!((page.header("x-quillo-session"), page.header("x-quillo-offline")), (Some(tag.as_str()), Some("private")));
-    assert_eq!(tag_cookie(&page), Some(format!("quillo_tag={}; Path=/; Max-Age=2592000; Secure; SameSite=Lax", tag)));
+    // Set again for what is left of the session's 30 days, in whole seconds: a second's boundary
+    // between the two requests makes it 2591999, as CI's run of 0.8.9 met (a test that held the
+    // clock still, not a change; branch feedback75).
+    let line = tag_cookie(&page).expect("set again");
+    let age: u64 = line
+        .strip_prefix(&format!("quillo_tag={}; Path=/; Max-Age=", tag))
+        .and_then(|r| r.strip_suffix("; Secure; SameSite=Lax"))
+        .and_then(|a| a.parse().ok())
+        .unwrap_or_else(|| panic!("{}", line));
+    assert!(age <= 2592000 && 2592000 - age <= made.elapsed().as_secs() + 1, "{}", line);
 }
 
 /// A page that did not read the session, in a program with offline routes: a session cookie that
