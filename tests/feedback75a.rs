@@ -467,15 +467,22 @@ fn a_pages_messages_wait_within_their_bytes_held_to_max_memory() {
         assert!(!finished(&sending, 2), "the page's messages were all read while the handler waited");
         assert_eq!(r.get("/go"), "going");
         assert!(finished(&sending, 30), "the page never got to send");
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // Each message is handled in turn; CI's unoptimized build takes over 30 s for all 64, so
+        // the wait ends only when none has been handled for 30 s (changed with FEEDBACK75.md,
+        // Q-1056's CI run: 60 of 64 handled, none dropped; branch feedback75).
+        let (mut seen, mut since) = (0, Instant::now());
         let got = loop {
             let g = settled(&r);
             if g.len() == 64 {
                 break g;
             }
+            if g.len() > seen {
+                (seen, since) = (g.len(), Instant::now());
+            }
             let metrics = r.get("/_quillo/metrics");
             let dropped = metrics.lines().find(|l| l.starts_with("quillo_channel_dropped_total")).unwrap_or("");
-            assert!(Instant::now() < deadline, "{} of 64 handled ({}); the log ends:\n{}", g.len(), dropped, r.log().lines().rev().take(20).collect::<Vec<_>>().join("\n"));
+            assert!(since.elapsed() < Duration::from_secs(30), "{} of 64 handled ({}); the log ends:\n{}", g.len(), dropped, r.log().lines().rev().take(20).collect::<Vec<_>>().join("\n"));
+            std::thread::sleep(Duration::from_millis(50));
         };
         assert!(got.iter().all(|n| *n == chars), "{:?}", got);
         // The page goes on: its next message is taken.
