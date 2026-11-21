@@ -4426,10 +4426,27 @@ pub fn css_value(s: &str) -> String {
 /// a declaration of: `${x ?? "black"}`, `${big && "x: 1;"}` and `${a || b}` choose as before,
 /// their values given here (found in the second review).
 fn css_value_fn(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let v = arg(&args, 0);
+    css_value_of(arg(&args, 0), line)
+}
+
+/// What `__css_value` gives for `v`, which the interpreter works out without a call where the
+/// parser put it (`Interp::eval`; FEEDBACK79.md, Q-1250, third review's speed check). An error
+/// stays an error, so `??` still chooses, its contents escaped as a value's: shown, they are
+/// written unquoted where they are markup or a map's keys, and `err(<b>{v}</b>)` added
+/// declarations, and Q-668's `}` was back in css`...` in a `<style>` (third review).
+pub fn css_value_of(v: Value, line: u32) -> R {
     match &v {
-        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Err(..) => return Ok(v),
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) => return Ok(v),
         Value::Str(s) if !crate::interp::css_special(s) => return Ok(v),
+        Value::Err(e, own, at) => {
+            let t = match &**e {
+                Value::Str(s) => s.to_string(),
+                other => other.display_held().map_err(|o| o.at(line))?,
+            };
+            let mut out = String::with_capacity(t.len() + 16);
+            crate::interp::css_escape_into(&t, &mut out, false);
+            return Ok(Value::Err(Arc::new(Value::str(&out)), *own, *at));
+        }
         _ => {}
     }
     let t = v.display_held().map_err(|o| o.at(line))?;

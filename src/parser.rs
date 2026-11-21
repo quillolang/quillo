@@ -30,82 +30,118 @@ pub const VOID_TAGS: &[&str] =
 /// A `style`'s expression, as Go's html/template has it: every value put into a template that
 /// reaches the style is escaped as one CSS value (`__css_value`), and every piece of text the
 /// program wrote stays as written (FEEDBACK79.md, Q-1250, decided in the second review; branch
-/// feedback72-81). Each template reached as the style's value is looked for: through a branch,
-/// `+`, `&&`, `||`, `??`, a call's arguments (`trim(...)`, `join([...])`), a list, a pipe, a
-/// block's statements; not a lambda's body, nor a style map's values (escaped as they are written,
-/// Q-668), nor css`...`, whose own values are escaped already and which is the program's way to
-/// compose declarations. A template made apart (a `let`, a function) and given whole
-/// (`style={s}`) is the program's whole value. In a loop, not by recursion.
+/// feedback72-81). Every template in the expression is taken for style text, wherever it stands:
+/// in a branch, `+`, a call (its callee and receiver too: `` `...`.trim() ``, `[...].join("; ")`),
+/// a list, a map, a field, an index, a `?`, a `for` or a `while`, a block's statements, a lambda's
+/// body (`map(xs, (x) => `...`)`); not a tagged css`...`, whose values the parser escaped already
+/// and which is the program's way to compose declarations, nor a style map's own values (escaped
+/// as they are written, Q-668), nor markup. A template made apart (a top-level `let`, a function)
+/// and given whole (`style={s}`) is the program's whole value (third review). In a loop, not by
+/// recursion.
 fn style_values(v: &mut Expr, line: u32) {
+    if matches!(v, Expr::Map(_)) {
+        return;
+    }
     let mut todo = vec![v];
     while let Some(e) = todo.pop() {
         if css_tag(e) {
             continue;
         }
-        match e {
-            Expr::Template(parts) => {
-                for p in parts.iter_mut() {
-                    if let TPart::Expr(x) = p {
-                        css_leaves(x, line);
-                    }
+        if let Expr::Template(parts) = e {
+            for p in parts.iter_mut() {
+                if let TPart::Expr(x) = p {
+                    css_leaves(x, line);
                 }
             }
-            Expr::Call(_, args, _) => todo.extend(args.iter_mut()),
-            Expr::If(_, a, b) => {
+        }
+        match e {
+            Expr::Lit(_) | Expr::Ident(..) | Expr::Html(..) => {}
+            Expr::Template(parts) => todo.extend(parts.iter_mut().filter_map(|p| match p {
+                TPart::Expr(x) => Some(x),
+                TPart::Lit(_) => None,
+            })),
+            Expr::List(xs) => todo.extend(xs.iter_mut()),
+            Expr::Map(kvs) => todo.extend(kvs.iter_mut().map(|(_, x)| x)),
+            Expr::Unary(_, a, _) | Expr::Field(a, _, _) | Expr::Try(a) => todo.push(&mut **a),
+            Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) | Expr::Pipe(a, b, _) | Expr::Index(a, b, _) | Expr::While(a, b, _) | Expr::For(_, a, b, _) => {
+                todo.push(&mut **a);
+                todo.push(&mut **b);
+            }
+            Expr::Call(f, args, _) => {
+                todo.push(&mut **f);
+                todo.extend(args.iter_mut());
+            }
+            Expr::If(c, a, b) => {
+                todo.push(&mut **c);
                 todo.push(&mut **a);
                 if let Some(b) = b {
                     todo.push(&mut **b);
                 }
             }
-            Expr::Match(_, arms, _) => todo.extend(arms.iter_mut().map(|a| &mut a.body)),
-            Expr::Coalesce(a, b) | Expr::Binary(_, a, b, _) | Expr::Pipe(a, b, _) => {
-                todo.push(&mut **a);
-                todo.push(&mut **b);
+            Expr::Match(x, arms, _) => {
+                todo.push(&mut **x);
+                for arm in arms.iter_mut() {
+                    if let Some(g) = &mut arm.guard {
+                        todo.push(g);
+                    }
+                    todo.push(&mut arm.body);
+                }
             }
-            Expr::List(items) => todo.extend(items.iter_mut()),
             Expr::Block(stmts) => {
                 for st in stmts.iter_mut() {
                     match st {
-                        Stmt::Let(_, x, _) | Stmt::Expr(x) | Stmt::Assign(_, _, x, _) => todo.push(x),
+                        Stmt::Let(_, x, _) | Stmt::Expr(x) | Stmt::Assign(_, _, x, _) | Stmt::State(_, x, _) | Stmt::Return(Some(x), _) => todo.push(x),
+                        Stmt::SetField(o, _, _, x, _) => {
+                            todo.push(o);
+                            todo.push(x);
+                        }
                         _ => {}
                     }
                 }
             }
-            _ => {}
+            // Made while the source is read: no one else holds it yet.
+            Expr::Lambda(d) => {
+                if let Some(d) = Arc::get_mut(d) {
+                    todo.push(&mut d.body);
+                }
+            }
+            Expr::Reply(s, b, _) => {
+                todo.push(&mut **s);
+                if let Some(b) = b {
+                    todo.push(&mut **b);
+                }
+            }
         }
     }
 }
 
-/// What a `${...}` of a style's template puts in, down to its leaves: a string or `null` stays (the
-/// program's text), a template keeps its own text and goes on into its values, css`...` passes, a
-/// branch of a `? :`, `if`, `match`, `??`, `&&` or `||` is looked into (`${big && "x: 1;"}` keeps
-/// the string and escapes `big`, which may show as `false`); any other value (a name, a call, a
-/// field) is given to `__css_value`. In a loop, not by recursion.
+/// What a `${...}` of a style's template puts in, down to its leaves: a literal stays (the
+/// program's text), a template too (its own values are `style_values`'), as does css`...` and a
+/// value given to `__css_value` already; a branch of a `? :`, `if`, `match`, `??`, `&&` or `||` is
+/// looked into (`${big && "x: 1;"}` keeps the string and escapes `big`, whose bool `__css_value`
+/// gives back as it is); any other value (a name, a call, a field) is given to `__css_value`. In a
+/// loop, not by recursion.
 fn css_leaves(x: &mut Expr, line: u32) {
     let mut todo = vec![x];
     while let Some(e) = todo.pop() {
-        if css_tag(e) {
+        if css_tag(e) || css_wrapped(e) || matches!(e, Expr::Lit(_) | Expr::Template(_)) {
             continue;
         }
         let looked_into = match &*e {
-            Expr::Lit(Lit::Str(_) | Lit::Nil) | Expr::Template(_) | Expr::If(..) | Expr::Match(..) | Expr::Coalesce(..) => true,
-            Expr::Binary(BinOp::And | BinOp::Or, ..) => true,
+            Expr::If(..) | Expr::Match(..) | Expr::Coalesce(..) | Expr::Binary(BinOp::And | BinOp::Or, ..) => true,
             Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(_))),
             _ => false,
         };
+        // A choice whose strings have nothing escaping would change (`${c ?? "black"}`, `${big ? c :
+        // "none"}`) is given whole: it writes the same, and is one value worked out as a direct
+        // `${v}` is, where each of its values given apart cost a call (third review's speed check).
+        let looked_into = looked_into && keeps_text(e);
         if !looked_into {
             let y = std::mem::replace(e, Expr::Lit(Lit::Nil));
             *e = Expr::Call(Box::new(Expr::Ident("__css_value".into(), line)), vec![y], line);
             continue;
         }
         match e {
-            Expr::Template(parts) => {
-                for p in parts.iter_mut() {
-                    if let TPart::Expr(y) = p {
-                        todo.push(y);
-                    }
-                }
-            }
             Expr::If(_, a, b) => {
                 todo.push(&mut **a);
                 if let Some(b) = b {
@@ -113,7 +149,7 @@ fn css_leaves(x: &mut Expr, line: u32) {
                 }
             }
             Expr::Match(_, arms, _) => todo.extend(arms.iter_mut().map(|a| &mut a.body)),
-            Expr::Coalesce(a, b) | Expr::Binary(BinOp::And | BinOp::Or, a, b, _) => {
+            Expr::Coalesce(a, b) | Expr::Binary(_, a, b, _) => {
                 todo.push(&mut **a);
                 todo.push(&mut **b);
             }
@@ -127,9 +163,56 @@ fn css_leaves(x: &mut Expr, line: u32) {
     }
 }
 
-/// css`...` as the parser writes it: `css(`...`)`, its values given to `__css_value` already.
+/// Whether a choice `css_leaves` would look into holds text it must keep as written: a string with
+/// a byte escaping changes, a template, or css`...` (whose text the escape would change too).
+fn keeps_text(e: &Expr) -> bool {
+    let mut todo = vec![e];
+    while let Some(e) = todo.pop() {
+        match e {
+            Expr::Lit(Lit::Str(s)) if s.bytes().any(|b| matches!(b, b'{' | b'}' | b';' | b'\\' | b'&')) => return true,
+            Expr::Template(_) => return true,
+            _ if css_tag(e) => return true,
+            Expr::If(_, a, b) => {
+                todo.push(a);
+                if let Some(b) = b {
+                    todo.push(b);
+                }
+            }
+            Expr::Match(_, arms, _) => todo.extend(arms.iter().map(|a| &a.body)),
+            Expr::Coalesce(a, b) | Expr::Binary(BinOp::And | BinOp::Or, a, b, _) => {
+                todo.push(a);
+                todo.push(b);
+            }
+            Expr::Block(stmts) => {
+                if let Some(Stmt::Expr(last)) = stmts.last() {
+                    todo.push(last);
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `__css_value(x)`, as `css_leaves` writes it.
+fn css_wrapped(e: &Expr) -> bool {
+    matches!(e, Expr::Call(f, args, _) if args.len() == 1 && matches!(&**f, Expr::Ident(n, _) if n == "__css_value"))
+}
+
+/// A tagged css`...`, as the parser writes it: `css(`...`)` whose values are each given to
+/// `__css_value` already. An explicit `css(`...`)` call is an ordinary call, its template's values
+/// not escaped yet, and its template is walked as any other (third review).
 fn css_tag(e: &Expr) -> bool {
-    matches!(e, Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if n == "css") && matches!(args.as_slice(), [Expr::Template(_)]))
+    match e {
+        Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if n == "css") => match args.as_slice() {
+            [Expr::Template(parts)] => parts.iter().all(|p| match p {
+                TPart::Expr(x) => css_wrapped(x),
+                TPart::Lit(_) => true,
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 /// Whether an element starts an XML answer's markup, where HTML's void names are XML's elements

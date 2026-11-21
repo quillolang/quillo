@@ -1281,7 +1281,7 @@ fn css_escaped_into(v: &Value, out: &mut Held) {
     match v {
         Value::Int(n) => push_int(out, *n),
         Value::Str(s) if next_special_in::<true>(s.as_bytes(), 0) == s.len() => push_short(out, s),
-        Value::Nil | Value::Bool(_) | Value::Float(_) | Value::Dec(_) | Value::Err(..) => display_escaped(v, out),
+        Value::Nil | Value::Bool(_) | Value::Float(_) | Value::Dec(_) => display_escaped(v, out),
         other => css_other_into(other, out),
     }
 }
@@ -1290,11 +1290,22 @@ fn css_escaped_into(v: &Value, out: &mut Held) {
 fn css_other_into(v: &Value, out: &mut Held) {
     match v {
         Value::Str(s) => css_escape_into(s, out, true),
+        // An error, its contents escaped, as `__css_value` gives it (`builtins::css_value_of`).
+        Value::Err(..) => match crate::builtins::css_value_of(v.clone(), 0) {
+            Ok(e) => display_escaped(&e, out),
+            Err(_) => out.stop(),
+        },
         other => match other.display_held() {
             Ok(t) => css_escape_into(&t, out, true),
             Err(_) => out.stop(),
         },
     }
+}
+
+/// The parser's `__css_value`, as a callee: its name's length first, which most callees' is not.
+#[inline(always)]
+fn css_value_call(callee: &Expr) -> bool {
+    matches!(callee, Expr::Ident(n, _) if n.len() == 11 && &**n == "__css_value")
 }
 
 /// Whether `s` has a byte `css_escape_into` writes otherwise.
@@ -4020,6 +4031,13 @@ impl Interp {
                 }
             }
             Expr::Pipe(lhs, rhs, line) => self.eval_pipe(lhs, rhs, env, *line),
+            // `__css_value(v)`, which the parser puts around a style template's values: worked out
+            // here, with no call made, as each costs a call's ~750 instructions (FEEDBACK79.md,
+            // Q-1250, third review's speed check; branch feedback72-81).
+            Expr::Call(callee, args, line) if args.len() == 1 && css_value_call(callee) => {
+                let v = self.eval(&args[0], env)?;
+                crate::builtins::css_value_of(v, *line)
+            }
             Expr::Call(callee, args, line) => self.eval_call(callee, args, None, env, *line),
             Expr::Field(obj, name, line) => {
                 // A local map's field, without a copy of the map.
@@ -7404,7 +7422,16 @@ impl Interp {
                 TPart::Lit(t) => out.push_str(t),
                 TPart::Expr(x) => {
                     at = part_line(x).max(at);
-                    match self.eval(x, env)? {
+                    let v = match x {
+                        // A style template's value (`__css_value`), with no level of `eval` more:
+                        // a number as it is (FEEDBACK79.md, Q-1250, third review's speed check).
+                        Expr::Call(f, args, line) if args.len() == 1 && css_value_call(f) => match self.eval(&args[0], env)? {
+                            n @ Value::Int(_) => n,
+                            v => crate::builtins::css_value_of(v, *line)?,
+                        },
+                        x => self.eval(x, env)?,
+                    };
+                    match v {
                         Value::Str(t) => out.push_str(&t),
                         Value::Int(n) => push_int(out, n),
                         v if self.printing => out.push_str(&crate::value::told(|| v.display())),

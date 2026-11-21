@@ -562,6 +562,126 @@ route GET / = <html><body><P/></body></html>
     assert_eq!(v["errors"], serde_json::json!([]), "{}", v);
 }
 
+/// Every template in a style's expression is style text, wherever it stands: a method's receiver,
+/// an index, a field, a `?`, a map given to a call, a `for`, a loop that builds the text in a
+/// block, a lambda's body; an explicit `css(...)` call is an ordinary call; an error's contents are
+/// escaped, markup and a map's keys too, and css`...` in a `<style>` is Q-668's again (third
+/// review).
+#[test]
+fn every_template_in_a_style_is_style_text_and_an_errors_contents_are_escaped() {
+    let out = run(r#"let v = trim(" red; background: blue ")
+let ds = [{ k: "color", v: v }]
+fn f() = `color: ${v}`
+print(<p style={[`color: ${v}`, "top: 0"].join("; ")}>listjoin</p>)
+print(<p style={`color: ${v}`?}>try</p>)
+print(<p style={`color: ${v}`.trim()}>trim</p>)
+print(<p style={`color: ${v}`.replace("x", "y")}>replace</p>)
+print(<p style={[`color: ${v}`][0]}>index</p>)
+print(<p style={{ a: `color: ${v}` }.a}>field</p>)
+print(<p style={join(values({ a: `color: ${v}` }), "; ")}>mapcall</p>)
+print(<p style={join(for d in ds => `${d.k}: ${d.v}`, "; ")}>for</p>)
+print(<p style={ds.map((d) => `${d.k}: ${d.v}`).join("; ")}>lambda</p>)
+print(<p style={{
+    let s = ""
+    for d in ds {
+        s = s + `${d.k}: ${d.v};`
+    }
+    s
+}}>loop</p>)
+print(<p style={f()}>helper</p>)
+print(<p style={css(`color: ${v}`)}>css</p>)
+print(<p style={`a: 1; ${css(`color: ${v}`)}`}>innercss</p>)
+print(<p style={css`color: ${v}; top: 0`}>tagged</p>)
+print(<p style={`color: ${err(<b>{"x); background: blue; y: ("}</b>)}`}>errhtml</p>)
+print(<p style={`color: ${err(set({}, "x); background: blue; y: (", 1))}`}>errkey</p>)
+print(<p style={`color: ${err(v) ?? "black"}`}>errchoice</p>)
+print(<style>{css`.a { color: ${err("x} body { display: none } .y {")} }`}</style>)
+"#);
+    for want in [
+        r#"<p style="color: red\3b  background: blue; top: 0">listjoin</p>"#,
+        r#"<p style="color: red\3b  background: blue">trim</p>"#,
+        r#"<p style="color: red\3b  background: blue">try</p>"#,
+        r#"<p style="color: red\3b  background: blue">replace</p>"#,
+        r#"<p style="color: red\3b  background: blue">index</p>"#,
+        r#"<p style="color: red\3b  background: blue">field</p>"#,
+        r#"<p style="color: red\3b  background: blue">mapcall</p>"#,
+        r#"<p style="color: red\3b  background: blue">for</p>"#,
+        r#"<p style="color: red\3b  background: blue">lambda</p>"#,
+        r#"<p style="color: red\3b  background: blue;">loop</p>"#,
+        // A function's text, given whole: the program's own value, as decided.
+        r#"<p style="color: red; background: blue">helper</p>"#,
+        r#"<p style="color: red\3b  background: blue">css</p>"#,
+        r#"<p style="a: 1; color: red\5c 3b  background: blue">innercss</p>"#,
+        r#"<p style="color: red\3b  background: blue; top: 0">tagged</p>"#,
+        r#"<p style="color: err(&quot;&lt;b&gt;x)\\3b  background: blue\\3b  y: (&lt;/b&gt;&quot;)">errhtml</p>"#,
+        r#"<p style="color: err(&quot;\\7b  \&quot;x)\\3b  background: blue\\3b  y: (\&quot;: 1 \\7d &quot;)">errkey</p>"#,
+        r#"<p style="color: black">errchoice</p>"#,
+        r#"<style>.a { color: err("x\\7d  body \\7b  display: none \\7d  .y \\7b ") }</style>"#,
+    ] {
+        assert!(out.contains(want), "{}\n{}", want, out);
+    }
+}
+
+/// The browser writes the same as the server, byte for byte, for each of those it can make.
+#[test]
+fn the_browser_writes_those_styles_as_the_server_does() {
+    let src = r#"component C() {
+    state v = "red; background: blue"
+    state ds = [{ k: "color", v: "red; background: blue" }]
+    state shown = false
+    <div>
+        <section id="server">
+            <p style={[`color: ${v}`, "top: 0"].join("; ")}>1</p>
+            <p style={`color: ${v}`.trim()}>2</p>
+            <p style={join(for d in ds => `${d.k}: ${d.v}`, "; ")}>3</p>
+            <p style={ds.map((d) => `${d.k}: ${d.v}`).join("; ")}>4</p>
+            <p style={css(`color: ${v}`)}>5</p>
+            <p style={`color: ${err(v)}`}>6</p>
+            <p style={`color: ${err(v) ?? "black"}`}>7</p>
+        </section>
+        <button id="t" onclick={() => { shown = true }}>t</button>
+        {shown ? <section id="browser">
+            <p style={[`color: ${v}`, "top: 0"].join("; ")}>1</p>
+            <p style={`color: ${v}`.trim()}>2</p>
+            <p style={join(for d in ds => `${d.k}: ${d.v}`, "; ")}>3</p>
+            <p style={ds.map((d) => `${d.k}: ${d.v}`).join("; ")}>4</p>
+            <p style={css(`color: ${v}`)}>5</p>
+            <p style={`color: ${err(v)}`}>6</p>
+            <p style={`color: ${err(v) ?? "black"}`}>7</p>
+        </section> : null}
+    </div>
+}
+route GET / = <html><body><C/></body></html>
+"#;
+    let Some(v) = in_page(
+        "styles-third",
+        src,
+        "/",
+        r#"const look = (sec) => [...$(sec).querySelectorAll("p")].map((e) => [e.getAttribute("style"), getComputedStyle(e).backgroundColor]);
+  const server = look("server");
+  $("t").click();
+  await tick(100);
+  return { server, browser: look("browser") };"#,
+        true,
+    ) else {
+        return;
+    };
+    let none = "rgba(0, 0, 0, 0)";
+    let one = r"color: red\3b  background: blue";
+    let want = serde_json::json!([
+        [format!("{}; top: 0", one), none],
+        [one, none],
+        [one, none],
+        [one, none],
+        [one, none],
+        [r#"color: err("red\\3b  background: blue")"#, none],
+        ["color: black", none],
+    ]);
+    assert_eq!(v["server"], want, "{}", v);
+    assert_eq!(v["browser"], want, "{}", v);
+    assert_eq!(v["remade"], 0, "{}", v);
+}
+
 // ---- Q-1259: HTML's void names in an XML answer ---------------------------------------------
 
 /// An Atom feed's `<link href="..."/>` ends as XML has it; an RSS channel's `<link>` holds its

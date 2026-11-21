@@ -3188,10 +3188,11 @@ B.t_html = (k, vars) => rawHtml(translate(k, vars, true));
 B.url = meta(() => currentUrl(), "url", null);
 B.css = meta((s) => S(s, "css"), "css", null);
 // And `&` as `\26 `, as on the server, for a sheet in <svg> or <math> (FEEDBACK55.md, Q-707; branch feedback55).
-// A text, a list, a map or markup as one CSS value; null, a bool, a number and an error as they are,
-// as on the server, so `??`, `&&` and `||` choose as before (FEEDBACK79.md, Q-1250; branch
-// feedback72-81).
-B.__css_value = meta((v) => (typeof v === "string" || Array.isArray(v) || isMap(v) || v instanceof Html ? cssValue(display(v)).replace(/&/g, "\\26 ") : v), "__css_value", null);
+// A text, a list, a map or markup as one CSS value; null, a bool and a number as they are, and an
+// error as an error of its contents escaped so, as on the server (`css_value_of`), so `??`, `&&`
+// and `||` choose as before (FEEDBACK79.md, Q-1250; branch feedback72-81).
+const cssOne = (v) => cssValue(display(v)).replace(/&/g, "\\26 ");
+B.__css_value = meta((v) => (v instanceof Err ? new Err(cssOne(v.error), v.own) : typeof v === "string" || Array.isArray(v) || isMap(v) || v instanceof Html ? cssOne(v) : v), "__css_value", null);
 B.sql = meta((s) => S(s, "sql"), "sql", null);
 // A run the page moved under does not move it again: once the person went to another page (a link,
 // Back or Forward, a link or a form the browser follows itself) or a run that began after it moved
