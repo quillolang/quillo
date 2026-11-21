@@ -1298,3 +1298,40 @@ route GET / = <html><body><pre id="sp">{{sweep_plain()}}</pre><pre id="sc">{{swe
     }
     assert!(differ.is_empty(), "{}", differ.join("\n"));
 }
+
+/// Node, for a compiled script (`quillo::client::test_script`): what it prints, or None without node.
+fn in_node(js: &str) -> Option<String> {
+    if !Command::new("node").arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        return None;
+    }
+    let d = support::temp_dir("f7281-css-node");
+    std::fs::write(d.join("t.cjs"), js).unwrap();
+    let mut c = Command::new("node");
+    c.arg(d.join("t.cjs")).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    let st = wait_for(&mut child, Duration::from_secs(30)).expect("node did not end");
+    let mut out = String::new();
+    child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    assert!(st.success(), "{}", out);
+    let _ = std::fs::remove_dir_all(&d);
+    Some(out.trim().to_string())
+}
+
+/// A count given to t() as css`...` text is a count on both sides: the server read it as its text,
+/// the browser took the Css object for no number and chose `other` (found in the docs pass of the
+/// trusted CSS; FEEDBACK79.md, Q-1250; branch feedback72-81). Plain text and numbers as before.
+#[test]
+fn a_css_count_in_t_is_a_count_on_both_sides() {
+    let src = "translations({ \"en\": { k: { one: \"one\", other: \"other\" } } })\nfn __t() = [css`1`, css`2`, css` 1 `, \"1\", 1, 2] | map((c) => t(\"k\", { count: c }))\n";
+    let mut it = quillo::Interp::new(".");
+    it.load_source(src, "case.qwe").unwrap_or_else(|e| panic!("{}", e));
+    let f = quillo::value::lookup(&it.globals, "__t").unwrap();
+    let server: serde_json::Value = serde_json::from_str(&quillo::value::js_numbers(true, || it.call(&f, vec![], 0)).unwrap_or_else(|_| panic!("__t failed")).repr()).unwrap();
+    assert_eq!(server, serde_json::json!(["one", "other", "one", "one", "one", "other"]));
+    let script = quillo::client::test_script(&it, "__t").unwrap();
+    let i18n = it.site.i18n.clone().unwrap();
+    let words = i18n.browser_json(&i18n.best("en").unwrap(), None);
+    let Some(out) = in_node(&format!("globalThis.window = {{ [Symbol.for(\"quillo\")]: {{ i18n: {} }} }};\n{}", words, script)) else { return };
+    let browser: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{}: {}", e, out));
+    assert_eq!(browser, server);
+}

@@ -2999,6 +2999,9 @@ const plural = (locale, o) => {
 // trimmed as Rust trims (not `0x1`, which Number reads) (FEEDBACK30.md,
 // Q-367; FEEDBACK55.md, Q-832; branch feedback55).
 const pluralCount = (c, shown) => {
+  // Trusted CSS is its text here, as on the server (found in the docs pass of FEEDBACK79.md's
+  // Q-1250 trusted CSS; branch feedback72-81).
+  c = un(c);
   if (typeof c === "number" || c instanceof Fl) {
     const x = numOf(c);
     if (Number.isSafeInteger(x)) return pluralInt(Math.abs(x));
