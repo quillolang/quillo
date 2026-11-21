@@ -1367,9 +1367,11 @@ impl Interp {
 
         let mut path_matched = false;
         let mut method_matched = false;
-        // The first route whose method and path took the request, and the pattern it missed,
-        // for what the 400 says (FEEDBACK47.md, Q-544).
-        let mut closest: Option<(Arc<crate::ast::RouteDef>, crate::ast::Pattern, Value, &'static str, Mode)> = None;
+        // Each route whose method and path took the request, and the pattern it missed (by its
+        // place among the route's checks), for what the 400 says (FEEDBACK47.md, Q-544); the closest
+        // is picked from them only for a 400: the first in the file was named, however far off
+        // (FEEDBACK79.md, Q-1257; branch feedback72-81).
+        let mut misses: Vec<(Arc<crate::ast::RouteDef>, usize, Value, &'static str, Mode)> = Vec::new();
         // The groups whose middleware gave null (see `no_match_of`).
         let mut excluded: Vec<Vec<(Option<Arc<str>>, u32)>> = Vec::new();
         // The methods the path takes, for `Allow` (FEEDBACK36.md, Q-440; branch feedback36-39).
@@ -1424,14 +1426,12 @@ impl Interp {
                 .chain(r.guards.iter().map(|g| (Some(g), &reqv, Mode::Request, "")))
                 .chain(std::iter::once((r.body_pat.as_ref(), &reqv, Mode::Request, "")));
             let mut matched = true;
-            for (pat, val, mode, place) in checks {
+            for (at, (pat, val, mode, place)) in checks.enumerate() {
                 let Some(pat) = pat else { continue };
                 match self.match_pat(pat, val, mode, &scope, &mut binds) {
                     Ok(Some(_)) => {}
                     Ok(None) => {
-                        if closest.is_none() {
-                            closest = Some((r.clone(), pat.clone(), val.clone(), place, mode));
-                        }
+                        misses.push((r.clone(), at, val.clone(), place, mode));
                         matched = false;
                         break;
                     }
@@ -1444,6 +1444,17 @@ impl Interp {
             }
             for (k, v) in binds {
                 define(&scope, &k, v);
+            }
+            // A form field the pattern names that came as a file, which only `request.files`
+            // holds: the route ran with its default, and nothing said why (FEEDBACK79.md, Q-1252;
+            // branch feedback72-81). Looked at only for a multipart body (its first boundary's
+            // `--`, as browsers send it), and then only when files came.
+            if let (Some(pat), Value::Map(m), true) = (r.body_pat.as_ref(), &reqv, req.body.starts_with(b"--")) {
+                if m.get("files").is_some_and(|f| matches!(f, Value::Map(fs) if !fs.is_empty())) {
+                    for why in self.files_in_form(pat, &reqv) {
+                        crate::httpd::warning_line(&format!("{} ({}): {}", r.shown(), route_written_at(&r), why));
+                    }
+                }
             }
             // The request as sent, for a group's middleware: a pattern binding `request` binds the
             // route's own name, never this one (FEEDBACK47.md, Q-535; branch feedback40-43). After
@@ -1528,24 +1539,26 @@ impl Interp {
                     method_matched = true;
                 }
             }
-            if closest.as_ref().is_some_and(|c| out(&c.0)) {
-                closest = None;
-            }
+            misses.retain(|c| !out(&c.0));
         }
         if method_matched {
             // Which route came closest, and its first miss: in the log always, and under `--watch`
-            // in the answer too, as a 400 nobody can explain is a guess (Q-544).
-            let why = closest.map(|(r, pat, val, place, mode)| {
-                // The file as from where the program was started, as other messages give it.
-                let at = match r.file.as_deref() {
-                    Some(file) => {
-                        let cwd = std::env::current_dir().ok();
-                        let file = cwd.as_ref().and_then(|d| std::path::Path::new(file).strip_prefix(d).ok()).map_or(file.to_string(), |p| p.display().to_string());
-                        format!("{}:{}", file, r.line)
-                    }
-                    None => format!("line {}", r.line),
-                };
-                format!("{} ({}): {}", r.shown(), at, self.why_no_match(&pat, &val, place, mode))
+            // in the answer too, as a 400 nobody can explain is a guess (Q-544). Closest: a route
+            // whose body is of the kind the request's content-type says (`form`, `json`) before one
+            // whose is not, then the one whose missed pattern matched the most fields; on a tie the
+            // first written (FEEDBACK79.md, Q-1257; branch feedback72-81).
+            let kind = body_kind_sent(req);
+            let mut closest: Option<((bool, usize), &(Arc<crate::ast::RouteDef>, usize, Value, &'static str, Mode))> = None;
+            for m in &misses {
+                let Some(pat) = check_pattern(&m.0, m.1) else { continue };
+                let score = (kind.is_some() && route_body_kind(&m.0) == kind, self.fields_matched(pat, &m.2, m.4));
+                if closest.as_ref().is_none_or(|(best, _)| score > *best) {
+                    closest = Some((score, m));
+                }
+            }
+            let why = closest.and_then(|(_, (r, at, val, place, mode))| {
+                let pat = check_pattern(r, *at)?;
+                Some(format!("{} ({}): {}", r.shown(), route_written_at(r), self.why_no_match(pat, val, place, *mode)))
             });
             if let Some(why) = &why {
                 crate::httpd::warning_line(&format!("400: {}", why));
@@ -1568,6 +1581,54 @@ impl Interp {
             plain(404, "not found\n")
         }
     }
+}
+
+/// Where a route is written, as from where the program was started, as other messages give it
+/// (Q-544).
+fn route_written_at(r: &crate::ast::RouteDef) -> String {
+    match r.file.as_deref() {
+        Some(file) => {
+            let cwd = std::env::current_dir().ok();
+            let file = cwd.as_ref().and_then(|d| std::path::Path::new(file).strip_prefix(d).ok()).map_or(file.to_string(), |p| p.display().to_string());
+            format!("{}:{}", file, r.line)
+        }
+        None => format!("line {}", r.line),
+    }
+}
+
+/// A route's check `at`, in the order `handle` tries them: its query pattern, its groups' patterns,
+/// its body pattern (FEEDBACK79.md, Q-1257; branch feedback72-81).
+fn check_pattern(r: &crate::ast::RouteDef, at: usize) -> Option<&crate::ast::Pattern> {
+    match at {
+        0 => r.query.as_ref(),
+        n if n <= r.guards.len() => r.guards.get(n - 1),
+        _ => r.body_pat.as_ref(),
+    }
+}
+
+/// The kind of body a request's content-type says it carries: "json" or "form"
+/// (FEEDBACK79.md, Q-1257; branch feedback72-81).
+fn body_kind_sent(req: &HttpRequest) -> Option<&'static str> {
+    let ctype = req.headers.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case("content-type"))?.1.to_ascii_lowercase();
+    let essence = ctype.split(';').next().unwrap_or("").trim();
+    if essence == "application/json" || essence.ends_with("+json") {
+        Some("json")
+    } else if essence == "application/x-www-form-urlencoded" || essence == "multipart/form-data" {
+        Some("form")
+    } else {
+        None
+    }
+}
+
+/// The kind of body a route's pattern takes: "json" for a `json` field, "form" for a `form` or
+/// `files` one (FEEDBACK79.md, Q-1257; branch feedback72-81).
+fn route_body_kind(r: &crate::ast::RouteDef) -> Option<&'static str> {
+    let Some(crate::ast::Pattern::Record(fields)) = &r.body_pat else { return None };
+    fields.iter().find_map(|f| match f.path.first().map(String::as_str) {
+        Some("json") => Some("json"),
+        Some("form" | "files") => Some("form"),
+        _ => None,
+    })
 }
 
 impl Interp {
@@ -1951,6 +2012,11 @@ impl Interp {
             }
             if let Some(v) = v {
                 resp.headers.push((k, v));
+            } else if k == "server" {
+                // `server: null` takes Quillo's `server: Quillo` away, as a route's own null does:
+                // the name's place, which the head's writer reads as the program's own (FEEDBACK79.md,
+                // Q-1256; branch feedback72-81).
+                resp.headers.push((k, DROPPED.into()));
             }
         }
         // An answer made from who the visitor is stays theirs, whatever its route, `file`'s
@@ -3992,6 +4058,28 @@ pub enum Loaded {
     Failed(String),
 }
 
+impl Loaded {
+    /// Whether the program has anything to answer over HTTP: a route (`files` routes, `build`s and
+    /// a page's among them), a server fn, a program or service mounted under a path, a channel or
+    /// a media stream (pages connect over HTTP: a WebSocket, a ticket for WebTransport), an MCP
+    /// door or tools its app's door calls, services of its own (their copies join it, and services
+    /// apart call back), or an app.toml's manifest. Not `every`, `udp.listen` or a job, which run
+    /// without a port (FEEDBACK72.md, Q-1011; branch feedback72-81). A program that did not load:
+    /// yes, as nothing is known of it.
+    pub fn serves_http(&self) -> bool {
+        let Loaded::Ready(it) = self else { return true };
+        it.routes.iter().any(|r| r.method != crate::ast::GUARD_METHOD)
+            || !it.server_fns.is_empty()
+            || !it.mounts.is_empty()
+            || !it.remote_mounts.is_empty()
+            || !it.site.channels.is_empty()
+            || it.offers_tools()
+            || it.has_door()
+            || !it.declared_services.is_empty()
+            || it.site.pwa.is_some()
+    }
+}
+
 /// The running program, which `--watch` swaps out when its files change.
 pub struct App {
     slot: Mutex<(u64, Arc<Loaded>)>,
@@ -4117,6 +4205,12 @@ impl App {
     fn current(&self) -> (u64, Arc<Loaded>) {
         let g = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         (g.0, g.1.clone())
+    }
+
+    /// Whether the program loaded has anything to answer over HTTP (see `Loaded::serves_http`;
+    /// FEEDBACK72.md, Q-1011; branch feedback72-81).
+    pub fn serves_http(&self) -> bool {
+        self.current().1.serves_http()
     }
 
     /// Loads the program again from disk and makes it current. A program that
@@ -5592,6 +5686,12 @@ impl Worker {
         if resp.status == 404 {
             resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(AS_WRITTEN));
         }
+        // The route's etag the browser holds makes it a 304 before it is logged and counted: made
+        // after, the log said 200 and the metrics a 2xx for an answer sent as a 304
+        // (FEEDBACK80.md, Q-1262; branch feedback72-81).
+        if streamed.is_none() {
+            not_modified(&req, &mut resp);
+        }
         // Chrome asks every site for this while DevTools is open; it is not
         // the program's business, so it is not logged.
         // Nor are the batches of UDP packets handed to the program: they are
@@ -5607,7 +5707,13 @@ impl Worker {
             || (req.url.starts_with("/_quillo/tick/") && resp.status == 200)
             // Channels between the app and a service apart, as channel
             // messages are (FEEDBACK12.md, Q-087; branch open-fixes); a refusal is logged.
-            || ((req.url.starts_with("/_quillo/service-channel") || req.url == "/_quillo/channel-relay") && resp.status == 200);
+            || ((req.url.starts_with("/_quillo/service-channel") || req.url == "/_quillo/channel-relay") && resp.status == 200)
+            // Nor an orchestrator's readiness probe, one every few seconds, as `/_quillo/health`
+            // is not: the guide says neither is logged or counted, and a 503 from one counted as
+            // a 5xx (FEEDBACK79.md, Q-1255; branch feedback72-81). Quillo's own answer only, at
+            // `/_quillo/ready` or a mounted program's or service's prefix before it, never a
+            // program's route that a path like it reached (found in review).
+            || self.readiness_probe(&req);
         if !delivery {
             crate::metrics::answered(resp.status, took);
         }
@@ -5654,9 +5760,20 @@ impl Worker {
             };
             return send_file(resp, what, req.method == "HEAD", &req.remote);
         }
-        not_modified(&req, &mut resp);
         compress(&req, &mut resp);
         Answer::Respond(resp)
+    }
+}
+
+impl Worker {
+    /// Whether `req` asked for Quillo's own `/_quillo/ready`: at the root, or under a prefix the
+    /// program mounts a program or a service at, which answer it before any route (FEEDBACK79.md,
+    /// Q-1255; branch feedback72-81).
+    fn readiness_probe(&self, req: &HttpRequest) -> bool {
+        let path = req.url.split('?').next().unwrap_or("");
+        let Some(prefix) = path.strip_suffix("/_quillo/ready") else { return false };
+        prefix.is_empty()
+            || self.local.as_ref().is_some_and(|it| it.mounts.iter().any(|(p, _)| p == prefix) || it.remote_mounts.iter().any(|(p, _)| p == prefix))
     }
 }
 
@@ -5667,7 +5784,9 @@ fn not_modified(req: &HttpRequest, resp: &mut HttpResponse) {
         return;
     }
     let (Some(etag), Some(asked)) = (resp.sent("etag"), req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("if-none-match"))) else { return };
-    if crate::statics::matches(&asked.1, etag) {
+    // Not a large file sent from disk, which `file()` judged already, as before this ran ahead of
+    // sending it (FEEDBACK80.md, Q-1262; branch feedback72-81).
+    if crate::statics::matches(&asked.1, etag) && resp.header(crate::statics::SEND_HEADER).is_none() {
         resp.status = 304;
         resp.body.clear();
     }
@@ -5816,6 +5935,48 @@ fn remove_if_mine(path: &Path, mine: Option<(u64, u64)>) {
     }
 }
 
+/// A program that keeps running (`every`, `udp.listen`, jobs) with nothing to serve over HTTP, and
+/// no port asked for: no port. It listened on 8080 all the same, answering 404, said "0 routes
+/// listening", and did not start beside the app on 8080 it fed (FEEDBACK72.md, Q-1011; branch
+/// feedback72-81). Its packets, ticks and jobs reach it as they reach any program, as requests to
+/// itself: here through a socket only this process knows of, in a folder only it can enter, as
+/// `quillo fcgi`'s own calls; in a short folder under /tmp where the temporary folder's path is too
+/// long for a socket's (found in review: a `$TMPDIR` of 63 bytes or more stopped the program); else
+/// (or on a system without Unix sockets) a port on 127.0.0.1 the system picks. Nothing is said of
+/// where.
+pub fn serve_portless(app: App, workers: usize) -> Result<(), String> {
+    take_descriptors();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let name = format!("quillo-self-{}", crate::service::new_id(16));
+        let mine = [std::env::temp_dir(), std::path::PathBuf::from("/tmp")].into_iter().find_map(|base| {
+            let dir = base.join(&name);
+            let own = dir.join("self.sock");
+            if own.as_os_str().len() > 100 || std::fs::DirBuilder::new().mode(0o700).create(&dir).is_err() {
+                return None;
+            }
+            match unix_listener(&own, 0o600) {
+                Ok(l) => Some((dir, own, l)),
+                Err(_) => {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    None
+                }
+            }
+        });
+        if let Some((dir, own, listener)) = mine {
+            crate::jobs::listening_at(&own);
+            let stand_in: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
+            let r = serve_from(app, crate::httpd::Listener::Other(crate::httpd::unix_connections(listener)), Some(stand_in), "", workers, |_| {});
+            let _ = std::fs::remove_dir_all(&dir);
+            return r;
+        }
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("cannot listen on 127.0.0.1: {}", e))?;
+    let bound = listener.local_addr().ok();
+    serve_from(app, crate::httpd::Listener::Tcp(listener), bound, "", workers, |_| {})
+}
+
 /// A FastCGI socket at `path`, for `quillo fcgi --listen unix:PATH`.
 #[cfg(unix)]
 pub fn fcgi_unix(path: &Path, mode: u32) -> Result<crate::fcgi::Source, String> {
@@ -5898,7 +6059,11 @@ fn serve_from(
     let app = Arc::new(app);
     if let Loaded::Ready(it) = &*app.current().1 {
         let n = it.routes.iter().filter(|r| r.method != crate::ast::GUARD_METHOD).count();
-        eprintln!("quillo: {} route{} listening on {}", n, if n == 1 { "" } else { "s" }, shown);
+        // No port, nothing said of one (`serve_portless`; FEEDBACK72.md, Q-1011; branch
+        // feedback72-81).
+        if !shown.is_empty() {
+            eprintln!("quillo: {} route{} listening on {}", n, if n == 1 { "" } else { "s" }, shown);
+        }
         if let Some(db) = &*crate::db::OPENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             eprintln!("quillo: database {}", db);
         }

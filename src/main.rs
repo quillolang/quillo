@@ -858,6 +858,9 @@ struct RunOptions {
     /// The program's tools, when `--split` checked it before its services started (FEEDBACK56.md,
     /// C.2; branch feedback56).
     tools: Option<Vec<quillo::mcp::Tool>>,
+    /// A flag that answers over HTTP was given (`--metrics`, `--describe`, `--query-stats`): the
+    /// program listens, whatever else it serves (FEEDBACK72.md, Q-1011; branch feedback72-81).
+    asks_port: bool,
 }
 
 fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
@@ -886,6 +889,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         join: None,
         with: Vec::new(),
         tools: None,
+        asks_port: false,
     };
     let mut tls: (Option<PathBuf>, Option<PathBuf>) = (None, None);
     // `--client-cert-header`, `--client-cert-subject`, and whether either identity header is named.
@@ -1014,17 +1018,20 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
             }
             ("--describe", _) => {
                 quillo::describe::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                o.asks_port = true;
                 i += 1;
                 continue;
             }
             ("--query-stats", _) => {
                 quillo::querystats::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+                o.asks_port = true;
                 i += 1;
                 continue;
             }
             ("--metrics", _) => {
                 quillo::metrics::ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
                 quillo::metrics::start();
+                o.asks_port = true;
                 i += 1;
                 continue;
             }
@@ -1668,6 +1675,10 @@ fn begin_stop(again: bool) {
             }
             if limit.is_some_and(|l| began.elapsed() >= l) {
                 eprintln!("quillo: stopping with requests in progress: {}", running.join(", "));
+                // As a stop that waited does: pages told, and each database not in a transaction
+                // whole (FEEDBACK80.md, Q-1260 and Q-1265; branch feedback72-81).
+                quillo::wt::close_all();
+                quillo::db::close_all(std::time::Duration::from_millis(200));
                 quillo::service::kill_split_now();
                 std::process::exit(0);
             }
@@ -1858,6 +1869,13 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
     if o.instances > 1 {
         return run_instances(path, o, &format!("{}:{}", host, port));
     }
+    // A port asked for: `--port`, `--host`, `--listen`, `$PORT` (a platform that sets it probes
+    // `/_quillo/health` there: Cloud Run, Heroku, Render, Kubernetes), a flag that answers over
+    // HTTP, a way of running that others reach it by (`--watch`'s pages, `--split`'s services
+    // calling back, `--register`, `--join`, `--as-service`, `quillo fcgi`) (FEEDBACK72.md, Q-1011;
+    // branch feedback72-81).
+    let port_env = std::env::var_os("PORT").is_some_and(|p| !p.is_empty());
+    let asked = o.port.is_some() || o.host.is_some() || o.listen.is_some() || port_env || o.asks_port || o.watch || o.split || o.register.is_some() || o.join.is_some() || o.as_service || fcgi;
     let mut app = match load(path, &o) {
         Ok(Some(app)) => app,
         Ok(None) => return 0,
@@ -1904,6 +1922,17 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
             (None, None) => quillo::fcgi::from_fd0(),
         };
         return match source.and_then(|s| quillo::server::serve_fcgi(app, s, listen.as_deref(), o.workers)) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("quillo: {}", e);
+                1
+            }
+        };
+    }
+    // Nothing to serve over HTTP and no port asked for: none (FEEDBACK72.md, Q-1011; branch
+    // feedback72-81).
+    if !asked && !app.serves_http() {
+        return match quillo::server::serve_portless(app, o.workers) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("quillo: {}", e);

@@ -1286,6 +1286,14 @@ pub fn serve_on(apps: Vec<Arc<App>>, listener: Listener, max_waiting: usize) -> 
     while STOPPING.load(SeqCst) && crate::statics::sending() > 0 {
         std::thread::sleep(Duration::from_millis(20));
     }
+    // A clean stop, every request answered: the pages' WebTransport sessions are told the server
+    // is going, as a WebSocket's close tells them, rather than finding out from the keep-alive 20 s
+    // on (FEEDBACK80.md, Q-1265); and each SQLite database is checkpointed and closed, so the file
+    // is whole once the program has ended (FEEDBACK80.md, Q-1260; branch feedback72-81).
+    if STOPPING.load(SeqCst) {
+        crate::wt::close_all();
+        crate::db::close_all(Duration::from_secs(1));
+    }
     r
 }
 

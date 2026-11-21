@@ -1729,6 +1729,13 @@ fn endpoint() -> Option<(u16, Option<String>)> {
     }
 }
 
+/// On a clean stop: each page's WebTransport session told the server is going (FEEDBACK80.md,
+/// Q-1265; branch feedback72-81).
+pub fn close_all() {
+    #[cfg(feature = "realtime")]
+    quic::close_all();
+}
+
 #[cfg(feature = "realtime")]
 mod quic {
     use super::*;
@@ -1737,6 +1744,9 @@ mod quic {
     struct Running {
         port: u16,
         hash: RwLock<Option<String>>,
+        /// Its listeners: one, or on loopback, 127.0.0.1's and [::1]'s (FEEDBACK80.md, Q-1266),
+        /// closed on a clean stop (Q-1265; branch feedback72-81).
+        servers: Vec<Arc<Endpoint<wtransport::endpoint::endpoint_side::Server>>>,
     }
 
     static RUNNING: OnceLock<Option<Running>> = OnceLock::new();
@@ -1827,27 +1837,45 @@ mod quic {
         };
         let hash = if own { hex_hash(&id) } else { None };
         let _in_rt = rt.enter();
-        let server = Endpoint::server(config(addr, id)).map_err(|e| format!("cannot listen on UDP port {}: {}", port, e))?;
-        let server = Arc::new(server);
-        rt.spawn({
-            let server = server.clone();
-            async move {
-                loop {
-                    let incoming = server.accept().await;
-                    tokio::spawn(session(incoming));
+        // On 127.0.0.1, [::1] too: a page at http://localhost dials the ticket's port at
+        // `localhost`, which Chrome takes to [::1] for QUIC, with no fall back to 127.0.0.1 as TCP
+        // has, so it was refused and took the WebSocket for good. Both are this machine alone, as
+        // the HTTP listener is; no wider. Listening there, rather than naming 127.0.0.1 in the
+        // ticket, keeps the page's own host name, which its certificate hash and its origin go
+        // with, and needs nothing of the page. A machine with no IPv6 loopback keeps 127.0.0.1
+        // (FEEDBACK80.md, Q-1266; branch feedback72-81).
+        let mut addrs = vec![addr];
+        if addr.ip() == std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST) {
+            addrs.push(SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), port));
+        }
+        let mut servers = Vec::new();
+        for (i, at) in addrs.into_iter().enumerate() {
+            let server = match Endpoint::server(config(at, id.clone_identity())) {
+                Ok(s) => Arc::new(s),
+                Err(e) if i == 0 => return Err(format!("cannot listen on UDP port {}: {}", port, e)),
+                Err(_) => continue,
+            };
+            rt.spawn({
+                let server = server.clone();
+                async move {
+                    loop {
+                        let incoming = server.accept().await;
+                        tokio::spawn(session(incoming));
+                    }
                 }
-            }
-        });
+            });
+            servers.push((at, server));
+        }
         if own {
             // A new certificate before this one ends; pages connecting after
             // are told the new hash, and those connected stay.
-            let server = server.clone();
+            let servers = servers.clone();
             rt.spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(11 * 86400)).await;
                     let Ok(id) = own_identity() else { continue };
                     let hash = hex_hash(&id);
-                    if server.reload_config(config(addr, id), false).is_ok() {
+                    if servers.iter().all(|(at, server)| server.reload_config(config(*at, id.clone_identity()), false).is_ok()) {
                         if let Some(Some(r)) = RUNNING.get() {
                             *r.hash.write().unwrap_or_else(std::sync::PoisonError::into_inner) = hash;
                         }
@@ -1856,8 +1884,34 @@ mod quic {
             });
         }
         eprintln!("quillo: WebTransport on UDP port {}", port);
-        Ok(Running { port, hash: RwLock::new(hash) })
+        Ok(Running { port, hash: RwLock::new(hash), servers: servers.into_iter().map(|(_, s)| s).collect() })
     }
+
+    /// On a clean stop: every session closed with HTTP/3's "no error" and a reason that says the
+    /// server is going, so its page connects again at once, as from a WebSocket's close, where
+    /// it heard nothing until the keep-alive gave up, 20 s on. Waits, briefly, for the closes to
+    /// be sent (FEEDBACK80.md, Q-1265; branch feedback72-81).
+    pub fn close_all() {
+        let Some(Some(r)) = RUNNING.get() else { return };
+        if r.servers.iter().all(|s| s.open_connections() == 0) {
+            return;
+        }
+        for s in &r.servers {
+            s.close(GOING.into(), b"server stopping");
+        }
+        let servers = r.servers.clone();
+        let _ = crate::pg::runtime().block_on(async move {
+            tokio::time::timeout(Duration::from_millis(500), async {
+                for s in &servers {
+                    s.wait_idle().await;
+                }
+            })
+            .await
+        });
+    }
+
+    /// H3_NO_ERROR: the connection closed with nothing wrong, a server going away (RFC 9114 §8.1).
+    const GOING: u32 = 0x100;
 
     async fn session(incoming: wtransport::endpoint::IncomingSession) {
         let Ok(req) = incoming.await else { return };

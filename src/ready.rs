@@ -38,8 +38,11 @@ fn report_at(it: &mut Interp, depth: u32) -> (bool, J) {
         all &= ok;
         checks.insert(name, detail);
     };
-    // The database, when the program opened one.
-    if it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
+    // The database, when the program opened one: with one per tenant, what a tenant's needs, as
+    // there is no one database to ask (FEEDBACK79.md, Q-1254; branch feedback72-81).
+    if let Some(ok) = crate::db::tenants_ready(it) {
+        put("database".into(), ok, json!(if ok { "ready (per tenant)" } else { "down" }));
+    } else if it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
         let ok = crate::parser::Parser::new("db.query(\"select 1\")")
             .parse_expr()
             .ok()

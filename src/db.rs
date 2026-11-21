@@ -918,33 +918,84 @@ fn wal(c: &Connection) -> Result<(), rusqlite::Error> {
 /// A MySQL database that is not there is an error, as PostgreSQL's is: a typo in a URL made a
 /// new, empty database (FEEDBACK55.md, Q-736; branch feedback55, the user's decision); only a
 /// tenant's is made, by its driver (`tenant_backend`).
-fn open_backend(it: &mut Interp, target: &str) -> Result<Backend, String> {
+fn open_backend(it: &mut Interp, target: &str) -> Result<Arc<Backend>, String> {
     open_backend_as(it, target, true, false)
 }
 
 /// `open_backend`; with `make` false, a Postgres schema (`?schema=`) must
 /// exist already; with `tenant` (and `make`), MySQL's database is made when not there.
-fn open_backend_as(it: &mut Interp, target: &str, make: bool, tenant: bool) -> Result<Backend, String> {
+fn open_backend_as(it: &mut Interp, target: &str, make: bool, tenant: bool) -> Result<Arc<Backend>, String> {
     if is_mysql_url(target) {
         #[cfg(feature = "mysql")]
         {
             let url = target.to_string();
             let make = make && tenant;
-            return it.unlocked(move || crate::my::Pool::open_as(&url, make)).map(Backend::Mysql);
+            return it.unlocked(move || crate::my::Pool::open_as(&url, make)).map(|p| Arc::new(Backend::Mysql(p)));
         }
         #[cfg(not(feature = "mysql"))]
         return Err("this Quillo was built without MySQL (cargo build --features mysql)".into());
     }
     if pg::is_url(target) {
         let url = target.to_string();
-        return it.unlocked(move || pg::Pool::open_as(&url, make)).map(Backend::Postgres);
+        return it.unlocked(move || pg::Pool::open_as(&url, make)).map(|p| Arc::new(Backend::Postgres(p)));
     }
     let full = if target == ":memory:" || Path::new(target).is_absolute() {
         target.to_string()
     } else {
         it.base_dir.join(target).display().to_string()
     };
-    connect(&full).map(|c| Backend::Sqlite(Mutex::new(c))).map_err(|e| e.to_string())
+    connect(&full).map(kept).map_err(|e| e.to_string())
+}
+
+/// Every SQLite database the program has opened, held weakly: each is checkpointed and closed on a
+/// clean stop (see `close_all`; FEEDBACK80.md, Q-1260; branch feedback72-81).
+static SQLITE_OPEN: Mutex<Vec<std::sync::Weak<Backend>>> = Mutex::new(Vec::new());
+
+/// A SQLite connection as the program's database, noted for `close_all`. Opening only: no query
+/// pays for it.
+fn kept(c: Connection) -> Arc<Backend> {
+    let b = Arc::new(Backend::Sqlite(Mutex::new(c)));
+    let mut open = SQLITE_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    open.retain(|w| w.strong_count() > 0);
+    open.push(Arc::downgrade(&b));
+    b
+}
+
+/// On a clean stop, once the requests in progress are answered: each SQLite database the program
+/// has open is checkpointed (TRUNCATE) and closed, its last connection's close removing its `-wal`
+/// and `-shm`, so the file is whole once the program has ended. Before, the process ended with
+/// its connections open: the WAL kept what the file did not have, and a backup copied over the
+/// file was undone at the next start by the stale WAL (FEEDBACK80.md, Q-1260; branch
+/// feedback72-81). One in a transaction still (a request `--drain` cut off), or held past
+/// `wait`, is left as it is: what it has not committed is not the file's. The connection's place
+/// holds an empty in-memory database after, which nothing reads, the program ending.
+pub fn close_all(wait: std::time::Duration) {
+    let open: Vec<Arc<Backend>> = SQLITE_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..).filter_map(|w| w.upgrade()).collect();
+    let until = std::time::Instant::now() + wait;
+    'each: for b in open {
+        let Backend::Sqlite(m) = &*b else { continue };
+        let mut c = loop {
+            match m.try_lock() {
+                Ok(c) => break c,
+                Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Err(std::sync::TryLockError::WouldBlock) => continue 'each,
+            }
+        };
+        if !c.is_autocommit() {
+            continue;
+        }
+        let path = c.path().filter(|p| !p.is_empty()).map(str::to_string);
+        let _ = c.query_row("pragma wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        let Ok(none) = Connection::open_in_memory() else { continue };
+        let was = std::mem::replace(&mut *c, none);
+        if let Err((_, e)) = was.close() {
+            eprintln!("quillo: the database {} did not close: {}", path.as_deref().unwrap_or("?"), e);
+        }
+        if let Some(p) = path {
+            closed(Path::new(&p));
+        }
+    }
 }
 
 /// The database a call is on: a connection's (`db.connect`), or the program's.
@@ -1019,7 +1070,7 @@ fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
         *it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DbSlot::PerTenant(t.clone()));
         return tenant_backend(it, &t);
     }
-    let b = Arc::new(open_backend(it, &target)?);
+    let b = open_backend(it, &target)?;
     // Opening is done outside the lock, so another request's `db.open` may have got here
     // first, with a database per tenant: that is the program's, and this one is let go
     // (FEEDBACK19.md, Q-159; branch feedback20-fixes).
@@ -1079,7 +1130,7 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         Err(e) if !make && (e.contains("there is no schema") || e.contains("Unknown database") || (e.contains("database") && e.contains("does not exist"))) => {
             return Err(no_such(it));
         }
-        b => Arc::new(b.map_err(|e| format!("tenant {}: {}", name, e))?),
+        b => b.map_err(|e| format!("tenant {}: {}", name, e))?,
     };
     let is_default = matches!(&*it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner), Some(DbSlot::PerTenant(t)) if Arc::ptr_eq(t, dbs));
     let dir = dbs.migrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().or_else(|| if is_default { it.site.migrations.clone() } else { None });
@@ -1097,6 +1148,132 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         open.shift_remove_index(0);
     }
     Ok(open.entry(name.to_string()).or_insert(b).clone())
+}
+
+/// For `/_quillo/ready`, with a database per tenant: whether a tenant's can be opened, as there is
+/// no one database to ask `select 1`, and ready said "down" for every app with tenants
+/// (FEEDBACK79.md, Q-1254; branch feedback72-81). SQLite files: their folder there and writable, or
+/// not there yet with the folder above it writable, as `new_tenant` makes it (a first signup
+/// would otherwise wait for a ready that waited for it). A server: the tenant used last answers
+/// `select 1`, or with none open yet, the server takes a connection (at its host, or its Unix
+/// socket). A function's: the tenant used
+/// last, or nothing to ask before one. None when the program's database is not one per tenant.
+pub(crate) fn tenants_ready(it: &mut Interp) -> Option<bool> {
+    let Some(DbSlot::PerTenant(dbs)) = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() else { return None };
+    let last = dbs.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().last().cloned();
+    let answers = |it: &mut Interp, b: &Arc<Backend>| apart(it, b, "select 1".into(), Vec::new()).is_ok();
+    Some(match &dbs.target {
+        Target::Text(t) if is_server_url(t) => match last {
+            Some(b) => answers(it, &b),
+            None => {
+                let at = server_reach(t);
+                it.unlocked(move || at.is_none_or(|at| at.reachable()))
+            }
+        },
+        Target::Text(t) => tenants_folder_ready(&it.base_dir, t),
+        Target::Fn(_) => last.is_none_or(|b| answers(it, &b)),
+    })
+}
+
+/// The folder a SQLite template puts its tenants' files in (the part before `{tenant}`): there and
+/// writable, or not there with the nearest folder above it writable (FEEDBACK79.md, Q-1254; branch
+/// feedback72-81).
+fn tenants_folder_ready(base: &Path, template: &str) -> bool {
+    let full = if Path::new(template).is_absolute() { Path::new(template).to_path_buf() } else { base.join(template) };
+    let full = full.to_string_lossy().into_owned();
+    let before = full.split_once("{tenant}").map_or(full.as_str(), |(b, _)| b);
+    let dir = match before.rfind(['/', std::path::MAIN_SEPARATOR]) {
+        Some(i) => Path::new(&before[..i.max(1)]).to_path_buf(),
+        None => base.to_path_buf(),
+    };
+    let mut at = dir.as_path();
+    loop {
+        match std::fs::metadata(at) {
+            Ok(m) => return m.is_dir() && writable(at),
+            Err(_) => match at.parent() {
+                Some(p) if !p.as_os_str().is_empty() => at = p,
+                _ => return false,
+            },
+        }
+    }
+}
+
+/// Whether this process may make files in the folder `dir`.
+fn writable(dir: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return false };
+        // SAFETY: `c` is a NUL-terminated path that lives through the call.
+        unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::metadata(dir).is_ok_and(|m| !m.permissions().readonly())
+    }
+}
+
+/// Where a server's URL says to connect (`postgres://u:p@host:5433/app_{tenant}`), the first of
+/// several hosts: a host and port, or a Unix socket (PostgreSQL's host a folder,
+/// `%2Fvar%2Frun%2Fpostgresql` or `?host=/var/run/postgresql`, its socket `.s.PGSQL.<port>` in it;
+/// MySQL's `?socket=/path`). None for none (the driver's default).
+enum Reach {
+    Tcp(String, u16),
+    Unix(std::path::PathBuf),
+}
+
+fn server_reach(url: &str) -> Option<Reach> {
+    let (scheme, rest) = url.split_once("://")?;
+    let pg = scheme.starts_with("postgres");
+    let param = |name: &str| {
+        rest.split_once('?')
+            .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix(name).and_then(|v| v.strip_prefix('='))))
+            .map(|v| crate::server::percent_decode(v, false))
+            .filter(|v| !v.is_empty())
+    };
+    if let (false, Some(socket)) = (pg, param("socket")) {
+        return Some(Reach::Unix(socket.into()));
+    }
+    let auth = rest.split(['/', '?']).next()?;
+    let hosts = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
+    let first = hosts.split(',').next()?;
+    let default = if pg { 5432 } else { 3306 };
+    let (host, port) = match first.strip_prefix('[') {
+        Some(v6) => {
+            let (h, p) = v6.split_once(']')?;
+            (h, p.strip_prefix(':'))
+        }
+        None => match first.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (first, None),
+        },
+    };
+    let port = port.and_then(|p| p.parse().ok()).or_else(|| param("port").and_then(|p| p.parse().ok())).unwrap_or(default);
+    let host = Some(crate::server::percent_decode(host, false)).filter(|h| !h.is_empty()).or_else(|| param("host"))?;
+    // A folder: PostgreSQL's socket in it, as libpq names it (FEEDBACK79.md, Q-1254, found in
+    // review: it was dialed as a host name, and ready said down; branch feedback72-81).
+    if host.starts_with('/') {
+        return Some(Reach::Unix(if pg { Path::new(&host).join(format!(".s.PGSQL.{}", port)) } else { host.into() }));
+    }
+    Some(Reach::Tcp(host, port))
+}
+
+impl Reach {
+    /// Whether it takes a connection, within a second and a half for a host (FEEDBACK79.md,
+    /// Q-1254).
+    fn reachable(&self) -> bool {
+        match self {
+            Reach::Tcp(host, port) => {
+                use std::net::ToSocketAddrs;
+                let Ok(addrs) = (host.as_str(), *port).to_socket_addrs() else { return false };
+                addrs.into_iter().any(|a| std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(1500)).is_ok())
+            }
+            #[cfg(unix)]
+            Reach::Unix(path) => std::os::unix::net::UnixStream::connect(path).is_ok(),
+            #[cfg(not(unix))]
+            Reach::Unix(path) => path.exists(),
+        }
+    }
 }
 
 /// Makes tenant `name`'s database, and says false when there is one already, in one step
@@ -1770,13 +1947,13 @@ fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Resul
             return fail(line, format!("`{}`: replicas are of a PostgreSQL or MySQL database, not SQLite", f));
         }
         let b = match open_backend(it, &primary) {
-            Ok(b) => Arc::new(b),
+            Ok(b) => b,
             Err(e) => return Ok(Err(e)),
         };
         let mut list = Vec::new();
         for u in &urls {
             match open_backend(it, u) {
-                Ok(r) => list.push(Arc::new(r)),
+                Ok(r) => list.push(r),
                 // Named without its user and password, as `db.connect`'s errors are: the URL
                 // went to the log whole (FEEDBACK51.md, Q-659; branch feedback51-fixes).
                 Err(e) => return Ok(Err(format!("replica {}: {}", target_label(&it.base_dir, u), e))),
@@ -1794,7 +1971,7 @@ fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Resul
             tenant_template(&it.base_dir, t);
             Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs::new(Target::Text(t.to_string()))))))
         }
-        Some(Value::Str(t)) => Ok(open_backend(it, t).map(|b| DbSlot::One(Arc::new(b)))),
+        Some(Value::Str(t)) => Ok(open_backend(it, t).map(DbSlot::One)),
         // Where each tenant's database is, opened when its tenant first uses it.
         Some(fv @ (Value::Func(_) | Value::Builtin(..))) => Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs::new(Target::Fn(fv.clone())))))),
         other => fail(
@@ -2228,7 +2405,7 @@ pub(crate) fn system_on_for(it: &mut Interp, make: bool, always: bool) -> Option
     }
     let b = open_backend(it, &target).map_err(|e| eprintln!("quillo: the system database {}: {}", target, e)).ok()?;
     let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    conns.push((SYSTEM.to_string(), DbSlot::One(Arc::new(b))));
+    conns.push((SYSTEM.to_string(), DbSlot::One(b)));
     Some(Some(conns.len() - 1))
 }
 
@@ -2274,7 +2451,7 @@ pub(crate) fn system_store(it: &mut Interp, make: bool) -> Result<OwnStore, Stri
     }
     let b = open_backend(it, &target).map_err(|e| format!("the system database {} cannot be opened: {}", target, e))?;
     let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    conns.push((SYSTEM.to_string(), DbSlot::One(Arc::new(b))));
+    conns.push((SYSTEM.to_string(), DbSlot::One(b)));
     Ok(OwnStore::On(Some(conns.len() - 1)))
 }
 
@@ -2299,7 +2476,7 @@ fn system(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     };
     let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     conns.retain(|(l, _)| l != SYSTEM);
-    conns.push((SYSTEM.to_string(), DbSlot::One(Arc::new(b))));
+    conns.push((SYSTEM.to_string(), DbSlot::One(b)));
     Ok(Value::Nil)
 }
 

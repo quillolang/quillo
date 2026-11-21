@@ -4,7 +4,7 @@
 // open-when: Address already in use
 // open-when: 0 routes listening on http
 // fixed-when: /port taken: [^\n]*tick/
-// fixed-when: port free: GET / -> 000
+// fixed-when: port free: TCP listeners: none
 // From FEEDBACK72.md §Q-1011 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). With the
 // port taken it stops at once; with it free it says it listens, and answers 404.
 

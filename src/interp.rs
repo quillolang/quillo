@@ -856,6 +856,34 @@ fn get_path(v: &Value, path: &[String]) -> Option<Value> {
     Some(cur)
 }
 
+/// The file the request sent in place of the form field `name` (`form.name`): its name, as
+/// `request.files.name` holds it, the first of several, without control characters and cut to
+/// 80 characters, as the log and the 400 under `--watch` say it (FEEDBACK79.md, Q-1252; branch
+/// feedback72-81). None when the field is not a form's or no file came under its name.
+fn file_in_form(files: Option<&Value>, name: &str) -> Option<String> {
+    let field = name.strip_prefix("form.")?;
+    let Some(Value::Map(fs)) = files else { return None };
+    let f = match fs.get(field)? {
+        Value::List(l) => l.first()?.clone(),
+        f => f.clone(),
+    };
+    let named = match &f {
+        Value::Map(m) => match m.get("filename") {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => String::new(),
+        },
+        _ => return None,
+    };
+    Some(named.chars().filter(|c| !c.is_control()).take(80).collect())
+}
+
+/// What is said of a form field that came as a file (FEEDBACK79.md, Q-1252; branch feedback72-81).
+fn file_said(name: &str, file: &str, wanted: &str) -> String {
+    let field = name.strip_prefix("form.").unwrap_or(name);
+    let file = if file.is_empty() { String::new() } else { format!(" ({})", file) };
+    format!("`{}` is a file{}, not {}; it is in request.files.{}", name, file, wanted, field)
+}
+
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     escape_into(s, &mut out);
@@ -5992,6 +6020,13 @@ impl Interp {
     /// branch feedback40-43). `place` is what the fields are under: `query`, or none for a
     /// request pattern, whose fields name `form`, `json` or `headers` themselves.
     pub fn why_no_match(&mut self, p: &Pattern, v: &Value, place: &str, mode: Mode) -> String {
+        // The request's files, for a form field that came as one (FEEDBACK79.md, Q-1252; branch
+        // feedback72-81).
+        let files = if place.is_empty() { get_path(v, &["files".to_string()]) } else { None };
+        self.why_no_match_in(p, v, place, mode, files.as_ref())
+    }
+
+    fn why_no_match_in(&mut self, p: &Pattern, v: &Value, place: &str, mode: Mode, files: Option<&Value>) -> String {
         // Neither a value sent (a token in a header, a password) nor a pattern's own literal
         // (a webhook's secret) is said: this goes to the log, and under `--watch` to whoever
         // sent the request. Nothing is evaluated either: a default is code of the program's
@@ -6018,6 +6053,11 @@ impl Interp {
             };
             match get_path(v, &f.path) {
                 None | Some(Value::Nil) if f.default.is_none() => {
+                    // Sent, as a file: in `request.files`, not missing (FEEDBACK79.md, Q-1252;
+                    // branch feedback72-81).
+                    if let Some(file) = file_in_form(files, &name) {
+                        return file_said(&name, &file, &wanted);
+                    }
                     let checkbox = name.starts_with("form.") && matches!(&f.pat, Pattern::Type(t) if t == "bool");
                     let hint = if checkbox {
                         format!(" (an unchecked checkbox sends nothing: give it a default, `{}: bool = false`)", f.path.last().map_or("", |s| s.as_str()))
@@ -6028,7 +6068,7 @@ impl Interp {
                 }
                 // `{ form: { agree: bool } }`: the field inside, by its whole name.
                 Some(x @ Value::Map(_)) if matches!(f.pat, Pattern::Record(_)) => {
-                    let inner = self.why_no_match(&f.pat, &x, &name, sub);
+                    let inner = self.why_no_match_in(&f.pat, &x, &name, sub, files);
                     if inner != "the request does not match its pattern" {
                         return inner;
                     }
@@ -6051,6 +6091,64 @@ impl Interp {
             }
         }
         "the request does not match its pattern".to_string()
+    }
+
+    /// How many of a route's pattern's fields `v` holds as the pattern takes them, by type and
+    /// shape as `why_no_match` reads them (a field with a default counts when missing): how close
+    /// a route that missed came, for the 400 (FEEDBACK79.md, Q-1257; branch feedback72-81).
+    pub fn fields_matched(&self, p: &Pattern, v: &Value, mode: Mode) -> usize {
+        let Pattern::Record(fields) = p else { return 0 };
+        let mut n = 0;
+        for f in fields {
+            let sub = match mode {
+                Mode::Request if f.path[0] == "json" => Mode::Json,
+                Mode::Request => Mode::Lenient,
+                m => m,
+            };
+            n += match get_path(v, &f.path) {
+                None | Some(Value::Nil) => usize::from(f.default.is_some() || matches!(&f.pat, Pattern::Alt(ps) if ps.iter().any(|q| matches!(q, Pattern::Lit(Lit::Nil))))),
+                Some(x @ Value::Map(_)) if matches!(f.pat, Pattern::Record(_)) => self.fields_matched(&f.pat, &x, sub),
+                Some(x) => usize::from(self.pattern_fits(&f.pat, &x, sub == Mode::Lenient)),
+            };
+        }
+        n
+    }
+
+    /// For a route that matched: each field of its pattern's `form` the request left out, so that
+    /// the route ran with its default, and that came as a file, which only `request.files` holds
+    /// (FEEDBACK79.md, Q-1252; branch feedback72-81).
+    pub fn files_in_form(&self, p: &Pattern, request: &Value) -> Vec<String> {
+        let files = get_path(request, &["files".to_string()]);
+        let mut out = Vec::new();
+        let Pattern::Record(fields) = p else { return out };
+        let mut look = |path: &[String], f: &RecField| {
+            if f.default.is_none() || !matches!(get_path(request, path), None | Some(Value::Nil)) {
+                return;
+            }
+            let name = path.join(".");
+            if let Some(file) = file_in_form(files.as_ref(), &name) {
+                let wanted = match &f.pat {
+                    Pattern::Type(t) => format!("{} {}", if t.starts_with(['a', 'e', 'i', 'o', 'u', 'A', 'E', 'I', 'O']) { "an" } else { "a" }, t),
+                    _ => "what its pattern takes".to_string(),
+                };
+                out.push(format!("{} (the route ran with its default)", file_said(&name, &file, &wanted)));
+            }
+        };
+        for f in fields {
+            match (f.path.first().map(String::as_str), &f.pat) {
+                // `{ form: { name: str = "" } }`
+                (Some("form"), Pattern::Record(inner)) if f.path.len() == 1 => {
+                    for g in inner {
+                        let path: Vec<String> = std::iter::once("form".to_string()).chain(g.path.iter().cloned()).collect();
+                        look(&path, g);
+                    }
+                }
+                // `{ form.name: str = "" }`
+                (Some("form"), _) if f.path.len() > 1 => look(&f.path, f),
+                _ => {}
+            }
+        }
+        out
     }
 
     /// Whether `x` is of the program's type `t`, one that is not a record, as a form's or a
