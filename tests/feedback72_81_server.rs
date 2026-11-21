@@ -814,7 +814,15 @@ fn tcp_listening(pid: u32) -> Option<Vec<String>> {
 /// without lsof, or when it has none.
 fn own_socket(pid: u32) -> Option<PathBuf> {
     let o = Command::new("lsof").args(["-nP", "-a", "-p", &pid.to_string(), "-U", "-Fn"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-    String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| l.strip_prefix('n')).find(|n| n.contains("quillo-self-") && n.ends_with("self.sock")).map(PathBuf::from)
+    // Linux's lsof follows a socket's path with ` type=STREAM` (and more); macOS gives the path
+    // alone: the path is the name's first word (found on CI, a test's own reading; branch
+    // feedback72-81).
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix('n'))
+        .filter_map(|n| n.split_whitespace().next())
+        .find(|n| n.contains("quillo-self-") && n.ends_with("self.sock"))
+        .map(PathBuf::from)
 }
 
 /// Stops a program started by `start` as SIGTERM does, and waits for it.

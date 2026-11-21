@@ -9256,7 +9256,11 @@ function takeHydration(name) {
 }
 
 // What each file of the program's brings in development: its compiled lines'
-// marks, so that an error can say where it happened (see `placed`).
+// marks, so that an error can say where it happened (read by the development
+// lines below). This comment goes out with `takeHydration`'s unit, as written
+// under QUILLO_RUNTIME_COVERAGE, so it names neither of the development words
+// tests/feedback22.rs refuses in a production bundle (found on CI once the
+// page's bundle took takeHydration; branch feedback72-81).
 const PLACES = {}; // dev
 // An error as the server's log has it: the file and line it happened on, and the
 // calls it came through, read from its stack. The console's link to the stack goes
