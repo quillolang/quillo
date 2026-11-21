@@ -3024,6 +3024,35 @@ fn b2_review2_a_page_of_no_one_drops_the_sessions_kept_pages() {
     assert_eq!(harness(port, OUT_SCRIPT), serde_json::json!({ "before": 1, "out": "not handled", "still": 1, "after": 0 }));
 }
 
+// A page's late `session` message after a sign-out: where the worker can read the cookie (Chrome's
+// Cookie Store), the cookie says the session, so Ana stays dropped and a late answer of hers is not
+// kept; without one, the page's word is taken as before. b2 met this race under load, 10 of 25 runs
+// on 0.8.9 as on this branch (a follow-up to B.2; branch feedback72-81).
+#[test]
+fn b2_a_late_session_message_after_a_sign_out_leaves_it_dropped() {
+    let d = dir("late-session", SECOND);
+    let (_s, port) = logged(&d, &["--no-check"]);
+    let script = |store: bool| {
+        format!(
+            r#"const b = await makeBrowser(O, {{ cookieStore: {} }});
+await b.install();
+await b.go("/in/ana");
+await b.go("/mine");
+const ana = b.jar.get("quillo_tag");
+b.jar.delete("quillo_tag");
+await b.cookieChange({{ deleted: [{{ name: "quillo_tag" }}] }});
+const before = (await b.droppedList()).includes(ana);
+await b.message({{ quillo: "session", who: ana }});
+const after = (await b.droppedList()).includes(ana);
+console.log(JSON.stringify({{ before, after }}));
+"#,
+            store
+        )
+    };
+    assert_eq!(harness(port, &script(true)), serde_json::json!({ "before": true, "after": true }));
+    assert_eq!(harness(port, &script(false)), serde_json::json!({ "before": true, "after": false }));
+}
+
 const OTHER_READS_SCRIPT: &str = r#"
 const b = await makeBrowser(O);
 await b.install();

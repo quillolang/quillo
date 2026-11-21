@@ -81,7 +81,12 @@ function redirected(e, res) {
 self.addEventListener("message", (e) => {
   const d = e.data || {};
   if (typeof d.who !== "string") return;
-  if (d.quillo === "session") e.waitUntil(current(d.who, true));
+  // A page's word is only a cue: where the worker can read the cookie, the cookie says the session.
+  // A page shown just before a sign-out posts its session late, after the cookie's deletion has
+  // dropped it, and taken as sure it took the session out of the dropped list, so a late answer of
+  // it could be kept again (found by tests/feedback67.rs's b2 under load, 10 of 25 runs on 0.8.9 as
+  // on this branch; a follow-up to FEEDBACK67.md's B.2; branch feedback72-81).
+  if (d.quillo === "session") e.waitUntil(self.cookieStore ? self.cookieStore.get(TAG).then((c) => current(c ? c.value : "-", true), () => current(d.who, true)) : current(d.who, true));
   else if (d.quillo === "drop") e.waitUntil(drop(d.who).then(() => e.ports[0] && e.ports[0].postMessage(1)));
 });
 

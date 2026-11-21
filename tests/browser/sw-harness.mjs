@@ -5,7 +5,9 @@
 // `redirect: "manual"` taken as a browser takes them.
 import vm from "node:vm";
 
-export async function makeBrowser(origin) {
+// `opts.cookieStore`: the worker gets a Cookie Store reading the jar, as Chrome's does (off by
+// default, as for the tests written before it; branch feedback72-81).
+export async function makeBrowser(origin, opts = {}) {
   let src = await (await fetch(origin + "/_quillo/sw.js")).text();
   // A clock the test sets (`browser.time`), for the worker's waits; none, the real one.
   let time = null;
@@ -86,6 +88,7 @@ export async function makeBrowser(origin) {
     registration: { navigationPreload: null, unregister() {} },
     clients: { claim: async () => {} },
   };
+  if (opts.cookieStore) self.cookieStore = { get: async (n) => (jar.has(n) ? { name: n, value: jar.get(n) } : null) };
   const start = () => vm.runInContext(src, vm.createContext({ self, caches, fetch: net, location: { origin, href: origin + "/_quillo/sw.js" }, Response, Headers, URL, Promise, console, Date: FakeDate, Set, RegExp, setTimeout }));
   start();
   const run = async (kind, e) => {
@@ -125,6 +128,13 @@ export async function makeBrowser(origin) {
       }
     },
     async message(data) { await run("message", { data }); },
+    // The browser's cookiechange, as the jar was changed by the test: `{ changed, deleted }`.
+    async cookieChange(e) { if (handlers.cookiechange) await run("cookiechange", { changed: [], deleted: [], ...e }); },
+    // The worker's list of dropped sessions, as it saved it.
+    async droppedList() {
+      for (const m of store.values()) for (const [u, v] of m) if (u.endsWith("/_quillo/sw-dropped")) return JSON.parse(new TextDecoder().decode(v.body));
+      return [];
+    },
     async dump() {
       const out = {};
       for (const [n, m] of store) out[n.replace(/:[0-9a-f]{16}/, ":V")] = [...m.keys()].map((u) => new URL(u).pathname);
