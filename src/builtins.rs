@@ -398,7 +398,10 @@ pub(crate) fn print_line(line: &str) {
     STDOUT_GONE.fetch_or(gone, std::sync::atomic::Ordering::Relaxed);
 }
 
-fn print(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn print(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // A top-level `print` of markup is a render of its own: an error shown in the next is said
+    // again (FEEDBACK81.md, Q-1272, found in review; branch feedback72-81).
+    it.err_shown = false;
     // The program's own log: what it hides from visitors, it sees. Its line held as any text a
     // request makes (FEEDBACK71.md, Q-977; branch security).
     let text = crate::value::told(|| {
@@ -4416,8 +4419,24 @@ pub fn css_value(s: &str) -> String {
 /// `\26 `: a `<style>` inside `<svg>` or `<math>` is markup, whose character references the
 /// browser decodes, and `&#125` (a `}` with no `;`) added a rule there (FEEDBACK55.md, Q-707;
 /// branch feedback55). The template's own text, CSS nesting's `&` say, stays as written.
+///
+/// Also in a `style` attribute's template, whose values the parser gives here (FEEDBACK79.md,
+/// Q-1250; branch feedback72-81): a text with nothing to escape given back as it is, the rest
+/// written once.
 fn css_value_fn(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    Ok(Value::str(&css_value(&arg(&args, 0).display_held().map_err(|o| o.at(line))?).replace('&', "\\26 ")))
+    let v = arg(&args, 0);
+    if let Value::Str(s) = &v {
+        if !crate::interp::css_special(s) {
+            return Ok(v);
+        }
+    }
+    let t = v.display_held().map_err(|o| o.at(line))?;
+    if !crate::interp::css_special(&t) {
+        return Ok(Value::str(&t));
+    }
+    let mut out = String::with_capacity(t.len() + 16);
+    crate::interp::css_escape_into(&t, &mut out, false);
+    Ok(Value::str(&out))
 }
 
 /// `css` and `sql`: css`...` and sql`...` are the text as written; the tag

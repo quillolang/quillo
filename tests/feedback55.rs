@@ -2906,7 +2906,9 @@ fn a_builtins_error_reads_the_same_on_both_sides() {
         format!("could not read: {hidden}"),
         hidden.to_string(),
         r#"err("mine")"#.into(),
-        hidden.to_string(),
+        // `{int(v)}`, an error value in markup: nothing, on both sides (FEEDBACK81.md, Q-1272,
+        // decided; branch feedback72-81), said in the log and the console instead.
+        String::new(),
         format!("err({hidden})"),
         format!("[{hidden}, {{ k: {hidden} }}]"),
         r#"not an int: "abc""#.into(),
@@ -2938,7 +2940,10 @@ fn a_builtins_error_reads_the_same_on_both_sides() {
     // Made in the browser after the click, with another value: hidden the same way.
     let after: Vec<String> = want_shown.iter().map(|t| t.replace("abc", "xyz")).collect();
     assert_eq!(r["after"], serde_json::json!(after), "{}", r);
-    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+    // `{int(v)}` said in the console, as taken up and as made again, hidden as on the server
+    // (FEEDBACK81.md, Q-1272; branch feedback72-81).
+    let said = |t: &str| format!("an error no statement took, shown in <Errs> as nothing: {} (give a value for it with `??`, or show something else with `is_err` or `match`)", t);
+    assert_eq!(r["errors"], serde_json::json!([said("internal error"), said("internal error")]), "{}", r);
 
     // Under --watch, all of it on both sides (but json.parse's, worded otherwise in the browser).
     let d = dir("errors-watch", &errors_program(false));
@@ -2957,7 +2962,7 @@ fn a_builtins_error_reads_the_same_on_both_sides() {
     assert_eq!(r["taken"], serde_json::json!(server), "{}", r);
     let after: Vec<String> = server.iter().enumerate().map(|(i, t)| if i == 10 { t.clone() } else { t.replace("abc", "xyz") }).collect();
     assert_eq!(r["after"], serde_json::json!(after), "{}", r);
-    assert_eq!(r["errors"], serde_json::json!([]), "{}", r);
+    assert_eq!(r["errors"], serde_json::json!([said("not an int: \"abc\""), said("not an int: \"xyz\"")]), "{}", r);
 }
 
 // Q-773, what reaches the page by other ways: a server fn's answer, a channel's message, and the

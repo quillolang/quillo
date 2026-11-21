@@ -72,7 +72,9 @@ fn the_rarer_component_forms_work_in_a_page() {
     };
     let r = run_page(&chrome, "forms.qwe", "/", "forms.js");
     assert_eq!(r["exception"], Value::Null, "{}", r);
-    assert_eq!(r["errors"], json!([]), "{}", r);
+    // `<Tried>`'s body gives its `int("x")?` error once clicked: shown, it shows nothing and is said
+    // in the console (FEEDBACK81.md, Q-1272, decided; branch feedback72-81).
+    assert_eq!(r["errors"], json!(["an error no statement took, shown in <Tried> as nothing: internal error (give a value for it with `??`, or show something else with `is_err` or `match`)"]), "{}", r);
     assert_eq!(r["late"], "late 0");
     assert_eq!(r["lateAfter"], "late 1");
     assert_eq!(r["earlyAfter"], "early 2");

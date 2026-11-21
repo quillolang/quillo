@@ -919,6 +919,9 @@ impl Interp {
             return resp;
         }
         self.rendered_island = false;
+        self.scroll_island = false;
+        // Q-1272: an error shown in this request's page is said once.
+        self.err_shown = false;
         self.island_names.clear();
         self.deferred.clear();
         self.tenant = None;
@@ -1246,7 +1249,7 @@ impl Interp {
                         s
                     }
                 };
-                tags.push_str(&format!("<script>{}</script>", island_loader(&srcs)));
+                tags.push_str(&format!("<script>{}</script>", island_loader(&srcs, std::mem::take(&mut self.scroll_island))));
             } else {
                 bundle_styles = self.styles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ids();
                 if let Some((i18n, l)) = &i18n {
@@ -6564,8 +6567,23 @@ fn ready_response(it: &mut Interp, req: &HttpRequest) -> HttpResponse {
     r
 }
 
-fn island_loader(srcs: &[String]) -> String {
+fn island_loader(srcs: &[String], scroll: bool) -> String {
     let src = serde_json::to_string(srcs).unwrap_or_default().replace("</", "<\\/");
+    // A page with a component that listens to scrolls (`data-sc`): a scroll in it, which does not
+    // bubble and may come with no pointer, touch, focus or key (a script or a link moving the box),
+    // loads the bundle too, heard as it goes down; the element is kept, and once the component is
+    // taken up its handler runs once on where the box is then (`boot` in runtime.js). `w.sc` tells
+    // the runtime to go on hearing them. Only on such a page (FEEDBACK72.md, Q-1010; branch
+    // feedback72-81).
+    let scroll = if scroll {
+        concat!(
+            "w.sc=1;d.addEventListener(\"scroll\",(e)=>{const el=e.target;if(w.booted||!el.closest||!el.closest(\"quillo-island[data-sc],[data-qi][data-sc]\"))return;",
+            "if(!q.some((r)=>r.t===\"scroll\"&&r.el===el))q.push({t:\"scroll\",el});load()},{capture:true,passive:true});",
+            "const r0=w.redo;w.redo=(r)=>{if(r.t!==\"scroll\")return r0(r);if(r.el.isConnected)r.el.dispatchEvent(new Event(\"scroll\"))};"
+        )
+    } else {
+        ""
+    };
     format!(
         concat!(
             "(()=>{{const d=document,W=window,k=Symbol.for(\"quillo\"),w=W[k]||(W[k]={{}}),q=w.q=[];let go=0;",
@@ -6591,9 +6609,10 @@ fn island_loader(srcs: &[String]) -> String {
             // goes on as the browser does it.
             "for(const v of[\"pointerdown\",\"mousedown\",\"pointerup\",\"mouseup\",\"click\",\"auxclick\",\"dblclick\",\"contextmenu\",\"submit\"])d.addEventListener(v,(e)=>{{if(w.booted||!isl(e))return;const i={{}};for(const k of K)if(k in e)i[k]=e[k];q.push({{t:v,el:e.target,i,p:typeof PointerEvent!==\"undefined\"&&e instanceof PointerEvent}});if(v===\"click\"||v===\"submit\"){{e.preventDefault();e.stopPropagation()}}load()}},true);",
             "const idle=()=>{{if(d.querySelector(\"quillo-island[data-e],quillo-island[data-l],[data-qi][data-e],[data-qi][data-l],body>quillo-island\"))(window.requestIdleCallback||setTimeout)(load)}};",
-            "d.readyState===\"loading\"?d.addEventListener(\"DOMContentLoaded\",idle):idle()}})()"
+            "{}d.readyState===\"loading\"?d.addEventListener(\"DOMContentLoaded\",idle):idle()}})()"
         ),
-        src
+        src,
+        scroll
     )
 }
 

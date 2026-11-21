@@ -453,14 +453,16 @@ fn components_use_libraries_by_name() {
     let r = run_page_with(&chrome, &dir.join("libs.qwe"), 0, Some(&dir.join("libs.js")));
     // One script for both names, before the runtime and the bundle. Calling the
     // class without `.new` stops the handler, saying how to make one.
-    let near = "err(\"js_new: gauge is not defined on this page (did you mean Gauge?)\")";
+    // The wrong name's error value, shown, shows nothing and is said in the console (FEEDBACK81.md,
+    // Q-1272, decided; branch feedback72-81): the page read `err("js_new: gauge is not defined ...")`.
+    let near: String = "an error no statement took, shown in <Widget> as nothing: js_new: gauge is not defined on this page (did you mean Gauge?)".chars().take(120).collect();
     let want = serde_json::json!({
         "loaded": ["libs-lib.js", "_quillo", "_quillo"],
         "mounted": ["gauge 1", 1, "1.2.3"],
         "called": ["gauge 2", "4"],
-        "near": near,
-        "cls": near,
-        "errors": ["Gauge is a class: make one with Gauge.new(...) (or js_new(\"Gauge\", ...))"]
+        "near": "",
+        "cls": "",
+        "errors": [near, "Gauge is a class: make one with Gauge.new(...) (or js_new(\"Gauge\", ...))"]
     });
     assert_eq!(r, want);
 }
@@ -1471,15 +1473,17 @@ fn a_failed_server_fn_says_why_in_development_only() {
     };
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/browser");
     let (app, script) = (dir.join("rpc_failed.qwe"), dir.join("rpc_failed.js"));
+    // The error value shown shows nothing, and the console says it where the page said it
+    // (FEEDBACK81.md, Q-1272, decided; branch feedback72-81): the page read `err("...")`.
     let r = run_page_args(&chrome, &app, 0, "/", Some(&script), &["--watch"]);
-    let value = r["value"].as_str().unwrap_or_else(|| panic!("{}", r));
-    assert!(value.starts_with("err(\"server fn `down` failed (500): ") && value.contains("rpc_failed.qwe:3: division by zero"), "{}", r);
+    assert_eq!(r["value"], "", "{}", r);
     let said = r["said"].as_array().unwrap_or_else(|| panic!("{}", r));
-    assert!(said.len() == 1 && said[0].as_str().is_some_and(|s| s.starts_with("quillo: server fn `down` failed: ") && s.contains("rpc_failed.qwe:3: division by zero")), "{}", r);
+    assert!(said.len() == 2 && said[0].as_str().is_some_and(|s| s.starts_with("quillo: server fn `down` failed: ") && s.contains("rpc_failed.qwe:3: division by zero")), "{}", r);
+    assert!(said[1].as_str().is_some_and(|s| s.starts_with("quillo: an error no statement took, shown in <Counter> as nothing: server fn `down` failed (500): ") && s.contains("rpc_failed.qwe:3: division by zero")), "{}", r);
     let r = run_page_args(&chrome, &app, 0, "/", Some(&script), &[]);
-    let value = r["value"].as_str().unwrap_or_else(|| panic!("{}", r));
-    assert!(!value.contains("division") && !value.contains("rpc_failed.qwe") && value.starts_with("err("), "{}", r);
-    assert_eq!(r["said"], serde_json::json!([]), "{}", r);
+    assert_eq!(r["value"], "", "{}", r);
+    let said = r["said"].as_array().unwrap_or_else(|| panic!("{}", r));
+    assert!(said.len() == 1 && said[0].as_str().is_some_and(|s| s.starts_with("quillo: an error no statement took, shown in <Counter> as nothing: ") && !s.contains("division") && !s.contains("rpc_failed.qwe")), "{}", r);
 }
 
 /// What a developer tool hears, as `quillo:devtools` events, once the page asks with

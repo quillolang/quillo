@@ -54,6 +54,13 @@ fn a_hidden_errors_text_never_reaches_a_visitor() {
     for path in ["/value", "/map", "/text", "/str", "/plus", "/markup", "/attr", "/inner", "/json", "/join", "/nested", "/inside"] {
         let a = send(s.port, "GET", path, &[], "");
         assert!(!a.body.contains(SECRET) && !a.body.contains("read_file"), "{}: {}", path, a.body);
+        // An error value shown in markup shows nothing at all, and goes to the log (FEEDBACK81.md,
+        // Q-1272, decided; branch feedback72-81; see `the_log_and_print_keep_the_text`): it read
+        // `err("internal error")` there.
+        if path == "/inner" {
+            assert_eq!(a.body, "<p></p>", "{}", path);
+            continue;
+        }
         assert!(a.body.contains("internal error"), "{}: {}", path, a.body);
     }
     // What the program wrote is its own to show.
@@ -91,9 +98,13 @@ fn the_log_and_print_keep_the_text() {
     let mut _server = support::Guard::new(child);
     let port = support::port_in_log(&mut _server.0, &d.join("log.txt"), STARTS);
     send(port, "GET", "/text", &[("x-request-id", "abc123")], "");
+    // Shown in markup, the error is the log's alone (FEEDBACK81.md, Q-1272; branch feedback72-81).
+    assert_eq!(send(port, "GET", "/inner", &[("x-request-id", "inner1")], "").body, "<p></p>");
     assert_eq!(send(port, "GET", "/printed", &[], "").body, "done");
     let logged = std::fs::read_to_string(d.join("log.txt")).unwrap();
     assert!(logged.contains("GET /text (rid abc123)") && logged.contains(SECRET), "{}", logged);
+    let inner = logged.lines().find(|l| l.contains("GET /inner (rid inner1)")).unwrap_or_else(|| panic!("{}", logged));
+    assert!(inner.contains("an error no statement took, made at ") && inner.contains(" shown as nothing: ") && inner.contains(SECRET), "{}", logged);
     let printed = std::fs::read_to_string(d.join("out.txt")).unwrap();
     assert_eq!(printed.matches(SECRET).count(), 2, "{}", printed);
     assert!(printed.contains("it failed: err("), "{}", printed);

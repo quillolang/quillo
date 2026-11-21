@@ -26,6 +26,103 @@ fn key_not_a_param(def: &FnDef) -> PResult<()> {
 pub const TYPE_NAMES: &[&str] = &["int", "float", "dec", "num", "str", "date", "money", "bool", "list", "map", "html", "fn", "any", "response"];
 pub const VOID_TAGS: &[&str] =
     &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
+
+/// The templates a `style` attribute's value gives, as written or from a branch of a `? :`, an
+/// `if`, a `match`, a `??`, an `&&` or an `||` (FEEDBACK79.md, Q-1250, found in review): each value
+/// put in them given to `__css_value`, which escapes it as a CSS value, but the program's own text
+/// known before the run (`program_text`), which may write declarations of its own (`${hidden ?
+/// "display: none;" : ""}`). In a loop, not by recursion.
+fn style_values(v: &mut Expr, line: u32) {
+    let mut todo = vec![v];
+    while let Some(e) = todo.pop() {
+        match e {
+            Expr::Template(parts) => {
+                for p in parts.iter_mut() {
+                    if let TPart::Expr(x) = p {
+                        if !program_text(x) {
+                            let y = std::mem::replace(x, Expr::Lit(Lit::Nil));
+                            *x = Expr::Call(Box::new(Expr::Ident("__css_value".into(), line)), vec![y], line);
+                        }
+                    }
+                }
+            }
+            Expr::If(_, a, b) => {
+                todo.push(&mut **a);
+                if let Some(b) = b {
+                    todo.push(&mut **b);
+                }
+            }
+            Expr::Match(_, arms, _) => todo.extend(arms.iter_mut().map(|a| &mut a.body)),
+            Expr::Coalesce(a, b) | Expr::Binary(BinOp::Or, a, b, _) => {
+                todo.push(&mut **a);
+                todo.push(&mut **b);
+            }
+            Expr::Binary(BinOp::And, _, b, _) => todo.push(&mut **b),
+            Expr::Block(stmts) => {
+                if let Some(Stmt::Expr(last)) = stmts.last_mut() {
+                    todo.push(last);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `e` gives only text the program wrote, as the parser knows for certain: a string (or
+/// `null`), or a `? :`, `if`, `match`, `??`, `&&` or `||` each of whose branches is one. Not data
+/// from outside, so a `style` template writes it as it is; a name, a top-level `let`'s too, is
+/// escaped as any value (FEEDBACK79.md, Q-1250, decided in review; branch feedback72-81). In a
+/// loop, not by recursion.
+fn program_text(e: &Expr) -> bool {
+    let mut todo = vec![e];
+    while let Some(e) = todo.pop() {
+        match e {
+            Expr::Lit(Lit::Str(_) | Lit::Nil) => {}
+            Expr::If(_, a, b) => {
+                todo.push(a);
+                match b {
+                    Some(b) => todo.push(b),
+                    None => {}
+                }
+            }
+            Expr::Match(_, arms, _) => todo.extend(arms.iter().map(|a| &a.body)),
+            Expr::Coalesce(a, b) | Expr::Binary(BinOp::And | BinOp::Or, a, b, _) => {
+                todo.push(a);
+                todo.push(b);
+            }
+            Expr::Block(stmts) => match stmts.as_slice() {
+                [Stmt::Expr(x)] => todo.push(x),
+                _ => return false,
+            },
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether an element starts an XML answer's markup, where HTML's void names are XML's elements
+/// (`<link>` in a feed): a feed's or a sitemap's root (`<rss>`, `<feed>`, `<urlset>`,
+/// `<sitemapindex>`), or the outermost element of its markup (`outermost`) with an `xmlns` or an
+/// `xmlns:x` that is not HTML's own, as the answer's type takes it (`markup_type` in server.rs).
+/// Not `<html>`, `<svg>` or `<math>`, whose rules are HTML's (`crate::foreign`) (FEEDBACK79.md,
+/// Q-1259; branch feedback72-81).
+fn xml_root(tag: &str, attrs: &[(String, AttrVal)], outermost: bool) -> bool {
+    // A view's or component's tag is a call.
+    if !tag.starts_with(|c: char| c.is_ascii_lowercase()) {
+        return false;
+    }
+    match tag.to_ascii_lowercase().as_str() {
+        // And a feed's or a sitemap's entry, which a helper makes apart (`fn entry(e) =
+        // <entry>...</entry>`): none of them is HTML's (found in review).
+        "rss" | "feed" | "urlset" | "sitemapindex" | "entry" | "item" | "url" | "sitemap" => true,
+        "html" | "svg" | "math" => false,
+        _ if !outermost => false,
+        _ => attrs.iter().any(|(n, v)| {
+            let n = n.to_ascii_lowercase();
+            (n == "xmlns" || n.starts_with("xmlns:")) && !matches!(v, AttrVal::Expr(Expr::Lit(Lit::Str(s))) if &**s == "http://www.w3.org/1999/xhtml")
+        }),
+    }
+}
 pub(crate) const KEYWORDS: &[&str] = &[
     "let", "fn", "view", "route", "use", "return", "if", "then", "else", "match", "for", "in", "and", "or", "not",
     "true", "false", "null", "nil", "reply", "as", "component", "while",
@@ -94,6 +191,9 @@ pub struct Parser {
     privacy_tag: String,
     /// The last `use` path read had its extension given here (`LibOptions::implied`).
     implied_ext: bool,
+    /// What the block about to be parsed is the body of (an `if`, a `for`), for a `state` in it
+    /// (FEEDBACK81.md, Q-1271; branch feedback72-81).
+    block_of: &'static str,
 }
 
 /// An element whose end tag has not been read yet.
@@ -107,6 +207,9 @@ pub struct OpenTag {
     pub end_line: u32,
     /// The indentation of the line it starts on.
     pub indent: String,
+    /// It is, or is inside, the root of an XML answer (see `xml_root`; FEEDBACK79.md, Q-1259;
+    /// branch feedback72-81).
+    pub xml: bool,
 }
 
 /// The elements open at the end of `src` (an editor's text up to its
@@ -408,7 +511,7 @@ impl Parser {
 
     pub fn with_line(src: &str, line: u32) -> Self {
         Parser { lx: Lexer::new(src, line), peeked: None, in_typedef: false, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, file_style: None, file_styles: 0, components: 0, callers_ok: false, callers: None, view_next: false, open: Vec::new(), unclosed_at_end: None, top: false, more: Vec::new(),
-                 privates: Default::default(), privacy_tag: crate::privacy::tag(None, src), implied_ext: false }
+                 privates: Default::default(), privacy_tag: crate::privacy::tag(None, src), implied_ext: false, block_of: "" }
     }
 
     /// Records `file` on the functions and routes parsed (see `FnDef::file`).
@@ -2714,7 +2817,13 @@ impl Parser {
         // `() => n += 1`, `() => count = 0`: the assignment is the body, as in `() => { n += 1 }`,
         // and the arrow gives null (FEEDBACK45.md, Q-518; branch feedback40-43).
         let line = self.line()?;
-        let e = self.parse_expr()?;
+        // A body in braces is a function's, for a `state` in it (Q-1271).
+        if self.at(&Tok::LBrace)? {
+            self.block_of = "fn";
+        }
+        let e = self.parse_expr();
+        self.block_of = "";
+        let e = e?;
         if matches!(self.peek()?, Tok::Assign | Tok::PlusAssign | Tok::MinusAssign) {
             return Ok(Expr::Block(vec![self.assign_rest(e, line)?]));
         }
@@ -2726,7 +2835,18 @@ impl Parser {
         self.parse_block_rest()
     }
 
+    /// The block that is the body of `what` (`if`, `for`, `while`), as `parse_block`, which a
+    /// `state` in it is told against (`state_in_block`; FEEDBACK81.md, Q-1271; branch
+    /// feedback72-81).
+    fn block_for(&mut self, what: &'static str) -> PResult<Expr> {
+        self.block_of = what;
+        let r = self.parse_block();
+        self.block_of = "";
+        r
+    }
+
     fn parse_block_rest(&mut self) -> PResult<Expr> {
+        let what = std::mem::take(&mut self.block_of);
         let mut stmts: Vec<Stmt> = Vec::new();
         loop {
             self.skip_seps()?;
@@ -2744,9 +2864,55 @@ impl Parser {
             if self.at(&Tok::Eof)? {
                 return self.err_at("unexpected end of input: missing `}`");
             }
+            if self.styling.as_ref().is_some_and(|s| s.component) && matches!(self.peek()?, Tok::Ident(w) if w == "state") {
+                self.state_in_block(what)?;
+            }
             stmts.push(self.parse_stmt()?);
             self.end_stmt()?;
         }
+    }
+
+    /// `state extra = "x"` in a block of a component's (an `if`'s, a handler's): a state is
+    /// declared at the top of the component's body, where it is found by its name. Read as the
+    /// name `state`, the next word was "expected end of statement", with a note that a newer
+    /// Quillo might know it (FEEDBACK81.md, Q-1271; branch feedback72-81). `what`: the block's
+    /// `if`, `for` or `while`, else none known.
+    fn state_in_block(&mut self, what: &str) -> PResult<()> {
+        let saved = self.save();
+        let line = self.line()?;
+        self.next()?;
+        let Tok::Ident(name) = self.peek()? else {
+            self.restore(saved);
+            return Ok(());
+        };
+        self.next()?;
+        if !self.at(&Tok::Assign)? || KEYWORDS.contains(&name.as_str()) {
+            self.restore(saved);
+            return Ok(());
+        }
+        self.next()?;
+        // A first value of the kind it is set to, for the line to write at the top.
+        let first = match self.parse_expr() {
+            Ok(Expr::Lit(Lit::Str(_)) | Expr::Template(_)) => "\"\"",
+            Ok(Expr::Lit(Lit::Int(_))) => "0",
+            Ok(Expr::Lit(Lit::Float(_))) => "0.0",
+            Ok(Expr::Lit(Lit::Bool(_))) => "false",
+            Ok(Expr::List(_)) => "[]",
+            Ok(Expr::Map(_)) => "{}",
+            _ => "null",
+        };
+        self.restore(saved);
+        let (inside, there) = match what {
+            "if" => ("an `if`", "the `if`"),
+            "for" => ("a `for`", "the `for`"),
+            "while" => ("a `while`", "the `while`"),
+            "fn" => ("a function", "the function"),
+            _ => ("a block", "the block"),
+        };
+        Err(QuilloError::new(
+            format!("`state` goes at the top of a component's body, not inside {}: declare `state {} = {}` there and set it in {}", inside, name, first, there),
+            line,
+        ))
     }
 
     // ---- expressions ---------------------------------------------------
@@ -3356,12 +3522,12 @@ impl Parser {
         if !self.at(&Tok::LBrace)? {
             return self.err_at("expected `{` after the `if` condition (or write `cond ? a : b`)");
         }
-        let a = self.parse_block()?;
+        let a = self.block_for("if")?;
         let b = if self.eat_kw("else")? {
             if self.eat_kw("if")? {
                 Some(Box::new(self.nested(Self::parse_if)?))
             } else {
-                Some(Box::new(self.parse_block()?))
+                Some(Box::new(self.block_for("if")?))
             }
         } else {
             None
@@ -3416,7 +3582,7 @@ impl Parser {
         if !self.at(&Tok::LBrace)? {
             return self.err_at("expected `{` after the `while` condition");
         }
-        let body = self.parse_block()?;
+        let body = self.block_for("while")?;
         Ok(Expr::While(Box::new(cond), Box::new(body), line))
     }
 
@@ -3480,7 +3646,7 @@ impl Parser {
                 self.parse_expr()?
             }
         } else if self.at(&Tok::LBrace)? {
-            self.parse_block()?
+            self.block_for("for")?
         } else {
             if matches!(self.peek()?, Tok::Ident(k) if k == "if") {
                 return self.err_at("a `for` takes no `if`: `filter` the list first, or put the `if` in its body");
@@ -3634,6 +3800,27 @@ impl Parser {
         Ok(Expr::Html(Box::new(el), line))
     }
 
+    /// Whether what follows a start tag just read is text up to `</tag>` (any case), with nothing
+    /// that starts another tag between (FEEDBACK79.md, Q-1259, found in review).
+    fn holds_up_to_end(&self, tag: &str) -> bool {
+        let mut i = 0;
+        while let Some(c) = self.lx.peek_char_at(i) {
+            if c == '<' {
+                let end: Vec<char> = format!("</{}", tag).chars().collect();
+                if !end.iter().enumerate().all(|(k, c)| self.lx.peek_char_at(i + k).is_some_and(|d| d.eq_ignore_ascii_case(c))) {
+                    return false;
+                }
+                let mut j = i + end.len();
+                while self.lx.peek_char_at(j).is_some_and(|c| c == ' ' || c == '\t') {
+                    j += 1;
+                }
+                return self.lx.peek_char_at(j) == Some('>');
+            }
+            i += 1;
+        }
+        false
+    }
+
     /// How many characters `!DOCTYPE html>` takes after a `<` just read (any case), or 0.
     fn doctype_len(&self) -> usize {
         let ahead: String = (0..15).map_while(|i| self.lx.peek_char_at(i)).collect();
@@ -3689,6 +3876,10 @@ impl Parser {
                 tag.to_ascii_lowercase()
             ));
         }
+        // Inside an XML answer's root, HTML's void names are XML's elements: `<link href="..."/>`
+        // written so, and `<link>text</link>` an element with text (FEEDBACK79.md, Q-1259; branch
+        // feedback72-81).
+        let in_xml = self.open.last().is_some_and(|o| o.xml);
         let mut id = None;
         let mut classes = Vec::new();
         loop {
@@ -3718,7 +3909,9 @@ impl Parser {
                 }
                 Some('>') => {
                     self.lx.bump();
-                    let void = VOID_TAGS.contains(&tag.as_str());
+                    // In an XML answer, one that holds text up to its end tag (`<link>url</link>`);
+                    // else empty, as 0.8.9 had `<link href="x">` there (found in review).
+                    let void = VOID_TAGS.contains(&tag.as_str()) && !(in_xml && self.holds_up_to_end(&tag));
                     // `<img></img>`, `<br></br>`, as JSX and XHTML write them: the end tag right
                     // after is passed over, where it was taken for the end of the element around
                     // it (FEEDBACK48.md, Q-576; branch main).
@@ -3885,6 +4078,17 @@ impl Parser {
                     renamed.push((format!("@{}", ev), n.clone()));
                     *n = format!("@{}", ev);
                 }
+                // What a `style` attribute's template puts in is a CSS value, as each of css`...`'s
+                // and a style map's are (Q-668): `{`, `}`, `;` and `\` as CSS's escapes, so
+                // `style={`color: ${c}`}` with a visitor's `red; position: fixed` is one value and
+                // adds no declaration, on the server and in the browser alike. Its own text stays
+                // as written; a whole value (`style={s}`) cannot be cut so (FEEDBACK79.md, Q-1250;
+                // branch feedback72-81).
+                if lower == "style" {
+                    if let AttrVal::Expr(e) = v {
+                        style_values(e, line);
+                    }
+                }
             }
         }
         // One of the two would be lost: in a list, `key` and a view's own
@@ -3936,6 +4140,7 @@ impl Parser {
                 end: self.lx.pos,
                 end_line: self.lx.line,
                 indent: text[start - col_at(text, start) as usize..].iter().take_while(|c| **c == ' ' || **c == '\t').collect(),
+                xml: in_xml || xml_root(&tag, &attrs, self.open.is_empty()),
             };
             self.open.push(opened);
             let r = self.parse_html_children(&tag, line, &mut dollars, &mut joined);
@@ -3976,7 +4181,19 @@ impl Parser {
                 }
             }
         }
-        let facts = ElFacts::of(&tag, &id, &classes, &attrs, &children, VOID_TAGS.contains(&tag.as_str()));
+        // In an XML answer, one with nothing in it is written `<link .../>`, one with text holds it
+        // (Q-1259).
+        let void = VOID_TAGS.contains(&tag.as_str()) && (!in_xml || children.is_empty());
+        let mut facts = ElFacts::of(&tag, &id, &classes, &attrs, &children, void);
+        // Written by the general way (`render_attrs`), which writes its `/`: an HTML page's
+        // elements are written as they were, asking nothing more.
+        if void && in_xml {
+            facts.xml_empty = true;
+            facts.plain_attrs = false;
+            facts.tags_fixed = false;
+            facts.pieces_root = false;
+            facts.flat = false;
+        }
         Ok(HtmlEl { tag, id, classes, attrs, children, line, dollars, joined, facts })
     }
 
@@ -4019,7 +4236,7 @@ impl Parser {
                     let close = self.read_html_name();
                     // An end tag for an element that has none, away from it: removed by the fix,
                     // where the fix made it this element's end (Q-576).
-                    if close != tag && VOID_TAGS.contains(&close.as_str()) {
+                    if close != tag && VOID_TAGS.contains(&close.as_str()) && !self.open.last().is_some_and(|o| o.xml) {
                         let col = col_at(self.lx.text(), at);
                         self.lx.skip_inline_ws();
                         let len = if self.lx.peek_char() == Some('>') { self.lx.pos + 1 - at } else { self.lx.pos - at };
@@ -4457,21 +4674,29 @@ fn old_syntax_hint(t: &Tok) -> Option<&'static str> {
 /// the two differ: React's `onChange` on a field is every keystroke, the DOM's `input`, where
 /// `change` waited for the field to lose focus; its `onFocus` and `onBlur` reach a wrapper, as
 /// the DOM's `focusin` and `focusout` do (FEEDBACK48.md, Q-560 and Q-561; branch main).
+///
+/// Only React's own names, `on` and a capital (`onChange`): the DOM's are lower case and
+/// compared as written, so `onchange` is the DOM's `change`, which waits for the field to be
+/// left, as `@change` is, and `onfocus` and `onblur` are `focus` and `blur`; lower case
+/// `onchange` ran at each keystroke (FEEDBACK81.md, Q-1270, and FEEDBACK73.md, Q-1025; branch
+/// feedback72-81). `doubleclick` is no DOM event: `ondoubleclick` is `dblclick` in any case.
 pub(crate) fn react_event(tag: &str, written: &str, ev: &str) -> Result<String, String> {
+    let react = written.len() > 2 && written.starts_with("on") && written.as_bytes()[2].is_ascii_uppercase();
     Ok(match ev {
-        "change" if tag == "input" || tag == "textarea" => "input",
+        "change" if react && (tag == "input" || tag == "textarea") => "input",
         "doubleclick" => "dblclick",
-        "focus" => "focusin",
-        "blur" => "focusout",
+        "focus" if react => "focusin",
+        "blur" if react => "focusout",
         "gotpointercapture" | "lostpointercapture" => ev,
         _ if ev.len() > "capture".len() && ev.ends_with("capture") => {
             let base = &ev[..ev.len() - "capture".len()];
+            // React's name it points to, and that name's event (Q-1270).
+            let name = format!("on{}{}", &written[2..3].to_ascii_uppercase(), &written[3..written.len() - "capture".len()]);
             return Err(format!(
-                "`{}` listens before the element's own handlers, as React's `…Capture` does, which Quillo has no form for: write `on{}{}` (or `@{}`), which hears it as it bubbles up",
+                "`{}` listens before the element's own handlers, as React's `…Capture` does, which Quillo has no form for: write `{}` (or `@{}`), which hears it as it bubbles up",
                 written,
-                &written[2..3].to_ascii_uppercase(),
-                &written[3..written.len() - "capture".len()],
-                react_event(tag, written, base).unwrap_or_else(|_| base.to_string())
+                name,
+                react_event(tag, &name, base).unwrap_or_else(|_| base.to_string())
             ));
         }
         _ => ev,

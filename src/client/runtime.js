@@ -7038,6 +7038,7 @@ function put(v, c, out) {
   // `true` shows nothing, as `false` and null do, as in React, and as the server writes it; a
   // function too (FEEDBACK48.md, Q-564 and Q-571; branch main).
   if (isNil(v) || typeof v === "boolean" || typeof v === "function") return;
+  if (v instanceof Err) { errShown(v); return; }
   if (Array.isArray(v)) { for (const x of v) put(x, c, out); return; }
   if (v instanceof Html) {
     // Made as the code of the component whose stamp it bears (see `Writer`).
@@ -7050,6 +7051,24 @@ function put(v, c, out) {
   }
   const t = shown(v);
   out.push(c.claim ? claimText(c, t) : document.createTextNode(t));
+}
+// An error value shown in markup shows nothing, as on the server, the program's as a builtin's: the
+// page read `err("...")` there. Said in the console once a render (the code that runs at once, to
+// its end: the next render, a click's, says it again, however soon it comes), as the server says
+// it in its log, with the component and, in development, the line (FEEDBACK81.md, Q-1272; branch
+// feedback72-81).
+let errSaid = false;
+function errShown(v) {
+  if (errSaid) return;
+  errSaid = true;
+  queueMicrotask(() => { errSaid = false; });
+  // The component whose code made it (`Scope.comp`), else the one it is in (a list's rows are
+  // scopes of their own; found in review).
+  let c = Writer !== null ? Writer : Owner ? Owner.comp : null;
+  for (let s = Owner; s && !(c instanceof Inst); s = s.up) if (s instanceof Inst) c = s;
+  const comp = c instanceof Inst ? c.def.$name : null;
+  const text = v.own || ERRORS_SHOWN ? display(v.error) : "internal error";
+  report(new Error(`an error no statement took, shown${comp ? ` in <${comp}>` : ""} as nothing: ${text} (give a value for it with \`??\`, or show something else with \`is_err\` or \`match\`)`));
 }
 // A value as the page shows it: a NUL is U+FFFD, as the server writes it and the HTML parser makes
 // it, or the server's page read otherwise than what the browser makes (FEEDBACK55.md, Q-772;
@@ -7489,6 +7508,7 @@ const live = (name) => name === "value" || name === "checked" || name === "selec
 function hole(el, kind, name, v, svg, i) {
   if (kind === 2) { listen(el, name, v); return; }
   if (kind === 3) { spreadInto(el, v); return; }
+  if (kind === 4) { bindReset(el, name); return; }
   if (typeof v !== "function") {
     if (kind === 0) setProp(el, name, v, undefined);
     else if (!isNil(v) && v !== "") setClass(el, v, svg);
@@ -7503,6 +7523,27 @@ function hole(el, kind, name, v, svg, i) {
   if (byRow(i)) rowHole(rowNow, v, kind === 0 ? attrApply : classApply, el, kind === 0 ? name : svg, undefined, false);
   else if (kind === 0) bound(v, attrApply, el, name, undefined);
   else bound(v, classApply, el, svg, undefined);
+}
+
+// A field bound two ways (`value={name}`, `checked={on}`) follows its form's reset as it follows
+// typing: the browser gives the fields their first values after the `reset` event, in the same
+// task, so after it each bound field of the form runs its binding's handler (`t`, the event it
+// listens to) on what it shows then, as an input event would, without a handler of the program's
+// joined to it (`$reset`). The field emptied and the state kept the old text (FEEDBACK80.md,
+// Q-1269; branch feedback72-81). One listener, put in place with the first bound field: none on a
+// page without one.
+let resetting = false;
+function bindReset(el, t) {
+  (el.__reset || (el.__reset = [])).push(t);
+  if (!resetting) { resetting = true; document.addEventListener("reset", formReset, true); }
+}
+function formReset(ev) {
+  const form = ev.target;
+  if (!form || !form.elements) return;
+  setTimeout(() => {
+    if (ev.defaultPrevented) return;
+    for (const el of form.elements) if (el.__reset) for (const t of el.__reset) fire(el, t, { target: el, $reset: true });
+  });
 }
 
 function liveApply(x) { setProp(this.el, this.name, x, undefined); }
@@ -7634,15 +7675,18 @@ function spreadAttrs(maps, written, tag) {
 }
 
 // The DOM event React's handler `written` (`onDoubleClick`, as `doubleclick`) listens for, as
-// the parser's `react_event` has it; a `…Capture` is refused, as written out.
+// the parser's `react_event` has it; a `…Capture` is refused, as written out. Only React's names,
+// `on` and a capital: lower case `onchange` is the DOM's `change`, `onfocus` and `onblur` the
+// DOM's own (FEEDBACK81.md, Q-1270; branch feedback72-81).
 function reactEvent(tag, written, ev) {
-  if (ev === "change" && (tag === "input" || tag === "textarea")) return "input";
+  const react = written.length > 2 && written.startsWith("on") && written[2] >= "A" && written[2] <= "Z";
+  if (react && ev === "change" && (tag === "input" || tag === "textarea")) return "input";
   if (ev === "doubleclick") return "dblclick";
-  if (ev === "focus") return "focusin";
-  if (ev === "blur") return "focusout";
+  if (react && ev === "focus") return "focusin";
+  if (react && ev === "blur") return "focusout";
   if (ev.length > 7 && ev.endsWith("capture") && ev !== "gotpointercapture" && ev !== "lostpointercapture") {
-    const base = written.slice(2, written.length - 7);
-    fail(`\`${written}\` listens before the element's own handlers, as React's \`…Capture\` does, which Quillo has no form for: write \`on${base[0].toUpperCase()}${base.slice(1)}\` (or \`@${reactEvent(tag, "on" + base, base.toLowerCase())}\`), which hears it as it bubbles up`);
+    const base = written.slice(2, written.length - 7), name = `on${base[0].toUpperCase()}${base.slice(1)}`;
+    fail(`\`${written}\` listens before the element's own handlers, as React's \`…Capture\` does, which Quillo has no form for: write \`${name}\` (or \`@${reactEvent(tag, name, base.toLowerCase())}\`), which hears it as it bubbles up`);
   }
   return ev;
 }
@@ -7653,6 +7697,8 @@ function reactEvent(tag, written, ev) {
 // list was its text, and after an update a scramble of words (FEEDBACK48.md, Q-566; branch main).
 function clsWords(x, out) {
   if (isNil(x) || typeof x === "boolean" || typeof x === "function" || x === "") return;
+  // An error value is no class, as on the server (FEEDBACK81.md, Q-1272, found in review).
+  if (x instanceof Err) { errShown(x); return; }
   if (Array.isArray(x)) { for (const y of x) clsWords(y, out); return; }
   // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
   if (isMap(x)) { for (const k of mkeys(x)) if (k !== "" && truthy(x[k])) out.push(k); return; }
@@ -8031,7 +8077,10 @@ const stylePx = (n, v) => styleNonzero(v) && !n.startsWith("--") && !UNITLESS.ha
 const cssValue = (s) => s.replace(/[{};\\]/g, (c) => "\\" + c.charCodeAt(0).toString(16) + " ");
 const styleKey = (k) => (k.startsWith("--") ? /^--[\p{L}\p{N}_-]+$/u : /^[A-Za-z0-9_-]+$/).test(k);
 // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
-const styleText = (m) => mkeys(m).filter((k) => !isNil(m[k]) && m[k] !== false && styleKey(k))
+// An error value's declaration is left out, and said, as on the server (FEEDBACK81.md, Q-1272, found
+// in review).
+const errLeft = (v) => v instanceof Err && (errShown(v), true);
+const styleText = (m) => mkeys(m).filter((k) => !isNil(m[k]) && m[k] !== false && styleKey(k) && !errLeft(m[k]))
   .map((k) => { const n = styleName(k); return n + ": " + cssValue(display(m[k])) + stylePx(n, m[k]); }).join("; ");
 
 // The text a bool is for an attribute whose values are words, as on the server (see its
@@ -8051,6 +8100,9 @@ function setProp(el, k, v, old) {
   if (el.__q && ISLAND_ATTRS.has(attrKey(k))) return;
   // A function is no value of an attribute's, as on the server (found in review).
   if (typeof v === "function") v = null;
+  // Nor an error, which shows nothing, as on the server (FEEDBACK81.md, Q-1272; branch
+  // feedback72-81).
+  else if (v instanceof Err) { errShown(v); v = null; }
   if (k === "style" && isMap(v)) v = styleText(v);
   if (k === "style" && isMap(old)) old = styleText(old);
   // What the attribute is only the default of, as `value` (FEEDBACK28.md, Q-338; branch
@@ -9739,6 +9791,10 @@ function boot() {
   // Someone reaching for an island takes it up (before their event is
   // handled: it reaches the component).
   for (const t of ["pointerover", "pointerdown", "touchstart", "focusin", "keydown", "click", "submit", "input"]) document.addEventListener(t, wake, true);
+  // And a scroll, on a page whose loader said it has a component that listens to them: heard as it
+  // goes down, so the component's handler, put in place as it is taken up, hears the same scroll
+  // (FEEDBACK72.md, Q-1010; branch feedback72-81).
+  if (QW.sc) document.addEventListener("scroll", wake, { capture: true, passive: true });
   const outer = [...document.querySelectorAll(ISLANDS)].filter((i) => !(i.parentElement && i.parentElement.closest(ISLANDS)));
   // An island runs by itself when one inside it does: the inner one starts
   // with its outer one (FEEDBACK5.md, Q-046; branch stays-fixes).

@@ -5517,6 +5517,9 @@ impl<'a> Compiler<'a> {
         // the attributes when they listen to the same event.
         let mut ons: Vec<(String, String)> = Vec::new();
         let mut binds: Vec<(&str, String)> = Vec::new();
+        // The events of a field's bindings, whose handlers run again after its form's reset (see
+        // `bindReset` in the runtime; FEEDBACK80.md, Q-1269; branch feedback72-81).
+        let mut resets: Vec<&str> = Vec::new();
         // `<input value={name}/>`, where `name` is the component's state and nothing on the input
         // sets it, can only mean what `bind:value` says: typing changes `name`. Held to it one way,
         // typing was undone at once, and nothing said why. A handler of its own (a transform), a
@@ -5633,6 +5636,9 @@ impl<'a> Compiler<'a> {
                 };
                 self.reactive = saved;
                 hole(&mut holes, vals, 0, prop, get);
+                if matches!(field, "value" | "checked") && matches!(el.tag.as_str(), "input" | "select" | "textarea") && !resets.contains(&event) {
+                    resets.push(event);
+                }
                 binds.push((event, set));
                 continue;
             }
@@ -5678,13 +5684,17 @@ impl<'a> Compiler<'a> {
             let f = if sets.is_empty() {
                 f
             } else {
-                format!("(e) => {{ {}; const $h = {}; if (typeof $h === \"function\") return $h.length > 0 ? $h(e) : $h(); }}", sets.join("; "), f)
+                // After a form's reset (`$reset`), the bindings alone (Q-1269).
+                format!("(e) => {{ {}; const $h = {}; if (typeof $h === \"function\" && !e.$reset) return $h.length > 0 ? $h(e) : $h(); }}", sets.join("; "), f)
             };
             hole(&mut holes, vals, 2, &ev, f);
         }
         while let Some((ev, _)) = binds.first().cloned() {
             let sets = sets_of(ev, &mut binds);
             hole(&mut holes, vals, 2, ev, format!("(e) => {{ {}; }}", sets.join("; ")));
+        }
+        for ev in resets {
+            hole(&mut holes, vals, 4, ev, "true".into());
         }
         if !spread_js.is_empty() {
             // The tag, for the names of React's handlers in it: `onChange` on an <input> is

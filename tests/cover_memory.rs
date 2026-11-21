@@ -298,14 +298,14 @@ fn many(n: int) -> list {
     return xs
 }
 route GET /ok = "ok"
-route GET /shown ? { n: int } = <html><body><p>{err(many(n))}</p></body></html>
+route GET /shown ? { n: int } = <html><body><p>{many(n)}</p></body></html>
 route GET /style ? { n: int } {
     let s = "x".repeat(n)
     return <html><body><p style={{ color: s, background: s, border: s }}>x</p></body></html>
 }
-route GET /words ? { n: int } = <html><body><p class={[err(many(n))]}>x</p></body></html>
-route GET /class ? { n: int } = <html><body><p class={err(many(n))}>x</p></body></html>
-route GET /attr ? { n: int } = <html><body><p class="a" data-x={err(many(n))}>x</p></body></html>
+route GET /words ? { n: int } = <html><body><p class={many(n)}>x</p></body></html>
+route GET /class ? { n: int } = <html><body><p class={join(many(n), " ")}>x</p></body></html>
+route GET /attr ? { n: int } = <html><body><p class="a" data-x={join(many(n), "")}>x</p></body></html>
 route GET /json ? { n: int } = <html><body><p data-x={[err(many(n))]}>x</p></body></html>
 route GET /key ? { k: int } = <html><body><p data-x={set({}, "k".repeat(k), 1)}>x</p></body></html>
 route GET /dec = <html><body><p data-x={[1.5m]}>x</p></body></html>
@@ -332,9 +332,11 @@ fn a_page_ends_where_a_value_written_in_it_passes_the_limit() {
     checked(&d, "pages.qwe");
     let (_g, port) = serve(&d, "pages.qwe", &["--max-memory", "1MB"], "pages.log");
     let past = [
-        // An error's list shown in a page; a style of three long properties; an error among a
-        // class's words, and as the class; as an attribute where a class is written; in an
-        // attribute's JSON; a map's key there and in a script's JSON; an error in a script.
+        // A list shown in a page; a style of three long properties; a class's words, and a long
+        // class; a long attribute where a class is written; an error in an attribute's JSON; a
+        // map's key there and in a script's JSON; an error in a script. (The first four were error
+        // values, which markup now leaves out: FEEDBACK81.md, Q-1272, decided; branch
+        // feedback72-81.)
         "/shown?n=20",
         "/style?n=400000",
         "/words?n=20",
@@ -364,7 +366,7 @@ fn a_page_ends_where_a_value_written_in_it_passes_the_limit() {
         body
     };
     let shown = page("/shown?n=1");
-    assert!(shown.contains(&format!("<p>err([&quot;{}&quot;])</p>", "q".repeat(100000))), "{}", &shown[..200]);
+    assert!(shown.contains(&format!("<p>{}</p>", "q".repeat(100000))), "{}", &shown[..200]);
     let style = page("/style?n=1000");
     let x = "x".repeat(1000);
     assert!(style.contains(&format!("<p style=\"color: {x}; background: {x}; border: {x}\">x</p>")), "{}", &style[..200]);

@@ -361,6 +361,12 @@ pub struct Interp {
     /// whose end a page that lost the parser's place goes back to HTML (`page_back_to_html`;
     /// coverage of 0.8.7, Q-1116; branch coverage-087).
     literals: u32,
+    /// An error value shown in markup was said in the log for this request (`error_shown`; again
+    /// after each request and each top-level `print`, not each literal: a list of rows made by a
+    /// helper said it once a row, found in review), and the component being rendered, which the
+    /// log names (FEEDBACK81.md, Q-1272; branch feedback72-81).
+    pub(crate) err_shown: bool,
+    rendering: Option<Arc<FnDef>>,
     /// Components marked by comments so far (see `island_wrap`), and those of them that run by
     /// themselves: what an island around them says (FEEDBACK61.md, Q-892; branch feedback61).
     marked: (usize, usize),
@@ -537,6 +543,9 @@ pub struct Interp {
     /// Whether the response being made has a component island, and so
     /// needs the browser bundle.
     pub rendered_island: bool,
+    /// And one whose component listens to scrolls (`data-sc`), which the page's loader takes up on
+    /// a scroll (FEEDBACK72.md, Q-1010; branch feedback72-81).
+    pub scroll_island: bool,
     /// The components this request's page was rendered with: the browser
     /// loads a bundle of those (and what they use) alone.
     pub island_names: Vec<String>,
@@ -935,13 +944,20 @@ fn entity(b: u8) -> Option<&'static str> {
 /// start.
 #[inline]
 fn next_special(b: &[u8], i: usize) -> usize {
+    next_special_in::<false>(b, i)
+}
+
+/// `next_special`, and with `CSS` the bytes `css_escape_into` writes otherwise too, in the same
+/// pass (FEEDBACK79.md, Q-1250, speed check; branch feedback72-81).
+#[inline(always)]
+fn next_special_in<const CSS: bool>(b: &[u8], i: usize) -> usize {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     {
         let n = b.len();
         let mut i = i;
         while i + 16 <= n {
             // SAFETY: 16 bytes from `i` are inside `b`.
-            let bits = unsafe { specials16(b.as_ptr().add(i)) };
+            let bits = unsafe { specials16::<CSS>(b.as_ptr().add(i)) };
             if bits != 0 {
                 return i + (bits.trailing_zeros() / STRIDE) as usize;
             }
@@ -954,12 +970,12 @@ fn next_special(b: &[u8], i: usize) -> usize {
         let bits = if n >= 16 {
             // The last sixteen, of which the first `16 - rem` were looked at already.
             // SAFETY: `n >= 16`, so 16 bytes from `n - 16` are inside `b`.
-            (unsafe { specials16(b.as_ptr().add(n - 16)) }) >> (STRIDE as usize * (16 - rem))
+            (unsafe { specials16::<CSS>(b.as_ptr().add(n - 16)) }) >> (STRIDE as usize * (16 - rem))
         } else {
             let mut pad = [b'x'; 16];
             pad[..rem].copy_from_slice(&b[i..]);
             // SAFETY: `pad` is 16 bytes.
-            unsafe { specials16(pad.as_ptr()) }
+            unsafe { specials16::<CSS>(pad.as_ptr()) }
         };
         if bits != 0 {
             i + (bits.trailing_zeros() / STRIDE) as usize
@@ -970,7 +986,7 @@ fn next_special(b: &[u8], i: usize) -> usize {
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     {
         let mut i = i;
-        while i < b.len() && entity(b[i]).is_none() {
+        while i < b.len() && entity(b[i]).is_none() && !(CSS && css_byte(b[i])) {
             i += 1;
         }
         i
@@ -990,13 +1006,17 @@ const STRIDE: u32 = 1;
 /// `p` must be valid for reads of 16 bytes.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
-unsafe fn specials16(p: *const u8) -> u64 {
+unsafe fn specials16<const CSS: bool>(p: *const u8) -> u64 {
     use std::arch::aarch64::*;
     let v = vld1q_u8(p);
-    let m = vorrq_u8(
+    let mut m = vorrq_u8(
         vorrq_u8(vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'&')), vceqq_u8(v, vdupq_n_u8(b'<'))), vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'>')), vceqq_u8(v, vdupq_n_u8(b'"')))),
         vorrq_u8(vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'\'')), vceqq_u8(v, vdupq_n_u8(b'\r'))), vceqzq_u8(v)),
     );
+    // CSS's `;`, `{`, `}` and `\` (its `&` is HTML's).
+    if CSS {
+        m = vorrq_u8(m, vorrq_u8(vorrq_u8(vceqq_u8(v, vdupq_n_u8(b';')), vceqq_u8(v, vdupq_n_u8(b'{'))), vorrq_u8(vceqq_u8(v, vdupq_n_u8(b'}')), vceqq_u8(v, vdupq_n_u8(b'\\')))));
+    }
     // Four bits a byte (0 or 0xF), in order.
     vget_lane_u64::<0>(vreinterpret_u64_u8(vshrn_n_u16::<4>(vreinterpretq_u16_u8(m))))
 }
@@ -1007,14 +1027,18 @@ unsafe fn specials16(p: *const u8) -> u64 {
 /// `p` must be valid for reads of 16 bytes.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-unsafe fn specials16(p: *const u8) -> u64 {
+unsafe fn specials16<const CSS: bool>(p: *const u8) -> u64 {
     use std::arch::x86_64::*;
     let v = _mm_loadu_si128(p.cast());
     let c = |x: u8| _mm_set1_epi8(x as i8);
-    let m = _mm_or_si128(
+    let mut m = _mm_or_si128(
         _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, c(b'&')), _mm_cmpeq_epi8(v, c(b'<'))), _mm_or_si128(_mm_cmpeq_epi8(v, c(b'>')), _mm_cmpeq_epi8(v, c(b'"')))),
         _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, c(b'\'')), _mm_cmpeq_epi8(v, c(b'\r'))), _mm_cmpeq_epi8(v, _mm_setzero_si128())),
     );
+    // As on aarch64.
+    if CSS {
+        m = _mm_or_si128(m, _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, c(b';')), _mm_cmpeq_epi8(v, c(b'{'))), _mm_or_si128(_mm_cmpeq_epi8(v, c(b'}')), _mm_cmpeq_epi8(v, c(b'\\')))));
+    }
     _mm_movemask_epi8(m) as u32 as u64
 }
 
@@ -1246,6 +1270,82 @@ fn display_escaped(v: &Value, out: &mut Held) {
     }
 }
 
+/// What `__css_value(v)` gives, escaped, appended to `out`: a value in a `style` attribute's
+/// template, as a CSS value, `{`, `}`, `;`, `\` and `&` as CSS's escapes (`css_escape_into`).
+/// Written straight into the page, the HTML's escapes with them: three texts were made for a value
+/// with `;` (FEEDBACK79.md, Q-1250; branch feedback72-81). A number, and a text with nothing to
+/// escape (found in one pass), as `display_escaped` writes them, asking nothing more.
+#[inline(always)]
+fn css_escaped_into(v: &Value, out: &mut Held) {
+    match v {
+        Value::Int(n) => push_int(out, *n),
+        Value::Str(s) if next_special_in::<true>(s.as_bytes(), 0) == s.len() => push_short(out, s),
+        other => css_other_into(other, out),
+    }
+}
+
+#[inline(never)]
+fn css_other_into(v: &Value, out: &mut Held) {
+    match v {
+        Value::Str(s) => css_escape_into(s, out, true),
+        other => match other.display_held() {
+            Ok(t) => css_escape_into(&t, out, true),
+            Err(_) => out.stop(),
+        },
+    }
+}
+
+/// Whether `s` has a byte `css_escape_into` writes otherwise.
+#[inline]
+pub(crate) fn css_special(s: &str) -> bool {
+    s.bytes().any(css_byte)
+}
+
+/// `{`, `}`, `;`, `\` and `&`, by two masks of the bytes below 128: a test and a shift a byte.
+#[inline(always)]
+fn css_byte(b: u8) -> bool {
+    const LO: u64 = (1 << b'&') | (1 << b';');
+    const HI: u64 = (1 << (b'\\' - 64)) | (1 << (b'{' - 64)) | (1 << (b'}' - 64));
+    match b {
+        0..=63 => (LO >> b) & 1 != 0,
+        64..=127 => (HI >> (b - 64)) & 1 != 0,
+        _ => false,
+    }
+}
+
+/// `s` as one CSS value: `{`, `}`, `;`, `\` and `&` as CSS's escapes, which make them part of a
+/// word (`builtins::css_value`, Q-668 and Q-707), the rest HTML-escaped with `html` (an attribute's
+/// text) or as it is, written into `out` with no text made between (FEEDBACK79.md, Q-1250; branch
+/// feedback72-81).
+pub(crate) fn css_escape_into<O: Text>(s: &str, out: &mut O, html: bool) {
+    // From one byte either changes to the next, sixteen at a time (`next_special_in`).
+    let b = s.as_bytes();
+    let (mut done, mut i) = (0, 0);
+    loop {
+        i = next_special_in::<true>(b, i);
+        let Some(&c) = b.get(i) else { break };
+        let e = match c {
+            b'{' => "\\7b ",
+            b'}' => "\\7d ",
+            b';' => "\\3b ",
+            b'\\' => "\\5c ",
+            b'&' => "\\26 ",
+            c => match entity(c).filter(|_| html) {
+                Some(e) => e,
+                None => {
+                    i += 1;
+                    continue;
+                }
+            },
+        };
+        push_short(out, &s[done..i]);
+        push_short(out, e);
+        i += 1;
+        done = i;
+    }
+    push_short(out, &s[done..]);
+}
+
 /// Whether a name can be written as an HTML attribute as it is.
 pub fn attr_name_ok(name: &str) -> bool {
     !name.is_empty()
@@ -1418,19 +1518,48 @@ fn is_react_handler(lower: &str) -> bool {
 /// A value shown in a page, written into the page's `Held` text, which stops at `--max-memory`:
 /// a list of 200 long texts made a 180 MB page under a 1 MB limit (FEEDBACK71.md, Q-977, found
 /// in review; branch security).
-fn render_value(v: &Value, out: &mut Held) {
+///
+/// An error value shows nothing, the program's as a builtin's, as in the browser: the page read
+/// `err("503 Service Unavailable")` where the value went. Whether one was left out, which the
+/// caller says in the log (`Interp::error_shown`; FEEDBACK81.md, Q-1272; branch feedback72-81).
+///
+/// A text and a number, which most values shown are, are written where it is called, with nothing
+/// asked after: the rest is `render_other` (FEEDBACK81.md, Q-1272, speed check; branch
+/// feedback72-81).
+#[must_use]
+#[inline(always)]
+fn render_value(v: &Value, out: &mut Held) -> bool {
+    match v {
+        Value::Str(s) => {
+            escape_into(s, out);
+            false
+        }
+        Value::Int(n) => {
+            push_int(out, *n);
+            false
+        }
+        _ => render_other(v, out),
+    }
+}
+
+/// `render_value` of what is neither a text nor a number.
+#[must_use]
+fn render_other(v: &Value, out: &mut Held) -> bool {
     match v {
         Value::Html(h) => out.push_str(h),
         // `true` shows nothing, as `false` and null do, as in React; a function too, where it
         // showed `<fn <fn>>` (FEEDBACK48.md, Q-564 and Q-571; branch main).
         Value::Nil | Value::Bool(_) | Value::Func(_) | Value::Builtin(..) => {}
+        Value::Err(..) => return true,
         Value::List(items) => {
+            let mut left = false;
             for i in items.iter() {
-                render_value(i, out);
+                left |= render_value(i, out);
                 if out.is_over() {
-                    return;
+                    break;
                 }
             }
+            return left;
         }
         Value::Str(s) => escape_into(s, out),
         Value::Int(n) => push_int(out, *n),
@@ -1438,6 +1567,41 @@ fn render_value(v: &Value, out: &mut Held) {
             Ok(t) => escape_into(&t, out),
             Err(_) => out.stop(),
         },
+    }
+    false
+}
+
+/// The line an error value shown by `e` is said at: `e`'s, else the first of what is in it (`null ??
+/// e` has none of its own; found in review). Asked only once an error was shown.
+#[cold]
+fn shown_line(e: &Expr) -> u32 {
+    let mut line = crate::debug::expr_line(e);
+    if line == 0 {
+        crate::check::walk_expr(e, &mut |x| {
+            if line == 0 {
+                line = crate::debug::expr_line(x);
+            }
+        });
+    }
+    line
+}
+
+/// An error value in a class list or a style map, which is left out of it (see `class_words`,
+/// `style_text`), for the log (FEEDBACK81.md, Q-1272, found in review).
+fn err_inside<'v>(name: &str, v: &'v Value) -> Option<&'v Value> {
+    match v {
+        Value::List(_) if name.eq_ignore_ascii_case("class") => first_err(v),
+        Value::Map(m) if name.eq_ignore_ascii_case("style") => m.iter().find_map(|(_, x)| matches!(x, Value::Err(..)).then_some(x)),
+        _ => None,
+    }
+}
+
+/// The first error value in `v`, a list's items looked into, which `render_value` left out.
+fn first_err(v: &Value) -> Option<&Value> {
+    match v {
+        Value::Err(..) => Some(v),
+        Value::List(items) => items.iter().find_map(first_err),
+        _ => None,
     }
 }
 
@@ -1467,7 +1631,8 @@ fn style_value(name: &str, v: Value, out: &mut Held) -> Value {
 pub fn style_text(m: &Map) -> Result<String, crate::httpd::OverMemory> {
     let mut out = Held::new();
     for (k, v) in m.iter() {
-        if matches!(v, Value::Nil | Value::Bool(false)) {
+        // An error value's declaration too (FEEDBACK81.md, Q-1272, found in review).
+        if matches!(v, Value::Nil | Value::Bool(false) | Value::Err(..)) {
             continue;
         }
         // A property's name, or a custom property's: a key from data with `;`, `:` or
@@ -1647,7 +1812,8 @@ fn class_words(v: &Value, out: &mut Held) {
         }
     };
     match v {
-        Value::Nil | Value::Bool(_) | Value::Func(_) | Value::Builtin(..) => {}
+        // An error too, as everywhere in markup (FEEDBACK81.md, Q-1272, found in review).
+        Value::Nil | Value::Bool(_) | Value::Func(_) | Value::Builtin(..) | Value::Err(..) => {}
         Value::Str(s) => word(s, out),
         Value::List(items) => {
             for i in items.iter() {
@@ -2454,6 +2620,8 @@ impl Interp {
             in_svg: false,
             ns: Default::default(),
             literals: 0,
+            err_shown: false,
+            rendering: None,
             marked: (0, 0),
             state_again: None,
             in_component: false,
@@ -2515,6 +2683,7 @@ impl Interp {
             parent_rules: None,
             mount_rules: Vec::new(),
             rendered_island: false,
+            scroll_island: false,
             island_names: Vec::new(),
             styles_used: Vec::new(),
             deferred: Vec::new(),
@@ -2590,6 +2759,8 @@ impl Interp {
             in_svg: false,
             ns: Default::default(),
             literals: 0,
+            err_shown: false,
+            rendering: None,
             marked: (0, 0),
             state_again: None,
             in_component: false,
@@ -2651,6 +2822,7 @@ impl Interp {
             parent_rules: None,
             mount_rules: Vec::new(),
             rendered_island: false,
+            scroll_island: false,
             island_names: Vec::new(),
             styles_used: Vec::new(),
             deferred: Vec::new(),
@@ -4132,6 +4304,26 @@ impl Interp {
             let made = if at.to_string().is_empty() || at.to_string() == here.to_string() { String::new() } else { format!(", made at {}", at) };
             crate::httpd::error_line(&here.before(&format!("an error no statement took{}: {} (pass it on with `?`, give a value with `??`, or take it with `let _ =`)", made, text)));
         }
+    }
+
+    /// An error value shown in markup, which shows nothing (`render_value`): said in the log as an
+    /// error no statement took, once a render, with where it is shown and the component around it
+    /// (FEEDBACK81.md, Q-1272; branch feedback72-81).
+    #[cold]
+    #[inline(never)]
+    fn error_shown(&mut self, v: &Value, line: u32) {
+        if std::mem::replace(&mut self.err_shown, true) {
+            return;
+        }
+        let Some(Value::Err(e, _, at)) = first_err(v) else { return };
+        let text = crate::value::told(|| e.display());
+        let here = Place::new(self.cur_file.as_ref(), line);
+        let made = if at.to_string().is_empty() || at.to_string() == here.to_string() { String::new() } else { format!(", made at {}", at) };
+        let inside = self.rendering.as_ref().map_or(String::new(), |d| format!(" in <{}>", d.name));
+        crate::httpd::error_line(&here.before(&format!(
+            "an error no statement took{}, shown{} as nothing: {} (give a value for it with `??`, or show something else with `is_err` or `match`)",
+            made, inside, text
+        )));
     }
 
     #[inline]
@@ -5732,7 +5924,9 @@ impl Interp {
         // A declared result type is checked on the value.
         if c.def.ret.is_some() || c.def.err.is_some() {
             let v = self.call_closure(c, args, line)?;
-            render_value(&v, out);
+            if render_value(&v, out) {
+                self.error_shown(&v, line);
+            }
             return Ok(());
         }
         // Views defined at the top level are cached (a nested one would
@@ -5827,7 +6021,9 @@ impl Interp {
                 // `return` (or `?`) part-way: the result is that value alone.
                 Err(Ctrl::Return(v)) => {
                     out.truncate(start);
-                    render_value(&v, out);
+                    if render_value(&v, out) {
+                        this.error_shown(&v, line);
+                    }
                     Ok(())
                 }
                 Err(e) => Err(e),
@@ -5857,7 +6053,9 @@ impl Interp {
             Expr::Binary(BinOp::And, a, b, _) => {
                 let x = self.eval(a, env)?;
                 if !x.truthy() {
-                    render_value(&x, out);
+                    if render_value(&x, out) {
+                        self.error_shown(&x, shown_line(a));
+                    }
                     return Ok(());
                 }
                 self.render_expr_into(b, env, out)
@@ -5865,7 +6063,9 @@ impl Interp {
             Expr::Binary(BinOp::Or, a, b, _) => {
                 let x = self.eval(a, env)?;
                 if x.truthy() {
-                    render_value(&x, out);
+                    if render_value(&x, out) {
+                        self.error_shown(&x, shown_line(a));
+                    }
                     return Ok(());
                 }
                 self.render_expr_into(b, env, out)
@@ -5936,13 +6136,17 @@ impl Interp {
                 }
                 _ => {
                     let v = self.eval_block(stmts, env, true)?;
-                    render_value(&v, out);
+                    if render_value(&v, out) {
+                        self.error_shown(&v, shown_line(e));
+                    }
                     Ok(())
                 }
             },
             _ => {
                 let v = self.eval(e, env)?;
-                render_value(&v, out);
+                if render_value(&v, out) {
+                    self.error_shown(&v, shown_line(e));
+                }
                 Ok(())
             }
         }
@@ -6516,12 +6720,16 @@ impl Interp {
             _ => {
                 let v = self.eval(e, env)?;
                 if holds_markup(&v) {
-                    self.render_unseen(out, line, |_, out| {
-                        render_value(&v, out);
+                    self.render_unseen(out, line, |this, out| {
+                        if render_value(&v, out) {
+                            this.error_shown(&v, line());
+                        }
                         Ok(())
                     })
                 } else {
-                    render_value(&v, out);
+                    if render_value(&v, out) {
+                        self.error_shown(&v, line());
+                    }
                     Ok(())
                 }
             }
@@ -6815,6 +7023,11 @@ impl Interp {
                 for c in &el.children {
                     if let HtmlChild::Expr(e) = c {
                         let v = self.eval(e, env)?;
+                        // Nothing, as elsewhere in markup (FEEDBACK81.md, Q-1272, found in review).
+                        if let Value::Err(..) = v {
+                            self.error_shown(&v, el.line);
+                            continue;
+                        }
                         // Each `<` written as it is reached, into the page, held.
                         match sheet_text(&v) {
                             Ok(t) => {
@@ -6963,6 +7176,15 @@ impl Interp {
             // Here too: an element with `class=`, a spread or a textarea (FEEDBACK46.md, Q-531;
             // branch feedback40-43).
             let v = style_value(name, v, out);
+            // An error value is no attribute's, as a child's shows nothing (FEEDBACK81.md, Q-1272;
+            // branch feedback72-81).
+            if let Value::Err(..) = v {
+                self.error_shown(&v, el.line);
+                continue;
+            }
+            if let Some(e) = err_inside(name, &v) {
+                self.error_shown(e, el.line);
+            }
             let v = match (&v, name) {
                 _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
                 _ if anim_value_attr(&el.tag, name) && shows_script_url_in_list(&v) => Value::str(BLOCKED_URL),
@@ -7041,6 +7263,12 @@ impl Interp {
             out.push('"');
         }
         out.push_str(&rest);
+        // `<link .../>` in an XML answer, which is written this way alone (`ElFacts::xml_empty`), so
+        // that an HTML page's elements ask nothing more (FEEDBACK79.md, Q-1259; branch
+        // feedback72-81).
+        if el.facts.xml_empty {
+            out.push('/');
+        }
         Ok(text_value)
     }
 
@@ -7103,6 +7331,13 @@ impl Interp {
                     for p in parts {
                         match p {
                             TPart::Lit(t) => escape_into(t, out),
+                            // A value in a `style` template, which the parser gave to
+                            // `__css_value`: escaped for CSS and for HTML as it is written, with
+                            // no text made between (FEEDBACK79.md, Q-1250; branch feedback72-81).
+                            TPart::Expr(Expr::Call(f, args, _)) if args.len() == 1 && matches!(&**f, Expr::Ident(n, _) if &**n == "__css_value") => {
+                                let v = self.eval(&args[0], env)?;
+                                css_escaped_into(&v, out);
+                            }
                             TPart::Expr(x) => {
                                 let v = self.eval(x, env)?;
                                 display_escaped(&v, out);
@@ -7126,6 +7361,19 @@ impl Interp {
                 }
                 AttrVal::Expr(e) => {
                     let v = self.eval(e, env)?;
+                    // As in `render_attrs` (FEEDBACK81.md, Q-1272; branch feedback72-81).
+                    match &v {
+                        Value::Err(..) => {
+                            self.error_shown(&v, el.line);
+                            continue;
+                        }
+                        Value::Map(_) => {
+                            if let Some(e) = err_inside(name, &v) {
+                                self.error_shown(e, el.line);
+                            }
+                        }
+                        _ => {}
+                    }
                     self.write_attr(&el.tag, name, v, out);
                 }
                 AttrVal::Spread(_) => unreachable!("render_attrs handles spreads"),
@@ -7374,7 +7622,10 @@ impl Interp {
         let mut held = Held::new();
         let was = std::mem::replace(&mut self.in_component, true);
         let marked = self.marked;
+        // The component an error shown in it is said in (Q-1272).
+        let outer = std::mem::replace(&mut self.rendering, Some(c.def.clone()));
         let r = crate::value::js_numbers(true, || self.render_call_into(&c, args, line, &mut held));
+        self.rendering = outer;
         self.in_component = was;
         let (mut state, mut live) = self.islands.pop().unwrap_or_default();
         let now = self.states_now(&state);
@@ -7432,6 +7683,12 @@ impl Interp {
         // branch feedback61).
         if self.marked.0 > marked.0 {
             extra.push_str(" data-qm");
+        }
+        // One that listens to scrolls says so, for the page's loader (FEEDBACK72.md, Q-1010; branch
+        // feedback72-81).
+        if c.def.listens_to_scroll() {
+            extra.push_str(" data-sc");
+            self.scroll_island = true;
         }
         let eager = c.def.runs_by_itself() || self.marked.1 > marked.1 || crate::value::page_reads() != page_reads;
         let by_itself = eager || !live.is_empty();
@@ -7676,7 +7933,12 @@ impl Interp {
         let mut out = Held::new();
         // As a component placed in the page says it (see `render_component_into`; FEEDBACK61.md, Q-892;
         // branch feedback61).
-        let extra = if self.marked.0 > marked.0 { " data-qm" } else { "" };
+        let extra = match (self.marked.0 > marked.0, d.c.def.listens_to_scroll()) {
+            (false, false) => "",
+            (true, false) => " data-qm",
+            (false, true) => " data-sc",
+            (true, true) => " data-qm data-sc",
+        };
         let eager = d.c.def.runs_by_itself() || self.marked.1 > marked.1 || crate::value::page_reads() != page_reads;
         self.island_wrap(&d.tag, d.props.clone(), state, live, eager, extra, &body, d.svg, false, &mut out);
         out.into_text().map_err(|o| o.at(d.line))

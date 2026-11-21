@@ -55,11 +55,35 @@ route GET /reply {
         let r = send(s.port, "GET", path, &[], "");
         assert_eq!((r.status, r.body.as_str()), (500, r#"{"error":"internal error"}"#), "{}", path);
     }
-    for path in ["/nested", "/list", "/page"] {
+    for path in ["/nested", "/list"] {
         let r = send(s.port, "GET", path, &[], "");
         assert!(r.body.contains("internal error"), "{}: {}", path, r.body);
         assert!(!r.body.contains("nope") && !r.body.contains("no such column"), "{}: {}", path, r.body);
     }
+    // In markup an error value shows nothing at all, and goes to the log (FEEDBACK81.md, Q-1272,
+    // decided; branch feedback72-81): it read `err("internal error")` there.
+    drop(s);
+    let log = f.with_file_name("log.txt");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .arg(&f)
+        .args(["--port", "0"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    support::stop_with_tests(&child);
+    let port = support::port_in_log(&mut child, &log, std::time::Duration::from_secs(20));
+    let r = send(port, "GET", "/page", &[], "");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !std::fs::read_to_string(&log).unwrap_or_default().contains("an error no statement took") && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!((r.status, r.body.as_str()), (200, "<p></p>"), "/page");
+    let said = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(said.contains("an error no statement took, shown as nothing: ") && said.contains("no such column: nope"), "{}", said);
 }
 
 #[test]

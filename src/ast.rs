@@ -269,9 +269,37 @@ impl FnDef {
         const KNOWN: u8 = 1;
         const YES: u8 = 2;
         let mut known = self.runs_by_itself.load(Relaxed);
-        if known == 0 {
+        if known & KNOWN == 0 {
+            // Or'ed in: the same byte keeps `listens_to_scroll`'s answer (Q-1010).
             known = KNOWN | if crate::island::runs_by_itself(&self.body) { YES } else { 0 };
-            self.runs_by_itself.store(known, Relaxed);
+            self.runs_by_itself.fetch_or(known, Relaxed);
+        }
+        known & YES != 0
+    }
+
+    /// Whether an element of its body listens to `scroll` (or `scrollend`), which comes with no
+    /// pointer, touch, focus or key when a script or a link moves the box: its island says so
+    /// (`data-sc`), and the page's loader takes it up on a scroll (`island_loader` in server.rs).
+    /// Worked out once, in `runs_by_itself`'s byte (FEEDBACK72.md, Q-1010; branch feedback72-81).
+    pub fn listens_to_scroll(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        const KNOWN: u8 = 4;
+        const YES: u8 = 8;
+        let mut known = self.runs_by_itself.load(Relaxed);
+        if known & KNOWN == 0 {
+            // The elements of each literal, through their children, looked at in a loop (the
+            // expressions by `walk_expr`, which goes into the markup in them).
+            let mut hit = false;
+            crate::check::walk_expr(&self.body, &mut |x| {
+                let Expr::Html(root, _) = x else { return };
+                let mut todo = vec![&**root];
+                while let Some(el) = todo.pop().filter(|_| !hit) {
+                    hit = el.attrs.iter().any(|(n, _)| n == "@scroll" || n == "@scrollend");
+                    todo.extend(el.children.iter().filter_map(|c| if let HtmlChild::El(e) = c { Some(e) } else { None }));
+                }
+            });
+            known = KNOWN | if hit { YES } else { 0 };
+            self.runs_by_itself.fetch_or(known, Relaxed);
         }
         known & YES != 0
     }
@@ -528,6 +556,9 @@ pub struct ElFacts {
     pub component: bool,
     /// A void element (`<br>`): no children, no closing tag.
     pub void: bool,
+    /// One of HTML's void names with nothing in it in an XML answer (an Atom feed's `<link>`):
+    /// written `<link .../>`, as XML has it (FEEDBACK79.md, Q-1259; branch feedback72-81).
+    pub xml_empty: bool,
     /// `<html>`, which the doctype goes before.
     pub html: bool,
     /// `<style>`, whose text is raw.
@@ -693,6 +724,7 @@ impl ElFacts {
         ElFacts {
             component,
             void,
+            xml_empty: false,
             html: tag == "html",
             style: tag == "style",
             plain_attrs,
