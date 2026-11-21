@@ -244,6 +244,11 @@ pub struct FnDef {
     pub request_use: std::sync::atomic::AtomicU8,
     /// Whether a component runs by itself, once asked (see `FnDef::runs_by_itself`).
     pub runs_by_itself: std::sync::atomic::AtomicU8,
+    /// The sandboxed script's run whose source it was read from (`run_script`;
+    /// `script::parsing_run`), 0 for the program's: a function made of it runs only while that run
+    /// goes on, as the script's (`Interp::script_mask`, `Interp::script_runs`; Q-1274, found reviewing the trusted CSS of
+    /// FEEDBACK79.md's Q-1250; branch feedback72-81).
+    pub run: u64,
 }
 
 impl FnDef {
@@ -449,7 +454,7 @@ impl RouteDef {
                 file: self.file.clone(),
                 doc: None,
                 hot: Default::default(),
-                request_use: Default::default(), runs_by_itself: Default::default(),
+                request_use: Default::default(), runs_by_itself: Default::default(), run: 0,
             })
         });
         self

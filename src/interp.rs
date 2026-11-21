@@ -258,6 +258,17 @@ pub struct Interp {
     /// milliseconds that says (`run_script`'s `timeout`; FEEDBACK75.md, Q-1055;
     /// branch feedback75).
     pub(crate) script: Option<(Env, u8, std::time::Instant, u64)>,
+    /// The runs of the sandboxed scripts this handle is running, the innermost last (each its
+    /// world's address, `script::run_of`): a function one made runs only while its run is here.
+    /// On the handle, a request's own: requests take turns on a thread, and a list kept for the
+    /// thread let one request's script end another's run (Q-1274, found reviewing the trusted CSS
+    /// of FEEDBACK79.md's Q-1250, in its review; branch feedback72-81).
+    pub(crate) script_runs: Vec<u64>,
+    /// Whether the code running is a helper the program gave a script (`helper_called`), not the
+    /// script's own: what a script's function gives back to it is made plain (`script_call`)
+    /// (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250, in its review; branch
+    /// feedback72-81).
+    pub(crate) in_helper: bool,
     pub(crate) restrictor: Option<Arc<FnDef>>,
     /// The running request's route's `with`, for what its answer runs after the body: a
     /// stream's function, deferred parts (branch feedback40-43).
@@ -2677,6 +2688,8 @@ impl Interp {
             fuel: u64::MAX,
             allowed: crate::policy::ceiling(),
             script: None,
+            script_runs: Vec::new(),
+            in_helper: false,
             restrictor: None,
             route_limit: None,
             server_fns: Arc::new(Vec::new()),
@@ -2816,6 +2829,8 @@ impl Interp {
             fuel: u64::MAX,
             allowed: crate::policy::ceiling(),
             script: None,
+            script_runs: Vec::new(),
+            in_helper: false,
             restrictor: None,
             route_limit: None,
             server_fns: self.server_fns.clone(),
@@ -3724,7 +3739,7 @@ impl Interp {
                     file: None,
                     doc: None,
                     hot: Default::default(),
-                    request_use: Default::default(), runs_by_itself: Default::default(),
+                    request_use: Default::default(), runs_by_itself: Default::default(), run: 0,
                 });
                 define(env, &td.name, Value::Func(Arc::new(Closure { def, env: env.clone() })));
                 Ok(Value::Nil)
@@ -5633,8 +5648,10 @@ impl Interp {
             }
         }
         // `(x) => x.name`, as given to `sort_by`, `map` and `filter`: the
-        // field, without a scope for the call.
-        if let (Some((field, at)), [Some(_)], u64::MAX) = (projection(&c.def), args.as_slice(), self.fuel) {
+        // field, without a scope for the call. Not a script's, which runs only while its script
+        // does (`call_closure_with`; Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's
+        // Q-1250; branch feedback72-81).
+        if let (Some((field, at)), [Some(_)], u64::MAX) = (projection(&c.def).filter(|_| c.def.run == 0), args.as_slice(), self.fuel) {
             let v = args.into_iter().next().flatten().unwrap_or(Value::Nil);
             return in_file(self.get_field(v, field, &c.env, at), &c.def.file);
         }
@@ -5669,7 +5686,9 @@ impl Interp {
                 crate::jit::Ran::Interpret => {}
             }
         }
-        if let (Some((field, at)), 1, u64::MAX) = (projection(&c.def), args.len(), self.fuel) {
+        // As `call_closure` has it (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's
+        // Q-1250; branch feedback72-81).
+        if let (Some((field, at)), 1, u64::MAX) = (projection(&c.def).filter(|_| c.def.run == 0), args.len(), self.fuel) {
             let v = args.into_iter().next().unwrap_or(Value::Nil);
             return in_file(self.get_field(v, field, &c.env, at), &c.def.file);
         }
@@ -5687,14 +5706,16 @@ impl Interp {
             self.burn(line)?;
             self.burn(line)?;
         }
+        // None of them a script's, which runs only while its script does (`call_closure_with`;
+        // Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
         if self.fuel == u64::MAX {
-            if identity(&c.def) {
+            if identity(&c.def) && c.def.run == 0 {
                 return Ok(x);
             }
-            if let Some(l) = constant_lambda(&c.def) {
+            if let Some(l) = constant_lambda(&c.def).filter(|_| c.def.run == 0) {
                 return Ok(lit_value(l));
             }
-            if let Some((field, at)) = projection(&c.def) {
+            if let Some((field, at)) = projection(&c.def).filter(|_| c.def.run == 0) {
                 return in_file(self.get_field(x, field, &c.env, at), &c.def.file);
             }
         }
@@ -5745,46 +5766,67 @@ impl Interp {
     }
 
     fn call_closure_with(&mut self, c: &Closure, args: impl IntoIterator<Item = Option<Value>>, nargs: usize, line: u32) -> Result<Value, Ctrl> {
-        let mask = if self.fuel != u64::MAX { self.script_mask(c) } else { None };
-        // A helper the program gave a script, called from it: looked at apart (`helper_called`).
-        if let Some((_, true)) = mask {
-            return self.helper_called(c, args.into_iter().collect(), line);
+        // In a script, or a function one made: looked at apart (`script_call`). Both asked at once,
+        // as `fuel != u64::MAX || def.run != 0`: one test on the program's every call (Q-1274,
+        // found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+        if (!self.fuel | c.def.run) != 0 {
+            return self.script_call(c, &mut args.into_iter(), nargs, line);
         }
-        self.call_closure_masked(c, mask, args, nargs, line)
+        self.call_closure_masked(c, None, args, nargs, line)
     }
 
-    /// A helper the program gave a script, called from the script: a function the script made never
-    /// leaves it, given to the helper whole or in a list, a map or an error, which could keep it
-    /// and call it later with no limit of steps or time: refused, an error value. Builtins the
-    /// script calls take its functions, and run them under its limits (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+    /// A call in a script, or of a function one made: whose it is (`script_mask`). A script's
+    /// function runs only while its run does, wherever it is called from; a helper the program
+    /// gave a script, called from it, is looked at apart (`helper_called`). Out of the way of the
+    /// program's calls, which took up to 0.4% more instructions with this in `call_closure_with`;
+    /// given the arguments as they come, as a list of them made a script's calls 12% dearer, and a
+    /// copy of this for each kind of argument list made the program's `map` 1% dearer (Q-1274,
+    /// found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+    #[cold]
+    #[inline(never)]
+    fn script_call(&mut self, c: &Closure, args: &mut dyn Iterator<Item = Option<Value>>, nargs: usize, line: u32) -> Result<Value, Ctrl> {
+        match self.script_mask(c) {
+            Some((_, true)) => self.helper_called(c, args.into_iter().collect(), line),
+            None => Ok(self.run_ended(line)),
+            mask => {
+                // What it gives back to a helper is plain, as what the script hands one is: a
+                // helper's trusted CSS, handed back by `() => getc()`, was written as it was in the
+                // helper's style (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's
+                // Q-1250, in its review; branch feedback72-81).
+                let from_helper = std::mem::replace(&mut self.in_helper, false);
+                let r = self.call_closure_masked(c, mask, args, nargs, line);
+                self.in_helper = from_helper;
+                match r {
+                    Ok(v) if from_helper => Ok(Value::plain_deep(&v).unwrap_or(v)),
+                    r => r,
+                }
+            }
+        }
+    }
+
+    /// A helper the program gave a script, called from the script: what the script hands it is
+    /// plain, its functions too, which the helper may call back while the script runs, as the
+    /// script's (`script_mask`); kept, they run no more once it has ended (Q-1274, found reviewing
+    /// the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
     #[cold]
     #[inline(never)]
     fn helper_called(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
-        if args.iter().flatten().any(|v| self.holds_script_fn(v)) {
-            return Ok(Value::own_err(Value::str("a script's function stays in the script")));
-        }
         // Trusted CSS the script hands a helper is text to it, as to a builtin (Q-1274, found in the second review of the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
         let args: Vec<Option<Value>> = args.into_iter().map(|a| a.map(|v| Value::plain_deep(&v).unwrap_or(v))).collect();
         let n = args.len();
         let mask = self.script_mask(c);
-        self.call_closure_masked(c, mask, args.into_iter(), n, line)
+        let outer = std::mem::replace(&mut self.in_helper, true);
+        let r = self.call_closure_masked(c, mask, args.into_iter(), n, line);
+        self.in_helper = outer;
+        r
     }
 
-    /// Whether `v` holds, however deep, a function the running script made (its scope within the
-    /// script's: `script_mask`) (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
-    fn holds_script_fn(&self, v: &Value) -> bool {
-        let Some((root, ..)) = self.script.as_ref() else { return false };
-        let mut todo = vec![v];
-        while let Some(x) = todo.pop() {
-            match x {
-                Value::Func(f) if within(&f.env, root) => return true,
-                Value::List(l) => todo.extend(l.iter()),
-                Value::Map(m) => todo.extend(m.values()),
-                Value::Err(e, ..) => todo.push(e),
-                _ => {}
-            }
-        }
-        false
+    /// A function a script made, called after its run ended: an error value, not run. Kept by a
+    /// helper, it ran later with no limit of steps or time, 100,000 steps and more past the
+    /// script's 20,000 (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch
+    /// feedback72-81).
+    fn run_ended(&self, line: u32) -> Value {
+        Value::Err(Arc::new(Value::str("a script's function runs only while its script does")), false, Place::new(self.cur_file.as_ref(), line))
     }
 
     #[inline(always)]
@@ -5955,11 +5997,21 @@ impl Interp {
     }
 
     /// In a sandboxed script, the effects function `c` may use: none for the
-    /// script's own, those the program had for a helper it passed in.
+    /// script's own, those the program had for a helper it passed in. A script's own is told by
+    /// its run (`FnDef::run`), which must be one this handle is running (`script_runs`), under
+    /// whose limits it runs: an outer script's too, as a helper calling a
+    /// script of its own may call it back, still with none; one whose run has ended gives None,
+    /// and is not run (`run_ended`; Q-1274, found reviewing the trusted CSS of
+    /// FEEDBACK79.md's Q-1250; branch feedback72-81).
     #[cold]
     fn script_mask(&self, c: &Closure) -> Option<(u8, bool)> {
         let (root, outer, ..) = self.script.as_ref()?;
-        Some(if within(&c.env, root) { (0, false) } else { (*outer, true) })
+        if c.def.run != 0 {
+            // The innermost script's at a glance: its run is its world's address (`script::run_of`).
+            let here = c.def.run == crate::script::run_of(root) || self.script_runs.contains(&c.def.run);
+            return here.then_some((0, false));
+        }
+        Some((*outer, true))
     }
 
     /// One step of a sandboxed script's budget, and every 256th its clock: a step reads less than
@@ -6138,8 +6190,10 @@ impl Interp {
     /// Calls `c` and renders what it returns into `out`, writing its HTML
     /// as it goes (see `render_expr_into`).
     fn render_call_into(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, out: &mut Held) -> Result<(), Ctrl> {
-        // A declared result type is checked on the value.
-        if c.def.ret.is_some() || c.def.err.is_some() {
+        // A declared result type is checked on the value. A script's function as a tag: called as
+        // it is anywhere, under its script's limits while it runs, an error after (Q-1274, found
+        // reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+        if c.def.ret.is_some() || c.def.err.is_some() || c.def.run != 0 {
             let v = self.call_closure(c, args, line)?;
             if render_value(&v, out) {
                 self.error_shown(&v, line);

@@ -23,7 +23,8 @@
 
 A name right before a template calls it with the text: `` shout`hi ${name}` `` is
 `` shout(`hi ${name}`) ``. The builtins `css` and `sql` return the text as it is, and
-tell editors to highlight it as CSS or SQL.
+tell editors to highlight it as CSS or SQL; `` css`...` `` escapes its values and makes
+trusted CSS (see [HTML literals](#html-literals)).
 
 Operators are as in JavaScript, with these meanings:
 
@@ -755,7 +756,11 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   `c = "red} input[value^=a]{background:url(//evil)}"` adds no rule *(since 0.7)*, and
   so is its `&`, as `\26 `, since inside `<svg>` and `<math>` a browser reads a
   `<style>`'s `&#125` as a `}`.
-  `` sql`...` `` does the same for queries.
+  `` sql`...` `` does the same for queries. What `` css`...` `` makes is trusted CSS: a
+  `style` writes it as written wherever it reaches one (through a name, a prop, a list or
+  a function's answer), so a component takes its caller's declarations with
+  `` style={`padding: 8px; ${style}`} ``, and everywhere else it is the `str` it says (see
+  Safety built in, under [Standard library](#standard-library)).
 - A component's or view's own CSS is `style` at the start of its body, before its markup
   (from the start, with what the page is sent: [Styling a component](#styling-a-component)):
 

@@ -554,7 +554,19 @@ run_script("total > 100", { total: 120 }, { timeout: "1s" })               // tr
 - It has no effects of its own: a builtin such as `env` passed in `vars` still cannot
   run. A function of the program passed in `vars` runs as the program's, with what the
   program may do, so it is the program's way to let a script ask for more
-  (`{ taken: (code) => db.one(...) != null }`).
+  (`{ taken: (code) => db.one(...) != null }`). A function the script makes may be given
+  to one of the program's, whole or inside a list, a map or an error, and called back while
+  the script runs: it runs as the script's, with no effects, its steps and time counted
+  against the script's. Once the script has ended (it gave its value or was stopped),
+  calling such a function anywhere, kept in a variable or called from a tick, gives the
+  error value `a script's function runs only while its script does`, so nothing a script
+  made runs past its limits. Test what such a function gives with `is_err` before acting on
+  it: after its script has ended it gives an error value, which `if !deny(x)` reads as
+  false. A component cannot use a global holding a function a script made: the program
+  stops at start, saying so, as it never runs in the browser. `parallel` given in `vars` runs the
+  script's functions one after another, under its steps and time. Trusted CSS (`` css`...` ``)
+  does not pass through a script: in `vars`, from a helper, in what the script's functions give
+  back to the program and in what it gives back, it is plain text.
 - It stops after 20,000 steps (calls and loop rounds). A value it makes may be up to
   1 MB (strings, and lists and maps counted with what they hold), and each KB it makes
   costs a step: doubling a string in a loop stops there, not when the memory runs out.
@@ -2183,7 +2195,8 @@ view Header(user) = <header>
   whole float shows as a route writes it, `1.0`, so it takes `other` in English there,
   and as a component writes it, `1`, so it takes `one` there, on both sides alike (a
   float past 2^53 by the digits it shows too). `"1e3"` is 1000; `"0x1"`, `"Infinity"`
-  and a full-width digit are not numbers, on either side, and take `other`.
+  and a full-width digit are not numbers, on either side, and take `other`. A
+  `` css`...` `` value given as `count` is read as its text, on both sides.
 - As it loads, a form the language never picks is warned of: ``translations (en): `a` has
   a `few` form, which en never picks (it has one, other)``.
 - Translations are text, escaped in pages like any other; `raw(t(...))` for markup you

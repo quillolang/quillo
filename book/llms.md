@@ -259,7 +259,9 @@ route GET / = <html><body><Card title="Hi"><Counter start={5}/></Card></body></h
   `volume={v}`. A handler of the input's own, or `readonly`, keeps it one way.
 - `style css`...`` at the start of a component's body is CSS for its elements only. A
   value in a `style` template is one CSS value and adds no declaration; build styles from
-  data with a style map, `style={{ color: c }}`.
+  data with a style map, `style={{ color: c }}`. Elsewhere `` css`...` `` is trusted CSS
+  that keeps its declarations through props, lists and function answers, so a component
+  merges its caller's styles with `` style={`padding: 8px; ${style}`} ``.
 - `state` goes at the top of a component's body. `random()` or `uuid()` that a component
   shows goes in a `state` (`state ref = uuid()`), which keeps the server's value.
 - A `server fn` is a function the browser calls over HTTP. In a component it is awaited

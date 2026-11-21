@@ -2656,7 +2656,7 @@ impl<'a> Compiler<'a> {
                             file: None,
                             doc: None,
                             hot: Default::default(),
-                            request_use: Default::default(), runs_by_itself: Default::default(),
+                            request_use: Default::default(), runs_by_itself: Default::default(), run: 0,
                         };
                         let saved = std::mem::take(&mut self.ctxs);
                         let r = self.function(&def);
@@ -2900,7 +2900,7 @@ impl<'a> Compiler<'a> {
                     doc: None,
                     hot: Default::default(),
                     request_use: Default::default(),
-                    runs_by_itself: Default::default(),
+                    runs_by_itself: Default::default(), run: 0,
                 };
                 let saved = (std::mem::take(&mut self.ctxs), self.counter, self.reactive, self.read_log.take());
                 self.counter = 0;
@@ -2975,6 +2975,15 @@ impl<'a> Compiler<'a> {
             Value::Map(m) if matches!(name, "db" | "udp" | "media") && m.values().all(|x| matches!(x, Value::Builtin(..))) => {
                 self.err(format!("`{}` is not available in the browser; use it from a `server fn`", name))
             }
+            // A function a sandboxed script made, which a helper kept in a global: never the
+            // browser's, where it would run a visitor's script in every page that loads it, nor
+            // anywhere once its script has ended. Refused, as a changed value is (Q-1274, found
+            // reviewing the trusted CSS of FEEDBACK79.md's Q-1250, in its review; branch
+            // feedback72-81).
+            Value::Func(f) if f.def.run != 0 => self.err(format!(
+                "`{}` holds a function a script made (`run_script`), which runs only while its script does and never in the browser; give the page a function the program wrote",
+                name
+            )),
             Value::Func(f) if f.def.server => {
                 let r = (js.clone(), true);
                 self.globals.insert(name.to_string(), r.clone());
@@ -3108,7 +3117,7 @@ impl<'a> Compiler<'a> {
             file: None,
             doc: None,
             hot: Default::default(),
-            request_use: Default::default(), runs_by_itself: Default::default(),
+            request_use: Default::default(), runs_by_itself: Default::default(), run: 0,
         };
         // Until made, references to it (from functions it holds) find it.
         self.globals.insert(name.to_string(), (js.to_string(), false));

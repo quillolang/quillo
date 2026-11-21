@@ -2851,10 +2851,27 @@ impl Vars {
         }
     }
 
-    /// Calls `f` with each value while it says go on; whether it always did.
+    /// Calls `f` with each value while it says go on; whether it always did. Plain loops: as
+    /// `slots.iter().flatten().chain(more.iter()).all(...)`, whether `f` was inlined into it or
+    /// called through `Chain::try_fold` for each value changed with code elsewhere, and with Q-1274's
+    /// change a loop keeping a lambda in a `let` (`Scope::reuse_held`, `own`) took 5% more
+    /// instructions (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250, speed check;
+    /// branch feedback72-81).
     fn each_value(&self, mut f: impl FnMut(&Value) -> bool) -> bool {
         match self {
-            Vars::Few(slots, more, _) => slots.iter().flatten().chain(more.iter()).all(|(_, v)| f(v)),
+            Vars::Few(slots, more, _) => {
+                for (_, v) in slots.iter().flatten() {
+                    if !f(v) {
+                        return false;
+                    }
+                }
+                for (_, v) in more.iter() {
+                    if !f(v) {
+                        return false;
+                    }
+                }
+                true
+            }
             Vars::Many(m) => m.values().all(f),
         }
     }

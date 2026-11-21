@@ -259,11 +259,21 @@ pub fn run_script(it: &mut Interp, src: &str, vars: Option<&Map>) -> Result<Valu
 pub fn run_script_for(it: &mut Interp, src: &str, vars: Option<&Map>, ms: u64) -> Result<Value, Ctrl> {
     // Its clock starts as it is read: a source near `--max-body` takes its time to parse.
     let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    // Its world: the safe builtins, then its variables (`run_parsed`). Quillo's own, not what the
+    // program's globals have by those names: a program's `fn upper` was the script's `upper`, run
+    // with the program's effects (FEEDBACK51.md, Q-648; branch feedback51-fixes). Made first: its
+    // address is the run's number, which each function written in the source carries (`run_of`,
+    // `parsing_run`; Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch
+    // feedback72-81).
+    let root = ROOT.with(Scope::root_copy);
     // Names are kept for good, and this source may be a visitor's: its own are its own
     // (src/sym.rs), and messages say them as it wrote them.
-    let (parsed, names) = crate::sym::Sym::in_script(|| crate::parser::Parser::new(src).parse_program());
+    let (parsed, names) = {
+        let _parsing = Parsing::of(run_of(&root));
+        crate::sym::Sym::in_script(|| crate::parser::Parser::new(src).parse_program())
+    };
     let out = match parsed {
-        Ok(stmts) => run_parsed(it, &stmts, &names, vars, (until, ms))?,
+        Ok(stmts) => run_parsed(it, &stmts, &names, vars, (until, ms), root)?,
         Err(e) => bad(&format!("line {}: {}", e.line, e.msg)),
     };
     // Each name a message quotes, cut at 100 characters: an unknown name of 1 MB was said whole,
@@ -322,11 +332,43 @@ fn said_as_written(msg: &str, names: &std::collections::HashMap<String, Sym>) ->
     out
 }
 
-fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap<String, Sym>, vars: Option<&Map>, clock: (std::time::Instant, u64)) -> Result<Value, Ctrl> {
-    // Its world: the safe builtins, then its variables. Quillo's own, not what the program's
-    // globals have by those names: a program's `fn upper` was the script's `upper`, run with the
-    // program's effects (FEEDBACK51.md, Q-648; branch feedback51-fixes).
-    let root = ROOT.with(Scope::root_copy);
+/// A run's number, never 0, which is the program's: the address of its world, `root` (`FnDef::run`).
+/// No other run has it while a function of this one is about, as each holds the world through its
+/// scope (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+pub fn run_of(root: &Env) -> u64 {
+    std::sync::Arc::as_ptr(root) as u64
+}
+
+thread_local! {
+    /// The run whose source is being read, 0 for the program's (`parsing_run`).
+    static PARSING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The run whose source the parser is reading, which each function written in it carries
+/// (`FnDef::run`): 0 but while a script's own source is read, not the program's that a helper
+/// loads while a script runs. For the thread: reading a source never waits, so no other request
+/// runs on it meanwhile (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250;
+/// branch feedback72-81).
+pub fn parsing_run() -> u64 {
+    PARSING.with(std::cell::Cell::get)
+}
+
+/// `PARSING` set for a script's source, and put back however its reading ends.
+struct Parsing(u64);
+
+impl Parsing {
+    fn of(run: u64) -> Parsing {
+        Parsing(PARSING.with(|p| p.replace(run)))
+    }
+}
+
+impl Drop for Parsing {
+    fn drop(&mut self) {
+        PARSING.with(|p| p.set(self.0));
+    }
+}
+
+fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap<String, Sym>, vars: Option<&Map>, clock: (std::time::Instant, u64), root: Env) -> Result<Value, Ctrl> {
     let env = Scope::child(&root);
     // A variable the script never names is none of its business, and makes no name. Trusted CSS
     // in one is text in the script's world, where css`...` makes text too (`Interp::eval_call`):
@@ -351,6 +393,12 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
         _ => clock,
     };
     let saved_script = it.script.replace((root.clone(), saved_allowed, clock.0, clock.1));
+    // Its number, which each function it makes carries: one runs only while this run does, as
+    // the script's, called back by a helper too; kept past it, it is not run (`FnDef::run`;
+    // Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+    let outer_runs = it.script_runs.len();
+    it.script_runs.push(run_of(&root));
+    let outer_helper = std::mem::replace(&mut it.in_helper, false);
     let mut stopped = None;
     // Room on the stack for code nested as deeply as the parser allows.
     let out = crate::stack::for_nesting(crate::parser::MAX_NESTING, || {
@@ -385,6 +433,8 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
     it.allowed = saved_allowed;
     it.restrictor = saved_restrictor;
     it.script = saved_script;
+    it.script_runs.truncate(outer_runs);
+    it.in_helper = outer_helper;
     if let Some(e) = stopped {
         return Err(Ctrl::Error(e));
     }

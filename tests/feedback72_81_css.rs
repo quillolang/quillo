@@ -787,19 +787,42 @@ print(<Box {...{ style: v, label: "name" }}/>)
     }
 }
 
-/// A function a script makes never leaves it: given to a helper the program handed in, whole or in
-/// a list, a map or an error, it is refused, an error value; 0.8.9 let the helper keep it and run
-/// it later with no limit of steps or time. Builtins the script calls still take its functions,
-/// under its limits; a helper given plain values still runs (Q-1274, found reviewing the trusted
-/// CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+/// A function a script makes runs only while the script does. Given to a helper the program handed
+/// in, whole or in a list, a map or an error, the helper may call it back during the script, where
+/// it runs as the script's: no effects (a helper's own script and a tag the helper renders it as
+/// too, which on 0.8.9 gave it the program's), its steps counted (a callback looping past the
+/// budget stops with "too many steps"). Kept past the script, it is not run, an error value,
+/// wherever it is called (directly, from a list, a map or an error, by `map`'s quick path for
+/// `(x) => x`, as a tag, in `parallel`; a tick: the next test); 0.8.9 ran a kept one later with no
+/// limit of steps or time. Builtins the script calls take its functions under its limits; a helper
+/// given plain values runs; `parallel` given to a script runs its functions in order under its
+/// limits; a css`...` a script's function makes, kept by a helper, is plain text (Q-1274, found
+/// reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+///
+/// Changed with the user's decision on Q-1274 (a script's function may be passed to the program's
+/// helpers and called back while the script runs, as the script's; once it has ended, calling one
+/// gives an error value): 45adbcb refused the helper's call itself whenever a script's function
+/// was in its arguments ("a script's function stays in the script"), which broke tests/security.rs
+/// `scripts_have_no_effects_of_their_own` (a helper calling back the script's `(h) => h`). So
+/// `hold(...)` of a function, in a list, a map or an error, now gives the helper's 1, not that
+/// refusal; `each([1, 2], (x) => x * 2)` gives [2, 4], not the refusal; the helper keeps 5
+/// values, not 1; and each kept one, called after, gives the new error.
 #[test]
 fn a_scripts_function_stays_in_the_script() {
     let out = run(r#"let holder = []
+let kept_css = ""
 fn hold(f) {
     holder = push(holder, f)
     return 1
 }
+fn call_last() = holder[len(holder) - 1]()
+fn keep_css(f) {
+    kept_css = f()
+    return 1
+}
 fn each(xs, f) = map(xs, f)
+fn inner(f) = run_script("g()", { g: f })
+fn show(F) = str(<div><F/></div>)
 view Box(style) = <p style={{ color: style }}>x</p>
 fn w(x) = str(<Box style={x}/>)
 print(run_script("let n = 0\nwhile n < 100000 { n = n + 1 }\nn", {}))
@@ -812,17 +835,264 @@ print(run_script("each([1, 2], (x) => x * 2)", { each: each }))
 print(run_script("sort_by(map(filter([3, 1, 2], (x) => x > 1), (x) => x * 10), (x) => -x)", {}))
 print(run_script("each([1, 2], upper_or)", { each: each, upper_or: (x) => x + 1 }))
 print(len(holder))
+// Kept past the script: not run, wherever it is called.
+print(holder[0]())
+print(holder[1][0](3))
+print(holder[2].f(3))
+print(error(holder[3])(3))
+print(map([3], holder[1][0]))
+print(parallel([() => holder[0](), () => 0]))
+print(show(holder[1][0]))
+print(holder[4])
+// Called back during the script: runs, as the script's, its steps counted.
+print(run_script("hold(() => 7)\ncall_last()", { hold: hold, call_last: call_last }))
+print(run_script("hold(() => { let n = 0\nwhile n < 100000 { n = n + 1 }\nreturn n })\ncall_last()", { hold: hold, call_last: call_last }))
+print(run_script("hold(() => e(\"HOME\"))\ncall_last()", { hold: hold, call_last: call_last, e: env }))
+print(run_script("inner(() => e(\"HOME\"))", { inner: inner, e: env }))
+print(run_script("inner(() => { let n = 0\nwhile n < 100000 { n = n + 1 }\nreturn n })", { inner: inner }))
+print(run_script("show(() => e(\"HOME\"))", { show: show, e: env }))
+print(run_script("show(() => 5)", { show: show }))
+print(len(holder))
+print(holder[5]())
+// What a script's function makes is the script's: css`...` is text, kept as text.
+print(run_script("keep_css(() => css`red; background: blue`)", { keep_css: keep_css, css: css }))
+print(type_of(kept_css))
+print(w(kept_css))
 // `parallel` given to a script runs its functions under its limits, and makes it no trusted CSS.
 print(run_script("parallel([() => { let n = 0\nwhile n < 100000 { n = n + 1 }\nreturn n }, () => 0])", { parallel: parallel }))
 print(run_script("w(parallel([() => css`red; background: blue`, () => 0])[0])", { parallel: parallel, w: w, css: css }))
 print(run_script("parallel([() => 1, () => 2])", { parallel: parallel }))
 "#);
-    let stays = "err(\"a script's function stays in the script\")";
-    let want = format!(
-        "err(\"line 2: the script took too many steps\")\n{s}\n{s}\n{s}\n{s}\n1\n{s}\n[30, 20]\n[2, 3]\n1\nerr(\"line 2: the script took too many steps\")\n<p style=\"color: red\\3b  background: blue\">x</p>\n[1, 2]\n",
-        s = stays
+    let ended = "err(\"a script's function runs only while its script does\")";
+    let steps = "err(\"line 2: the script took too many steps\")";
+    let env = "err(\"line 1: `env` needs the env effect, which is not allowed here\")";
+    let escaped = "<p style=\"color: red\\3b  background: blue\">x</p>";
+    let want = [
+        steps,
+        "1",
+        "1",
+        "1",
+        "1",
+        "1",
+        "[2, 4]",
+        "[30, 20]",
+        "[2, 3]",
+        "5",
+        ended,
+        ended,
+        ended,
+        ended,
+        &format!("[{}]", ended),
+        &format!("[{}, 0]", ended),
+        "<div></div>",
+        "1",
+        "7",
+        steps,
+        env,
+        env,
+        steps,
+        env,
+        "<div>5</div>",
+        "8",
+        ended,
+        "1",
+        "str",
+        escaped,
+        steps,
+        escaped,
+        "[1, 2]",
+    ]
+    .join("\n")
+        + "\n";
+    // What it printed first; then what it said, the tag's kept function where the program shows
+    // it, as an error markup shows nothing.
+    assert!(out.starts_with(&want), "{}", out);
+    assert!(out[want.len()..].contains("main.qwe:14: an error no statement took, shown as nothing: a script's function runs only while its script does"), "{}", out);
+}
+
+/// A function a script made, kept by a helper and called by a tick after the script ended, is not
+/// run: an error value; 0.8.9 ran it, 100,000 steps past the script's 20,000
+/// (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+#[test]
+fn a_kept_script_function_called_by_a_tick_is_not_run() {
+    let s = served(
+        "tick",
+        r#"let holder = []
+let seen = "none"
+fn hold(f) {
+    holder = push(holder, f)
+    return 1
+}
+fn tick() {
+    if len(holder) > 0 {
+        let r = holder[0]()
+        seen = is_err(r) ? error(r) : "ran"
+    }
+}
+every(20, tick)
+route GET /keep = str(run_script("hold(() => { let n = 0\nwhile n < 100000 { n = n + 1 }\nreturn n })", { hold: hold }))
+route GET /seen = seen
+"#,
+        &[],
+        &[],
     );
+    assert_eq!(s.get("/seen", &[]).body, "none");
+    assert_eq!(s.get("/keep", &[]).body, "1");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let seen = loop {
+        let b = s.get("/seen", &[]).body;
+        if b != "none" || Instant::now() > deadline {
+            break b;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(seen, "a script's function runs only while its script does", "{}", s.log());
+}
+
+/// Requests take turns on one thread, each with its scripts' runs of its own: one script that
+/// starts first and ends first leaves another request's still-running script its run (a list kept
+/// for the thread lost it, and `inner(() => 42)` was the run-ended error), and a function one
+/// request's script made, still running, does not run in another request's script, which got 7
+/// (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250, in its review; branch
+/// feedback72-81).
+#[test]
+fn each_requests_scripts_keep_their_own_runs() {
+    let s = served(
+        "turns",
+        r#"let on = []
+let kept = []
+fn nap(ms) {
+    sleep(ms)
+    return 1
+}
+fn mark(k) {
+    on = push(on, k)
+    return 1
+}
+fn inner(f) = run_script("g()", { g: f })
+fn hold(f) {
+    kept = push(kept, f)
+    return 1
+}
+fn call_kept() = kept[0]()
+route GET /on = join(on, ",")
+route GET /x = str(run_script("mark(\"x\")\nnap(1500)\n1", { nap: nap, mark: mark }, { timeout: 20000 }))
+route GET /y = str(run_script("mark(\"y\")\nnap(3000)\ninner(() => 42)", { nap: nap, mark: mark, inner: inner }, { timeout: 20000 }))
+route GET /a = str(run_script("hold(() => 7)\nmark(\"a\")\nnap(3000)\n1", { hold: hold, nap: nap, mark: mark }, { timeout: 20000 }))
+route GET /b {
+    let r = run_script("call_kept()", { call_kept: call_kept }, { timeout: 20000 })
+    return is_err(r) ? error(r) : str(r)
+}
+"#,
+        &[],
+        &[],
+    );
+    let port = s.port;
+    let until_on = |k: &str| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !s.get("/on", &[]).body.split(',').any(|x| x == k) {
+            assert!(Instant::now() < deadline, "{} never started:\n{}", k, s.log());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ask = |path: &'static str| {
+        let order = order.clone();
+        std::thread::spawn(move || {
+            let body = support::send(port, "GET", path, &[], "").body;
+            order.lock().unwrap().push(path);
+            body
+        })
+    };
+    // /x's script starts first and ends first, while /y's still runs.
+    let x = ask("/x");
+    until_on("x");
+    let y = ask("/y");
+    until_on("y");
+    assert_eq!(x.join().unwrap(), "1");
+    assert_eq!(y.join().unwrap(), "42", "{}", s.log());
+    assert_eq!(*order.lock().unwrap(), ["/x", "/y"]);
+    // /a's script keeps a function and is still running when /b's script calls it.
+    let a = ask("/a");
+    until_on("a");
+    assert_eq!(s.get("/b", &[]).body, "a script's function runs only while its script does", "{}", s.log());
+    assert!(!order.lock().unwrap().contains(&"/a"), "/a ended before /b asked: {}", s.log());
+    assert_eq!(a.join().unwrap(), "1");
+}
+
+/// What a script's function gives back to a helper is plain, as what the script hands one is: a
+/// helper's trusted CSS a callback hands back (`() => getc()`, through `map`, in a list, or the
+/// value the helper gave it) is escaped in the helper's style; the program's own callback still
+/// gives it trusted (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250, in its
+/// review; branch feedback72-81).
+#[test]
+fn what_a_scripts_function_gives_a_helper_is_plain() {
+    let out = run(r#"let C = css`red; position: fixed; inset: 0`
+fn getc() = C
+fn show_cb(f) = str(<div style={{ color: f() }}/>)
+fn show_val(v) = str(<div style={{ color: v }}/>)
+fn show_map(f) = str(<div style={{ color: map([1], (x) => f())[0] }}/>)
+fn show_given(f) = str(<div style={{ color: f(C) }}/>)
+print(run_script("show_cb(() => getc())", { show_cb: show_cb, getc: getc }))
+print(run_script("show_val(getc())", { show_val: show_val, getc: getc }))
+print(run_script("show_map(() => getc())", { show_map: show_map, getc: getc }))
+print(run_script("show_given((c) => c)", { show_given: show_given }))
+print(run_script("show_cb(() => [getc()][0])", { show_cb: show_cb, getc: getc }))
+print(run_script("show_cb(() => \"blue\")", { show_cb: show_cb }))
+print(show_cb(() => C))
+"#);
+    let escaped = "<div style=\"color: red\\3b  position: fixed\\3b  inset: 0\"></div>";
+    let want = [escaped, escaped, escaped, escaped, escaped, "<div style=\"color: blue\"></div>", "<div style=\"color: red; position: fixed; inset: 0\"></div>"].join("\n") + "\n";
     assert!(out.ends_with(&want), "{}", out);
+}
+
+/// A function a script made, which a helper kept in a global a component reads, is never
+/// compiled for the browser, where it would run a visitor's script in every page: the program
+/// stops at its start, saying so; 0.8.9 wrote `W.add($x_1, 1000)` into the page's bundle. The
+/// program's own function there still is (Q-1274, found reviewing the trusted CSS of
+/// FEEDBACK79.md's Q-1250, in its review; branch feedback72-81).
+#[test]
+fn a_kept_script_function_never_reaches_the_browser() {
+    let src = |keep: &str| {
+        format!(
+            r#"let stash = (x) => x
+fn keep(f) {{
+    stash = f
+    return 1
+}}
+{}
+let pick = stash
+component Shows() {{
+    state n = 1
+    <button onclick={{() => n = pick(n)}}>{{n}}</button>
+}}
+route GET / = <html><head><title>t</title></head><body><Shows/></body></html>
+"#,
+            keep
+        )
+    };
+    let d = Dir::new("bundle", &src("let made = run_script(\"keep((x) => x + 1000)\", { keep: keep })"));
+    let (ok, out) = quillo_in(&d.0, "check");
+    assert!(ok, "{}", out);
+    let mut c = Command::new(quillo()).arg("run").arg(d.main()).args(["--port", "0"]).current_dir(&d.0).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut se = c.stderr.take().unwrap();
+    let t = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = se.read_to_string(&mut s);
+        s
+    });
+    let status = wait_for(&mut c, Duration::from_secs(120));
+    let said = t.join().unwrap();
+    assert!(status.is_some_and(|s| !s.success()), "{}", said);
+    assert!(
+        said.contains("<Shows> (compiled for the browser): `pick` holds a function a script made (`run_script`), which runs only while its script does and never in the browser"),
+        "{}",
+        said
+    );
+    // The program's own function in the same place.
+    let s = served("bundle-own", &src("let made = 1"), &[], &[]);
+    let page = s.get("/", &[]);
+    assert_eq!(page.status, 200, "{}", s.log());
 }
 
 /// A server fn's answer the program wrote itself (`respond`, `reply`) is the program's JSON: the

@@ -894,7 +894,8 @@ program's own gets an error value from `ask`, rather than have Quillo's replace 
 
 A name right before a template calls it with the text: `` shout`hi ${name}` `` is
 `` shout(`hi ${name}`) ``. The builtins `css` and `sql` return the text as it is, and
-tell editors to highlight it as CSS or SQL.
+tell editors to highlight it as CSS or SQL; `` css`...` `` escapes its values and makes
+trusted CSS (see [HTML literals](#html-literals)).
 
 Operators are as in JavaScript, with these meanings:
 
@@ -1626,7 +1627,11 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   `c = "red} input[value^=a]{background:url(//evil)}"` adds no rule *(since 0.7)*, and
   so is its `&`, as `\26 `, since inside `<svg>` and `<math>` a browser reads a
   `<style>`'s `&#125` as a `}`.
-  `` sql`...` `` does the same for queries.
+  `` sql`...` `` does the same for queries. What `` css`...` `` makes is trusted CSS: a
+  `style` writes it as written wherever it reaches one (through a name, a prop, a list or
+  a function's answer), so a component takes its caller's declarations with
+  `` style={`padding: 8px; ${style}`} ``, and everywhere else it is the `str` it says (see
+  Safety built in, under [Standard library](#standard-library)).
 - A component's or view's own CSS is `style` at the start of its body, before its markup
   (from the start, with what the page is sent: [Styling a component](#styling-a-component)):
 
@@ -4817,7 +4822,19 @@ run_script("total > 100", { total: 120 }, { timeout: "1s" })               // tr
 - It has no effects of its own: a builtin such as `env` passed in `vars` still cannot
   run. A function of the program passed in `vars` runs as the program's, with what the
   program may do, so it is the program's way to let a script ask for more
-  (`{ taken: (code) => db.one(...) != null }`).
+  (`{ taken: (code) => db.one(...) != null }`). A function the script makes may be given
+  to one of the program's, whole or inside a list, a map or an error, and called back while
+  the script runs: it runs as the script's, with no effects, its steps and time counted
+  against the script's. Once the script has ended (it gave its value or was stopped),
+  calling such a function anywhere, kept in a variable or called from a tick, gives the
+  error value `a script's function runs only while its script does`, so nothing a script
+  made runs past its limits. Test what such a function gives with `is_err` before acting on
+  it: after its script has ended it gives an error value, which `if !deny(x)` reads as
+  false. A component cannot use a global holding a function a script made: the program
+  stops at start, saying so, as it never runs in the browser. `parallel` given in `vars` runs the
+  script's functions one after another, under its steps and time. Trusted CSS (`` css`...` ``)
+  does not pass through a script: in `vars`, from a helper, in what the script's functions give
+  back to the program and in what it gives back, it is plain text.
 - It stops after 20,000 steps (calls and loop rounds). A value it makes may be up to
   1 MB (strings, and lists and maps counted with what they hold), and each KB it makes
   costs a step: doubling a string in a loop stops there, not when the memory runs out.
@@ -6446,7 +6463,8 @@ view Header(user) = <header>
   whole float shows as a route writes it, `1.0`, so it takes `other` in English there,
   and as a component writes it, `1`, so it takes `one` there, on both sides alike (a
   float past 2^53 by the digits it shows too). `"1e3"` is 1000; `"0x1"`, `"Infinity"`
-  and a full-width digit are not numbers, on either side, and take `other`.
+  and a full-width digit are not numbers, on either side, and take `other`. A
+  `` css`...` `` value given as `count` is read as its text, on both sides.
 - As it loads, a form the language never picks is warned of: ``translations (en): `a` has
   a `few` form, which en never picks (it has one, other)``.
 - Translations are text, escaped in pages like any other; `raw(t(...))` for markup you
@@ -7632,14 +7650,11 @@ Safety built in:
   only take away the declarations after it, never add one. Its `{ } ; \` are written as
   CSS's escapes and its `&` as `\26 `, as are css`...`'s `${...}`, and a style map's values
   have `{ } ; \` escaped (so a value adds no rule or declaration, in `<svg>` and `<math>`
-  too). Compose declarations with a style map, `style={{ color: c }}`, or css`...`. A
-  template made in a `let` or a helper and given whole, `style={s}`, is the program's own
-  text and written as it is (escaped as any attribute): keep a visitor's value in a template
-  written in the `style={...}` itself, or in a style map. A component's or view's `style`
-  prop is escaped where its tag gives it (`` <Box style={`color: ${c}`}/> ``), while a view
-  or `fn` called as a function, `Box(...)`, gets its arguments as given. A component that
-  takes its caller's styles merges them with a style map: `style={{ padding: "8px", ...style
-  }}`. `<style>{x}</style>` has
+  too), but for a css`...` value, below. Compose declarations with a style map,
+  `style={{ color: c }}`, or css`...`. A template made in a `let` or a helper and given
+  whole, `style={s}`, is the program's own text and written as it is (escaped as any
+  attribute): keep a visitor's value in a template written in the `style={...}` itself, in
+  css`...`, or in a style map. `<style>{x}</style>` has
   its `<` rewritten (`\3c `), so none can end the element; within a value, what it says is
   CSS. CSS runs no script in today's browsers; data put
   there can still restyle the page (cover it with an overlay,
@@ -7649,6 +7664,38 @@ Safety built in:
   number), or check what users give against what you allow. A Content-Security-Policy
   header that keeps loading on the site (`img-src 'self'; font-src 'self'`, sent with
   `respond` or by a proxy in front) stops the beacons that go through `url()`.
+- `` css`...` `` makes trusted CSS: its `${...}` values are escaped where it is written, and
+  a style writes the rest as written wherever the value reaches one: through a name, a
+  `let`, a prop, a spread, a list or a map, a function's answer, an island's props and
+  state, and a `live` or `server fn` answer. A style map takes it as written too:
+  `` style={{ color: css`red; font-weight: bold` }} `` is `color: red; font-weight: bold`.
+  A template or text written straight in a component's or view's `style` prop is trusted
+  CSS as well, its values escaped there. So a component adds its caller's declarations to
+  its own with a template:
+
+  ```quillo
+  component Card(style: str = "") {
+      <div style={`padding: 8px; ${style}`}>Hi</div>
+  }
+  ```
+
+  With `c` as above, `` <Card style={css`color: ${c}; font-size: 20px`}/> `` and
+  `` <Card style={`color: ${c}; font-size: 20px`}/> `` both write
+  `padding: 8px; color: red\3b  background: blue; font-size: 20px`: `c` stays one value,
+  and the caller's `font-size` is kept. Plain text is one value there: the same template
+  made in a `let` (`` let look = `color: ${c}; font-size: 20px` ``) and given by its name,
+  `<Card style={look}/>`, or given to a view called as a function, `Box(...)`, which gets
+  its arguments as given, is written
+  `padding: 8px; color: red\3b  background: blue\3b  font-size: 20px`, which the browser
+  drops whole. Everywhere else a css value is the `str` it says: `type_of` gives `str`,
+  and `==`, `json` and every builtin read its text. What is made from it is plain text:
+  `+`, a builtin (`trim`, `replace`), a plain template around it made outside a style
+  (`` let t = `${s}` `` with `s` a css value), and `css(k)` of text made elsewhere. Nothing from outside
+  the program is trusted CSS: a request's data, what a page sends (a `server fn`'s
+  arguments, channel messages), the database, the session, files, `env`, `run_script`
+  (what it is given and what it gives back), MCP, other sites and services. A channel
+  message pushed to pages is text, and an answer the program writes itself with `respond`
+  or `reply` carries no trusted CSS to the browser.
 - Code nested more than 256 levels deep (brackets, operators, elements, ...) is refused
   when it is parsed, so source from anywhere cannot use up the stack.
 - `respond` and `redirect` refuse header values with line breaks, which would let text

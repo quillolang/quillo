@@ -1795,7 +1795,7 @@ impl Parser {
         name_unmarked_styles(&mut body, ours);
         // Its `///` comment (FEEDBACK56.md, Q-854; branch feedback56).
         let doc = self.lx.doc_above(line);
-        Ok(FnDef { name, params, ret, err, effects, server: false, mcp: false, component: false, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default(), runs_by_itself: Default::default() })
+        Ok(FnDef { name, params, ret, err, effects, server: false, mcp: false, component: false, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default(), runs_by_itself: Default::default(), run: 0 })
     }
 
     /// `style <css>` at a file's top level: the CSS of the components the file declares, and no
@@ -1827,7 +1827,7 @@ impl Parser {
             args[1] = Expr::Lit(Lit::Nil);
         }
         let body = Expr::Block(vec![Stmt::Expr(Expr::Call(Box::new(Expr::Ident("__style".into(), line)), args, line))]);
-        Ok(Stmt::Fn(Arc::new(FnDef { name, params: Vec::new(), ret: None, err: None, effects: None, server: false, mcp: false, component: false, body, line, nesting: 1, file: self.file.clone(), doc: None, hot: Default::default(), request_use: Default::default(), runs_by_itself: Default::default() })))
+        Ok(Stmt::Fn(Arc::new(FnDef { name, params: Vec::new(), ret: None, err: None, effects: None, server: false, mcp: false, component: false, body, line, nesting: 1, file: self.file.clone(), doc: None, hot: Default::default(), request_use: Default::default(), runs_by_itself: Default::default(), run: 0 })))
     }
 
     /// `style <css>` in a component's or view's body: the call of `__style`,
@@ -1919,7 +1919,7 @@ impl Parser {
         let (mut body, nesting) = body?;
         name_unmarked_styles(&mut body, ours);
         let doc = self.lx.doc_above(line);
-        let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, mcp, component: true, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default(), runs_by_itself: Default::default() };
+        let def = FnDef { name, params, ret: None, err: None, effects: None, server: false, mcp, component: true, body, line, nesting, file: self.file.clone(), doc, hot: Default::default(), request_use: Default::default(), runs_by_itself: Default::default(), run: 0 };
         key_not_a_param(&def)?;
         Ok(def)
     }
@@ -4706,6 +4706,10 @@ impl Parser {
 }
 
 fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line: u32, file: Option<Arc<str>>) -> Expr {
+    // A script's own carries its run, and is never made into machine code, which no limit of
+    // steps reaches (jit.rs's `NEVER`; Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's
+    // Q-1250; branch feedback72-81).
+    let run = crate::script::parsing_run();
     Expr::Lambda(Arc::new(FnDef {
         name: "<fn>".into(),
         params,
@@ -4720,8 +4724,9 @@ fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line
         nesting,
         file,
         doc: None,
-        hot: Default::default(),
+        hot: std::sync::atomic::AtomicU32::new(if run == 0 { 0 } else { u32::MAX }),
         request_use: Default::default(), runs_by_itself: Default::default(),
+        run,
     }))
 }
 

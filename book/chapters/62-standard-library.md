@@ -253,14 +253,11 @@ Safety built in:
   only take away the declarations after it, never add one. Its `{ } ; \` are written as
   CSS's escapes and its `&` as `\26 `, as are css`...`'s `${...}`, and a style map's values
   have `{ } ; \` escaped (so a value adds no rule or declaration, in `<svg>` and `<math>`
-  too). Compose declarations with a style map, `style={{ color: c }}`, or css`...`. A
-  template made in a `let` or a helper and given whole, `style={s}`, is the program's own
-  text and written as it is (escaped as any attribute): keep a visitor's value in a template
-  written in the `style={...}` itself, or in a style map. A component's or view's `style`
-  prop is escaped where its tag gives it (`` <Box style={`color: ${c}`}/> ``), while a view
-  or `fn` called as a function, `Box(...)`, gets its arguments as given. A component that
-  takes its caller's styles merges them with a style map: `style={{ padding: "8px", ...style
-  }}`. `<style>{x}</style>` has
+  too), but for a css`...` value, below. Compose declarations with a style map,
+  `style={{ color: c }}`, or css`...`. A template made in a `let` or a helper and given
+  whole, `style={s}`, is the program's own text and written as it is (escaped as any
+  attribute): keep a visitor's value in a template written in the `style={...}` itself, in
+  css`...`, or in a style map. `<style>{x}</style>` has
   its `<` rewritten (`\3c `), so none can end the element; within a value, what it says is
   CSS. CSS runs no script in today's browsers; data put
   there can still restyle the page (cover it with an overlay,
@@ -270,6 +267,38 @@ Safety built in:
   number), or check what users give against what you allow. A Content-Security-Policy
   header that keeps loading on the site (`img-src 'self'; font-src 'self'`, sent with
   `respond` or by a proxy in front) stops the beacons that go through `url()`.
+- `` css`...` `` makes trusted CSS: its `${...}` values are escaped where it is written, and
+  a style writes the rest as written wherever the value reaches one: through a name, a
+  `let`, a prop, a spread, a list or a map, a function's answer, an island's props and
+  state, and a `live` or `server fn` answer. A style map takes it as written too:
+  `` style={{ color: css`red; font-weight: bold` }} `` is `color: red; font-weight: bold`.
+  A template or text written straight in a component's or view's `style` prop is trusted
+  CSS as well, its values escaped there. So a component adds its caller's declarations to
+  its own with a template:
+
+  ```quillo
+  component Card(style: str = "") {
+      <div style={`padding: 8px; ${style}`}>Hi</div>
+  }
+  ```
+
+  With `c` as above, `` <Card style={css`color: ${c}; font-size: 20px`}/> `` and
+  `` <Card style={`color: ${c}; font-size: 20px`}/> `` both write
+  `padding: 8px; color: red\3b  background: blue; font-size: 20px`: `c` stays one value,
+  and the caller's `font-size` is kept. Plain text is one value there: the same template
+  made in a `let` (`` let look = `color: ${c}; font-size: 20px` ``) and given by its name,
+  `<Card style={look}/>`, or given to a view called as a function, `Box(...)`, which gets
+  its arguments as given, is written
+  `padding: 8px; color: red\3b  background: blue\3b  font-size: 20px`, which the browser
+  drops whole. Everywhere else a css value is the `str` it says: `type_of` gives `str`,
+  and `==`, `json` and every builtin read its text. What is made from it is plain text:
+  `+`, a builtin (`trim`, `replace`), a plain template around it made outside a style
+  (`` let t = `${s}` `` with `s` a css value), and `css(k)` of text made elsewhere. Nothing from outside
+  the program is trusted CSS: a request's data, what a page sends (a `server fn`'s
+  arguments, channel messages), the database, the session, files, `env`, `run_script`
+  (what it is given and what it gives back), MCP, other sites and services. A channel
+  message pushed to pages is text, and an answer the program writes itself with `respond`
+  or `reply` carries no trusted CSS to the browser.
 - Code nested more than 256 levels deep (brackets, operators, elements, ...) is refused
   when it is parsed, so source from anywhere cannot use up the stack.
 - `respond` and `redirect` refuse header values with line breaks, which would let text
