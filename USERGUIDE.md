@@ -2294,10 +2294,11 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```
 
   `js("document.querySelector", "#name").focus()` focuses an input the same way.
-- Each page loads two scripts, minified, whose addresses change with their content, so
-  the browser keeps them for good:
+- Each page loads two scripts, whose addresses change with their content, so the browser
+  keeps them for good. Their comment lines, blank lines and indentation are taken out, but
+  they are not minified: names and the spaces inside a line stay.
   - `/_quillo/r/<hash>.js`, the runtime: the parts of it the program's components
-    reach (about 35 KB, 11 KB gzipped, for a page with one counter). Every page of the program
+    reach (about 139 KB, 39 KB gzipped, for a page with one counter). Every page of the program
     loads the same one, so the browser downloads it once.
   - `/_quillo/b/<hash>.js`, the page's own code: the components it was rendered with,
     every component they can show, and what they use. Pages with the same components
@@ -2307,8 +2308,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   256 sets of components pages were made of (`quillo_bundles` under [`--metrics`](#options-of-quillo-run)); a
   page that names one no longer kept is sent the whole program's. There is no splitting
   by route and no lazy component: an `App` whose `match` shows thirty pages carries the
-  thirty in its bundle. Under `--watch` a page loads one unminified bundle instead,
-  which loads a file per component and function (see [Debugging](#in-the-browser)).
+  thirty in its bundle. Under `--watch` a page loads one bundle instead, the runtime as
+  it is written, which loads a file per component and function (see [Debugging](#in-the-browser)).
 
   ```sh
   curl -s localhost:8080/ | grep -o '/_quillo/[rb]/[^"]*'
@@ -4267,7 +4268,11 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
   is an optional `-` and digits with no leading `0` (`05`, `+5` and ` 5` are not one, so a
   page has one address), a `float`, `num` or `dec` also takes a fraction and an exponent and
   is finite (`NaN`, `inf` and `1e999` are not), and nothing is trimmed, a `str` included.
-  The same holds for typed fields of a query or a form. `*rest` (or `*name`) takes the rest
+  The same holds for typed fields of a query or a form. `int(x)` and `float(x)` are looser:
+  they take white space at either end, a leading `+` and leading zeros (`int(" 05")` is 5;
+  see [Standard library](#standard-library)). A field taken as `str` and checked by hand
+  takes the pattern's rule with `re.test(s, "^(0|-?[1-9][0-9]*)$")` before `int(s)`.
+  `*rest` (or `*name`) takes the rest
   of the path, so it comes last: nothing can follow it, in the route or in its group's
   routes *(since 0.7: what followed was ignored)*; `*` alone names it `rest`. `/users/{id}`, as OpenAPI and Express write a parameter, is an
   error that says to write `:id`. The path is split at `/`, empty pieces dropped, so `/users`,
@@ -4879,6 +4884,18 @@ A wrong password, or an email no one has (`user` is null, so its `password_hash`
 which `verify_password` says is false), shows the plain text `Wrong email or password`
 with status 401. The right one sets the cookie and goes to `/`, which now shows the
 button; `/me` then gives `{"name":"Ana"}`, and after logging out `Log in first` (401).
+
+`verify_password` does its whole work for a null hash, or text that is no hash, and takes
+as long as for a real one, so an email no one has is answered no sooner than a member's,
+and the time tells no one who has an account. A null check before it,
+`if user == null || !crypto.verify_password(...)`, skips that work for a stranger, who is
+then answered at once. To keep one, verify every time, then decide (no stand-in hash is
+needed):
+
+```quillo
+let ok = crypto.verify_password(password, user.password_hash)
+if user == null || !ok { reply 401 "Wrong email or password" }
+```
 
 - `set_session(map, { max_age })` replaces the session (30 days unless given),
   `session()` gives it (`{}` when there is none) and `end_session()` forgets it.
@@ -7025,7 +7042,10 @@ What the document holds:
 - Its title is the program file's name (`main`), both ways. Under [`--base /shop`](#options-of-quillo-run) it has
   `"servers": [{ "url": "/shop" }]`.
 - Several routes on one method and path shape are one operation: their bodies a `oneOf`
-  (each literal field an `enum`), their query parameters merged (required only where every
+  (each literal field an `enum`), or an `anyOf` when one body could fit two of them, as
+  with a catch-all route after the others (`{ json: { type: str } }` after
+  `{ json: { type: "order.placed", id: str } }`: an `anyOf` with it, a `oneOf` without),
+  their query parameters merged (required only where every
   route requires them), the path template named as the first route names it (`/users/{id}`,
   its parameter a `oneOf` of the routes' types), and `x-quillo-at` a list of the places
   when there are several.
@@ -7431,8 +7451,8 @@ What each does at its edges, where the answer is not what another language would
 | `remove(list, x)` | every item equal to `x` gone; `remove(map, k)` the key |
 | `set(xs, i, v)` | `i` past the end is an error |
 | `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int, up to 2^63 (`type_of(round(1e16))` is `int`; past it, and NaN and the infinities, the float), and an int is itself (exact past 2^53); `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); fewer than no places round to tens, hundreds, ...: `round(1234.5678, -2)` is `1200.0`, from the float's shortest digits and exact at every place (`round(1e30, -29)` is `1e30`), and a result past the largest float is an error; an int to 0 places or more is itself (`round(5, 2)` is `5`, as in Python), and to fewer the nearest multiple, exactly, a half away from zero (`round(1250, -2)` is `1300`, where Python's is `1200`, half to even); `round(a / b)` of two ints is exact (see `/` under [Values](#values)); a decimal takes a mode (see [Decimals](#decimals)) |
-| `int(x)` | a float or decimal cut toward zero (an error value when too large for an int); `true` is 1; text of digits only (`int("1.0")`, `int("1e3")` are error values) |
-| `float(x)` | a number as a float; text as Rust reads a float (`"2.5"`, `" 7 "`, `"1e3"`, `".5"`, `"inf"`, `"nan"`), so `"0x10"`, `"0b11"`, `"1_000"` and `""` are error values, in the browser too |
+| `int(x)` | a float or decimal cut toward zero (an error value when too large for an int); `true` is 1; text of digits after an optional `+` or `-`, with leading zeros and white space at either end taken (`int(" 5")`, `int("+2")` and `int("02")` are 5, 2 and 2), so looser than a route's `int` (see [Routes](#routes)); `"1.0"`, `"1e3"`, `"0x0A"`, `"1_000"`, `""` and a number past an int's range are error values, in the browser too |
+| `float(x)` | a number as a float; text as Rust reads a float (`"2.5"`, `" 7 "`, `"+2"`, `"02"`, `"1e3"`, `".5"`, `"inf"`, `"nan"`; `"1e400"` is `inf`), so looser than a route's `float`; `"0x10"`, `"0b11"`, `"1_000"` and `""` are error values, in the browser too |
 | `floor(x)`, `ceil(x)` | a float to an int, up to 2^63 (`type_of(floor(1e16))` is `int`; past it the float); an int as it is, past 2^53 too, as `round(x)` gives it; `floor(a / b)` of two ints divides in ints, exactly (see `/` under [Values](#values)) |
 | `str(x)` | a whole float as `2.0` (in a component's text, `2`, on both sides), never in exponent form (`1e16` is `10000000000000000`); a float's shortest digits, a tie taking the even digit as JavaScript does (`1916218016406818.3`, which is held as ...818.25, is written `1916218016406818.2`); markup as its HTML, in the browser too; a list or map as Quillo writes it (`{ a: 1, b: "x" }`, a key of letters, digits and `_` of any script, not starting with a digit, bare (`{ é: 1, 日本: 2 }`), another quoted (`{ "a b": 3, "1a": 4 }`), on both sides); `null` as `null` |
 | `type_of(x)` | one of `null bool int float dec str list map fn html response error` (`promise` for a JavaScript Promise in the browser) |
@@ -8576,6 +8596,13 @@ There is no SQLCipher (no encryption at rest), and a file is opened by path, not
 file, whatever its name or folder (see [Static files](#static-files)); `file("app.db")`
 sends one on purpose. Back it up with `db.exec("vacuum into
 'backup.db'")` or `sqlite3 app.db ".backup ..."`, not by copying the file while it runs.
+A path inside SQL is SQLite's own: it counts from the folder the process was started in,
+not from the program's folder as `db.open`'s does, so `vacuum into 'backups/b.db'` in a
+program started from elsewhere (`quillo run app/main.qwe`, or a service manager) fails
+with `unable to open database`. Start the program in its folder (systemd's
+`WorkingDirectory=`), or give an absolute path: `pragma database_list` gives the
+database's, so `db.exec("vacuum into ?", db.one("pragma database_list").file + ".bak")`
+puts the copy beside it from any folder.
 
 **PostgreSQL:**
 
@@ -9827,7 +9854,7 @@ from its lines to the `.qwe` file's. The browser's developer tools show them by 
 with the `.qwe` source beside them, and a variable a statement declares carries its own name
 (`count`, which the compiled code calls `$count_1`); a component's state is a signal, its
 value in `.v`. Values are JavaScript's: the debug console takes JavaScript, not Quillo. In
-production a page's bundle is one minified file, as before. In both, the runtime keeps its
+production a page's bundle is one file, without comments or indentation, as before. In both, the runtime keeps its
 names to itself: none of its functions is the page's, so a page's own `function report()`
 or a widget's `function run()` and Quillo's leave each other alone (FEEDBACK42.md, Q-481).
 

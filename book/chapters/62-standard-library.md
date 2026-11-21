@@ -163,8 +163,8 @@ What each does at its edges, where the answer is not what another language would
 | `remove(list, x)` | every item equal to `x` gone; `remove(map, k)` the key |
 | `set(xs, i, v)` | `i` past the end is an error |
 | `round(x)` | a float rounds half away from zero (`round(-2.5)` is `-3`) to an int, up to 2^63 (`type_of(round(1e16))` is `int`; past it, and NaN and the infinities, the float), and an int is itself (exact past 2^53); `round(x, 2)` a float with at most 15 places, from its shortest decimal (`round(1.005, 2)` is `1.01`, as `format_number` writes it); fewer than no places round to tens, hundreds, ...: `round(1234.5678, -2)` is `1200.0`, from the float's shortest digits and exact at every place (`round(1e30, -29)` is `1e30`), and a result past the largest float is an error; an int to 0 places or more is itself (`round(5, 2)` is `5`, as in Python), and to fewer the nearest multiple, exactly, a half away from zero (`round(1250, -2)` is `1300`, where Python's is `1200`, half to even); `round(a / b)` of two ints is exact (see `/` under [Values](#values)); a decimal takes a mode (see [Decimals](#decimals)) |
-| `int(x)` | a float or decimal cut toward zero (an error value when too large for an int); `true` is 1; text of digits only (`int("1.0")`, `int("1e3")` are error values) |
-| `float(x)` | a number as a float; text as Rust reads a float (`"2.5"`, `" 7 "`, `"1e3"`, `".5"`, `"inf"`, `"nan"`), so `"0x10"`, `"0b11"`, `"1_000"` and `""` are error values, in the browser too |
+| `int(x)` | a float or decimal cut toward zero (an error value when too large for an int); `true` is 1; text of digits after an optional `+` or `-`, with leading zeros and white space at either end taken (`int(" 5")`, `int("+2")` and `int("02")` are 5, 2 and 2), so looser than a route's `int` (see [Routes](#routes)); `"1.0"`, `"1e3"`, `"0x0A"`, `"1_000"`, `""` and a number past an int's range are error values, in the browser too |
+| `float(x)` | a number as a float; text as Rust reads a float (`"2.5"`, `" 7 "`, `"+2"`, `"02"`, `"1e3"`, `".5"`, `"inf"`, `"nan"`; `"1e400"` is `inf`), so looser than a route's `float`; `"0x10"`, `"0b11"`, `"1_000"` and `""` are error values, in the browser too |
 | `floor(x)`, `ceil(x)` | a float to an int, up to 2^63 (`type_of(floor(1e16))` is `int`; past it the float); an int as it is, past 2^53 too, as `round(x)` gives it; `floor(a / b)` of two ints divides in ints, exactly (see `/` under [Values](#values)) |
 | `str(x)` | a whole float as `2.0` (in a component's text, `2`, on both sides), never in exponent form (`1e16` is `10000000000000000`); a float's shortest digits, a tie taking the even digit as JavaScript does (`1916218016406818.3`, which is held as ...818.25, is written `1916218016406818.2`); markup as its HTML, in the browser too; a list or map as Quillo writes it (`{ a: 1, b: "x" }`, a key of letters, digits and `_` of any script, not starting with a digit, bare (`{ é: 1, 日本: 2 }`), another quoted (`{ "a b": 3, "1a": 4 }`), on both sides); `null` as `null` |
 | `type_of(x)` | one of `null bool int float dec str list map fn html response error` (`promise` for a JavaScript Promise in the browser) |
@@ -1308,6 +1308,13 @@ There is no SQLCipher (no encryption at rest), and a file is opened by path, not
 file, whatever its name or folder (see [Static files](#static-files)); `file("app.db")`
 sends one on purpose. Back it up with `db.exec("vacuum into
 'backup.db'")` or `sqlite3 app.db ".backup ..."`, not by copying the file while it runs.
+A path inside SQL is SQLite's own: it counts from the folder the process was started in,
+not from the program's folder as `db.open`'s does, so `vacuum into 'backups/b.db'` in a
+program started from elsewhere (`quillo run app/main.qwe`, or a service manager) fails
+with `unable to open database`. Start the program in its folder (systemd's
+`WorkingDirectory=`), or give an absolute path: `pragma database_list` gives the
+database's, so `db.exec("vacuum into ?", db.one("pragma database_list").file + ".bak")`
+puts the copy beside it from any folder.
 
 **PostgreSQL:**
 

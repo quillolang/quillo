@@ -541,7 +541,7 @@ from its lines to the `.qwe` file's. The browser's developer tools show them by 
 with the `.qwe` source beside them, and a variable a statement declares carries its own name
 (`count`, which the compiled code calls `$count_1`); a component's state is a signal, its
 value in `.v`. Values are JavaScript's: the debug console takes JavaScript, not Quillo. In
-production a page's bundle is one minified file, as before. In both, the runtime keeps its
+production a page's bundle is one file, without comments or indentation, as before. In both, the runtime keeps its
 names to itself: none of its functions is the page's, so a page's own `function report()`
 or a widget's `function run()` and Quillo's leave each other alone (FEEDBACK42.md, Q-481).
 

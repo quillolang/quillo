@@ -12,8 +12,9 @@ https://quillolang.org/v0.8.0/llms.txt, https://quillolang.org/v0.7.0/llms.txt o
 https://quillolang.org/v0.6.0/llms.txt.
 
 This file is for AI coding assistants. Quillo is new, so what you know from other
-languages will lead you wrong in a few places, listed below. Rules for working on a
-Quillo program:
+languages will lead you wrong in a few places, listed below. The whole manual is
+`llms-full.txt`, beside this file: each command's options, every class Quillo sets and
+each builtin's edge cases are only there. Rules for working on a Quillo program:
 
 - After every edit, run `quillo check` (in the program's folder, or `quillo check
   main.qwe`). It finds syntax errors, wrong types, misspelled fields, missing `import`s,
@@ -21,6 +22,8 @@ Quillo program:
   Fix what it says before you go on.
 - `quillo fix` *(since 0.7)* writes the `import` lines a program's files need.
 - `quillo run --watch` serves at http://127.0.0.1:8080 and reloads on each save.
+  `quillo serve <folder>` *(since 0.7)* serves a folder of files as they are, as a static
+  host does (index.html, clean URLs, 404.html), with no program.
 - Do not invent builtins. The list is at the end of this file and in
   https://quillolang.org/docs/standard-library/. When unsure, `quillo repl` answers
   quickly: `echo 'split("a,b", ",")' | quillo repl`.
@@ -61,6 +64,8 @@ let big = xs | filter((x) => x > 1) | map(double)    // a | f(b) is f(a, b)
 let first_big = xs.filter((x) => x > 1).first()      // x.f(y) is f(x, y) too
 let label = n > 0 ? "positive" : "not positive"
 let squares = for x in xs => x * x                   // for gives a list
+let tries = 0
+while tries < 3 { tries += 1 }                       // while loops as long as it holds; gives null
 let kind = match user {
     { role: "admin" } => "staff"
     { role: str as r } => r
@@ -277,6 +282,13 @@ component Tasks() {
 }
 ```
 
+- `live(load, ...args)` passes the arguments after `load` to it one by one, and runs it
+  again when one changes: `state found = live(search, q)` for `server fn search(q: str)`,
+  not `live(search, [q])`.
+- `ask(message, { title, ok, cancel, tone })` waits for a yes or no in a dialog, and
+  `notify(message, { title, tone, seconds })` shows a note that goes by itself, in the
+  browser only. Both are plain markup with `q-` classes (`q-dialog`, `q-toast`, ...) that
+  the page lays out and styles itself; the class names are in the full manual.
 - `state x = load()` with a `server fn` loads on the server while the page is made, so
   the page arrives with its data. A state set from a call shows the latest call's
   answer: an older answer that comes late is dropped, but `n += 1` after a call is

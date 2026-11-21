@@ -55,7 +55,11 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
   is an optional `-` and digits with no leading `0` (`05`, `+5` and ` 5` are not one, so a
   page has one address), a `float`, `num` or `dec` also takes a fraction and an exponent and
   is finite (`NaN`, `inf` and `1e999` are not), and nothing is trimmed, a `str` included.
-  The same holds for typed fields of a query or a form. `*rest` (or `*name`) takes the rest
+  The same holds for typed fields of a query or a form. `int(x)` and `float(x)` are looser:
+  they take white space at either end, a leading `+` and leading zeros (`int(" 05")` is 5;
+  see [Standard library](#standard-library)). A field taken as `str` and checked by hand
+  takes the pattern's rule with `re.test(s, "^(0|-?[1-9][0-9]*)$")` before `int(s)`.
+  `*rest` (or `*name`) takes the rest
   of the path, so it comes last: nothing can follow it, in the route or in its group's
   routes *(since 0.7: what followed was ignored)*; `*` alone names it `rest`. `/users/{id}`, as OpenAPI and Express write a parameter, is an
   error that says to write `:id`. The path is split at `/`, empty pieces dropped, so `/users`,
@@ -667,6 +671,18 @@ A wrong password, or an email no one has (`user` is null, so its `password_hash`
 which `verify_password` says is false), shows the plain text `Wrong email or password`
 with status 401. The right one sets the cookie and goes to `/`, which now shows the
 button; `/me` then gives `{"name":"Ana"}`, and after logging out `Log in first` (401).
+
+`verify_password` does its whole work for a null hash, or text that is no hash, and takes
+as long as for a real one, so an email no one has is answered no sooner than a member's,
+and the time tells no one who has an account. A null check before it,
+`if user == null || !crypto.verify_password(...)`, skips that work for a stranger, who is
+then answered at once. To keep one, verify every time, then decide (no stand-in hash is
+needed):
+
+```quillo
+let ok = crypto.verify_password(password, user.password_hash)
+if user == null || !ok { reply 401 "Wrong email or password" }
+```
 
 - `set_session(map, { max_age })` replaces the session (30 days unless given),
   `session()` gives it (`{}` when there is none) and `end_session()` forgets it.
@@ -2813,7 +2829,10 @@ What the document holds:
 - Its title is the program file's name (`main`), both ways. Under [`--base /shop`](#options-of-quillo-run) it has
   `"servers": [{ "url": "/shop" }]`.
 - Several routes on one method and path shape are one operation: their bodies a `oneOf`
-  (each literal field an `enum`), their query parameters merged (required only where every
+  (each literal field an `enum`), or an `anyOf` when one body could fit two of them, as
+  with a catch-all route after the others (`{ json: { type: str } }` after
+  `{ json: { type: "order.placed", id: str } }`: an `anyOf` with it, a `oneOf` without),
+  their query parameters merged (required only where every
   route requires them), the path template named as the first route names it (`/users/{id}`,
   its parameter a `oneOf` of the routes' types), and `x-quillo-at` a list of the places
   when there are several.

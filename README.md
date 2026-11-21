@@ -86,7 +86,8 @@ route GET /feed ? { page: int = 1 } = request | auth.required | load_feed(page) 
 A component's code runs once; its state is signals, and each place in the page that
 shows a value follows that value alone. Rendered on the server, resumed in the browser
 on the server's own HTML. A page loads only what it uses, when someone reaches for it:
-9 KB compressed for a simple component, 13 KB for the benchmark's table.
+39 KB compressed for a simple component, 45 KB for the benchmark's table, the runtime
+included.
 
 ### Exact money
 

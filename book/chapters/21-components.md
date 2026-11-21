@@ -459,10 +459,11 @@ route GET / = <html><body><Counter start={5}/></body></html>
   ```
 
   `js("document.querySelector", "#name").focus()` focuses an input the same way.
-- Each page loads two scripts, minified, whose addresses change with their content, so
-  the browser keeps them for good:
+- Each page loads two scripts, whose addresses change with their content, so the browser
+  keeps them for good. Their comment lines, blank lines and indentation are taken out, but
+  they are not minified: names and the spaces inside a line stay.
   - `/_quillo/r/<hash>.js`, the runtime: the parts of it the program's components
-    reach (about 35 KB, 11 KB gzipped, for a page with one counter). Every page of the program
+    reach (about 139 KB, 39 KB gzipped, for a page with one counter). Every page of the program
     loads the same one, so the browser downloads it once.
   - `/_quillo/b/<hash>.js`, the page's own code: the components it was rendered with,
     every component they can show, and what they use. Pages with the same components
@@ -472,8 +473,8 @@ route GET / = <html><body><Counter start={5}/></body></html>
   256 sets of components pages were made of (`quillo_bundles` under [`--metrics`](#options-of-quillo-run)); a
   page that names one no longer kept is sent the whole program's. There is no splitting
   by route and no lazy component: an `App` whose `match` shows thirty pages carries the
-  thirty in its bundle. Under `--watch` a page loads one unminified bundle instead,
-  which loads a file per component and function (see [Debugging](#in-the-browser)).
+  thirty in its bundle. Under `--watch` a page loads one bundle instead, the runtime as
+  it is written, which loads a file per component and function (see [Debugging](#in-the-browser)).
 
   ```sh
   curl -s localhost:8080/ | grep -o '/_quillo/[rb]/[^"]*'
