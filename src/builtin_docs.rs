@@ -71,7 +71,8 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("exit", "n", "Ends a script with status `n`, 0 to 255 (0 if left out), once what it printed is out. Not while the program serves."),
     ("print", "values", "Writes the values as text, a space between, on stdout (the console in a page)."),
     ("str", "x", "`x` as text: a whole float as `2.0`, a list or map as Quillo writes it, null as `null`."),
-    ("int", "x", "A number cut toward zero, `true` as 1, or text of digits; `\"1.0\"` and a number too large for an int are error values."),
+    // What it takes of text, as it takes it (FEEDBACK79.md, Q-1253; branch feedback72-81).
+    ("int", "x", "A number cut toward zero, `true` as 1, or text: digits with an optional sign, leading zeros and outer spaces; `\"1.0\"`, `\"1e3\"` are errors."),
     ("float", "x", "A number or numeric text as a float; anything else is an error value."),
     ("dec", "x", "A decimal from text, an int, or a float through its shortest text; else an error value."),
     ("format_number", "x, locale, digits, mode", "`x` as `locale` writes numbers, to `digits` if given: a tie away from zero, or as `mode` says (`\"half_even\"` as money)."),
@@ -155,7 +156,8 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("js_new", "name, args", "Makes an object of a class of the page's scripts, by `name`; null on the server."),
     ("defer", "x", "`x`; as the `state` initializer of a component placed in a page, the page goes first and `x` follows."),
     // Live data
-    ("live", "load, args", "State that follows the server: runs the `server fn` `load`, and again when what it read changes; `{ every: \"2s\" }` before it sets a gap."),
+    // Its arguments one by one, not a list (FEEDBACK73.md, Q-1024; branch feedback72-81).
+    ("live", "load, args...", "State from `server fn` `load`, given the rest one by one: `live(search, q)`, not `live(search, [q])`; `{ every: \"2s\" }` first sets a gap."),
     ("waiting", "state", "Whether a `live` state waits for the answer to new arguments; false on the server."),
     ("publish", "topics", "Wakes the pages whose `live` data watches these topics."),
     ("watch", "topics", "Inside a `live` loader, runs it again when these topics are published."),

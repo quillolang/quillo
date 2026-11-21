@@ -5110,9 +5110,19 @@ const dtLocales = [dtEn, dtGb,
   dtPt,
   dtOf(dtPt, ["pt-pt"], ["DD/MM/YY", "DD/MM/YYYY", "D [de] MMMM [de] YYYY", "dddd, D [de] MMMM [de] YYYY"], { dy: ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"] }),
 ];
+// A locale whose language has no names here is written in English and said once, as the
+// server says it (src/dates.rs, no_names; FEEDBACK73.md, Q-1021; branch feedback72-81).
+const dtSaid = new Set();
 function dtNames(locale) {
   const tag = locale.trim().toLowerCase().replaceAll("_", "-"), lang = tag.split("-")[0];
-  return dtLocales.find((n) => n.tags.includes(tag)) || dtLocales.find((n) => n.tags.includes(lang)) || dtEn;
+  const n = dtLocales.find((n) => n.tags.includes(tag)) || dtLocales.find((n) => n.tags.includes(lang));
+  if (n) return n;
+  const cut = Array.from(locale), name = cut.length > 100 ? cut.slice(0, 100).join("") + "…" : locale;
+  if (dtSaid.size < 64 && !dtSaid.has(name)) {
+    dtSaid.add(name);
+    console.warn(`quillo: warning: no date data for locale ${JSON.stringify(name)}: written in English`);
+  }
+  return dtEn;
 }
 // Longest first, so "MMMM" is not read as "MM" twice.
 const dtTokens = ["YYYY", "YY", "MMMM", "MMM", "MM", "M", "DD", "D", "dddd", "ddd", "HH", "H", "hh", "h", "mm", "ss", "A", "Z"];

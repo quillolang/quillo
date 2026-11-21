@@ -4,7 +4,7 @@
 //! ```text
 //! component Alerts() {
 //!     state on = notification.state()          // "granted", "denied", "default" or "unsupported"
-//!     <button @click={() => { on = notification.ask() }}>Tell me when it ships</button>
+//!     <button onclick={() => { on = notification.ask() }}>Tell me when it ships</button>
 //! }
 //! server fn ship(order: int) {
 //!     notification.send(user_id, { title: "Shipped", body: `Order ${order}`, url: `/orders/${order}` })
@@ -65,8 +65,9 @@ fn in_browser(_: &mut Interp, _: Vec<Value>, line: u32) -> R {
     fail(line, BROWSER_ONLY)
 }
 
-/// What `notification.ask`, `.state` and `.stop` on the server are told, here and by `quillo check`.
-pub const BROWSER_ONLY: &str = "`notification.ask`, `notification.state` and `notification.stop` ask and read the browser: call them from an event handler of a component (`@click`); the server sends with `notification.send(user, { title, body, url })`";
+/// What `notification.ask`, `.state` and `.stop` on the server are told, here and by `quillo check`:
+/// its handler as the guide writes one, `onclick` (FEEDBACK72.md, Q-1030; branch feedback72-81).
+pub const BROWSER_ONLY: &str = "`notification.ask`, `notification.state` and `notification.stop` ask and read the browser: call them from an event handler of a component (`onclick`); the server sends with `notification.send(user, { title, body, url })`";
 
 /// `notification.state()`: the browser's. While the server renders a component, null (as `js`
 /// gives), and the state it sets is read again in the browser; elsewhere on the server, a mistake.

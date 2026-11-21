@@ -286,7 +286,7 @@ fn reacts_event_names_are_the_doms() {
     // `@mouseEnter`: compared as written.
     assert_eq!(
         diags("fn f(e) = 1\nprint(<div @mouseEnter={f} @keydown={f} @myEvent={f}>x</div>)\n"),
-        ["2 warning: `@mouseEnter` never fires: the browser's event names are lower case, `@mouseenter` (or React's `onMouseEnter`)"]
+        ["2 warning: `@mouseEnter` never fires: the browser's event names are lower case, `onmouseenter` (or React's `onMouseEnter`)"]
     );
     // On a view, `onChange` is a parameter, as before.
     assert!(diags("view V(onChange) = <input @input={onChange}/>\nfn f(e) = 1\nprint(<V onChange={f}/>)\n").is_empty());

@@ -9671,7 +9671,7 @@ impl Checker {
                     let (nested, init) = self.fns.last().map_or((false, false), |x| (x.nested, x.state_init));
                     if (!nested && !init) || (init && f != "state") {
                         let or = if f == "state" { ", or set a state with it: state on = notification.state()" } else { "" };
-                        self.error(format!("`notification.{}` in <{}> runs in the browser, and the server renders <{}> first: call it from an event handler (@click){}", f, c, c, or));
+                        self.error(format!("`notification.{}` in <{}> runs in the browser, and the server renders <{}> first: call it from an event handler (onclick){}", f, c, c, or));
                     }
                 }
             }
@@ -10676,7 +10676,7 @@ impl Checker {
             }
             if sig.server && !nested {
                 self.error(format!(
-                    "`{}` waits on the server, so <{}> can only call it from an event handler (@click={{() => {{ ... }}}}) or to set state: state x = {}(...)",
+                    "`{}` waits on the server, so <{}> can only call it from an event handler (onclick={{() => {{ ... }}}}) or to set state: state x = {}(...)",
                     name, c, name
                 ));
             }
@@ -10861,7 +10861,7 @@ impl Checker {
                 (Kind::State, false) => format!("`{}` is a field of the state `{}`, which `{}=` only shows; give it a state of its own, or", shown, name, n),
                 _ => continue,
             };
-            let event = if n == "checked" { "@change" } else { "@input" };
+            let event = if n == "checked" { "onchange" } else { "oninput" };
             self.line = el.line;
             self.warn(format!("{} changes nothing: {} take what changes with `{}={{(e) => ...}}`, or add `{}`", verb, what, event, holds));
         }

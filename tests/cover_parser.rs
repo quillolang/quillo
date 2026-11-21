@@ -97,15 +97,15 @@ fn a_match_arm_s_name_then_a_value_needs_its_arrow() {
 fn a_handler_that_assigns_is_not_a_value() {
     errs(
         "component C() {\n  state n = 0\n  <button @click={n = 1}>x</button>\n}\n",
-        "3 an assignment is not a value: a handler is a function, `@click={() => { n = ... }}`",
+        "3 an assignment is not a value: a handler is a function, `onclick={() => { n = ... }}`",
     );
     errs(
         "component C() {\n  state n = 0\n  <button @click={n -= 1}>x</button>\n}\n",
-        "3 an assignment is not a value: a handler is a function, `@click={() => { n -= ... }}`",
+        "3 an assignment is not a value: a handler is a function, `onclick={() => { n -= ... }}`",
     );
     errs(
         "component C() {\n  state n = { a: 0 }\n  <button @click={n.a += 1}>x</button>\n}\n",
-        "3 an assignment is not a value: a handler is a function, `@click={() => { x += ... }}`",
+        "3 an assignment is not a value: a handler is a function, `onclick={() => { x += ... }}`",
     );
 }
 

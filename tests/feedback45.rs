@@ -161,7 +161,7 @@ fn an_arrow_may_assign_and_a_handler_must_be_a_function() {
     assert!(diags("component C() {\n    state n = 0\n    <button @click={() => n = n + 1}>{n}</button>\n}\n").is_empty());
     assert_eq!(
         diags("component C() {\n    state n = 0\n    <button @click={n += 1}>{n}</button>\n}\n"),
-        ["3 an assignment is not a value: a handler is a function, `@click={() => { n += ... }}`"]
+        ["3 an assignment is not a value: a handler is a function, `onclick={() => { n += ... }}`"]
     );
     // What cannot be assigned says so, as a statement would.
     assert_eq!(diags("let f = () => 1 = 2\n"), ["1 only variables, and the fields of the page's objects (`el.value = x`), can be assigned to"]);
@@ -222,7 +222,7 @@ fn names_declared_twice_are_refused() {
 #[test]
 fn misspelt_markup_is_said() {
     let d = diags("view V() = <div className=\"box\" clas=\"a\"><a hreff=\"/x\">x</a><p @clik={() => 1}>y</p><input placholder=\"n\"/></div>\nview Card() = <div>c</div>\nview W() = <main><card/></main>\n");
-    for part in ["`className` is React's name", "`clas` is no attribute the browser knows: did you mean `class`?", "did you mean `href`?", "`@clik` is no event the browser knows: did you mean `@click`?", "did you mean `placeholder`?"] {
+    for part in ["`className` is React's name", "`clas` is no attribute the browser knows: did you mean `class`?", "did you mean `href`?", "`onclik` is no event the browser knows: did you mean `onclick`?", "did you mean `placeholder`?"] {
         assert!(d.iter().any(|w| w.contains(part)), "{} {:?}", part, d);
     }
     assert!(has(&d, 3, "<card> is no HTML element, and is written to the page as it is: the view is <Card>"), "{:?}", d);

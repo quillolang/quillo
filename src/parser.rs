@@ -3901,8 +3901,9 @@ impl Parser {
         if let Some((name, _)) = attrs.iter().find(|(n, v)| code_from_data(&tag, &attrs, n, v)) {
             let lower = name.to_ascii_lowercase();
             let msg = match lower.strip_prefix("bind:").unwrap_or(&lower).strip_prefix("on") {
+                // The handler as the guide writes it (FEEDBACK72.md, Q-1030; branch feedback72-81).
                 Some(ev) if !ev.is_empty() && ev.bytes().all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_') => {
-                    format!("`{}` in <{}> takes only text written here, as it runs as code: handle the event with `@{}={{...}}`", name, tag, ev)
+                    format!("`{}` in <{}> takes only text written here, as it runs as code: `on{}` needs a function, `on{}={{() => ...}}`", name, tag, ev, ev)
                 }
                 Some(_) => format!("`{}` in <{}> takes only text written here, as the browser runs it as code", name, tag),
                 None => format!("`{}` in <{}> takes only text written here, unless the element also has a `sandbox` attribute without allow-same-origin", name, tag),
@@ -4283,7 +4284,8 @@ impl Parser {
                 Expr::Ident(n, _) => n.to_string(),
                 _ => "x".to_string(),
             };
-            return self.err_at(format!("an assignment is not a value: a handler is a function, `@click={{() => {{ {} {} ... }}}}`", name, op));
+            // The handler as the guide writes it (FEEDBACK72.md, Q-1030; branch feedback72-81).
+            return self.err_at(format!("an assignment is not a value: a handler is a function, `onclick={{() => {{ {} {} ... }}}}`", name, op));
         }
         self.expect(&Tok::RBrace, "`}`")?;
         Ok(e)

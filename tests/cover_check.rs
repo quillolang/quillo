@@ -189,17 +189,17 @@ fn a_class_from_a_block_that_ends_in_a_let_writes_no_class() {
 fn an_input_whose_value_nothing_takes_says_whose_it_is() {
     says(
         "component C(v) {\n  <input value={v}/>\n}\n",
-        &["2 warning: typing here changes nothing: `v` is `C`'s parameter, which `value=` only shows: take what changes with `@input={(e) => ...}`, or add `readonly`"],
+        &["2 warning: typing here changes nothing: `v` is `C`'s parameter, which `value=` only shows: take what changes with `oninput={(e) => ...}`, or add `readonly`"],
     );
     // Through `??`, and a field of the parameter.
     says(
         "component C(p) {\n  <input value={p.name ?? \"\"}/>\n}\n",
-        &["2 warning: typing here changes nothing: `p.name` is a field of `C`'s parameter `p`, which `value=` only shows: take what changes with `@input={(e) => ...}`, or add `readonly`"],
+        &["2 warning: typing here changes nothing: `p.name` is a field of `C`'s parameter `p`, which `value=` only shows: take what changes with `oninput={(e) => ...}`, or add `readonly`"],
     );
     // A state's field.
     says(
         "component C() {\n  state form = { a: \"\" }\n  <textarea value={form.a}/>\n}\n",
-        &["3 warning: typing here changes nothing: `form.a` is a field of the state `form`, which `value=` only shows; give it a state of its own, or take what changes with `@input={(e) => ...}`, or add `readonly`"],
+        &["3 warning: typing here changes nothing: `form.a` is a field of the state `form`, which `value=` only shows; give it a state of its own, or take what changes with `oninput={(e) => ...}`, or add `readonly`"],
     );
     // Nothing can be typed, the type is decided as it runs, or the state itself is shown.
     says("component C(v) {\n  <input value={v} disabled/>\n}\n", &[]);

@@ -4925,7 +4925,7 @@ impl<'a> Compiler<'a> {
         let c = self.ctx();
         if c.component.is_some() || (c.state_init && name != "state") {
             return self.err(format!(
-                "`notification.{}` in a component runs in the browser, and the server renders the component first: call it from an event handler (@click){}",
+                "`notification.{}` in a component runs in the browser, and the server renders the component first: call it from an event handler (onclick){}",
                 name,
                 if name == "state" { ", or set a state with it: state on = notification.state()" } else { "" }
             ));
@@ -4977,7 +4977,7 @@ impl<'a> Compiler<'a> {
         if is_async && self.ctx().component.is_some() {
             return self.err(format!(
                 "`{}` waits on the server, so a component can only call it from an event handler \
-                 (@click={{() => {{ ... }}}}) or to set state: state x = {}(...)",
+                 (onclick={{() => {{ ... }}}}) or to set state: state x = {}(...)",
                 name, name
             ));
         }

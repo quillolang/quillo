@@ -7,7 +7,9 @@
 
 use std::path::{Path, PathBuf};
 
-/// The to-do app, as `app/` has it.
+/// The to-do app, as `app/` has it. Both templates write markup as the guide does, `onclick`,
+/// `onsubmit`, `onchange` and `value={draft}`, not `@click` and `bind:value` (FEEDBACK72.md,
+/// Q-1030; branch feedback72-81).
 const TODO: &[(&str, &str)] = &[
     ("main.qwe", include_str!("../app/main.qwe")),
     ("lib/todos.qwe", include_str!("../app/lib/todos.qwe")),
@@ -58,7 +60,7 @@ view Page(title: str, children) =
 
 component Counter(start: int) {
     state count = start
-    <button @click={() => { count += 1 }}>Clicked {count} times</button>
+    <button onclick={() => { count += 1 }}>Clicked {count} times</button>
 }
 "#;
 

@@ -5974,8 +5974,8 @@ pub fn serve_portless(app: App, workers: usize) -> Result<(), String> {
         });
         if let Some((dir, own, listener)) = mine {
             crate::jobs::listening_at(&own);
-            let stand_in: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
             *PRIVATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir.clone());
+            let stand_in: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
             let r = serve_from(app, crate::httpd::Listener::Other(crate::httpd::unix_connections(listener)), Some(stand_in), "", workers, |_| {});
             leave_private();
             return r;
@@ -5986,7 +5986,6 @@ pub fn serve_portless(app: App, workers: usize) -> Result<(), String> {
     serve_from(app, crate::httpd::Listener::Tcp(listener), bound, "", workers, |_| {})
 }
 
-/// A FastCGI socket at `path`, for `quillo fcgi --listen unix:PATH`.
 /// The folder of `serve_portless`'s socket, while it serves.
 static PRIVATE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
 
@@ -5999,6 +5998,7 @@ pub fn leave_private() {
     }
 }
 
+/// A FastCGI socket at `path`, for `quillo fcgi --listen unix:PATH`.
 #[cfg(unix)]
 pub fn fcgi_unix(path: &Path, mode: u32) -> Result<crate::fcgi::Source, String> {
     unix_listener(path, mode).map(crate::fcgi::Source::Unix)

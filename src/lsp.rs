@@ -2081,10 +2081,12 @@ const MCP_DOC: &str = "`fn mcp name(params) with db = ...`, `server fn mcp name(
 /// The hover of `writes` (FEEDBACK70.md, Q-965; branch security).
 const WRITES_DOC: &str = "`route writes GET /confirm/:code = ...`, `routes writes /p { ... }`\n\nA GET whose write is meant. A link on another site, in an email or in a chat runs a GET with the visitor's session, so `quillo check` warns of a GET route that writes and reads who the visitor is; `writes` says the write is meant there (a confirm-your-address link, a sign-in callback, a presence ping). Otherwise make it a `POST`, which Quillo refuses from other sites. Only a GET takes it, and an ANY route, which answers a GET.";
 
+// The handlers it shows are written as the guide writes them, `onclick`, not `@click`
+// (FEEDBACK72.md, Q-1030; branch feedback72-81).
 fn keyword_doc(w: &str) -> Option<String> {
     let text = match w {
         "route" => "`route METHOD /path/:param ? { query } { request pattern } = expr`\n\nDeclares an HTTP route. Routes are tried in order; the first whose method, path and patterns match handles the request.",
-        "component" => "`component Name(props) { state count = 0 ... <html/> }`\n\nA view that also runs in the browser: rendered on the server, then interactive. Assigning to its state re-renders it. Handlers: `@click={() => { count += 1 }}`.",
+        "component" => "`component Name(props) { state count = 0 ... <html/> }`\n\nA view that also runs in the browser: rendered on the server, then interactive. Assigning to its state re-renders it. Handlers: `onclick={() => { count += 1 }}`.",
         "server" => "`server fn name(params) = ...`\n\nA function the browser can call. Component code awaits it automatically.",
         "view" => "`view Name(params, children) = <html/>`\n\nA function returning HTML, used as `<Name .../>`.",
         "reply" => "`reply status [body]`\n\nEnds the current request immediately with that response, from anywhere.",

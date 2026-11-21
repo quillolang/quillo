@@ -132,10 +132,10 @@ component D(t, on) {
 route GET / = <html><body><A/><B/><D t="x" on={true}/></body></html>
 "#,
     );
-    assert!(out.contains("main.qwe:1: warning: typing here changes nothing: `v` is `Field`'s parameter, which `value=` only shows: take what changes with `@input={(e) => ...}`, or add `readonly`"), "{}", out);
-    assert!(out.contains("main.qwe:8: warning: typing here changes nothing: `f.name` is a field of the state `f`, which `value=` only shows; give it a state of its own, or take what changes with `@input={(e) => ...}`, or add `readonly`"), "{}", out);
+    assert!(out.contains("main.qwe:1: warning: typing here changes nothing: `v` is `Field`'s parameter, which `value=` only shows: take what changes with `oninput={(e) => ...}`, or add `readonly`"), "{}", out);
+    assert!(out.contains("main.qwe:8: warning: typing here changes nothing: `f.name` is a field of the state `f`, which `value=` only shows; give it a state of its own, or take what changes with `oninput={(e) => ...}`, or add `readonly`"), "{}", out);
     assert!(out.contains("main.qwe:11: warning: typing here changes nothing: `t` is `D`'s parameter"), "{}", out);
-    assert!(out.contains("main.qwe:11: warning: ticking this changes nothing: `on` is `D`'s parameter, which `checked=` only shows: take what changes with `@change={(e) => ...}`"), "{}", out);
+    assert!(out.contains("main.qwe:11: warning: ticking this changes nothing: `on` is `D`'s parameter, which `checked=` only shows: take what changes with `onchange={(e) => ...}`"), "{}", out);
     assert_eq!(out.matches(": warning:").count(), 4, "{}", out);
     // Something takes it, nothing can be typed, a form sends it, or it is a state: no warning.
     let fine = check(
@@ -205,8 +205,8 @@ component U(user) {
 route GET / = <html><body><X v={true}/><S v="a"/><U user={{ name: "n" }}/></body></html>
 "#,
     );
-    assert!(out.contains("main.qwe:2: warning: ticking this changes nothing: `v` is `X`'s parameter, which `checked=` only shows: take what changes with `@change={(e) => ...}`, or add `disabled`"), "{}", out);
-    assert!(out.contains("main.qwe:5: warning: choosing here changes nothing: `v` is `S`'s parameter, which `value=` only shows: take what changes with `@input={(e) => ...}`, or add `disabled`"), "{}", out);
+    assert!(out.contains("main.qwe:2: warning: ticking this changes nothing: `v` is `X`'s parameter, which `checked=` only shows: take what changes with `onchange={(e) => ...}`, or add `disabled`"), "{}", out);
+    assert!(out.contains("main.qwe:5: warning: choosing here changes nothing: `v` is `S`'s parameter, which `value=` only shows: take what changes with `oninput={(e) => ...}`, or add `disabled`"), "{}", out);
     assert!(out.contains("main.qwe:9: warning: typing here changes nothing: `user.name` is a field of `U`'s parameter `user`"), "{}", out);
     assert!(out.contains("`f.a.b` is a field of the state `f`"), "{}", out);
     assert!(out.contains("`user.nick` is a field of `U`'s parameter `user`"), "{}", out);

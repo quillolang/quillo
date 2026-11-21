@@ -428,7 +428,9 @@ fn the_repl_shows_what_a_return_or_a_reply_would_give() {
     let text = out(&o);
     assert!(text.contains("quillo> 4\n"), "{}", text);
     assert!(text.contains("quillo> <reply 404>\n"), "{}", text);
-    assert!(!text.contains("null"), "a value of null shows nothing: {}", text);
+    // A literal's null shows as `null`, as a name's or a field's does; a call's shows nothing
+    // (FEEDBACK73.md, Q-1023; branch feedback72-81).
+    assert!(text.contains("quillo> null\n"), "{}", text);
 }
 
 #[test]

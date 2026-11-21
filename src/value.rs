@@ -2819,6 +2819,27 @@ impl Scope {
         Arc::new(Scope { vars: VarsCell::new(Vars::Many(HashMap::default())), parent: None })
     }
 
+    /// A root holding a copy of `of`'s variables: a world made once and started from many times,
+    /// each run free to change its own (`run_script`'s; FEEDBACK72.md, Q-1013; branch
+    /// feedback72-81). One table copied, where defining each name again hashed it again.
+    pub fn root_copy(of: &Env) -> Env {
+        let vars = match &*of.vars() {
+            Vars::Many(m) => Vars::Many(m.clone()),
+            Vars::Few(first, rest, bits) => Vars::Few(first.clone(), rest.clone(), *bits),
+        };
+        Arc::new(Scope { vars: VarsCell::new(vars), parent: None })
+    }
+
+    /// Its variables let go of, though others hold it: a world copied for one run (`root_copy`),
+    /// to which that run may have given a function, whose scope holds the world back in turn.
+    /// `upper = (x) => x` in a script kept its world, 9 KB, for good (FEEDBACK72.md, Q-1013,
+    /// found in review; branch feedback72-81). Taken out under the lock, let go of after it: what
+    /// they hold may hold this scope.
+    pub fn forget(e: &Env) {
+        let vars = std::mem::replace(&mut *e.vars(), Vars::Many(HashMap::default()));
+        drop(vars);
+    }
+
     pub fn child(parent: &Env) -> Env {
         if let Some(mut e) = SPARE.with(|s| s.borrow_mut().pop()) {
             if let Some(s) = Arc::get_mut(&mut e) {

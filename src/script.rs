@@ -18,7 +18,19 @@ const SAFE: &[&str] = &[
     "replace", "slice", "sum", "min", "max", "sort", "reverse", "first", "last", "push", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "unwrap", "escape", "url_encode", "abs", "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten",
     "zip", "take", "drop", "index_of", "map", "filter", "find", "any", "all", "reduce", "sort_by", "count", "group_by",
+    // A decimal from text, as `int` and `float` are; and what `{ ...m }` and `[...xs]` are
+    // written as (src/parser.rs), which a script's spread called an unknown `__concat`
+    // (FEEDBACK72.md, Q-1013; branch feedback72-81).
+    "dec", "__merge", "__concat",
 ];
+
+/// Modules a script may use whole, as `date` without its clock: they compute from their
+/// arguments and nothing else, where the guide's names for them were each an unknown name in a
+/// formula (FEEDBACK72.md, Q-1013; branch feedback72-81). `stats.histogram`'s bins are held to
+/// what a script may make (`would_be_too_big`); `re` keeps its guard, and the script's limits
+/// hold inside its searches (src/re.rs, `script_room`). Not `vec`: `vec.zeros`, `vec.full`,
+/// `vec.linspace`, `vec.arange` and `vec.matmul` make big values from small ones.
+const SAFE_MODULES: &[&str] = &["math", "stats", "re", "bit"];
 
 /// Steps (calls and loop rounds) a script may take.
 pub const SCRIPT_STEPS: u64 = 20_000;
@@ -33,6 +45,9 @@ const MOST_SCRIPT_MS: u64 = 60_000;
 /// bytes, and eight for each number, item or entry, through nested lists
 /// and maps. Each 1 KB made also costs a step.
 pub const SCRIPT_BYTES: usize = 1 << 20;
+
+/// What a script is told of a value past `SCRIPT_BYTES`.
+pub const TOO_BIG: &str = "the script made a value larger than 1 MB";
 
 /// How deep a script's lists and maps may nest.
 const SCRIPT_NESTING: usize = 256;
@@ -67,7 +82,7 @@ pub fn too_big(v: &Value) -> Result<usize, &'static str> {
             _ => n += 8,
         }
         if n > SCRIPT_BYTES {
-            return Err("the script made a value larger than 1 MB");
+            return Err(TOO_BIG);
         }
     }
     Ok(n)
@@ -174,6 +189,19 @@ pub fn would_be_too_big(name: &str, args: &[Value]) -> bool {
         },
         "split" => match text(0) {
             Some(s) => s.len().saturating_add(8 * times(s, text(1).unwrap_or(" "))),
+            _ => 0,
+        },
+        // Each list's items, 8 bytes each at the least: `[...xs, ...xs, ...]` (FEEDBACK72.md,
+        // Q-1013; branch feedback72-81).
+        "__concat" => args.iter().map(|v| if let Value::List(l) = v { l.len() } else { 0 }).fold(0usize, usize::saturating_add).saturating_mul(8),
+        // Its counts and its edges, two lists of a number a bin, from one int that may ask for a
+        // million bins: 16 bytes a number in a list, as `too_big` counts (FEEDBACK72.md, Q-1013;
+        // branch feedback72-81).
+        // A whole float too, as `stats.histogram` takes it (src/numeric.rs, `int`): 1000000.0 made
+        // its 99 MB (found in review).
+        "stats.histogram" => match args.get(1) {
+            Some(Value::Int(bins)) => usize::try_from(*bins).unwrap_or(0).saturating_mul(32),
+            Some(Value::Float(x)) if x.fract() == 0.0 && *x >= 1.0 && *x < 9.0e15 => (*x as usize).saturating_mul(32),
             _ => 0,
         },
         _ => 0,
@@ -298,18 +326,7 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
     // Its world: the safe builtins, then its variables. Quillo's own, not what the program's
     // globals have by those names: a program's `fn upper` was the script's `upper`, run with the
     // program's effects (FEEDBACK51.md, Q-648; branch feedback51-fixes).
-    let root = Scope::root();
-    BUILTINS.with(|builtins| {
-        for name in SAFE {
-            if let Some(v) = lookup(builtins, name) {
-                define(&root, name, v);
-            }
-        }
-    });
-    // Dates, without the clock: a script gives the same answer each time.
-    let mut date = Map::new();
-    crate::dates::install_pure(&mut date);
-    define(&root, "date", Value::map(date));
+    let root = ROOT.with(Scope::root_copy);
     let env = Scope::child(&root);
     // A variable the script never names is none of its business, and makes no name.
     if let Some(m) = vars {
@@ -347,14 +364,20 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
                     stopped = Some(e);
                     return Value::Nil;
                 }
-                Err(Ctrl::Error(e)) => return bad(&if e.line > 0 { format!("line {}: {}", e.line, e.msg) } else { e.msg.clone() }),
+                Err(Ctrl::Error(e)) => {
+                    let msg = left_out(&e.msg).unwrap_or_else(|| e.msg.clone());
+                    return bad(&if e.line > 0 { format!("line {}: {}", e.line, msg) } else { msg });
+                }
                 Err(Ctrl::Reply(_)) => return bad("a script cannot reply"),
             }
         }
         last
     });
-    // Its own variables let go of, a lambda it kept in one too, which held them for ever
-    // (FEEDBACK65.md, Q-941; branch feedback65).
+    // Its world let go of first: a lambda it gave a name there (`upper = (x) => x`) held its
+    // scope, and so the world, for ever (FEEDBACK72.md, Q-1013, found in review; branch
+    // feedback72-81). Then its own variables, a lambda it kept in one too, which held them for
+    // ever (FEEDBACK65.md, Q-941; branch feedback65).
+    Scope::forget(&root);
     Scope::done(env);
     it.fuel = saved;
     it.allowed = saved_allowed;
@@ -372,7 +395,57 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
     Ok(out)
 }
 
+/// `format_number` in a script: the program's, but its locale is the script's to give, en-US
+/// where it gives none. The visitor's, as the program's call takes, would make one script's
+/// answer differ from one visitor to the next, and a script reads only what it is given
+/// (FEEDBACK72.md, Q-1013; branch feedback72-81).
+fn format_number(it: &mut Interp, mut args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+    match args.get(1) {
+        None if args.len() == 1 => args.push(Value::str("en-US")),
+        Some(Value::Nil) => args[1] = Value::str("en-US"),
+        _ => {}
+    }
+    crate::money::format_number_fn(it, args, line)
+}
+
+/// "unknown name `range`" said of one of Quillo's own builtins that a script does not have: what
+/// it is, and why it is not there. It read as a typo (FEEDBACK72.md, Q-1013; branch
+/// feedback72-81). A script's own names are `$1`, ... here (src/sym.rs), never a builtin's.
+fn left_out(msg: &str) -> Option<String> {
+    let name = msg.strip_prefix("unknown name `")?.strip_suffix('`')?;
+    if !BUILTINS.with(|b| lookup(b, name).is_some()) || name.starts_with("__") {
+        return None;
+    }
+    let why = match name {
+        "range" | "repeat" | "join_on" | "vec" => "it can make a huge value from a small one",
+        "raw" | "markdown" | "markdown_page" | "highlight" => "a script gives values, not markup",
+        _ => "a script has only the builtins the guide lists for `run_script`, which reach nothing outside it: no database, files, network, clock, randomness, sessions or replies",
+    };
+    Some(format!("`{}` is not available in a script: {}", name, why))
+}
+
 thread_local! {
+    /// A script's world, made once on each thread: the safe builtins, `date` without its clock
+    /// (a script gives the same answer each time) and the script's `format_number`. Each script
+    /// runs in a copy (`Scope::root_copy`), as it may assign to a name here. Made again for each
+    /// script, the eight names Q-1013 added made 50,000 short scripts 6% slower (FEEDBACK72.md,
+    /// Q-1013; branch feedback72-81).
+    static ROOT: Env = {
+        let root = Scope::root();
+        BUILTINS.with(|builtins| {
+            for name in SAFE.iter().chain(SAFE_MODULES) {
+                if let Some(v) = lookup(builtins, name) {
+                    define(&root, name, v);
+                }
+            }
+        });
+        let mut date = Map::new();
+        crate::dates::install_pure(&mut date);
+        define(&root, "date", Value::map(date));
+        define(&root, "format_number", Value::Builtin("format_number", format_number));
+        root
+    };
+
     /// The builtins as Quillo installs them, for scripts' safe names.
     static BUILTINS: Env = {
         let g = Scope::root();

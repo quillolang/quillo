@@ -21,10 +21,12 @@ run_script("taken(value) ? `${value} is taken` : null", { value: "AB-123", taken
 
 #[test]
 fn scripts_cannot_reach_the_database_files_or_the_program() {
+    // A builtin a script does not have is said as left out, not as a typo (FEEDBACK72.md, Q-1013;
+    // branch feedback72-81).
     let e = run(r#"run_script("db.query(\"select 1\")", {})"#);
-    assert!(e.contains("unknown name `db`"), "{}", e);
+    assert!(e.contains("`db` is not available in a script"), "{}", e);
     let e = run(r#"run_script("read_file(\"/etc/passwd\")", {})"#);
-    assert!(e.contains("unknown name `read_file`"), "{}", e);
+    assert!(e.contains("`read_file` is not available in a script"), "{}", e);
     let e = run(r#"fn secret() = 42
 run_script("secret()", {})"#);
     assert!(e.contains("unknown name `secret`"), "{}", e);

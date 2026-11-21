@@ -734,8 +734,8 @@ route POST /a = <a {...request.json} href="/ok" class="c">"x"</a>"#,
 fn handlers_and_frame_pages_take_only_text_written_in_the_program() {
     let load = |src: &str| Interp::new(env!("CARGO_MANIFEST_DIR")).load_source(src, "t.qwe").err().map(|e| e.to_string()).unwrap_or_default();
     for (src, needle) in [
-        ("route GET /a ? { u: str } = <div onmouseover={`go('${u}')`}>\"x\"</div>", "@mouseover"),
-        ("route GET /a ? { u: str } = <div bind:onclick={u}>\"x\"</div>", "@click"),
+        ("route GET /a ? { u: str } = <div onmouseover={`go('${u}')`}>\"x\"</div>", "`onmouseover` needs a function, `onmouseover={() => ...}`"),
+        ("route GET /a ? { u: str } = <div bind:onclick={u}>\"x\"</div>", "`onclick` needs a function, `onclick={() => ...}`"),
         ("route GET /a ? { u: str } = <iframe srcdoc={u}></iframe>", "sandbox"),
         ("route GET /a ? { u: str } = <iframe sandbox=\"allow-scripts allow-same-origin\" srcdoc={u}></iframe>", "sandbox"),
     ] {

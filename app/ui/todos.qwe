@@ -13,7 +13,7 @@ component Todos(initial: list<Todo>) {
         js("todoApp.showLeft", left_of(list))
     }
     <section @mount={() => js("todoApp.showLeft", left_of(todos))}>
-        <form @submit={() => {
+        <form onsubmit={() => {
             let r = add_todo(draft)
             if is_err(r) {
                 problem = r.error
@@ -23,14 +23,14 @@ component Todos(initial: list<Todo>) {
                 problem = null
             }
         }}>
-            <input bind:value={draft} placeholder="Something to do" autofocus/>
+            <input value={draft} placeholder="Something to do" autofocus/>
             <button>Add</button>
         </form>
         {problem && <p.problem>{problem}</p>}
         <ul>
             {for t in todos => <li key={t.id} class={t.done == 1 && "done"}>
                 <label>
-                    <input type="checkbox" checked={t.done == 1} @change={() => show(toggle(t.id))}/>
+                    <input type="checkbox" checked={t.done == 1} onchange={() => show(toggle(t.id))}/>
                     {t.text}
                 </label>
             </li>}

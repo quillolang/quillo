@@ -2062,6 +2062,18 @@ fn plural_warnings(n: usize) -> String {
     }
 }
 
+/// Whether the REPL shows a bare expression's null as `null`, as it shows `true` or `"Rex"`: a
+/// missing field (`p.age`) printed nothing, like a line that did nothing (FEEDBACK73.md, Q-1023;
+/// branch feedback72-81). Only where null is what was asked for: a name, a field (`p.age`), an
+/// index (`xs[9]`), a literal. A call whose value is null shows nothing, as before (`null` after
+/// each `print(...)` or `db.open("app.db")` would be noise, as FEEDBACK73 warns, and the guide
+/// counts on the silence), nor does an `if`, a `match` or a block. A statement (`let`, `fn`, an
+/// assignment) is no expression, and shows nothing.
+fn shows_null(e: &quillo::ast::Expr) -> bool {
+    use quillo::ast::Expr;
+    matches!(e, Expr::Lit(_) | Expr::Ident(..) | Expr::Field(..) | Expr::Index(..))
+}
+
 fn repl(prompts: bool) -> i32 {
     let mut interp = Interp::new(".");
     let stdin = io::stdin();
@@ -2137,8 +2149,10 @@ fn repl(prompts: bool) -> i32 {
         for s in stmts {
             match interp.exec_stmt(s, &globals) {
                 Ok(v) => {
-                    if matches!(s, Stmt::Expr(_)) && !matches!(v, Value::Nil) {
-                        println!("{}", v.repr());
+                    if let Stmt::Expr(e) = s {
+                        if !matches!(v, Value::Nil) || shows_null(e) {
+                            println!("{}", v.repr());
+                        }
                     }
                 }
                 Err(Ctrl::Return(v)) => println!("{}", v.repr()),

@@ -6105,6 +6105,9 @@ impl Interp {
                 Mode::Request => Mode::Lenient,
                 m => m,
             };
+            // Only what the request sent and fits: a field left to its default is not sent, and a
+            // route with three such fields came before one whose sent field was of another type
+            // (found in review).
             n += match get_path(v, &f.path) {
                 None | Some(Value::Nil) => 0,
                 Some(x @ Value::Map(_)) if matches!(f.pat, Pattern::Record(_)) => self.fields_matched(&f.pat, &x, sub),
@@ -6183,9 +6186,6 @@ impl Interp {
             Pattern::Type(t) if t == "dec" => as_dec(x).is_some(),
             Pattern::Type(t) if t == "money" => crate::money::from_data(x).is_ok(),
             Pattern::Type(t) => type_name_matches(t, x) || (lenient && matches!(x, Value::Str(s) if coerce(t, s).is_some())),
-            // Only what the request sent and fits: a field left to its default is not sent, and a
-            // route with three such fields came before one whose sent field was of another type
-            // (found in review).
             Pattern::Lit(l) => {
                 let lv = lit_value(l);
                 equal(&lv, x) || (lenient && matches!(x, Value::Str(s) if coerce(lv.type_name(), s).is_some_and(|c| equal(&c, &lv))))

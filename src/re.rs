@@ -2408,6 +2408,14 @@ impl<'a> Names<'a> {
         }
     }
 
+    /// How many groups it has, the whole match not counted.
+    fn groups(self) -> usize {
+        match self {
+            Names::Crate(r) => r.captures_len().saturating_sub(1),
+            Names::Guard(g) => g.groups.get_nfa().group_info().group_len(regex_automata::PatternID::ZERO).saturating_sub(1),
+        }
+    }
+
     /// `f` of each named group's index and name.
     fn each(self, mut f: impl FnMut(usize, &'a str)) {
         match self {
@@ -2456,13 +2464,15 @@ fn text_arg(args: &[Value], f: &str, line: u32) -> Result<std::sync::Arc<str>, C
 /// `re.test(s, pattern, flags)`: whether it matches anywhere in `s`.
 /// `re.valid(pattern, flags)`: a pattern from data can be asked about first
 /// (FEEDBACK25.md, Q-318; branch feedback26-fixes).
-fn valid(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn valid(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    script_room(it, line)?;
     let Some(p @ Value::Str(_)) = args.first() else { return Ok(Value::Bool(false)) };
     let asked = [Value::Nil, p.clone(), args.get(1).cloned().unwrap_or(Value::Nil)];
     Ok(Value::Bool(regex_of(&asked, 2, "re.valid", line).is_ok()))
 }
 
-fn test(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn test(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    script_room(it, line)?;
     let s = text_arg(&args, "re.test", line)?;
     let mut pat = pattern(&args, 2, "re.test", line, s.len(), false)?;
     // By its guard where the crate could take too long (FEEDBACK75.md, Q-1075; branch feedback75).
@@ -2475,8 +2485,51 @@ fn test(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::Bool(pat.r.is_match(&s)))
 }
 
+/// In a sandboxed script (`run_script`), the most a value its call makes may hold, and its time
+/// looked at as the call begins; None outside one (FEEDBACK72.md, Q-1013; branch feedback72-81).
+/// A search may take its guard's tenth of a second, and the script's clock, looked at every 256
+/// steps, let some ninety searches of 1 ms each run past a script's time; what a script's builtin
+/// makes is paid for once it is made, and `re.replace(s, "", s)` on a text of 1 MB would make a
+/// million copies of it first.
+#[inline]
+fn script_room(it: &Interp, line: u32) -> Result<Option<usize>, Ctrl> {
+    if it.fuel == u64::MAX {
+        return Ok(None);
+    }
+    script_late(it, line)?;
+    Ok(Some(crate::script::SCRIPT_BYTES))
+}
+
+#[cold]
+#[inline(never)]
+fn script_late(it: &Interp, line: u32) -> Result<(), Ctrl> {
+    match &it.script {
+        Some((_, _, until, ms)) if std::time::Instant::now() >= *until => fail(line, format!("the script took longer than its {} ms", ms)),
+        _ => Ok(()),
+    }
+}
+
+/// Less than a match of `re.find_all` counts for in what a script makes (`script::too_big`): its
+/// place in the list (8), and its map's five keys at 8 bytes and their length each, with `start`
+/// and `end` at 8, are 87 bytes with no text, group or name.
+const MATCH_LEAST: usize = 80;
+
+/// In a script, the most matches a call holds, one more than may be: so that finding that many
+/// says the script made too much. Each match costs at least `value` bytes of what the call gives,
+/// and while it works, a span for each of its `groups` (`Found`), held to 8 MB in all: 1,024 `()`
+/// on 32 KB of text held 13,108 matches of 1,024 spans each, 344 MB, before what they made was
+/// counted (FEEDBACK72.md, Q-1013, found in review; branch feedback72-81). Outside a script, as
+/// many as there are.
+fn script_most(room: Option<usize>, value: usize, groups: usize) -> usize {
+    let Some(b) = room else { return usize::MAX };
+    let by_value = if value == 0 { usize::MAX } else { b / value };
+    let by_groups = if groups == 0 { usize::MAX } else { b.saturating_mul(8) / groups.saturating_mul(std::mem::size_of::<Option<(usize, usize)>>()) };
+    by_value.min(by_groups).saturating_add(1)
+}
+
 /// `re.find(s, pattern, flags)`: the first match, or null.
-fn find(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn find(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    script_room(it, line)?;
     let s = text_arg(&args, "re.find", line)?;
     let mut pat = pattern(&args, 2, "re.find", line, s.len(), true)?;
     let Ok(guard) = guard_for(&mut pat, Key { args: &args, flags_at: 2 }, s.len(), true) else { return Ok(gave_up("re.find", s.len())) };
@@ -2489,17 +2542,25 @@ fn find(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 /// `re.find_all(s, pattern, flags)`: every match, from left to right.
-fn find_all(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn find_all(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let room = script_room(it, line)?;
     let s = text_arg(&args, "re.find_all", line)?;
     let mut pat = pattern(&args, 2, "re.find_all", line, s.len(), true)?;
     // Its searches by the guard where one could take too long (FEEDBACK75.md, Q-1075; branch
     // feedback75).
     let Ok(guard) = guard_for(&mut pat, Key { args: &args, flags_at: 2 }, s.len(), true) else { return Ok(gave_up("re.find_all", s.len())) };
     let r = &pat.r;
-    let found = match all_matches(r, &s, usize::MAX, "re.find_all", line, guard.as_ref())? {
+    // In a script, no more matches than a value it may make holds, each group's 8 bytes counted
+    // (FEEDBACK72.md, Q-1013; branch feedback72-81).
+    let groups = Names::of(r, guard.as_ref()).groups();
+    let most = script_most(room, MATCH_LEAST + 8 * groups, groups);
+    let found = match all_matches(r, &s, most, "re.find_all", line, guard.as_ref())? {
         Ok(found) => found,
         Err(e) => return Ok(e),
     };
+    if found.len() == most {
+        return fail(line, crate::script::TOO_BIG);
+    }
     // A map for each, asked about first under `--max-memory` (FEEDBACK71.md, Q-977; branch
     // security).
     crate::httpd::making(found.len().saturating_mul(ITEM_BYTES)).map_err(|s| s.at(line))?;
@@ -2512,6 +2573,7 @@ fn find_all(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// text in which `$1`, `$<name>` and `$0` are the match's and `$$` is `$`,
 /// or a function given the match (as `re.find` gives it).
 fn replace(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let room = script_room(it, line)?;
     let s = text_arg(&args, "re.replace", line)?;
     let mut pat = pattern(&args, 3, "re.replace", line, s.len(), true)?;
     // Its searches by the guard where one could take too long (FEEDBACK75.md, Q-1075; branch
@@ -2523,10 +2585,16 @@ fn replace(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return fail(line, format!("`re.replace` expects what to put in (a str or a function) as argument 3, got {}", with.type_name()));
     }
     let names: Vec<Option<&str>> = Names::of(r, guard.as_ref()).list();
-    let found = match all_matches(r, &s, usize::MAX, "re.replace", line, guard.as_ref())? {
+    // In a script, the matches' groups held as for `re.find_all`; a match may put in nothing
+    // (FEEDBACK72.md, Q-1013, found in review; branch feedback72-81).
+    let most = script_most(room, 0, names.len().saturating_sub(1));
+    let found = match all_matches(r, &s, most, "re.replace", line, guard.as_ref())? {
         Ok(found) => found,
         Err(e) => return Ok(e),
     };
+    if found.len() == most {
+        return fail(line, crate::script::TOO_BIG);
+    }
     // The text it makes, written through a `Held` text, which stops at `--max-memory` as it grows:
     // each match given a long text (FEEDBACK71.md, Q-977; branch security).
     let mut out = Held::with_capacity(s.len());
@@ -2535,7 +2603,14 @@ fn replace(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     for m in found {
         out.push_str(&s[last..m.start]);
         match &with {
-            Value::Str(t) => expand(t, &s, &m, &names, &mut out).or_else(|e| fail(line, format!("`re.replace`: {}", e)))?,
+            Value::Str(t) => {
+                // Stopped as it writes, in a script: one match's text put in 8,192 times by `$0`
+                // was 1.9 GB before the check after the match (FEEDBACK72.md, Q-1013, found in
+                // review; branch feedback72-81).
+                if !expand(t, &s, &m, &names, &mut out, room.unwrap_or(usize::MAX)).or_else(|e| fail(line, format!("`re.replace`: {}", e)))? {
+                    return fail(line, crate::script::TOO_BIG);
+                }
+            }
             f => {
                 let v = match_value(Names::of(r, guard.as_ref()), &s, &m, &mut chars);
                 // The function's error is given back: its text went into the text, and a `?` in
@@ -2549,18 +2624,35 @@ fn replace(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         if out.is_over() {
             return Err(crate::httpd::OverMemory.at(line));
         }
+        // A script's text stops at what it may make, as it grows (FEEDBACK72.md, Q-1013; branch
+        // feedback72-81).
+        if room.is_some_and(|b| out.len() > b) {
+            return fail(line, crate::script::TOO_BIG);
+        }
         last = m.end;
     }
     out.push_str(&s[last..]);
     Ok(Value::str(out.into_text().map_err(|o| o.at(line))?))
 }
 
-/// `$0`..`$9`, `$<name>` and `$$` in replacement text.
-fn expand(t: &str, s: &str, m: &Found, names: &[Option<&str>], out: &mut Held) -> Result<(), String> {
+/// `$0`..`$9`, `$<name>` and `$$` in replacement text, while `out` holds no more than `most`
+/// bytes: false, with nothing past it written, where it would hold more.
+fn expand(t: &str, s: &str, m: &Found, names: &[Option<&str>], out: &mut Held, most: usize) -> Result<bool, String> {
     let group = |g: usize| if g == 0 { Some((m.start, m.end)) } else { m.groups.get(g - 1).copied().flatten() };
+    // Each part asked about before it is written: a group's text may be the whole text, put in
+    // once for each `$0`.
+    let put = |out: &mut Held, part: &str| {
+        let fits = out.len().saturating_add(part.len()) <= most;
+        if fits {
+            out.push_str(part);
+        }
+        fits
+    };
     let mut rest = t;
     while let Some(k) = rest.find('$') {
-        out.push_str(&rest[..k]);
+        if !put(out, &rest[..k]) {
+            return Ok(false);
+        }
         let after = &rest[k + 1..];
         match after.chars().next() {
             Some('$') => {
@@ -2573,7 +2665,9 @@ fn expand(t: &str, s: &str, m: &Found, names: &[Option<&str>], out: &mut Held) -
                     return Err(format!("`${}`, but the pattern has {} group{}", g, m.groups.len(), if m.groups.len() == 1 { "" } else { "s" }));
                 }
                 if let Some((a, b)) = group(g) {
-                    out.push_str(&s[a..b]);
+                    if !put(out, &s[a..b]) {
+                        return Ok(false);
+                    }
                 }
                 rest = &after[1..];
             }
@@ -2582,7 +2676,9 @@ fn expand(t: &str, s: &str, m: &Found, names: &[Option<&str>], out: &mut Held) -
                 let name = &after[1..end];
                 let g = names.iter().position(|n| *n == Some(name)).ok_or_else(|| format!("no group is named `{}`", name))?;
                 if let Some((a, b)) = group(g) {
-                    out.push_str(&s[a..b]);
+                    if !put(out, &s[a..b]) {
+                        return Ok(false);
+                    }
                 }
                 rest = &after[end + 1..];
             }
@@ -2592,12 +2688,12 @@ fn expand(t: &str, s: &str, m: &Found, names: &[Option<&str>], out: &mut Held) -
             }
         }
     }
-    out.push_str(rest);
-    Ok(())
+    Ok(put(out, rest))
 }
 
 /// `re.split(s, pattern, flags)`: the text between the matches.
-fn split(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+fn split(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let room = script_room(it, line)?;
     let s = text_arg(&args, "re.split", line)?;
     let mut pat = pattern(&args, 2, "re.split", line, s.len(), true)?;
     // Its searches by the guard where one could take too long (FEEDBACK75.md, Q-1075; branch
@@ -2606,10 +2702,16 @@ fn split(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let r = &pat.r;
     let mut out = Vec::new();
     let mut last = 0;
-    let found = match all_matches(r, &s, usize::MAX, "re.split", line, guard.as_ref())? {
+    // In a script, no more parts than a value it may make holds, 8 bytes each at the least, and
+    // the matches' groups held as for `re.find_all` (FEEDBACK72.md, Q-1013; branch feedback72-81).
+    let most = script_most(room, 8, Names::of(r, guard.as_ref()).groups());
+    let found = match all_matches(r, &s, most, "re.split", line, guard.as_ref())? {
         Ok(found) => found,
         Err(e) => return Ok(e),
     };
+    if found.len() == most {
+        return fail(line, crate::script::TOO_BIG);
+    }
     // The list of parts, asked about first under `--max-memory` (Q-977).
     crate::httpd::making((found.len() + 1).saturating_mul(ITEM_BYTES)).map_err(|s| s.at(line))?;
     for m in found {

@@ -411,6 +411,10 @@ quillo> db.query("select * from notes")
 - What a line defines (`let`, `fn`, assignments, `use "lib.qwe"`) stays for the lines
   after it. A statement left open (a `{` not yet closed) goes on to the next line, shown
   by `....>`.
+- A null is printed where it is what you asked for: a name, a field or an index (`p.age`
+  prints `null` when `p` has no `age`), or `null` itself. A call whose value is null prints
+  nothing, so `db.open(...)` above, a `print` and a function of yours that gives nothing
+  show only what they do; nor does an `if`, a `match` or a block whose value is null.
 - It runs from the folder it was started in: `use`, `db.open` and `read_file` paths are
   from there. `db.open` (or `db.connect`) gives it a database, as in a program. It does
   not read a `.env`.

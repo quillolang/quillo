@@ -858,7 +858,25 @@ fn names(locale: &str) -> &'static Names {
         .iter()
         .find(|n| n.tags.contains(&tag.as_str()))
         .or_else(|| LOCALES.iter().find(|n| n.tags.contains(&lang)))
-        .unwrap_or(&LOCALES[0])
+        .unwrap_or_else(|| no_names(locale))
+}
+
+/// English, for a locale whose language has no names here, said in the log once for each
+/// (at most 64, each cut at 100 characters), as `format_number` and `money.format` say theirs
+/// (src/money.rs, `locale_data`): "ja-JP" and "xx-YY" gave English in silence, which looked like
+/// the program's mistake (FEEDBACK73.md, Q-1021; branch feedback72-81). The browser's is
+/// `dtNames` in runtime.js.
+#[cold]
+#[inline(never)]
+fn no_names(locale: &str) -> &'static Names {
+    static SAID: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    let name = crate::interp::said_name(locale);
+    let mut said = SAID.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if said.len() < 64 && !said.contains(name.as_ref()) {
+        said.insert(name.to_string());
+        eprintln!("quillo: warning: no date data for locale {:?}: written in English", name);
+    }
+    &LOCALES[0]
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]

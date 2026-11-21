@@ -4578,7 +4578,7 @@ fn check_lines(name: &str, src: &str) -> (bool, Vec<String>) {
     (o.status.success(), text.lines().filter(|l| l.contains(": error: ") || l.contains(": warning: ")).map(String::from).collect())
 }
 
-const BROWSER_ONLY: &str = "`notification.ask`, `notification.state` and `notification.stop` ask and read the browser: call them from an event handler of a component (`@click`); the server sends with `notification.send(user, { title, body, url })`";
+const BROWSER_ONLY: &str = "`notification.ask`, `notification.state` and `notification.stop` ask and read the browser: call them from an event handler of a component (`onclick`); the server sends with `notification.send(user, { title, body, url })`";
 
 // B.3, `quillo check`: `send` and `user` are the server's, refused in a component (its body or a
 // handler); `ask`, `state` and `stop` the browser's, refused where the code surely runs on the
@@ -4641,7 +4641,7 @@ route GET / = <html><body><C/></body></html>
     let (ok, lines) = check_lines("n-check-bad", bad);
     assert!(!ok);
     let on = |line: u32, f: &str, place: &str| format!("main.qwe:{}: error: `notification.{}` {} runs on the server; {}", line, f, place, BROWSER_ONLY);
-    let body = |line: u32, f: &str, or: &str| format!("main.qwe:{}: error: `notification.{}` in <C> runs in the browser, and the server renders <C> first: call it from an event handler (@click){}", line, f, or);
+    let body = |line: u32, f: &str, or: &str| format!("main.qwe:{}: error: `notification.{}` in <C> runs in the browser, and the server renders <C> first: call it from an event handler (onclick){}", line, f, or);
     let late = |line: u32, w: &str| format!("main.qwe:{}: warning: `notification.ask` comes after `{}` waits in this handler: browsers show the permission prompt only close to the click, so ask first, then wait", line, w);
     let want = vec![
         on(3, "state", "in a `server fn`"),

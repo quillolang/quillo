@@ -555,8 +555,8 @@ fn server_calls_given_wrongly_stop_the_request_saying_why() {
 /// FEEDBACK67.md B.3; coverage of 0.8.7; branch coverage-087).
 #[test]
 fn the_browsers_compile_says_what_notification_has_and_where() {
-    let in_body = |f: &str, or: &str| format!("`notification.{}` in a component runs in the browser, and the server renders the component first: call it from an event handler (@click){}", f, or);
-    let checked = |f: &str, or: &str| format!("`notification.{}` in <C> runs in the browser, and the server renders <C> first: call it from an event handler (@click){}", f, or);
+    let in_body = |f: &str, or: &str| format!("`notification.{}` in a component runs in the browser, and the server renders the component first: call it from an event handler (onclick){}", f, or);
+    let checked = |f: &str, or: &str| format!("`notification.{}` in <C> runs in the browser, and the server renders <C> first: call it from an event handler (onclick){}", f, or);
     let state_or = ", or set a state with it: state on = notification.state()";
     let cases = [
         ("none", "component C() {\n    state on = \"\"\n    <button @click={() => { on = notification.push() }}>{on}</button>\n}\n", 3, "`notification` has no function `push`".to_string(), "`notification` has no function `push`".to_string()),

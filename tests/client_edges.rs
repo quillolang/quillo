@@ -211,7 +211,7 @@ fn a_component_may_end_with_its_live_state() {
 fn a_method_call_of_something_that_waits_is_refused_in_markup() {
     assert_eq!(
         refused("server fn save(x) = x\ncomponent C() = <p>{1.save()}</p>"),
-        "case.qwe:2: <C> (compiled for the browser): `save` waits on the server, so a component can only call it from an event handler (@click={() => { ... }}) or to set state: state x = save(...)"
+        "case.qwe:2: <C> (compiled for the browser): `save` waits on the server, so a component can only call it from an event handler (onclick={() => { ... }}) or to set state: state x = save(...)"
     );
 }
 
@@ -314,7 +314,7 @@ fn a_pipe_into_a_server_fn_compiles_to_a_call() {
 fn a_pipe_into_a_server_fn_in_markup_is_refused() {
     assert_eq!(
         refused("server fn save(x) = x\ncomponent C() = <p>{1 | save}</p>"),
-        "case.qwe:2: <C> (compiled for the browser): `save` waits on the server, so a component can only call it from an event handler (@click={() => { ... }}) or to set state: state x = save(...)"
+        "case.qwe:2: <C> (compiled for the browser): `save` waits on the server, so a component can only call it from an event handler (onclick={() => { ... }}) or to set state: state x = save(...)"
     );
 }
 

@@ -301,13 +301,23 @@ pub(crate) fn argon_hash(pw: &[u8]) -> Result<String, String> {
 /// hash is checked against a stand-in, taking as long, and is false.
 pub(crate) fn argon_check(pw: &[u8], hash: Option<&str>) -> bool {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
-    let check = |h: &PasswordHash| argon2::Argon2::default().verify_password(pw, h).is_ok();
+    let check = |h: &PasswordHash| argon2::Argon2::default().verify_password(pw, h);
+    let stand_in = || {
+        let _ = check(&PasswordHash::new(STAND_IN).expect("the stand-in hash parses"));
+        false
+    };
     match hash.map(PasswordHash::new) {
-        Some(Ok(h)) if hash != Some(STAND_IN) => check(&h),
-        _ => {
-            let _ = check(&PasswordHash::new(STAND_IN).expect("the stand-in hash parses"));
-            false
-        }
+        // Argon2 hashes only when the text has a salt and a hash, and then gives `Password` for a
+        // wrong one; anything else it refuses at once: a PHC text of another algorithm
+        // (`$scrypt$...`, a migrated account's), or one whose parameters it cannot take, answered
+        // in no time where a real hash took 10 ms, and told an attacker such an account is there.
+        // Those take the stand-in's work too (FEEDBACK80.md, Q-1264; branch feedback72-81).
+        Some(Ok(h)) if hash != Some(STAND_IN) && h.salt.is_some() && h.hash.is_some() => match check(&h) {
+            Ok(()) => true,
+            Err(argon2::password_hash::Error::Password) => false,
+            Err(_) => stand_in(),
+        },
+        _ => stand_in(),
     }
 }
 
