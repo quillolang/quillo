@@ -2796,7 +2796,7 @@ struct Checker {
     /// Each link, `redirect` and `navigate` the walk met, for `dead_links`: the file, the line, the
     /// address's literal start, whether that is all of it, and what it is (FEEDBACK79.md, Q-1251;
     /// branch feedback72-81).
-    page_links: Vec<(Arc<str>, u32, String, bool, &'static str)>,
+    page_links: Vec<(Arc<str>, u32, String, LinkEnd, &'static str)>,
     /// Whether the walk met a call of `random`, `random_int` or `uuid` anywhere: with none, no
     /// component is read for one (FEEDBACK72.md, Q-1015; branch feedback72-81). And the functions
     /// and components whose code makes one, for those that call them.
@@ -2885,6 +2885,9 @@ struct Checker {
     /// Elements around this one that take keys or focus themselves: a key handler, `tabindex`, or
     /// a `role` (FEEDBACK72.md, Q-1019, found in review; branch feedback72-81).
     keys_above: usize,
+    /// A click no key reaches, said after `page_handlers` unless its handler never runs at all
+    /// (Q-1019, found in review).
+    unreachable: Vec<(Arc<str>, u32, String)>,
     /// Each scope's number, and the last given (Checker::push).
     scope_ids: Vec<u64>,
     scope_serial: u64,
@@ -3131,6 +3134,7 @@ impl Checker {
             early: Vec::new(),
             input_above: 0,
             keys_above: 0,
+            unreachable: Vec::new(),
             scope_ids: Vec::new(),
             scope_serial: 0,
             gone: Vec::new(),
@@ -9266,7 +9270,11 @@ impl Checker {
             if (n == "redirect" || n == "navigate") && self.builtin_in_scope(n) {
                 if let Some((t, whole)) = args.first().and_then(link_start) {
                     // A 307 or 308 is followed with the request's own method (found in review).
-                    let same = matches!(args.get(1), Some(Expr::Lit(Lit::Int(307 | 308))));
+                    // One not written as a number may be either (found in review).
+                    let same = match args.get(1) {
+                        None | Some(Expr::Lit(Lit::Int(_))) => matches!(args.get(1), Some(Expr::Lit(Lit::Int(307 | 308)))),
+                        Some(_) => true,
+                    };
                     let what = match (n.as_str(), same) {
                         ("navigate", _) => "navigate",
                         (_, true) => "redirect-same",
@@ -11208,7 +11216,7 @@ impl Checker {
         }
         // Where a link goes (FEEDBACK79.md, Q-1251; branch feedback72-81): an element's `href`, not a
         // view's or component's prop of that name, which may be anything (found in review).
-        for (n, v) in el.attrs.iter().filter(|_| !is_view) {
+        for (n, v) in el.attrs.iter().filter(|_| !is_view && !el.tag.eq_ignore_ascii_case("base")) {
             if let (true, AttrVal::Expr(x)) = (n.eq_ignore_ascii_case("href"), v) {
                 if let Some((t, whole)) = link_start(x) {
                     self.page_links.push((self.file.clone(), el.line, t, whole, "link"));
@@ -11498,24 +11506,29 @@ impl Checker {
         // Not a click on what is around the content, read by its `e.target` (a backdrop, a list
         // handling its items' clicks, a box focusing its field), nor an element hidden from a
         // screen reader or with a key handler of its own: in the website's kit 12 of 17 were such.
-        let clicked = || {
-            el.attrs.iter().any(|(a, v)| {
-                a == "@click"
-                    && match v {
-                        AttrVal::Expr(Expr::Lambda(d)) => {
-                            let mut target = false;
-                            walk_fn(d, &mut |x| target |= matches!(x, Expr::Field(_, f, _) if f == "target" || f == "currentTarget"));
-                            !target
-                        }
-                        AttrVal::Expr(_) => true,
-                        _ => false,
-                    }
-            })
+        // A handler that takes the event (`(e) => pick(e)`, `pick` declared `fn pick(e)`) handles
+        // what was clicked inside, a list's buttons say: the keyboard reaches those (found in
+        // review).
+        let takes_event = |me: &Self, v: &AttrVal| match v {
+            AttrVal::Expr(Expr::Lambda(d)) => !d.params.is_empty(),
+            AttrVal::Expr(Expr::Ident(n, _)) => {
+                let var = me.scopes.iter().rev().find_map(|s| s.get(n.as_str())).or_else(|| me.globals.get(n.as_str()));
+                var.and_then(|v| v.sig.as_ref()).is_some_and(|s| !s.params.is_empty())
+            }
+            _ => false,
         };
+        let clicked = el.attrs.iter().find(|(a, v)| a == "@click" && matches!(v, AttrVal::Expr(_)));
         let still = || ["role", "tabindex", "contenteditable", "aria-hidden", "@keydown", "@keyup", "@keypress"].iter().all(|a| !has(a));
-        if el.attrs.iter().any(|(a, _)| a == "@click") && !spread && self.keys_above == 0 && STILL.contains(&el.tag.as_str()) && still() && clicked() {
-            let an = if el.tag.starts_with(['a', 'e', 'i', 'o']) || (el.tag.len() == 2 && el.tag.starts_with('h')) { "an" } else { "a" };
-            self.warn(format!("{} `<{}>` with onclick can't be reached with the keyboard: use a `<button>`", an, el.tag));
+        if let Some((_, v)) = clicked {
+            if !spread && self.keys_above == 0 && STILL.contains(&el.tag.as_str()) && still() && !takes_event(self, v) && !reachable_inside(el) {
+                let an = if el.tag.starts_with(['a', 'e', 'i', 'o']) || (el.tag.len() == 2 && el.tag.starts_with('h')) { "an" } else { "a" };
+                let msg = format!("{} `<{}>` with onclick can't be reached with the keyboard: use a `<button>`", an, el.tag);
+                // Said once the page's handlers are known: one in markup the server alone makes
+                // never runs, and that is all there is to say of it (found in review).
+                if self.quiet == 0 {
+                    self.unreachable.push((self.file.clone(), el.line, msg));
+                }
+            }
         }
         if el.tag == "img" && !spread && !["alt", "role", "aria-label", "aria-labelledby", "aria-hidden", "hidden"].iter().any(|a| has(a)) {
             self.warn("this `<img>` has no `alt`: `alt=\"\"` if it is decoration, or words for what it shows");
@@ -11574,11 +11587,11 @@ impl Checker {
     /// `service`'s prefix takes what is under it, and a route ending in `*rest` all below it. Not in
     /// a program checked inside another (a mounted one's addresses are under its prefix), nor in one
     /// with no routes (a file of views for other programs).
-    fn dead_links(&mut self, order: &[Item]) {
+    fn dead_links<'a>(&mut self, order: &'a [Item]) {
         if DEPTH.with(|d| d.get()) > 1 {
             return;
         }
-        let mut routes: Vec<&RouteDef> = Vec::new();
+        let mut routes: Vec<&'a RouteDef> = Vec::new();
         let mut prefixes: Vec<Vec<String>> = Vec::new();
         for it in order {
             match &it.stmt {
@@ -11590,49 +11603,71 @@ impl Checker {
         if routes.is_empty() {
             return;
         }
-        // The routes by their first piece, written out; those that start with a parameter or
-        // `*rest` are tried for every address. And by how many pieces they have, for "did you
-        // mean": every link against every route, and an edit distance for each, made 3,000 routes
-        // and 9,000 links 39% slower to check (found in review).
-        let mut by_first: HashMap<&str, Vec<usize>> = HashMap::new();
-        let mut open: Vec<usize> = Vec::new();
-        // By how many pieces, and the first letter of the first piece written out.
-        let mut by_shape: HashMap<(usize, Option<char>), Vec<usize>> = HashMap::new();
-        let mut by_len: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (i, r) in routes.iter().enumerate() {
-            let initial = match r.path.first() {
-                Some(Seg::Lit(l)) => {
-                    by_first.entry(l.as_str()).or_default().push(i);
-                    l.chars().next()
-                }
-                _ => {
-                    open.push(i);
-                    None
-                }
-            };
-            let len = r.path.iter().position(|s| matches!(s, Seg::Rest(_))).unwrap_or(r.path.len());
-            by_shape.entry((len, initial)).or_default().push(i);
-            by_len.entry(len).or_default().push(i);
-        }
+        // The routes as a tree of their pieces, so a link meets only the routes that can take it
+        // (every link against every route made 3,000 routes and 9,000 links 39% slower to check,
+        // and routes that share a first piece, `/app/...`, or start with one, `/:lang/...`, 135%;
+        // found in reviews). And by their first piece and how many pieces they have, for "did you
+        // mean".
+        let tree = LinkTree::of(&routes);
+        let mut scratch: Vec<(usize, usize, bool)> = Vec::new();
+        // By the first piece, by how many pieces and the first letter, and by how many: made at the
+        // first dead link, for its "did you mean".
+        type Near<'r> = (HashMap<&'r str, Vec<usize>>, HashMap<(usize, Option<char>), Vec<usize>>, HashMap<usize, Vec<usize>>);
+        let near_of = |routes: &[&'a RouteDef]| -> Near<'a> {
+            let (mut by_first, mut by_shape, mut by_len): Near = Default::default();
+            for (i, r) in routes.iter().enumerate() {
+                let initial = match r.path.first() {
+                    Some(Seg::Lit(l)) => {
+                        by_first.entry(l.as_str()).or_default().push(i);
+                        l.chars().next()
+                    }
+                    _ => None,
+                };
+                let len = r.path.iter().position(|s| matches!(s, Seg::Rest(_))).unwrap_or(r.path.len());
+                by_shape.entry((len, initial)).or_default().push(i);
+                by_len.entry(len).or_default().push(i);
+            }
+            (by_first, by_shape, by_len)
+        };
+        let mut near_index: Option<Near> = None;
         // What the suggestions may cost: routes looked at for one dead link, and edit distances in
         // all; past them, a dead link is said with none (found in review).
         const LOOKED_AT: usize = 64;
         let mut budget: u32 = 5_000;
         // As the walk met them; one met twice is said once (`diag_at`).
-        for (file, line, text, whole, what) in std::mem::take(&mut self.page_links) {
+        for (file, line, text, end, what) in std::mem::take(&mut self.page_links) {
             if !text.starts_with('/') || text.starts_with("//") || text.starts_with("/\\") {
                 continue;
             }
-            let (path, whole) = match text.find(['?', '#']) {
-                Some(i) => (&text[..i], true),
-                None => (text.as_str(), whole),
+            let (path, end) = match text.find(['?', '#']) {
+                Some(i) => (&text[..i], LinkEnd::Whole),
+                None => (text.as_str(), end),
             };
+            let (whole, last) = (end == LinkEnd::Whole, end == LinkEnd::Last);
             if path == "/_quillo" || path.starts_with("/_quillo/") || path == "/manifest.webmanifest" || path == "/apple-touch-icon.png" {
                 continue;
             }
-            let mut pieces: Vec<std::borrow::Cow<str>> =
-                path.split('/').skip(1).map(|s| if s.contains('%') { std::borrow::Cow::Owned(crate::server::percent_decode(s, false)) } else { std::borrow::Cow::Borrowed(s) }).collect();
-            let partial = if whole { None } else { pieces.pop() };
+            // Pieces as the browser asks for them: `.` and `..` (`%2e` too) taken out, as it does
+            // (found in review).
+            let (head, partial) = match (whole, path.rsplit_once('/')) {
+                (false, Some((h, p))) => (h, Some(std::borrow::Cow::Borrowed(p))),
+                _ => (path, None),
+            };
+            let mut pieces: Vec<std::borrow::Cow<str>> = Vec::new();
+            for s in head.split('/').skip(1) {
+                if !s.contains(['.', '%']) {
+                    pieces.push(std::borrow::Cow::Borrowed(s));
+                    continue;
+                }
+                match s.to_ascii_lowercase().replace("%2e", ".").as_str() {
+                    "." => {}
+                    ".." => {
+                        pieces.pop();
+                    }
+                    _ if s.contains('%') => pieces.push(std::borrow::Cow::Owned(crate::server::percent_decode(s, false))),
+                    _ => pieces.push(std::borrow::Cow::Borrowed(s)),
+                }
+            }
             pieces.retain(|s| !s.is_empty());
             // A program with no `/` of its own is part of a site whose home is elsewhere (behind a
             // proxy, or a fragment such as a guard's `redirect("/")`): its home is not said.
@@ -11642,25 +11677,21 @@ impl Checker {
             if prefixes.iter().any(|p| pieces.len() >= p.len() && pieces[..p.len()] == p[..]) {
                 continue;
             }
-            // The routes that could take it: those of its first piece, or of a first piece that
-            // starts as a template's does, and those that start with a parameter.
-            let (first, start) = (pieces.first(), partial.as_deref());
-            let by_start = by_first.iter().filter(|(k, _)| first.is_none() && start.is_some_and(|s| k.starts_with(s))).flat_map(|(_, v)| v.iter());
-            let firsts = first.and_then(|f| by_first.get(&**f)).into_iter().flatten();
             // A 307 or 308 keeps the method, so any route of the path takes it (found in review).
             let gets = |r: &RouteDef| what == "redirect-same" || r.method == "GET" || r.method == "ANY";
             let mut other: Option<&RouteDef> = None;
-            let mut taken = false;
-            for &i in firsts.chain(open.iter()).chain(if first.is_none() && start.is_some() { Some(by_start) } else { None }.into_iter().flatten()) {
+            let taken = tree.find(&pieces, partial.as_deref(), last, &mut scratch, &mut |i| {
                 let r = routes[i];
-                if link_fits(&r.path, &pieces, partial.as_deref()) {
-                    if gets(r) {
-                        taken = true;
-                        break;
-                    }
-                    other = other.or(Some(r));
+                // The tree matched a whole address piece by piece already.
+                if partial.is_some() && !link_fits(&r.path, &pieces, partial.as_deref(), last) {
+                    return false;
                 }
-            }
+                if gets(r) {
+                    return true;
+                }
+                other = other.or(Some(r));
+                false
+            });
             if taken {
                 continue;
             }
@@ -11680,20 +11711,22 @@ impl Checker {
             // first letter, then the rest, as far as the limits go.
             let n = pieces.len();
             let lens = if whole { n.saturating_sub(1)..=n + 1 } else { n..=n + 2 };
+            let (by_first, by_shape, by_len) = near_index.get_or_insert_with(|| near_of(&routes));
             let first_len = pieces.first().map(|p| p.chars().count());
             let initial = pieces.first().and_then(|p| p.chars().next());
             let same_first = pieces.first().and_then(|f| by_first.get(&**f)).into_iter().flatten();
             let same_initial = lens.clone().flat_map(|len| by_shape.get(&(len, initial)).into_iter().flatten());
             let rest = lens.clone().flat_map(|len| by_len.get(&len).into_iter().flatten());
             let mut near: Option<(usize, usize, &RouteDef)> = None;
-            let mut looked: HashSet<usize> = HashSet::new();
+            let mut looked: Vec<usize> = Vec::new();
             for i in same_first.chain(same_initial).chain(rest) {
                 if budget == 0 || looked.len() >= LOOKED_AT {
                     break;
                 }
-                if !looked.insert(*i) {
+                if looked.contains(i) {
                     continue;
                 }
+                looked.push(*i);
                 {
                     let r = routes[*i];
                     if !gets(r) {
@@ -11812,8 +11845,14 @@ impl Checker {
                 }
             }
         }
+        let dead: HashSet<(Arc<str>, u32)> = said.iter().map(|(f, l, _)| (f.clone(), *l)).collect();
         for (file, line, msg) in said {
             self.diag_at(file, line, Severity::Warning, msg);
+        }
+        for (file, line, msg) in std::mem::take(&mut self.unreachable) {
+            if !dead.contains(&(file.clone(), line)) {
+                self.diag_at(file, line, Severity::Warning, msg);
+            }
         }
     }
 
@@ -11977,19 +12016,61 @@ impl Checker {
     /// A whole number the name it follows is given at the top level is that name's value, written
     /// as a result (`consts`; found in review).
     fn value_comments_said(&mut self, consts: &HashMap<String, i64>) {
+        // Whether `name` is a number where it is read: a local in scope there, else a top-level
+        // `let`, typed or given one; never a function, a field, or of no known type (`retries //
+        // 3` with `retries` a parameter, `amount // price` with `price` a function; found in
+        // review).
+        let numeric = |me: &Self, name: &str, file: &Arc<str>, line: u32| {
+            let detail = me
+                .out
+                .locals
+                .iter()
+                .rev()
+                .find(|l| l.name == name && l.file == **file && l.line <= line && line <= l.end)
+                .map(|l| l.detail.as_str())
+                .or_else(|| me.out.symbols.iter().find(|s| s.name == name && s.kind == SymbolKind::Variable).map(|s| s.detail.as_str()));
+            detail.and_then(|d| d.split_once(": ")).is_some_and(|(kw, t)| {
+                !kw.contains('(') && t.split(" | ").all(|p| matches!(p, "int" | "float" | "dec" | "num"))
+            })
+        };
         for (file, line, word, after) in std::mem::take(&mut self.value_comments) {
             let number = word.starts_with(|c: char| c.is_ascii_digit());
             if number && consts.get(&after).is_some_and(|v| word.parse::<i64>().ok() == Some(*v)) {
                 continue;
             }
-            let named = !number
-                && (self.out.locals.iter().any(|l| l.name == word && l.file == *file && l.line <= line && line <= l.end)
-                    || self.out.symbols.iter().any(|s| s.name == word && s.kind != SymbolKind::Route));
-            if number || named {
+            let named = !number && numeric(self, &word, &file, line);
+            if (number || named) && numeric(self, &after, &file, line) {
                 self.diag_at(file, line, Severity::Warning, format!("`//` starts a comment here, so `// {}` is left out: whole-number division is `floor(a / b)`", word));
             }
         }
     }
+}
+
+/// Whether an element holds one the keyboard reaches: a button, a link, a field, a summary, or one
+/// with `tabindex`, as written inside it or in its `{...}` (FEEDBACK72.md, Q-1019, found in review;
+/// branch feedback72-81).
+fn reachable_inside(el: &HtmlEl) -> bool {
+    let reachable = |h: &HtmlEl| {
+        matches!(h.tag.as_str(), "button" | "input" | "select" | "textarea" | "summary")
+            || (h.tag == "a" && h.attrs.iter().any(|(n, _)| n == "href"))
+            || h.attrs.iter().any(|(n, _)| n == "tabindex")
+    };
+    let mut found = false;
+    for c in &el.children {
+        let mut look = |h: &HtmlEl| found |= reachable(h);
+        match c {
+            HtmlChild::El(h) => walk_html_els(h, &mut look),
+            HtmlChild::Expr(x) => walk_expr(x, &mut |e| {
+                if let Expr::Html(h, _) = e {
+                    walk_html_els(h, &mut look);
+                }
+            }),
+        }
+        if found {
+            return true;
+        }
+    }
+    false
 }
 
 /// The builtins that give another value at each call, which a component's body draws again in the
@@ -12060,22 +12141,35 @@ fn css_written(e: &Expr, known: &HashSet<String>) -> bool {
     true
 }
 
-/// What a link's value says of its address (Q-1251): a literal, whole, or the literal start of a
-/// template or of a `+` (not whole).
-fn link_start(e: &Expr) -> Option<(String, bool)> {
+/// What a link's value says of its address (Q-1251): a literal (`Whole`), or the literal start of a
+/// template or of a `+`, then one value that ends it (`Last`: `/todos/${id}`, one more piece's
+/// worth, found in review) or more (`Open`).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum LinkEnd {
+    Whole,
+    Last,
+    Open,
+}
+
+fn link_start(e: &Expr) -> Option<(String, LinkEnd)> {
     match e {
-        Expr::Lit(Lit::Str(s)) => Some((s.to_string(), true)),
-        Expr::Template(parts) => match parts.first() {
-            Some(TPart::Lit(s)) => Some((s.clone(), parts.len() == 1)),
+        Expr::Lit(Lit::Str(s)) => Some((s.to_string(), LinkEnd::Whole)),
+        Expr::Template(parts) => match parts.as_slice() {
+            [TPart::Lit(s)] => Some((s.clone(), LinkEnd::Whole)),
+            [TPart::Lit(s), TPart::Expr(_)] => Some((s.clone(), LinkEnd::Last)),
+            [TPart::Lit(s), ..] => Some((s.clone(), LinkEnd::Open)),
             _ => None,
         },
-        Expr::Binary(BinOp::Add, a, _, _) => {
+        Expr::Binary(BinOp::Add, a, b, _) => {
             let mut left = &**a;
+            let mut more = false;
             while let Expr::Binary(BinOp::Add, x, _, _) = left {
                 left = x;
+                more = true;
             }
             match left {
-                Expr::Lit(Lit::Str(s)) => Some((s.to_string(), false)),
+                Expr::Lit(Lit::Str(s)) if !more && !matches!(&**b, Expr::Lit(_)) => Some((s.to_string(), LinkEnd::Last)),
+                Expr::Lit(Lit::Str(s)) => Some((s.to_string(), LinkEnd::Open)),
                 _ => None,
             }
         }
@@ -12083,10 +12177,121 @@ fn link_start(e: &Expr) -> Option<(String, bool)> {
     }
 }
 
+/// The routes' paths as a tree of pieces (Q-1251, found in review): each node's routes that end
+/// there and that take the rest there, and its children by a written piece and by a parameter (one
+/// child for each prefix and type, so `/:lang/...` routes share it).
+#[derive(Default)]
+struct LinkNode {
+    lits: HashMap<String, usize, crate::value::BuildFx>,
+    params: Vec<(String, Option<String>, usize)>,
+    ends: Vec<usize>,
+    rests: Vec<usize>,
+}
+
+struct LinkTree {
+    nodes: Vec<LinkNode>,
+}
+
+impl LinkTree {
+    fn of(routes: &[&RouteDef]) -> LinkTree {
+        let mut nodes = vec![LinkNode::default()];
+        'routes: for (i, r) in routes.iter().enumerate() {
+            let mut at = 0;
+            for seg in &r.path {
+                let next = nodes.len();
+                at = match seg {
+                    Seg::Rest(_) => {
+                        nodes[at].rests.push(i);
+                        continue 'routes;
+                    }
+                    Seg::Lit(l) => *nodes[at].lits.entry(l.clone()).or_insert(next),
+                    Seg::Param(_, ty, prefix) => match nodes[at].params.iter().find(|(p, t, _)| p == prefix && t == ty) {
+                        Some((_, _, c)) => *c,
+                        None => {
+                            nodes[at].params.push((prefix.clone(), ty.clone(), next));
+                            next
+                        }
+                    },
+                };
+                if at == next {
+                    nodes.push(LinkNode::default());
+                }
+            }
+            nodes[at].ends.push(i);
+        }
+        LinkTree { nodes }
+    }
+
+    /// Calls `take` with each route that may take an address of these pieces (and, with `start`,
+    /// a piece starting so and anything after), until it says yes; whether it did. Read with a list
+    /// of what is left, not by recursion.
+    fn find<S: AsRef<str>>(&self, pieces: &[S], start: Option<&str>, last: bool, todo: &mut Vec<(usize, usize, bool)>, take: &mut dyn FnMut(usize) -> bool) -> bool {
+        todo.clear();
+        todo.push((0, 0, false));
+        while let Some((n, depth, below)) = todo.pop() {
+            let node = &self.nodes[n];
+            if node.rests.iter().any(|&i| take(i)) {
+                return true;
+            }
+            // Under a template's start: every route below.
+            if below {
+                if node.ends.iter().any(|&i| take(i)) {
+                    return true;
+                }
+                todo.extend(node.lits.values().map(|&c| (c, depth + 1, true)));
+                todo.extend(node.params.iter().map(|(_, _, c)| (*c, depth + 1, true)));
+                continue;
+            }
+            if depth == pieces.len() {
+                match start {
+                    None => {
+                        if node.ends.iter().any(|&i| take(i)) {
+                            return true;
+                        }
+                    }
+                    Some(st) => {
+                        let kids = node
+                            .lits
+                            .iter()
+                            .filter(|(k, _)| k.starts_with(st))
+                            .map(|(_, &c)| c)
+                            .chain(node.params.iter().filter(|(p, _, _)| st.starts_with(p.as_str()) || p.starts_with(st)).map(|(_, _, c)| *c));
+                        if last {
+                            // One piece more, ending the address: those that end there.
+                            for c in kids {
+                                let kid = &self.nodes[c];
+                                if kid.ends.iter().chain(kid.rests.iter()).any(|&i| take(i)) {
+                                    return true;
+                                }
+                            }
+                        } else {
+                            todo.extend(kids.map(|c| (c, depth + 1, true)));
+                        }
+                    }
+                }
+                continue;
+            }
+            let piece = pieces[depth].as_ref();
+            if let Some(&c) = node.lits.get(piece) {
+                todo.push((c, depth + 1, false));
+            }
+            for (prefix, ty, c) in &node.params {
+                let Some(v) = piece.strip_prefix(prefix.as_str()) else { continue };
+                if (v.is_empty() && !prefix.is_empty()) || ty.as_ref().is_some_and(|t| crate::interp::coerce(t, v).is_none()) {
+                    continue;
+                }
+                todo.push((*c, depth + 1, false));
+            }
+        }
+        false
+    }
+}
+
 /// Whether a route's path can take an address whose pieces are `pieces` (Q-1251): all of it, or,
 /// with `partial`, those and then a piece starting with `partial` and anything after, as the
-/// rest of a template may be. As `server::match_path` matches, a typed parameter by its type.
-fn link_fits<S: AsRef<str>>(def: &[Seg], pieces: &[S], partial: Option<&str>) -> bool {
+/// rest of a template may be (`last`: that piece ends the address). As `server::match_path`
+/// matches, a typed parameter by its type.
+fn link_fits<S: AsRef<str>>(def: &[Seg], pieces: &[S], partial: Option<&str>, last: bool) -> bool {
     for (i, seg) in def.iter().enumerate() {
         match (pieces.get(i).map(AsRef::as_ref), partial) {
             (Some(p), _) => match seg {
@@ -12105,16 +12310,19 @@ fn link_fits<S: AsRef<str>>(def: &[Seg], pieces: &[S], partial: Option<&str>) ->
             },
             // What the template gives from here on is not known: this piece starts with `start`.
             (None, Some(start)) => {
-                return match seg {
-                    Seg::Rest(_) => true,
+                let takes = match seg {
+                    Seg::Rest(_) => return true,
                     Seg::Lit(l) => l.starts_with(start),
                     Seg::Param(_, _, prefix) => start.starts_with(prefix.as_str()) || prefix.starts_with(start),
                 };
+                return takes && (!last || def.len() == i + 1 || matches!(def.get(i + 1), Some(Seg::Rest(_))));
             }
             (None, None) => return matches!(seg, Seg::Rest(_)),
         }
     }
-    def.len() == pieces.len() && partial.map_or(true, str::is_empty)
+    // A template's start after a `/` (`/todos/${id}`) is a piece of its own still (found in
+    // review).
+    def.len() == pieces.len() && partial.is_none()
 }
 
 /// How far an address is from a route's path, piece by piece (Q-1251): a literal by its edits, a
@@ -14022,7 +14230,7 @@ fn class_rules(order: &[Item], base: &Path, serves: bool, focus: &mut Vec<(Arc<s
         });
     }
     let own = sheets.len();
-    let mut files = program_files(base, &base.join("public"), usize::MAX, false, &|p| p.extension().is_some_and(|x| x == "css"));
+    let mut files = program_files(&base.join("public"), usize::MAX, false, &|p| p.extension().is_some_and(|x| x == "css"));
     files.sort();
     for p in files {
         // A regular file of a bounded size, as a program's own file is read: a style sheet that
@@ -14043,19 +14251,14 @@ fn class_rules(order: &[Item], base: &Path, serves: bool, focus: &mut Vec<(Arc<s
 }
 
 /// The files under `dir` that `keep` takes, as deep as eight folders and at most `most` of them,
-/// `hidden` leaving out folders named with a dot and node_modules. A folder that is a symbolic link
-/// is followed only to a place inside the program's folder `base` not yet read, and `dir` itself
-/// only when it is inside it: `files("site")` with `site -> ~/dev` read 4,096 files outside the
-/// program, and five links `site/sN -> .` took two minutes, 5^8 folders (found in review of
-/// FEEDBACK73.md's Q-1022; branch feedback72-81). A file that is a link is read as before. Read
-/// with a list of what is left, not by recursion.
-fn program_files(base: &Path, dir: &Path, most: usize, hidden: bool, keep: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
+/// `hidden` leaving out folders named with a dot and node_modules. What the server serves the check
+/// reads: `dir` and the folders in it are followed wherever their links point (`public ->
+/// ../shared/public`), each real folder once, so links to `.` or to each other end; five links
+/// `site/sN -> .` took two minutes, 5^8 folders, before (found in reviews of FEEDBACK73.md's Q-1022;
+/// branch feedback72-81). Read with a list of what is left, not by recursion.
+fn program_files(dir: &Path, most: usize, hidden: bool, keep: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let home = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
     let Ok(root) = dir.canonicalize() else { return out };
-    if !root.starts_with(&home) {
-        return out;
-    }
     let mut seen: HashSet<PathBuf> = HashSet::from([root.clone()]);
     let mut todo: Vec<(PathBuf, PathBuf, u32)> = vec![(dir.to_path_buf(), root, 0)];
     while let Some((at, real, depth)) = todo.pop() {
@@ -14080,8 +14283,8 @@ fn program_files(base: &Path, dir: &Path, most: usize, hidden: bool, keep: &dyn 
             }
             let inner = if ft.is_symlink() {
                 match p.canonicalize() {
-                    Ok(c) if c.starts_with(&home) => c,
-                    _ => continue,
+                    Ok(c) => c,
+                    Err(_) => continue,
                 }
             } else {
                 real.join(&name)
@@ -14136,10 +14339,12 @@ fn serves_pages(order: &[Item]) -> bool {
 /// styles `:focus-visible`: the keyboard then shows nothing of where it is, on every element
 /// (FEEDBACK72.md, Q-1019; branch feedback72-81). By file and line.
 fn focus_rings_removed(sheets: &[(Arc<str>, u32, String)]) -> Vec<(Arc<str>, u32)> {
-    if sheets.iter().any(|(_, _, t)| t.contains(":focus-visible")) {
+    if sheets.iter().any(|(_, _, t)| t.contains(":focus-visible")) || !sheets.iter().any(|(_, _, t)| t.contains(":focus")) {
         return Vec::new();
     }
-    let mut out = Vec::new();
+    // Each rule: its selectors, in lower case and trimmed, its declarations without spaces, and
+    // where it starts.
+    let mut rules: Vec<(Vec<String>, String, Arc<str>, u32)> = Vec::new();
     for (file, line, text) in sheets {
         if !text.contains(":focus") {
             continue;
@@ -14161,23 +14366,38 @@ fn focus_rings_removed(sheets: &[(Arc<str>, u32, String)]) -> Vec<(Arc<str>, u32
                     let selector = &src[boundary..i];
                     let body_end = src[i + 1..].find(['{', '}']).map_or(src.len(), |k| i + 1 + k);
                     let body: String = src[i + 1..body_end].chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
-                    let focus = selector.match_indices(":focus").any(|(k, _)| !selector[k + 6..].starts_with('-'));
-                    let none = |d: &str| d.strip_prefix("outline:").is_some_and(|v| matches!(v.trim_end_matches("!important"), "none" | "0" | "0px"));
-                    // A ring of its own in the same rule (a shadow, a border, an outline set again)
-                    // is a ring still (found in review).
-                    let ring = |d: &str| {
-                        !none(d) && !d.ends_with(":none") && !d.ends_with(":0") && (d.starts_with("box-shadow:") || d.starts_with("border") || d.starts_with("outline-offset:") || (d.starts_with("outline") && d.contains(':')))
-                    };
-                    let gone = body.split(';').any(none) && !body.split(';').any(ring);
-                    if focus && gone {
-                        let at = boundary + (selector.len() - selector.trim_start().len());
-                        out.push((file.clone(), line + src[..at].matches('\n').count() as u32));
-                    }
+                    let at = boundary + (selector.len() - selector.trim_start().len());
+                    let sels = selector.split(',').map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()).collect();
+                    rules.push((sels, body, file.clone(), line + src[..at].matches('\n').count() as u32));
                     boundary = i + 1;
                 }
                 '}' | ';' => boundary = i + 1,
                 _ => {}
             }
+        }
+    }
+    // Only for every element, or every element of a type (`:focus`, `*:focus`, `a:focus`): a class's,
+    // an id's, or one under `:focus-within` is a component's own look (found in review).
+    let global = |s: &str| {
+        s.strip_suffix(":focus").is_some_and(|el| el.is_empty() || el == "*" || el.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+    };
+    let none = |d: &str| d.strip_prefix("outline:").is_some_and(|v| matches!(v.trim_end_matches("!important"), "none" | "0" | "0px"));
+    // A ring of another kind, in any rule of that selector: a shadow, a border, an outline set
+    // again, a background or a colour (found in review).
+    let ring = |d: &str| {
+        !none(d)
+            && !d.ends_with(":none")
+            && !d.ends_with(":0")
+            && ["box-shadow:", "border", "outline", "background", "color:"].iter().any(|p| d.starts_with(p))
+    };
+    let mut out = Vec::new();
+    for (sels, body, file, line) in &rules {
+        if !body.split(';').any(none) {
+            continue;
+        }
+        let bare = sels.iter().filter(|s| global(s)).any(|s| !rules.iter().any(|(o, b, _, _)| o.contains(s) && b.split(';').any(ring)));
+        if bare {
+            out.push((file.clone(), *line));
         }
     }
     out
@@ -14330,7 +14550,7 @@ fn unstyled_classes(order: &[Item], base: &Path, rules: &[(String, String, u32)]
     // What the app's scripts and sheets say of classes they set themselves.
     let mut scripts = String::new();
     let mut elsewhere = Vec::new();
-    for p in program_files(base, &base.join("public"), usize::MAX, false, &|_| true) {
+    for p in program_files(&base.join("public"), usize::MAX, false, &|_| true) {
         let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
         let Ok(text) = crate::error::read_text(&p) else { continue };
         match ext {
@@ -14503,7 +14723,7 @@ fn unused_classes(order: &[Item], base: &Path, unparsed: &[String], serves: bool
     }
     // The app's own files under public/: its sheets, and what its scripts write. Only a program
     // that serves pages has them (FEEDBACK72.md, Q-1012; branch feedback72-81).
-    let mut public = if serves { program_files(base, &base.join("public"), usize::MAX, false, &|_| true) } else { Vec::new() };
+    let mut public = if serves { program_files(&base.join("public"), usize::MAX, false, &|_| true) } else { Vec::new() };
     public.sort();
     for p in public {
         let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
@@ -14516,17 +14736,21 @@ fn unused_classes(order: &[Item], base: &Path, unparsed: &[String], serves: bool
             _ => {}
         }
     }
-    // The pages and scripts of the other folders `files()` serves, as written (Q-1022): at most
-    // 4096 files of each, not in a folder named with a dot or node_modules.
+    // The pages of the other folders `files()` serves, and the scripts in them (Q-1022): at most
+    // 4096 files of each and 16 MB in all, not in a folder named with a dot or node_modules. Not
+    // their .js: an app's `dist` of 24 MB of bundles made each check read them all, 0.07G → 2.35G
+    // instructions (found in review).
     if !sheets.is_empty() {
-        for d in folders {
-            let found = program_files(base, &base.join(&d), 4096, true, &|p| p.extension().is_some_and(|x| x == "html" || x == "htm" || x == "js" || x == "mjs"));
-            for p in found {
-                let Ok(text) = crate::error::read_text(&p) else { continue };
-                match p.extension().and_then(|x| x.to_str()) {
-                    Some("js" | "mjs") => words(&text, &mut written),
-                    _ => html_classes(&text, &mut written),
+        let mut room: u64 = 16 << 20;
+        'folders: for d in folders {
+            for p in program_files(&base.join(&d), 4096, true, &|p| p.extension().is_some_and(|x| x == "html" || x == "htm")) {
+                let size = std::fs::metadata(&p).map_or(0, |m| m.len());
+                if size > room {
+                    break 'folders;
                 }
+                room -= size;
+                let Ok(text) = crate::error::read_text(&p) else { continue };
+                html_classes(&text, &mut written);
             }
         }
     }

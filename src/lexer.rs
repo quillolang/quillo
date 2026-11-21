@@ -241,6 +241,12 @@ impl Lexer {
         if NOT_VALUES.contains(&name.as_str()) || !VALUE_COMMENTS.with(|v| v.borrow().is_some()) {
             return;
         }
+        // A bare name: not a field's, `settings.timeout // 30` (found in review).
+        let end = self.chars[..start].iter().rposition(|c| !matches!(c, ' ' | '\t')).map_or(0, |i| i + 1);
+        let from = end.saturating_sub(name.chars().count());
+        if from > 0 && self.chars[from - 1] == '.' {
+            return;
+        }
         // Nor on a line that takes names from a file or a script (`use b  // two`).
         let from = self.chars[..start].iter().rposition(|c| *c == '\n').map_or(0, |i| i + 1);
         let first: String = self.chars[from..start].iter().skip_while(|c| matches!(c, ' ' | '\t')).take_while(|c| c.is_alphabetic()).collect();

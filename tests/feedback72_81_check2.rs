@@ -185,6 +185,35 @@ route GET / = <html><body><Go/><a href="/notes">notes</a></body></html>
             "5 warning: only `POST /api/orders` answers `/api/orders`, and a redirect is followed with GET, so it gets a 405",
         ],
     );
+    // A status not written as a number may keep the method: not said (found in review).
+    says("let code = 308\nroute POST /a = redirect(\"/api\", code)\nroute POST /api = \"ok\"\n", &[]);
+}
+
+// A template's start that ends in `/` has a piece of its own after it, `<base>` names no page, and
+// `.` and `..` are taken out as the browser does (found in review). (FEEDBACK79.md, Q-1251; branch
+// feedback72-81)
+#[test]
+fn q1251_a_templates_next_piece_base_and_dots() {
+    let src = r#"route POST /todos = "made"
+route POST /orders/:id(int)/paid = "paid"
+route GET /done/:id(int) = redirect(`/todos/${id}`)
+route GET /pay/:id(int) = redirect(`/orders/${id}`)
+route GET /c/:name = name
+route GET / = <html><head><base href="/app/"/></head><body>
+    <a href="/c/./x">dot</a>
+    <a href="/zz/../c/y">up</a>
+    <a href="/c/%2e%2e/c/z">encoded</a>
+    <a href="/c/x/y/..">up at the end</a>
+    <a href="/c/x/../..">up past it</a>
+</body></html>
+"#;
+    says(
+        src,
+        &[
+            "3 warning: no route answers `/todos/…`, so this redirect ends at a 404",
+            "4 warning: no route answers `/orders/…`, so this redirect ends at a 404",
+        ],
+    );
 }
 
 // A view's or component's `href` is a prop, which may be anything; an element's is a link.
@@ -217,6 +246,15 @@ fn q1251_many_routes_and_links() {
     assert_eq!(d.len(), 601, "{:?}", &d[..d.len().min(3)]);
     assert_eq!(d[0], "602 warning: no route answers `/r7x/1`, so this link is a 404 (did you mean `/r7/1`?)");
     assert_eq!(d.iter().filter(|m| m.starts_with("603 warning: no route answers `/x")).count(), 600, "{:?}", &d[..d.len().min(3)]);
+    // Routes that share their first piece, and routes that start with a parameter (found in
+    // review): each link meets only the routes of its own pieces.
+    let mut src = String::new();
+    for i in 0..300 {
+        src.push_str(&format!("route GET /app/r{}/:id(int) = id\nroute GET /:lang/p{} = lang\n", i, i));
+    }
+    let links: String = (0..1800).map(|i| format!("<a href=\"/app/r{}/{}\">a</a><a href=\"/en/p{}\">b</a>", i % 300, i, i % 300)).collect();
+    src.push_str(&format!("route GET / = <nav>{}<a href=\"/app/rx/1\">c</a></nav>\n", links));
+    assert_eq!(diags(&src), ["601 warning: no route answers `/app/rx/1`, so this link is a 404 (did you mean `/app/r0/1`?)"]);
 }
 
 // A route that takes the rest, a program's `redirect` of its own, a file of views, and a mounted
@@ -297,12 +335,13 @@ fn q1022_the_classes_public_pages_and_served_folders_write_are_written() {
     );
 }
 
-// A folder that is a link is followed only inside the program's folder, once: a link out of it
-// is not read, and links to `.` make no loop, under public/ and a folder `files()` serves alike.
+// What the server serves the check reads: a folder that is a link is followed wherever it points,
+// public/ itself too (a shared folder, a deploy link), each real folder once, so links to `.` end.
+// The test once said a link out of the program was not read (decided otherwise in review).
 // (FEEDBACK73.md, Q-1022, found in review; branch feedback72-81)
 #[cfg(unix)]
 #[test]
-fn q1022_links_to_folders_stay_inside_the_program() {
+fn q1022_links_to_folders_are_followed_once() {
     use std::os::unix::fs::symlink;
     let outside = App::new("q1022-outside", &[("page.html", "<p class=\"outside\">x</p>\n")]);
     let app = App::new(
@@ -311,7 +350,7 @@ fn q1022_links_to_folders_stay_inside_the_program() {
             ("main.qwe", "route GET /site/*path = files(\"site\", path)\nroute GET /loops/*path = files(\"loops\", path)\nroute GET /*path = files(\"public\", path)\n"),
             ("loops/page.html", "<p class=\"inside\">x</p>\n"),
             ("public/pub.html", "<p class=\"pub\">x</p>\n"),
-            ("public/style.css", ".outside { }\n.inside { }\n.pub { }\n"),
+            ("public/style.css", ".outside { }\n.inside { }\n.pub { }\n.lonely { }\n"),
         ],
     );
     symlink(&outside.0, app.0.join("site")).unwrap();
@@ -319,7 +358,36 @@ fn q1022_links_to_folders_stay_inside_the_program() {
     for i in 0..5 {
         symlink(".", app.0.join(format!("loops/s{}", i))).unwrap();
     }
-    assert_eq!(app.check("main.qwe"), ["public/style.css:1 warning: `.outside` is styled here, but nothing in the program writes it"]);
+    symlink("../loops", app.0.join("loops/back")).unwrap();
+    assert_eq!(app.check("main.qwe"), ["public/style.css:4 warning: `.lonely` is styled here, but nothing in the program writes it"]);
+    // public/ itself a link to a folder outside the program: its sheet is the program's, for the
+    // classes markup writes, those it styles and nothing writes, and the LSP's.
+    let shared = App::new("q1022-shared", &[("public/app.css", ".cards { }\n.lone { }\n")]);
+    let app = App::new(
+        "q1022-linked-public",
+        &[("main.qwe", "let theme = css`\n.card { padding: 1px; }\n`\nroute GET / = <html><head><style>{theme}</style><link rel=\"stylesheet\" href=\"/app.css\"/></head><body><div class=\"card\"><p class=\"cards\">hi</p></div></body></html>\nroute GET /app.css = file(\"public/app.css\")\n")],
+    );
+    symlink(shared.0.join("public"), app.0.join("public")).unwrap();
+    assert_eq!(app.check("main.qwe"), ["public/app.css:2 warning: `.lone` is styled here, but nothing in the program writes it"]);
+    let opts = Options { classes: true, ..Default::default() };
+    let hints: Vec<String> = check_file_opts(&app.0.join("main.qwe"), HashMap::new(), opts).diagnostics.iter().map(shown).collect();
+    assert_eq!(hints, Vec::<String>::new());
+}
+
+// A folder `files()` serves gives its pages' classes and their own scripts', not its bundles':
+// 24 MB of .js made each check read them all (found in review). (FEEDBACK73.md, Q-1022; branch
+// feedback72-81)
+#[test]
+fn q1022_a_served_folders_scripts_are_not_read() {
+    let app = App::new(
+        "q1022-dist",
+        &[
+            ("main.qwe", "let page_css = css`\n.shell { margin: 0; }\n.in-page { }\n.in-bundle { }\n`\nroute GET /x = <html><head><style>{page_css}</style></head><body><div class=\"shell\">x</div></body></html>\nroute GET /*path = files(\"dist\", path)\n"),
+            ("dist/index.html", "<div id=\"app\"></div><script>document.body.classList.add(\"in-page\")</script>\n"),
+            ("dist/assets/app.js", "el.classList.add(\"in-bundle\")\n"),
+        ],
+    );
+    assert_eq!(app.check("main.qwe"), ["main.qwe:4 warning: `.in-bundle` is styled here, but nothing in the program writes it"]);
 }
 
 // ---- Q-1016: `pages // 2` ------------------------------------------------------------------------
@@ -329,9 +397,26 @@ fn q1022_links_to_folders_stay_inside_the_program() {
 // do (decided in review). (FEEDBACK72.md, Q-1016; branch feedback72-81)
 #[test]
 fn q1016_a_comment_holding_a_number_or_a_name_after_a_name() {
-    let src = "let pages = 9\nlet half = pages // 2\nlet n = 3\nlet third = pages // n\nlet tenth = pages//10\nlet box = { count: 9 }\nlet c = box.count // 3\nprint(half, third, tenth, c, `${pages // 4}`)\n";
+    let src = "let pages = 9\nlet half = pages // 2\nlet n = 3\nlet third = pages // n\nlet tenth = pages//10\nfn share(total: int) {\n    let each = total // 4\n    return each\n}\nprint(half, third, tenth, share(8), `${pages // 4}`)\n";
     let w = |line: u32, word: &str| format!("{} warning: `//` starts a comment here, so `// {}` is left out: whole-number division is `floor(a / b)`", line, word);
-    says(src, &[&w(2, "2"), &w(4, "n"), &w(5, "10"), &w(7, "3"), &w(8, "4")]);
+    says(src, &[&w(2, "2"), &w(4, "n"), &w(5, "10"), &w(7, "4"), &w(10, "4")]);
+}
+
+// Only after a bare name bound to a number: not a field, a parameter of no known type, a function,
+// or a name of another type (found in review). (FEEDBACK72.md, Q-1016; branch feedback72-81)
+#[test]
+fn q1016_only_after_a_number() {
+    let src = r#"let settings = { timeout: 30, retries: 3 }
+let timeout = settings.timeout // 30
+fn tries(retries) = retries // 3
+fn price(x: int) -> int = x
+let amount = 5
+let shown = amount // price
+let label = "x"
+let named = label // 2
+print(timeout, tries(1), shown, named)
+"#;
+    says(src, &[]);
 }
 
 // What a line gives, written after it: after `)`, `]`, a string or a number, a decimal, and the
@@ -434,10 +519,12 @@ fn q1019_a_click_on_what_no_key_reaches_and_an_image_with_no_alt() {
         <img src="/logo.png"/>
         <li onclick={() => { sent = true }}>a</li>
         <h2 @click={() => { sent = true }}>b</h2>
+        <div class="backdrop" onclick={close}></div>
         {sent && <p>Welcome!</p>}
     </section>
 }
 route GET / = <html><body><Signup/></body></html>
+fn close() = null
 "#;
     says(
         src,
@@ -447,6 +534,7 @@ route GET / = <html><body><Signup/></body></html>
             "7 warning: this `<img>` has no `alt`: `alt=\"\"` if it is decoration, or words for what it shows",
             "8 warning: a `<li>` with onclick can't be reached with the keyboard: use a `<button>`",
             "9 warning: an `<h2>` with onclick can't be reached with the keyboard: use a `<button>`",
+            "10 warning: a `<div>` with onclick can't be reached with the keyboard: use a `<button>`",
         ],
     );
 }
@@ -457,6 +545,9 @@ fn q1019_what_a_keyboard_or_a_reader_reaches_is_left_alone() {
     let src = r#"component Box() {
     state n = 0
     state shade = null
+    fn pick(e) {
+        n = len(str(e))
+    }
     <section>
         <button onclick={() => { n += 1 }}>a</button>
         <a href="/" onclick={() => { n += 1 }}>b</a>
@@ -476,6 +567,10 @@ fn q1019_what_a_keyboard_or_a_reader_reaches_is_left_alone() {
         <div onkeydown={(e) => { if e.key == "Escape" { n = 0 } }}><div class="shade" onclick={() => { n = 0 }}></div></div>
         <table tabindex="0"><tr onclick={() => { n += 1 }}><td>row</td></tr></table>
         <div role="listbox">{n > 0 && <span onclick={() => { n = 1 }}>opt</span>}</div>
+        <ul onclick={pick}><li><button>a</button></li></ul>
+        <ul onclick={(e) => pick(e)}><li>c</li></ul>
+        <table><tr onclick={() => { n += 1 }}><td><a href="/">x</a></td></tr></table>
+        <div onclick={() => { n += 1 }}>{for i in [1, 2] => <input value={str(i)}/>}</div>
         <p>{n}</p>
     </section>
 }
@@ -489,22 +584,29 @@ route GET / = <html><body><Box/></body></html>
 fn q1019_a_sheet_that_takes_the_focus_ring_away() {
     let page = "route GET / = <html><head><link rel=\"stylesheet\" href=\"/s.css\"/></head><body><button.b>a</button></body></html>\nroute GET /*path = files(\"public\", path)\n";
     let ring = "warning: `outline: none` on `:focus` takes the keyboard's ring away everywhere: style `:focus-visible` instead";
-    let app = App::new("q1019-ring", &[("main.qwe", page), ("public/s.css", ".b { color: red }\n/* :focus { outline: none } */\n\nbutton:focus,\n  a:focus { outline: none; }\n:focus-within { outline: 0 }\n@media (min-width: 1px) { .b:focus { OUTLINE: 0 !important } }\n")]);
-    assert_eq!(app.check("main.qwe"), [format!("public/s.css:4 {}", ring), format!("public/s.css:7 {}", ring)]);
+    let app = App::new(
+        "q1019-ring",
+        &[("main.qwe", page), ("public/s.css", ".b { color: red }\n/* :focus { outline: none } */\n\nbutton:focus,\n  a:focus { outline: none; }\n:focus-within { outline: 0 }\n@media (min-width: 1px) { *:focus { OUTLINE: 0 !important } }\n:focus { outline: none }\n")],
+    );
+    assert_eq!(app.check("main.qwe"), [format!("public/s.css:4 {}", ring), format!("public/s.css:7 {}", ring), format!("public/s.css:8 {}", ring)]);
     // A `:focus-visible` rule anywhere: the ring is shown where the keyboard is.
-    let app = App::new("q1019-visible", &[("main.qwe", page), ("public/s.css", ".b { color: red }\n.b:focus { outline: none }\n"), ("public/t.css", ".b:focus-visible { outline: 2px solid }\n")]);
+    let app = App::new("q1019-visible", &[("main.qwe", page), ("public/s.css", ".b { color: red }\nbutton:focus { outline: none }\n"), ("public/t.css", ".b:focus-visible { outline: 2px solid }\n")]);
     assert_eq!(app.check("main.qwe"), Vec::<String>::new());
     // And in the program's own sheet, at its line.
-    let src = "let s = css`\n.b { color: red }\n.b:focus { outline: 0px }\n`\nroute GET / = <html><head><style>{s}</style></head><body><button.b>a</button></body></html>\n";
+    let src = "let s = css`\n.b { color: red }\nbutton:focus { outline: 0px }\n`\nroute GET / = <html><head><style>{s}</style></head><body><button.b>a</button></body></html>\n";
     let app = App::new("q1019-own", &[("main.qwe", src)]);
     assert_eq!(app.check("main.qwe"), [format!("main.qwe:3 {}", ring)]);
-    // A ring of the rule's own in place of the outline (found in review); `box-shadow: none` is
-    // none.
-    let sheet = ".b { color: red }\nbutton:focus { outline: none; box-shadow: 0 0 0 3px gold }\na:focus { outline: 0; border: 2px solid }\ninput:focus { outline: none; outline-offset: 2px }\nselect:focus { outline: none; box-shadow: none }\n";
+    // A ring of another kind for that selector, in the rule or in another (found in review);
+    // `box-shadow: none` is none.
+    let sheet = ".b { color: red }\nbutton:focus { outline: none; box-shadow: 0 0 0 3px gold }\na:focus { outline: 0; border: 2px solid }\ninput:focus { outline: none; outline-offset: 2px }\nselect:focus { outline: none; box-shadow: none }\ntextarea:focus { outline: none }\ntextarea:focus { background: #eef }\nsummary:focus { outline: none; color: navy }\n";
     let app = App::new("q1019-replaced", &[("main.qwe", page), ("public/s.css", sheet)]);
     assert_eq!(app.check("main.qwe"), [format!("public/s.css:5 {}", ring)]);
+    // A class's, an id's or one under `:focus-within` is a component's own look (found in review).
+    let sheet = ".b { color: red }\n.b:focus-within { box-shadow: 0 0 0 3px blue }\n.b input:focus { outline: none }\n.b:focus { outline: none }\n#main:focus { outline: none }\na.b:focus { outline: none }\n";
+    let app = App::new("q1019-component", &[("main.qwe", page), ("public/s.css", sheet)]);
+    assert_eq!(app.check("main.qwe"), Vec::<String>::new());
     // A script kept beside the app is not told of the app's sheets.
-    let app = App::new("q1019-script", &[("tool.qwe", "print(1)\n"), ("public/s.css", ".b:focus { outline: none }\n")]);
+    let app = App::new("q1019-script", &[("tool.qwe", "print(1)\n"), ("public/s.css", ":focus { outline: none }\n")]);
     assert_eq!(app.check("tool.qwe"), Vec::<String>::new());
 }
 
@@ -618,13 +720,16 @@ component Box() {
 }
 route GET / = layout(<div>{action("a", null)}<Box/></div>)
 route GET /own = <html><body><button onclick={() => { n += 1 }} ondblclick={() => { n = 0 }}>{n}</button></body></html>
+route GET /div = <html><body><div onclick={() => { n += 1 }}>{n}</div></body></html>
 "#;
+    // The `<div>`'s: only that it never runs, not also that no key reaches it (found in review).
     says(
         src,
         &[
             "2 warning: `onclick` in `layout` never runs: `layout` makes markup for the page of `GET /` (t.qwe:8), on the server, and only a component's handlers reach the browser: put it in a component",
             "9 warning: `onclick` here never runs: the page of `GET /own` is made on the server, and only a component's handlers reach the browser: put this markup in a component",
             "9 warning: `ondblclick` here never runs: the page of `GET /own` is made on the server, and only a component's handlers reach the browser: put this markup in a component",
+            "10 warning: `onclick` here never runs: the page of `GET /div` is made on the server, and only a component's handlers reach the browser: put this markup in a component",
         ],
     );
 }
