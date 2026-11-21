@@ -251,3 +251,41 @@ fn a_typed_parameter_is_checked_and_a_component_is_refused() {
     let (ok, out) = run("component", "component Tag(p) {\n    return <b>{p}</b>\n}\nprint(map([1], Tag))\n");
     assert!(!ok && out.contains("`Tag` is a component, which the page runs from its tag"), "{}", out);
 }
+
+/// What each check says, as `file:line message`.
+fn said(a: &Analysis) -> Vec<String> {
+    a.diagnostics.iter().map(|d| format!("{}:{} {}", Path::new(&d.file).file_name().unwrap().to_string_lossy(), d.line, d.message)).collect()
+}
+
+// Q-1016's `//` warning reads a local's type from the scopes' names, which a plain check gathered
+// no more: `total // 4` on a parameter went unsaid, and a local shadowing a top-level number was
+// taken for it (found in review of this fix). They are gathered where a file has such a comment.
+#[test]
+fn a_plain_check_says_the_comment_warnings_an_editors_does() {
+    let comment = "`//` starts a comment here, so `// 4` is left out";
+    for (name, src, warned) in [
+        ("param", "fn share(total: int) {\n    let each = total // 4\n    return each\n}\nprint(share(8))\n", true),
+        ("local", "fn share() {\n    let n = 8\n    let each = n // 4\n    return each\n}\nprint(share())\n", true),
+        ("shadow", "let n = 3\nfn f(n: str) {\n    let x = n // 4\n    return x\n}\nprint(f(\"a\"))\n", false),
+        ("untyped", "fn tries(retries) {\n    return retries // 4\n}\nprint(tries(1))\n", false),
+    ] {
+        let d = Dir::new(name, &[("main.qwe", src)]);
+        let editor = check_file_opts(&d.main(), Default::default(), Options::default());
+        let plain = check_file_opts(&d.main(), Default::default(), Options::plain());
+        assert_eq!(said(&editor), said(&plain), "{}", src);
+        assert_eq!(said(&plain).iter().any(|m| m.contains(comment)), warned, "{}: {:#?}", name, said(&plain));
+        // Still no references in the plain one.
+        assert!(plain.references.is_empty());
+    }
+    // A mounted file is checked on its own, by a plain sub-check, for the editor too.
+    let d = Dir::new("mounted", &[
+        ("main.qwe", "mount /b = \"b.qwe\"\nroute GET / = \"app\"\n"),
+        ("b.qwe", "fn share(total: int) {\n    let each = total // 4\n    return each\n}\nroute GET / = str(share(8))\n"),
+    ]);
+    for opts in [Options::default(), Options::plain()] {
+        let a = check_file_opts(&d.main(), Default::default(), opts);
+        assert!(said(&a).iter().any(|m| m.starts_with("b.qwe:2 ") && m.contains(comment)), "{:#?}", said(&a));
+    }
+    let (ok, out) = quillo_in(&d.0, "check");
+    assert!(ok && out.contains("b.qwe:2: warning: `//` starts a comment here, so `// 4` is left out"), "{}", out);
+}

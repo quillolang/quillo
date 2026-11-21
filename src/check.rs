@@ -2412,7 +2412,8 @@ pub struct Options {
     /// feedback75).
     pub time: Option<std::time::Duration>,
     /// Also gather each use of a name and the scopes' names, with their hover text, which only an
-    /// editor reads (`quillo lsp`): on unless turned off (`Options::plain`), as `quillo check`,
+    /// editor reads (`quillo lsp`; the scopes' names are gathered anyway in a program with a `//`
+    /// right after a value, for Q-1016's warning): on unless turned off (`Options::plain`), as `quillo check`,
     /// `quillo run`, `quillo mcp`, `quillo fix` and `check_program` do. Making the text was a
     /// sixth of a check of quillolang.org's site (the 0.8.10 release benchmark found `quillo check`
     /// 2.2% slower than 0.8.9's; branch feedback72-81).
@@ -4829,7 +4830,10 @@ impl Checker {
         if let Some(scope) = popped {
             for (name, v) in scope {
                 // Quillo's own names (`__request`) are no editor's to offer (FEEDBACK47.md, Q-535).
-                if self.quiet == 0 && self.references && !name.starts_with("__") {
+                // Also for Q-1016's `//` warning, which reads a local's type here, where a file has
+                // such a comment (`value_comments_said`; found in review of the 0.8.10 release
+                // benchmark's fix; branch feedback72-81).
+                if self.quiet == 0 && (self.references || !self.value_comments.is_empty()) && !name.starts_with("__") {
                     let detail = var_detail(&name, &v);
                     let (file, line, end) = (v.file.to_string(), v.line, self.line.max(v.line));
                     let statement = matches!(v.kind, Kind::Let | Kind::State);
