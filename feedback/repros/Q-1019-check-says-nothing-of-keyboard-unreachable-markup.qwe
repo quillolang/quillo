@@ -1,0 +1,24 @@
+// Q-1019 `quillo check` says nothing of markup a keyboard can't reach: `onclick` on a `div` or a `span`, and an `<img>` with no `alt`
+// mode: check
+// open-when: /ok \(1 route, 0 functions, 1 component\)\s*$/
+// fixed-when: /:18: warning/
+// fixed-when: /:19: warning/
+// fixed-when: /:20: warning/
+// From FEEDBACK72.md §Q-1019 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). Wanted: a
+// warning for the `<span>` and the `<div>` with onclick (lines 18, 19) and the `<img>`
+// with no `alt` (line 20).
+
+// A sign-up form that a keyboard can't finish, to see what quillo check says.
+component Signup() {
+    state agreed = false
+    state sent = false
+    <section>
+        <input name="name" placeholder="Your name"/>
+        <input name="email" placeholder="Email"/>
+        <span class={{ box: true, on: agreed }} onclick={() => { agreed = !agreed }}></span> I agree to the rules
+        <div class="next" onclick={() => { sent = agreed }}>Join</div>
+        <img src="/logo.png"/>
+        {sent && <p>Welcome!</p>}
+    </section>
+}
+route GET / = <html><body><Signup/></body></html>

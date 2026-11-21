@@ -1,0 +1,11 @@
+// Q-1021 `date.format` with a locale it has no data for gives English without a warning; `format_number` and `money.format` warn
+// mode: run
+// fixed-when: /warning: [^\n]*"ja-JP"/
+// fixed-when: /warning: (?!no money)[^\n]*"xx-YY"/
+// From FEEDBACK73.md §Q-1021 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). Only the
+// money and number warning comes, for `format_number`'s "xx-YY".
+
+let d = date.parse("2026-11-17T09:10:06+09:00")
+print(date.format(d, { locale: "ja-JP", style: "full" }))   // Tuesday, November 17, 2026
+print(date.format(d, { locale: "xx-YY", style: "full" }))   // Tuesday, November 17, 2026
+print(format_number(1.5, "xx-YY", 1))                       // 1.5, with a warning

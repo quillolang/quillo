@@ -1,0 +1,11 @@
+// Q-1012 `quillo check` on a script warns about the classes in the folder's stylesheets
+// mode: cli
+// args: check tool.qwe
+// open-when: `.card` is styled here, but nothing in the program writes it
+// fixed-when: /tool.qwe: ok \(0 routes, 0 functions, 0 components\)\s*$/
+// From FEEDBACK72.md §Q-1012 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). This app
+// writes `.card` and checks clean; tool.qwe, a script beside it with no routes, is
+// warned of the app's class.
+
+route GET / = <html><head><link rel="stylesheet" href="/style.css"/></head><body><p.card>hi</p></body></html>
+route GET /*path = files("public", path)

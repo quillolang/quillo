@@ -1,0 +1,29 @@
+// Q-1018 An error dropped as the value of an `if` gets no warning from `quillo check`, though the run says "an error no statement took"
+// mode: check
+// open-when: ok (0 routes, 4 functions, 0 components), 1 warning
+// fixed-when: /:18: warning/
+// fixed-when: /:23: warning/
+// From FEEDBACK72.md §Q-1018 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). Line 13 is
+// warned of; lines 18 and 23 are not, and `quillo run` reports all three.
+
+// An error value dropped three ways, to see which quillo check says.
+fn save(n: int) -> int ! str { if n < 0 { return err("negative") }; n }
+
+fn a(n: int) {
+    save(n)                         // a statement on its own
+    print("a done")
+}
+
+fn b(n: int) {
+    if n != 0 { save(n) }           // the value of an if, which nothing takes
+    print("b done")
+}
+
+fn c(n: int) {
+    let f = () => { if n != 0 { save(n) }; print("c done") }
+    f()
+}
+
+a(-1)
+b(-1)
+c(-1)

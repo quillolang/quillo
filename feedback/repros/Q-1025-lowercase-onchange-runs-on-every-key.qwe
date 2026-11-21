@@ -1,0 +1,24 @@
+// Q-1025 A lowercase `onchange` on a text input runs on every keystroke, as React's `onChange` does, not when the field is left as HTML's does (the same as Q-1270)
+// mode: browser
+// page: /
+// probe: const sleep = (ms) => new Promise((r) => setTimeout(r, ms)); const out = () => document.querySelector("#out").textContent; for (const id of ["a", "b", "c"]) { const el = document.getElementById(id); el.focus(); for (const v of ["x", "xy", "xyz"]) { el.value = v; el.dispatchEvent(new Event("input", { bubbles: true })); await sleep(100); } } await sleep(300); const typed = out(); for (const id of ["a", "b", "c"]) document.getElementById(id).dispatchEvent(new Event("change", { bubbles: true })); await sleep(300); return { typed, left: out() }
+// open-when: "typed": "3 0 3"
+// fixed-when: "typed": "0 0 3"
+// fixed-when: "left": "1 1 3"
+// From FEEDBACK73.md §Q-1025 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). Three keys
+// in each box, then each left: `onchange` counts every key as `oninput` does; `@change`
+// counts once, as HTML's `onchange` would. FEEDBACK81's Q-1270 is the same issue.
+
+// onchange, @change and oninput, side by side.
+component Box() {
+    state a = 0
+    state b = 0
+    state c = 0
+    <section>
+        <input id="a" onchange={() => { a += 1 }}/>
+        <input id="b" @change={() => { b += 1 }}/>
+        <input id="c" oninput={() => { c += 1 }}/>
+        <p id="out">{a} {b} {c}</p>
+    </section>
+}
+route GET / = <html><body><Box/></body></html>

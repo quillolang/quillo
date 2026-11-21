@@ -1,0 +1,11 @@
+// Q-1023 The REPL prints nothing for an expression whose value is null, and the guide says it "prints each expression's value"
+// mode: script
+// script: steps.sh
+// open-when: verdict: open
+// fixed-when: verdict: fixed
+// From FEEDBACK73.md §Q-1023 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). The REPL is
+// fed `p.age` (null), `p.name` and `p.age == null`; fixed when it prints the null, or when
+// the guide's REPL section (book/chapters/64-concurrency-and-reloading.md) says a null is
+// not printed. This file is not run: the REPL takes no program.
+
+let p = { name: "Rex" }

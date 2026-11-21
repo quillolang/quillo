@@ -1,0 +1,13 @@
+// Q-1017 A `<style>` built from a value with a plain template or `+` is CSS injection, and `quillo check` warns of the same in SQL but not here
+// mode: check
+// open-when: ok (3 routes, 0 functions, 0 components), 1 warning
+// fixed-when: /:12: warning/
+// fixed-when: /:13: warning/
+// From FEEDBACK72.md §Q-1017 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). Line 11's SQL
+// warning is the twin; lines 12 and 13 get none. A `style=` string is Q-1250.
+
+// Joining a value into SQL text, and into a <style>, to see what quillo check says of each.
+db.open(":memory:")
+route GET /a ? { id: str = "1" } = db.query(`select 1 where 1 = ${id}`)
+route GET /b ? { c: str = "red" } = <html><body><style>{`p { color: ${c} }`}</style><p>hi</p></body></html>
+route GET /c ? { c: str = "red" } = <html><body><style>{"p { color: " + c + " }"}</style><p>hi</p></body></html>

@@ -1,0 +1,20 @@
+// Q-1010 A component whose only events are scrolls misses a scroll that comes without a pointer, a touch, a focus or a key
+// mode: browser
+// page: /
+// probe: const box = document.querySelector("#box"); box.scrollTop = 1200; await new Promise((r) => setTimeout(r, 1500)); return { top: box.scrollTop, at: document.querySelector("#at").textContent }
+// open-when: "at": "scrolled to 0"
+// fixed-when: "at": "scrolled to 1200"
+// From FEEDBACK72.md §Q-1010 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). A script
+// moves the box (no pointer, touch, focus or key): the box is at 1200, the handler never
+// runs. With the wheel over the box, or `onmount={...}`, the code loads and it does.
+
+component Scroller() {
+    state at = 0
+    <section>
+        <div id="box" style="height: 100px; overflow-y: scroll" onscroll={(e) => { at = floor(e.target.scrollTop) }}>
+            <div style="height: 5000px">tall</div>
+        </div>
+        <p id="at">scrolled to {at}</p>
+    </section>
+}
+route GET / = <html><body><main><h1>A list</h1><Scroller/></main></body></html>

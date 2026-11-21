@@ -1,0 +1,25 @@
+// Q-1015 A random value in a component's body is drawn twice, and the browser's replaces the server's when the component wakes, silently in production
+// mode: script
+// script: steps.sh
+// open-when: /check: [^\n]*component\)\n[\s\S]*"same": false/
+// fixed-when: /check: [^\n]*warning|"same": true/
+// From FEEDBACK72.md §Q-1015 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). Without
+// --watch: the page shows the server's ticket, and once the raffle is pointed at, the
+// browser's own. Fixed when the two agree, or `quillo check` warns of it.
+
+fn new_ticket() -> int {
+    print("a ticket is drawn")
+    return random_int(1000, 9999)
+}
+
+component Raffle(name: str) {
+    let ticket = new_ticket()             // state ticket = new_ticket() keeps one
+    state prize = ""
+    <section.raffle>
+        <p>{name}'s ticket: <b>#{ticket}</b></p>
+        <button onclick={() => { prize = "a kite" }}>Draw a prize</button>
+        {prize != "" && <p>{prize}</p>}
+    </section>
+}
+
+route GET / = <html><body><main><h1>Lucky Draw</h1><Raffle name="Ada"/></main></body></html>

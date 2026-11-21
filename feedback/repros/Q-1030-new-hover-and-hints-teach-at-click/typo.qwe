@@ -1,0 +1,10 @@
+// A misspelt onclick, and a value={} on a field of a state.
+component F() {
+    state form = { name: "" }
+    state n = 0
+    <div>
+        <button onclik={() => { n += 1 }}>{n}</button>
+        <input value={form.name}/>
+    </div>
+}
+route GET / = <html><body><F/></body></html>

@@ -1,0 +1,22 @@
+// Q-1030 The guide writes `onclick` and `value={x}`, but `quillo new`, the hover and the hints still teach `@click` and `bind:value`
+// mode: script
+// script: steps.sh
+// open-when: /quillo new: \d/
+// open-when: Handlers: `@click
+// open-when: /hints:[\s\S]*@(click|clik|input)/
+// fixed-when: quillo new: none
+// fixed-when: Handlers: `onclick
+// fixed-when: /hints:(?![\s\S]*@(click|clik|input))/
+// From FEEDBACK72.md §Q-1030 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). What
+// `quillo new` writes (with and without --minimal), the `component` hover's text in the
+// binary (what `quillo lsp` shows), and four hints given for programs written with `on...`.
+
+// Plain event attributes, as the guide writes them: a handler written as an assignment.
+component Counter() {
+    state count = 0
+    <div>
+        <button onclick={count += 1}>+</button>
+        <p>{count}</p>
+    </div>
+}
+route GET / = <html><body><Counter/></body></html>

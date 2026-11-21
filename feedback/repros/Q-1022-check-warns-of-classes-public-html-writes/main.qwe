@@ -1,0 +1,9 @@
+// Q-1022 `quillo check` warns of classes that the HTML under `public/` writes
+// mode: check
+// open-when: `.hero` is styled here, but nothing in the program writes it
+// fixed-when: `.card` is styled here, but nothing in the program writes it
+// From FEEDBACK73.md §Q-1022 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). The
+// `.card` warning is right (nothing writes it); `.hero` is written by public/index.html.
+
+// A static site: the program serves public/, whose page writes .hero.
+route GET /*path = files("public", path)

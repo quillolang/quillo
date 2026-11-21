@@ -1,0 +1,20 @@
+// Q-1020 An event handler in a view placed in a page is dropped, and `quillo check` says ok
+// mode: script
+// script: steps.sh
+// open-when: /check: [^\n]*component\)\n[\s\S]*"view": "0"/
+// fixed-when: /check: [^\n]*warning|"view": "3"/
+// From FEEDBACK73.md §Q-1020 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). Each button
+// clicked three times: the view's stays at 0, the component's counts. Fixed when the view's
+// handler runs, or `quillo check` warns of it.
+
+// A view with a click handler, and a component with the same one.
+state likes = 0
+
+view LikeView() =
+    <button id="view" @click={() => { likes += 1 }}>{likes}</button>
+
+component LikeButton() {
+    <button id="component" @click={() => { likes += 1 }}>{likes}</button>
+}
+
+route GET / = <html><body><LikeView/><LikeButton/></body></html>

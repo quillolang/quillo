@@ -1,0 +1,19 @@
+// Q-1026 A page's runtime is about 3.3 times the size the guide gives ("about 35 KB, 11 KB gzipped", "minified"), and is not minified
+// mode: script
+// script: steps.sh
+// open-when: verdict: open
+// fixed-when: verdict: fixed
+// From FEEDBACK73.md §Q-1026 (found on 238dac2, 0.8.6: 132,544 B, 36,498 B gzip -9, 644
+// lines; open on 77ffcd0, 0.8.9). Fixed when the runtime of React's counter is within twice
+// the guide's 35 KB, or the guide (book/chapters/21-components.md) no longer says 35 KB.
+
+// The counter from React's docs, in Quillo.
+
+component Counter() {
+    state count = 0
+    <button onclick={() => { count += 1 }}>
+        Clicked {count} times
+    </button>
+}
+
+route GET / = <html><body><Counter/></body></html>

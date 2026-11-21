@@ -1,0 +1,11 @@
+// Q-1016 `pages // 2`, Python's whole-number division, is `pages` and a comment, and `quillo check` says ok
+// mode: check
+// open-when: /0 components\)\s*$/
+// fixed-when: /:10: warning/
+// From FEEDBACK72.md §Q-1016 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). `quillo run`
+// prints 7; the warning wanted is on line 10.
+
+// Halves: a Python habit.
+let pages = 7
+let half = pages // 2
+print(half)

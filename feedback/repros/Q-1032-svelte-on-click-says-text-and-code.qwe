@@ -1,0 +1,13 @@
+// Q-1032 Svelte's `on:click={...}` gets "takes only text written here, as the browser runs it as code", which does not say to write `onclick`
+// mode: check
+// open-when: `on:click` in <button> takes only text written here, as the browser runs it as code
+// fixed-when: /:11: error[^\n]*`onclick/
+// From FEEDBACK72.md §Q-1032 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). Refused,
+// rightly; the message should name the spelling to use, as `@mouseEnter`'s does.
+
+// Svelte's spelling of an event.
+component Pot() {
+    state n = 0
+    <button on:click={() => { n += 1 }}>{n}</button>
+}
+route GET / = <html><body><Pot/></body></html>

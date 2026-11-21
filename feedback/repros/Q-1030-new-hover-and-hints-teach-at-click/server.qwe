@@ -1,0 +1,11 @@
+// A server fn called in the markup of a component written with onclick.
+server fn total() -> int = 42
+
+component Counter() {
+    state count = 0
+    <div>
+        <button onclick={() => { count += 1 }}>+</button>
+        <p>{total()}</p>
+    </div>
+}
+route GET / = <html><body><Counter/></body></html>

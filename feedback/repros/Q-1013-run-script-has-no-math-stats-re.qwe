@@ -1,0 +1,24 @@
+// Q-1013 `run_script` has `date` but not `math`, `stats`, `re` or `format_number`, and calls what it left out (and `range`, left out on purpose) an unknown name
+// mode: run
+// open-when: math: err("line 1: unknown name `math`")
+// open-when: stats: err("line 1: unknown name `stats`")
+// open-when: re: err("line 1: unknown name `re`")
+// open-when: format_number: err("line 1: unknown name `format_number`")
+// fixed-when: math: 4.0
+// fixed-when: stats: 2.0
+// fixed-when: re: true
+// fixed-when: format_number: 1,234.50
+// From FEEDBACK72.md §Q-1013 (found on 238dac2, 0.8.6; open on 77ffcd0, 0.8.9). `range`
+// is shown too: left out on purpose, but said as a typo would be.
+
+// A spreadsheet's formulas: what a script has, and what it calls an unknown name.
+fn show(name, formula) {
+    print(name + ": " + str(run_script(formula, {})))
+}
+show("sqrt", "sqrt(16.0)")
+show("date", "date.add_days(\"2026-11-17\", 1)")
+show("math", "math.sqrt(16.0)")
+show("stats", "stats.mean([1, 2, 3])")
+show("re", "re.test(\"abc\", \"b\")")
+show("format_number", "format_number(1234.5, \"en-US\", 2)")
+show("range", "range(3)")
