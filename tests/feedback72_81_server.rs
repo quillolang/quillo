@@ -852,6 +852,10 @@ fn output(log: &Path) -> String {
 /// out removes. Gives the output and the folder seen while it ran (None without lsof).
 fn runs_without_a_port(p: &mut support::Guard, log: &Path, what: &str) -> Option<PathBuf> {
     says(p, log, what);
+    // Its own word too, which a program's `print("up")` at its top comes before by a few
+    // milliseconds: read at once after "up", the log could hold only that (seen in the coverage
+    // fixes of feedback72-81, on 85ebb05's binary as on this one; branch feedback72-81).
+    says(p, log, "8080 is taken");
     let said = output(log);
     assert!(said.contains("8080 is taken; this program serves nothing over HTTP, so it runs without a port (give --port for /_quillo/health)"), "{}", said);
     assert!(!said.contains("listening") && !said.contains("cannot listen"), "{}", said);

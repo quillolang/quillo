@@ -38,16 +38,27 @@ pub const VOID_TAGS: &[&str] =
 /// as they are written, Q-668), nor markup. A template made apart (a top-level `let`, a function)
 /// and given whole (`style={s}`) is the program's whole value (third review). In a loop, not by
 /// recursion.
+///
+/// What decides is no style text: an `if`'s or a `while`'s condition, a `match`'s subject and its
+/// guards, a comparison's sides and `!`'s, whose answer is true or false, and what is put together
+/// there (a template, a list, a branch); a guard comparing `${v}` with a visitor's text took the
+/// next arm inside a style, the first outside one. Nor a `reply`, whose status and body end the
+/// request and never reach the style: its body was written escaped as CSS, and the same reply
+/// before the markup sent the text as written. A value a decision hands on is still walked as a
+/// style's: a call's callee and arguments (a function may keep what it is given, for a name the
+/// style then gives), a block's statements, a lambda's or a fn's body, a `for` or a `while` loop's
+/// (FEEDBACK79.md, Q-1250, found by the coverage tests of feedback72-81; branch feedback72-81).
 fn style_values(v: &mut Expr, line: u32) {
     if matches!(v, Expr::Map(_)) {
         return;
     }
-    let mut todo = vec![v];
-    while let Some(e) = todo.pop() {
+    // Each expression, with whether it only decides.
+    let mut todo = vec![(v, false)];
+    while let Some((e, decides)) = todo.pop() {
         if css_tag(e) {
             continue;
         }
-        if let Expr::Template(parts) = e {
+        if let (Expr::Template(parts), false) = (&mut *e, decides) {
             for p in parts.iter_mut() {
                 if let TPart::Expr(x) = p {
                     css_leaves(x, line);
@@ -55,45 +66,58 @@ fn style_values(v: &mut Expr, line: u32) {
             }
         }
         match e {
-            Expr::Lit(_) | Expr::Ident(..) | Expr::Html(..) => {}
+            Expr::Lit(_) | Expr::Ident(..) | Expr::Html(..) | Expr::Reply(..) => {}
             Expr::Template(parts) => todo.extend(parts.iter_mut().filter_map(|p| match p {
-                TPart::Expr(x) => Some(x),
+                TPart::Expr(x) => Some((x, decides)),
                 TPart::Lit(_) => None,
             })),
-            Expr::List(xs) => todo.extend(xs.iter_mut()),
-            Expr::Map(kvs) => todo.extend(kvs.iter_mut().map(|(_, x)| x)),
-            Expr::Unary(_, a, _) | Expr::Field(a, _, _) | Expr::Try(a) => todo.push(&mut **a),
-            Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) | Expr::Pipe(a, b, _) | Expr::Index(a, b, _) | Expr::While(a, b, _) | Expr::For(_, a, b, _) => {
-                todo.push(&mut **a);
-                todo.push(&mut **b);
+            Expr::List(xs) => todo.extend(xs.iter_mut().map(|x| (x, decides))),
+            Expr::Map(kvs) => todo.extend(kvs.iter_mut().map(|(_, x)| (x, decides))),
+            Expr::Unary(UnOp::Not, a, _) => todo.push((&mut **a, true)),
+            Expr::Unary(_, a, _) | Expr::Field(a, _, _) | Expr::Try(a) => todo.push((&mut **a, decides)),
+            Expr::Binary(BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge, a, b, _) => {
+                todo.push((&mut **a, true));
+                todo.push((&mut **b, true));
+            }
+            Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) | Expr::Index(a, b, _) => {
+                todo.push((&mut **a, decides));
+                todo.push((&mut **b, decides));
+            }
+            Expr::Pipe(a, b, _) | Expr::For(_, a, b, _) => {
+                todo.push((&mut **a, false));
+                todo.push((&mut **b, false));
+            }
+            Expr::While(c, body, _) => {
+                todo.push((&mut **c, true));
+                todo.push((&mut **body, false));
             }
             Expr::Call(f, args, _) => {
-                todo.push(&mut **f);
-                todo.extend(args.iter_mut());
+                todo.push((&mut **f, false));
+                todo.extend(args.iter_mut().map(|x| (x, false)));
             }
             Expr::If(c, a, b) => {
-                todo.push(&mut **c);
-                todo.push(&mut **a);
+                todo.push((&mut **c, true));
+                todo.push((&mut **a, decides));
                 if let Some(b) = b {
-                    todo.push(&mut **b);
+                    todo.push((&mut **b, decides));
                 }
             }
             Expr::Match(x, arms, _) => {
-                todo.push(&mut **x);
+                todo.push((&mut **x, true));
                 for arm in arms.iter_mut() {
                     if let Some(g) = &mut arm.guard {
-                        todo.push(g);
+                        todo.push((g, true));
                     }
-                    todo.push(&mut arm.body);
+                    todo.push((&mut arm.body, decides));
                 }
             }
             Expr::Block(stmts) => {
                 for st in stmts.iter_mut() {
                     match st {
-                        Stmt::Let(_, x, _) | Stmt::Expr(x) | Stmt::Assign(_, _, x, _) | Stmt::State(_, x, _) | Stmt::Return(Some(x), _) => todo.push(x),
+                        Stmt::Let(_, x, _) | Stmt::Expr(x) | Stmt::Assign(_, _, x, _) | Stmt::State(_, x, _) | Stmt::Return(Some(x), _) => todo.push((x, false)),
                         Stmt::SetField(o, _, _, x, _) => {
-                            todo.push(o);
-                            todo.push(x);
+                            todo.push((o, false));
+                            todo.push((x, false));
                         }
                         // A fn declared in the block, its parameters' defaults and its body: a
                         // template there is style text too (`{ fn mk(x) = `color: ${x}`; mk(v) }`
@@ -102,8 +126,8 @@ fn style_values(v: &mut Expr, line: u32) {
                         // else holds it yet.
                         Stmt::Fn(d) => {
                             if let Some(FnDef { params, body, .. }) = Arc::get_mut(d) {
-                                todo.extend(params.iter_mut().filter_map(|p| p.default.as_mut()));
-                                todo.push(body);
+                                todo.extend(params.iter_mut().filter_map(|p| p.default.as_mut()).map(|x| (x, false)));
+                                todo.push((body, false));
                             }
                         }
                         _ => {}
@@ -114,14 +138,8 @@ fn style_values(v: &mut Expr, line: u32) {
             // as well as its body (`((x = `color: ${v}`) => x)()`; found verifying 10bf35a).
             Expr::Lambda(d) => {
                 if let Some(FnDef { params, body, .. }) = Arc::get_mut(d) {
-                    todo.extend(params.iter_mut().filter_map(|p| p.default.as_mut()));
-                    todo.push(body);
-                }
-            }
-            Expr::Reply(s, b, _) => {
-                todo.push(&mut **s);
-                if let Some(b) = b {
-                    todo.push(&mut **b);
+                    todo.extend(params.iter_mut().filter_map(|p| p.default.as_mut()).map(|x| (x, false)));
+                    todo.push((body, false));
                 }
             }
         }
@@ -1785,7 +1803,13 @@ impl Parser {
         let body = if self.eat(&Tok::Assign)? {
             self.measured(Self::parse_arrow_body)
         } else if self.at(&Tok::LBrace)? {
-            self.measured(Self::parse_block)
+            // A function's body, for a `state` in it: told as a function's, where it was told as a
+            // block's (FEEDBACK81.md, Q-1271, found by the coverage tests of feedback72-81; branch
+            // feedback72-81).
+            self.block_of = "fn";
+            let body = self.measured(Self::parse_block);
+            self.block_of = "";
+            body
         } else {
             self.styling = outer;
             return self.err_at(format!("expected `=` or `{{` to start the body of `{}`", name));
@@ -2940,6 +2964,13 @@ impl Parser {
     /// `fn f() = ...`. Here `{ x }` is a block giving `x`, as in
     /// JavaScript, not the map `{ x: x }`; `{ x, y }` and `{ x: 1 }` are maps.
     fn parse_arrow_body(&mut self) -> PResult<Expr> {
+        self.arrow_body_of("fn")
+    }
+
+    /// `parse_arrow_body` for the body of `what`, which a `state` in its braces is told against: a
+    /// function's, or a `match` arm's, which was told as a function's (FEEDBACK81.md, Q-1271, found
+    /// by the coverage tests of feedback72-81; branch feedback72-81).
+    fn arrow_body_of(&mut self, what: &'static str) -> PResult<Expr> {
         if self.at(&Tok::LBrace)? {
             let s = self.save();
             self.next()?;
@@ -2955,9 +2986,9 @@ impl Parser {
         // `() => n += 1`, `() => count = 0`: the assignment is the body, as in `() => { n += 1 }`,
         // and the arrow gives null (FEEDBACK45.md, Q-518; branch feedback40-43).
         let line = self.line()?;
-        // A body in braces is a function's, for a `state` in it (Q-1271).
+        // A body in braces is a function's, or an arm's, for a `state` in it (Q-1271).
         if self.at(&Tok::LBrace)? {
-            self.block_of = "fn";
+            self.block_of = what;
         }
         let e = self.parse_expr();
         self.block_of = "";
@@ -3045,6 +3076,9 @@ impl Parser {
             "for" => ("a `for`", "the `for`"),
             "while" => ("a `while`", "the `while`"),
             "fn" => ("a function", "the function"),
+            // A `match` arm's block (FEEDBACK81.md, Q-1271, found by the coverage tests of
+            // feedback72-81; branch feedback72-81).
+            "match" => ("a block", "the `match`"),
             _ => ("a block", "the block"),
         };
         Err(QuilloError::new(
@@ -3468,6 +3502,12 @@ impl Parser {
                         ),
                         other => other,
                     };
+                    // A script's own css`...` is text: given to `css` inside a block, which is no
+                    // tagged css`...` (`css_tag_arg`), so that its call makes no trusted CSS. Decided
+                    // here, where it is written, as the program's helpers a script calls make trusted
+                    // CSS as they do outside one (FEEDBACK79.md, Q-1250, found by the coverage tests
+                    // of feedback72-81; branch feedback72-81).
+                    let t = if &*k == "css" && crate::script::parsing_run() != 0 { Expr::Block(vec![Stmt::Expr(t)]) } else { t };
                     Ok(Expr::Call(Box::new(Expr::Ident(k.clone().into(), line)), vec![t], line))
                 }
                 _ => {
@@ -3705,7 +3745,7 @@ impl Parser {
                 }
             }
             self.expect(&Tok::FatArrow, "`=>` after the match pattern")?;
-            let body = self.parse_arrow_body()?;
+            let body = self.arrow_body_of("match")?;
             tested_once(&pat, &[&body].into_iter().chain(guard.iter()).collect::<Vec<_>>(), arm_line)?;
             arms.push(Arm { pat, guard, body, line: arm_line });
         }

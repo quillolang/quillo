@@ -257,8 +257,6 @@ pub fn run_script(it: &mut Interp, src: &str, vars: Option<&Map>) -> Result<Valu
 
 /// `run_script`, stopped after `ms` milliseconds (FEEDBACK75.md, Q-1055; branch feedback75).
 pub fn run_script_for(it: &mut Interp, src: &str, vars: Option<&Map>, ms: u64) -> Result<Value, Ctrl> {
-    // Its clock starts as it is read: a source near `--max-body` takes its time to parse.
-    let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     // Its world: the safe builtins, then its variables (`run_parsed`). Quillo's own, not what the
     // program's globals have by those names: a program's `fn upper` was the script's `upper`, run
     // with the program's effects (FEEDBACK51.md, Q-648; branch feedback51-fixes). Made first: its
@@ -266,6 +264,11 @@ pub fn run_script_for(it: &mut Interp, src: &str, vars: Option<&Map>, ms: u64) -
     // `parsing_run`; Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch
     // feedback72-81).
     let root = ROOT.with(Scope::root_copy);
+    // Its clock starts as it is read: a source near `--max-body` takes its time to parse. Not
+    // before its world is there: the first script on a thread paid for making the world, and every
+    // builtin Quillo has (`BUILTINS`), out of its own 100 ms (FEEDBACK75.md, Q-1055, found by the
+    // coverage tests of feedback72-81; branch feedback72-81).
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     // Names are kept for good, and this source may be a visitor's: its own are its own
     // (src/sym.rs), and messages say them as it wrote them.
     let (parsed, names) = {

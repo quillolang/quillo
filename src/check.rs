@@ -6922,11 +6922,16 @@ impl Checker {
                     }
                 } else if MODULES.contains(&n.as_str()) && builtin_effect(&n) & missing != 0 {
                     return Some(n);
-                } else if let Some((m, _)) = n.split_once('.') {
+                } else if let Some((m, f)) = n.split_once('.') {
                     let bit = if MODULES.contains(&m) {
                         builtin_effect(&n)
                     } else if (self.services.contains_key(m) || self.sites.contains(m)) && !d.params.iter().any(|p| p.name == m) {
                         crate::ast::effect_bit("http")
+                    } else if self.sql_var(m) == SqlVar::Conn && !d.params.iter().any(|p| p.name == m) {
+                        // A connection's call, named as `db`'s is, as `fn_effects` reads it
+                        // (FEEDBACK80.md, Q-1261, found by the coverage tests of feedback72-81;
+                        // branch feedback72-81).
+                        builtin_effect(&format!("db.{}", f))
                     } else {
                         0
                     };
@@ -11708,8 +11713,11 @@ impl Checker {
                 self.diag_at(file, line, Severity::Warning, format!("only `{} {}` answers `{}`, and {}, so it gets a 405", r.method, route_path(r), shown, asks));
                 continue;
             }
-            let most = (path.chars().count() / 4).clamp(1, 3);
-            let written = path.chars().filter(|c| *c != '/').count();
+            // Measured on the address as the browser asks for it, the pieces the match read: `/a/../b`,
+            // `/%62` and `/./b` are `/b`, which keeps nothing of `/` (FEEDBACK79.md, Q-1251, found by
+            // the coverage tests of feedback72-81; branch feedback72-81).
+            let written = pieces.iter().map(|p| p.chars().count()).sum::<usize>() + partial.as_deref().map_or(0, |p| p.chars().count());
+            let most = ((written + pieces.len() + usize::from(partial.is_some())) / 4).clamp(1, 3);
             // Routes of about as many pieces: first those of the same first piece, then of the same
             // first letter, then the rest, as far as the limits go.
             let n = pieces.len();
@@ -11900,12 +11908,14 @@ impl Checker {
             // What the page shows: the markup the body ends with, and each `let` it reads, or that
             // a `let` it reads reads (a value drawn and used only in a handler, or not at all,
             // changes nothing shown; found in review). A `let` reads only those before it, so one
-            // pass from the end finds them.
+            // pass from the end finds them. Markup given with `return` is the markup the body ends
+            // with too (FEEDBACK72.md, Q-1015, found by the coverage tests of feedback72-81; branch
+            // feedback72-81).
             let (lets, markup): (Vec<(&str, &Expr)>, Option<&Expr>) = match &c.body {
                 Expr::Block(stmts) => (
                     stmts.iter().filter_map(|s| if let Stmt::Let(Pattern::Bind(n), e, _) = s { Some((n.as_str(), e)) } else { None }).collect(),
                     match stmts.last() {
-                        Some(Stmt::Expr(e)) => Some(e),
+                        Some(Stmt::Expr(e) | Stmt::Return(Some(e), _)) => Some(e),
                         _ => None,
                     },
                 ),
@@ -12509,12 +12519,13 @@ fn page_marks_html(el: &HtmlEl, components: &HashSet<String>, params: &HashSet<S
     }
 }
 
-/// The tag of the element a view's body gives, when it ends with one.
+/// The tag of the element a view's body gives, when it ends with one, written bare or with `return`
+/// (FEEDBACK48.md, Q-573, found by the coverage tests of feedback72-81; branch feedback72-81).
 fn root_tag(body: &Expr) -> Option<&str> {
     match body {
         Expr::Html(el, _) => Some(el.tag.as_str()),
         Expr::Block(stmts) => match stmts.last() {
-            Some(Stmt::Expr(e)) => root_tag(e),
+            Some(Stmt::Expr(e) | Stmt::Return(Some(e), _)) => root_tag(e),
             _ => None,
         },
         _ => None,

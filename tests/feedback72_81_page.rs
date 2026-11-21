@@ -719,6 +719,77 @@ route GET / = <html><body><C/></body></html>
     assert_eq!(v["remade"], 0, "{}", v);
 }
 
+/// What decides in a style decides in the browser as on the server, and as outside a style: a
+/// `match` guard, a `? :`'s condition, a `match`'s subject and a comparison inside `&&`, each
+/// comparing `${v}` with the visitor's text; the values chosen stay one value each; a call in a
+/// condition still has its argument escaped (FEEDBACK79.md, Q-1250, found by the coverage tests of
+/// feedback72-81; branch feedback72-81).
+#[test]
+fn the_browser_decides_in_a_style_as_the_server_does() {
+    let src = r#"component C() {
+    state v = "red; background: blue"
+    state shown = false
+    let keep = (x) => x != ""
+    <div>
+        <section id="server">
+            <p style={match 1 {
+                n if `${v}` == "red; background: blue" => `top: 0; color: ${v}`
+                _ => "left: 0"
+            }}>1</p>
+            <p style={`${v}` == "red; background: blue" ? "top: 1px" : `color: ${v}`}>2</p>
+            <p style={match `${v}` {
+                "red; background: blue" => "top: 2px"
+                _ => `color: ${v}`
+            }}>3</p>
+            <p style={(`${v}` == "red; background: blue") && "top: 3px"}>4</p>
+            <p style={keep(`${v}`) ? `color: ${v}` : ""}>5</p>
+        </section>
+        <button id="t" onclick={() => { shown = true }}>t</button>
+        {shown ? <section id="browser">
+            <p style={match 1 {
+                n if `${v}` == "red; background: blue" => `top: 0; color: ${v}`
+                _ => "left: 0"
+            }}>1</p>
+            <p style={`${v}` == "red; background: blue" ? "top: 1px" : `color: ${v}`}>2</p>
+            <p style={match `${v}` {
+                "red; background: blue" => "top: 2px"
+                _ => `color: ${v}`
+            }}>3</p>
+            <p style={(`${v}` == "red; background: blue") && "top: 3px"}>4</p>
+            <p style={keep(`${v}`) ? `color: ${v}` : ""}>5</p>
+        </section> : null}
+    </div>
+}
+route GET / = <html><body><C/></body></html>
+"#;
+    let Some(v) = in_page(
+        "styles-decide",
+        src,
+        "/",
+        r#"const look = (sec) => [...$(sec).querySelectorAll("p")].map((e) => [e.getAttribute("style"), getComputedStyle(e).backgroundColor]);
+  const server = look("server");
+  $("t").click();
+  await tick(100);
+  return { server, browser: look("browser") };"#,
+        true,
+    ) else {
+        return;
+    };
+    let none = "rgba(0, 0, 0, 0)";
+    let one = r"color: red\3b  background: blue";
+    let want = serde_json::json!([
+        [format!("top: 0; {}", one), none],
+        ["top: 1px", none],
+        ["top: 2px", none],
+        ["top: 3px", none],
+        [one, none],
+    ]);
+    assert_eq!(v["server"], want, "{}", v);
+    assert_eq!(v["browser"], want, "{}", v);
+    assert_eq!(v["remade"], 0, "{}", v);
+    assert_eq!(v["errors"], serde_json::json!([]), "{}", v);
+}
+
 // ---- Q-1259: HTML's void names in an XML answer ---------------------------------------------
 
 /// An Atom feed's `<link href="..."/>` ends as XML has it; an RSS channel's `<link>` holds its

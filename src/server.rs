@@ -5972,12 +5972,21 @@ pub fn serve_portless(app: App, workers: usize) -> Result<(), String> {
     take_descriptors();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
         let name = format!("quillo-self-{}", crate::service::new_id(16));
         let mine = [std::env::temp_dir(), std::path::PathBuf::from("/tmp")].into_iter().find_map(|base| {
             let dir = base.join(&name);
             let own = dir.join("self.sock");
             if own.as_os_str().len() > 100 || std::fs::DirBuilder::new().mode(0o700).create(&dir).is_err() {
+                return None;
+            }
+            // Its owner's alone whatever the umask, which took from the mode it was made with: under
+            // `umask 777` a folder of mode 000 its socket could not be made in, nor the folder
+            // removed, was left in the temporary folder at each start (FEEDBACK72.md, Q-1011, found
+            // by the coverage tests of feedback72-81; branch feedback72-81). Set on the folder this
+            // call made, under a name no one can guess.
+            if std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).is_err() {
+                let _ = std::fs::remove_dir(&dir);
                 return None;
             }
             match unix_listener(&own, 0o600) {

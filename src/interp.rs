@@ -4659,10 +4659,14 @@ impl Interp {
                 Value::Dec(d) => Ok(Value::Dec(d.neg())),
                 o => fail(line, format!("cannot negate {}", o.type_name())),
             },
-            // A component's `style` the parser marked: trusted CSS; text in a script, where
-            // nothing trusted is made (FEEDBACK79.md, Q-1250, the user's decision; branch feedback72-81).
+            // A component's `style` the parser marked: trusted CSS (FEEDBACK79.md, Q-1250, the
+            // user's decision; branch feedback72-81). The program's wherever it runs: markup, and
+            // so this mark, is never a script's (`script::forbidden`), and the program's helper a
+            // script calls made it text, which its component then escaped again (`\5c 3b`) where
+            // the same call outside a script wrote it once (found by the coverage tests of
+            // feedback72-81; branch feedback72-81).
             UnOp::Css => Ok(match v {
-                Value::Str(s) if self.fuel == u64::MAX => Value::Css(s),
+                Value::Str(s) => Value::Css(s),
                 v => v,
             }),
         }
@@ -5586,13 +5590,16 @@ impl Interp {
     }
 
     /// `css(x)` by that name: css`...` as the parser writes it, the builtin's (`parser::css_tag_arg`),
-    /// makes trusted CSS; any other call is made as any call is. Not in a script, whose css`...` is
-    /// text, so that nothing trusted leaves it (FEEDBACK79.md, Q-1250, the user's decision; branch
-    /// feedback72-81).
+    /// makes trusted CSS; any other call is made as any call is (FEEDBACK79.md, Q-1250, the user's
+    /// decision; branch feedback72-81). Decided by where it is written, not by whether a script
+    /// runs: a script's own css`...` the parser writes as text (a tagged template in
+    /// `parse_primary`), and the program's helper a script calls makes trusted CSS as it does
+    /// outside one, where it made text that its component escaped again (found by the coverage
+    /// tests of feedback72-81; branch feedback72-81).
     #[inline(never)]
     #[cold]
     fn css_tagged(&mut self, callee: &Expr, args: &[Expr], env: &Env, line: u32) -> Result<Value, Ctrl> {
-        if self.fuel == u64::MAX && crate::parser::css_tag_arg(&args[0]) {
+        if crate::parser::css_tag_arg(&args[0]) {
             let f = self.eval(callee, env)?;
             if matches!(f, Value::Builtin("css", _)) {
                 let v = self.eval(&args[0], env)?;

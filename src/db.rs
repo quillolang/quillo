@@ -1186,6 +1186,10 @@ pub(crate) fn tenants_ready(it: &mut Interp) -> Option<bool> {
 /// writable, or not there with the nearest folder above it writable (FEEDBACK79.md, Q-1254; branch
 /// feedback72-81).
 fn tenants_folder_ready(base: &Path, template: &str) -> bool {
+    // No base folder is the working folder, where a tenant's file is made (`Interp::new("")`); it
+    // was looked for as "", which is none, and ready said down (FEEDBACK79.md, Q-1254, found by the
+    // coverage tests of feedback72-81; branch feedback72-81).
+    let base = if base.as_os_str().is_empty() { Path::new(".") } else { base };
     let full = if Path::new(template).is_absolute() { Path::new(template).to_path_buf() } else { base.join(template) };
     let full = full.to_string_lossy().into_owned();
     let before = full.split_once("{tenant}").map_or(full.as_str(), |(b, _)| b);
@@ -1199,6 +1203,8 @@ fn tenants_folder_ready(base: &Path, template: &str) -> bool {
             Ok(m) => return m.is_dir() && writable(at),
             Err(_) => match at.parent() {
                 Some(p) if !p.as_os_str().is_empty() => at = p,
+                // A relative path's first folder, not there yet, is made in the working folder.
+                Some(_) if at != Path::new(".") => at = Path::new("."),
                 _ => return false,
             },
         }
@@ -1229,8 +1235,13 @@ enum Reach {
     Unix(std::path::PathBuf),
 }
 
-fn server_reach(url: &str) -> Option<Reach> {
-    let (scheme, rest) = url.split_once("://")?;
+/// `Reach` of a server's URL. Err for a URL the driver would not read, saying why: an IPv6 host with no `]` closing it, or
+/// something after it, a port that is no number, written after a host or as `?port=`. Each was
+/// taken for none, or for the default port: ready said "ready (per tenant)" without asking anyone,
+/// or asked 5432 (FEEDBACK79.md, Q-1254, found by the coverage tests of feedback72-81; branch
+/// feedback72-81).
+fn server_reach(url: &str) -> Result<Option<Reach>, String> {
+    let Some((scheme, rest)) = url.split_once("://") else { return Ok(None) };
     let pg = scheme.starts_with("postgres");
     let param = |name: &str| {
         rest.split_once('?')
@@ -1239,30 +1250,49 @@ fn server_reach(url: &str) -> Option<Reach> {
             .filter(|v| !v.is_empty())
     };
     if let (false, Some(socket)) = (pg, param("socket")) {
-        return Some(Reach::Unix(socket.into()));
+        return Ok(Some(Reach::Unix(socket.into())));
     }
-    let auth = rest.split(['/', '?']).next()?;
+    let auth = rest.split(['/', '?']).next().unwrap_or("");
     let hosts = auth.rsplit_once('@').map_or(auth, |(_, h)| h);
-    let first = hosts.split(',').next()?;
     let default = if pg { 5432 } else { 3306 };
-    let (host, port) = match first.strip_prefix('[') {
-        Some(v6) => {
-            let (h, p) = v6.split_once(']')?;
-            (h, p.strip_prefix(':'))
+    // A port as the driver reads one: none, or empty, is the default; any other a number.
+    let number = |p: &str| -> Result<Option<u16>, String> {
+        let p = crate::server::percent_decode(p, false);
+        if p.is_empty() {
+            return Ok(None);
         }
-        None => match first.rsplit_once(':') {
-            Some((h, p)) => (h, Some(p)),
-            None => (first, None),
-        },
+        p.parse().map(Some).map_err(|_| "a port in the URL is not a number from 0 to 65535".to_string())
     };
-    let port = port.and_then(|p| p.parse().ok()).or_else(|| param("port").and_then(|p| p.parse().ok())).unwrap_or(default);
-    let host = Some(crate::server::percent_decode(host, false)).filter(|h| !h.is_empty()).or_else(|| param("host"))?;
+    // Each host the URL names, as the driver reads them all; the first is asked.
+    let mut first = None;
+    for chunk in hosts.split(',') {
+        let (host, port) = match chunk.strip_prefix('[') {
+            Some(v6) => {
+                let (h, p) = v6.split_once(']').ok_or("an IPv6 host in the URL has no `]` closing it")?;
+                match p.strip_prefix(':') {
+                    Some(p) => (h, Some(p)),
+                    None if p.is_empty() => (h, None),
+                    None => return Err("an IPv6 host in the URL is followed by something other than `:` and its port".into()),
+                }
+            }
+            None => match chunk.rsplit_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (chunk, None),
+            },
+        };
+        let port = port.map(number).transpose()?.flatten();
+        first.get_or_insert((host, port));
+    }
+    let (host, port) = first.unwrap_or(("", None));
+    let given = param("port").map(|p| number(&p)).transpose()?.flatten();
+    let port = port.or(given).unwrap_or(default);
+    let Some(host) = Some(crate::server::percent_decode(host, false)).filter(|h| !h.is_empty()).or_else(|| param("host")) else { return Ok(None) };
     // A folder: PostgreSQL's socket in it, as libpq names it (FEEDBACK79.md, Q-1254, found in
     // review: it was dialed as a host name, and ready said down; branch feedback72-81).
     if host.starts_with('/') {
-        return Some(Reach::Unix(if pg { Path::new(&host).join(format!(".s.PGSQL.{}", port)) } else { host.into() }));
+        return Ok(Some(Reach::Unix(if pg { Path::new(&host).join(format!(".s.PGSQL.{}", port)) } else { host.into() })));
     }
-    Some(Reach::Tcp(host, port))
+    Ok(Some(Reach::Tcp(host, port)))
 }
 
 /// The most a probe of a server takes, its name's lookup included (FEEDBACK79.md, Q-1254, found in
@@ -1284,6 +1314,23 @@ fn server_ready(url: &str) -> bool {
     /// By URL: when last answered, the answer, and whether a probe runs now.
     static KEPT: Mutex<Option<HashMap<String, (Option<Instant>, bool, bool)>>> = Mutex::new(None);
     let kept = || KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // A URL the driver would not read: down, and why said once (as it is first kept), without the
+    // URL, which may hold a password (FEEDBACK79.md, Q-1254, found by the coverage tests of
+    // feedback72-81; branch feedback72-81).
+    let reach = if is_mysql_url(url) {
+        None
+    } else {
+        match server_reach(url) {
+            Ok(at) => Some(at),
+            Err(why) => {
+                if let std::collections::hash_map::Entry::Vacant(e) = kept().get_or_insert_with(HashMap::new).entry(url.to_string()) {
+                    e.insert((None, false, false));
+                    eprintln!("quillo: /_quillo/ready: the tenants' database is down: {}", why);
+                }
+                return false;
+            }
+        }
+    };
     {
         let mut k = kept();
         let e = k.get_or_insert_with(HashMap::new).entry(url.to_string()).or_insert((None, false, false));
@@ -1296,10 +1343,9 @@ fn server_ready(url: &str) -> bool {
     let (tx, rx) = std::sync::mpsc::channel();
     let probed = url.to_string();
     let started = std::thread::Builder::new().name("quillo-ready".into()).spawn(move || {
-        let ok = if is_mysql_url(&probed) {
-            mysql_logs_in(&probed)
-        } else {
-            server_reach(&probed).is_none_or(|at| at.reachable(Instant::now() + PROBE_WAIT))
+        let ok = match reach {
+            None => mysql_logs_in(&probed),
+            Some(at) => at.is_none_or(|at| at.reachable(Instant::now() + PROBE_WAIT)),
         };
         if let Some(e) = kept().as_mut().and_then(|k| k.get_mut(&probed)) {
             *e = (Some(Instant::now()), ok, false);
