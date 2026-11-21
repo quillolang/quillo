@@ -566,7 +566,9 @@ run_script("total > 100", { total: 120 }, { timeout: "1s" })               // tr
   stops at start, saying so, as it never runs in the browser. `parallel` given in `vars` runs the
   script's functions one after another, under its steps and time. Trusted CSS (`` css`...` ``)
   does not pass through a script: in `vars`, from a helper, in what the script's functions give
-  back to the program and in what it gives back, it is plain text.
+  back to the program and in what it gives back, it is plain text. Where code is written
+  decides: in a helper of the program's that the script calls, styles and css`...` are as
+  they are outside a script, while a css`...` the script writes is plain text.
 - It stops after 20,000 steps (calls and loop rounds). A value it makes may be up to
   1 MB (strings, and lists and maps counted with what they hold), and each KB it makes
   costs a step: doubling a string in a loop stops there, not when the memory runs out.
@@ -580,7 +582,8 @@ run_script("total > 100", { total: 120 }, { timeout: "1s" })               // tr
 - It stops after 100 ms, with the error value `the script took longer than its 100 ms`,
   unless `timeout` gives another time: milliseconds (`250`) or text (`"250ms"`, `"2s"`), from
   1 ms to 60 s. Another option, or a time out of range, is an error (`` `run_script`:
-  `timeout` is milliseconds from 1 to 60000, as 250, "250ms" or "2s", got 0 ``). A helper of
+  `timeout` is milliseconds from 1 to 60000, as 250, "250ms" or "2s", got 0 ``). The time
+  starts once the script's builtins are ready, so reading its source counts. A helper of
   the program's that waits (a query) counts in that time, and a script run inside another
   ends by the outer one's time *(since 0.8.9: it had no time limit)*. [`--max-compute`](#options-of-quillo-run)
   still ends the whole request, script and all.

@@ -19,7 +19,7 @@ cargo build --release
 cargo test
 ```
 
-This guide is for Quillo 0.8.9, and [CHANGELOG.md](CHANGELOG.md) says what it changed.
+This guide is for Quillo 0.8.10, and [CHANGELOG.md](CHANGELOG.md) says what it changed.
 Features marked *(since 0.7)* came in 0.7.0. On an older release, read that release's guide:
 https://github.com/quillolang/quillo/blob/v0.7.0/USERGUIDE.md or
 https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md.
@@ -1485,7 +1485,10 @@ as a function does (see [Scheduled jobs](#scheduled-jobs)).
 - **A connection's calls** need `db` as `db`'s do: `analytics.query(...)` in a `with
   http` function is an error. On a parameter with no type, `c.query(...)` (or `.one`,
   `.exec`, `.transaction`) is a warning, since `c` may be a connection: `` `c.query` reads
-  like a database call, which needs the db effect ``.
+  like a database call, which needs the db effect ``. A warning that what a page runs
+  while it is made needs `db` names a connection's call as it names `db.query`: `` `visits`
+  needs the db effect (it calls `analytics.query`), but `route GET /` is declared `with
+  time` ``.
 - **A Rust function** (a `.qwer` or `.rs` file) has the effects its file declares in
   its header, `//! effects: db, http` *(since 0.7)* (or `//! effects: none`). A file without that line
   may do anything, so its functions run outside any `with` as before, and are refused
@@ -1524,6 +1527,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   are joined with a space. So text and an element on lines of their own touch, as in JSX
   (`Hello,` then `<b>{name}</b>` on the next line is "Hello,Ann"), and `quillo check` says
   so for an inline element or a view *(since 0.7)*: write `{" "}` at the end of the line.
+  A view or component whose markup is a block element starts a line of its own, and is
+  not warned of: one that ends in `return <ul>...</ul>` counts as `= <ul>...</ul>` does.
   In a `<pre>`, a `<textarea>` and a `<listing>`, text keeps its lines and spaces as HTML
   has them, and a `//` line in it is text *(since 0.7)*; only the line break right after the
   start tag is dropped, and spaces alone across lines, between its tags, as code laid out
@@ -2318,9 +2323,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   `<Receipt total={1234.5} at="2026-11-03"/>` shows `1,234.5 on 2026-11-03, ref` and a
   uuid, the same on the server and in the browser. `random()`, `random_int` and `uuid()`
   written in the body or the markup would be drawn again when the component wakes in the
-  browser, and the page would change under the visitor (`quillo check` warns): a `state`
-  keeps the server's, and a prop (`ref={order.ref}`) works too. `env("PUBLIC_SHOP")` may
-  join them; `env("DB_URL")` may not.
+  browser, and the page would change under the visitor (`quillo check` warns, in markup
+  given with `return` too): a `state` keeps the server's, and a prop (`ref={order.ref}`)
+  works too. `env("PUBLIC_SHOP")` may join them; `env("DB_URL")` may not.
 - There is nothing built in for `document`, `window`, `localStorage`, the clipboard,
   focus or scrolling: reach them through the page, `js("localStorage.getItem", k)`,
   `js("navigator.clipboard.writeText", s)`, `js("window.innerWidth")` (no arguments
@@ -4834,7 +4839,9 @@ run_script("total > 100", { total: 120 }, { timeout: "1s" })               // tr
   stops at start, saying so, as it never runs in the browser. `parallel` given in `vars` runs the
   script's functions one after another, under its steps and time. Trusted CSS (`` css`...` ``)
   does not pass through a script: in `vars`, from a helper, in what the script's functions give
-  back to the program and in what it gives back, it is plain text.
+  back to the program and in what it gives back, it is plain text. Where code is written
+  decides: in a helper of the program's that the script calls, styles and css`...` are as
+  they are outside a script, while a css`...` the script writes is plain text.
 - It stops after 20,000 steps (calls and loop rounds). A value it makes may be up to
   1 MB (strings, and lists and maps counted with what they hold), and each KB it makes
   costs a step: doubling a string in a loop stops there, not when the memory runs out.
@@ -4848,7 +4855,8 @@ run_script("total > 100", { total: 120 }, { timeout: "1s" })               // tr
 - It stops after 100 ms, with the error value `the script took longer than its 100 ms`,
   unless `timeout` gives another time: milliseconds (`250`) or text (`"250ms"`, `"2s"`), from
   1 ms to 60 s. Another option, or a time out of range, is an error (`` `run_script`:
-  `timeout` is milliseconds from 1 to 60000, as 250, "250ms" or "2s", got 0 ``). A helper of
+  `timeout` is milliseconds from 1 to 60000, as 250, "250ms" or "2s", got 0 ``). The time
+  starts once the script's builtins are ready, so reading its source counts. A helper of
   the program's that waits (a query) counts in that time, and a script run inside another
   ends by the outer one's time *(since 0.8.9: it had no time limit)*. [`--max-compute`](#options-of-quillo-run)
   still ends the whole request, script and all.
@@ -7647,7 +7655,10 @@ Safety built in:
   the text the program writes stays as written: with `c` from a visitor as `red; background:
   blue`, `` style={`color: ${c}; padding: 4px`} `` is written `color: red\3b  background:
   blue; padding: 4px`, a colour the browser drops, and no declaration is added. A value can
-  only take away the declarations after it, never add one. Its `{ } ; \` are written as
+  only take away the declarations after it, never add one. What decides there decides as
+  outside a style (an `if` or `while` condition, a `match` subject or guard, a comparison,
+  `!`), while what it hands to a call, a block or a lambda is still one value, and a `reply`
+  there sends its body as written. Its `{ } ; \` are written as
   CSS's escapes and its `&` as `\26 `, as are css`...`'s `${...}`, and a style map's values
   have `{ } ; \` escaped (so a value adds no rule or declaration, in `<svg>` and `<math>`
   too), but for a css`...` value, below. Compose declarations with a style map,
@@ -9417,7 +9428,9 @@ It also warns of what a page does:
   route, mount, service, file route or file under `public/` or `files()` answers, with
   the nearest one: ``no route answers `/abuot`, so this link is a 404 (did you mean
   `/about`?)``; and a redirect to a path only another method answers, as a redirect is
-  followed with `GET` (a 307 or 308 keeps the method, and is not warned of).
+  followed with `GET` (a 307 or 308 keeps the method, and is not warned of). The nearest
+  route is measured on the address the browser asks for: `/docs/../abuot` is `/abuot`, as
+  is `/%61buot`.
 - Markup a keyboard can't reach: a click on an element with no role, `tabindex` or key
   handler around it (`` a `<div>` with onclick can't be reached with the keyboard: use a
   `<button>` ``), an `<img>` with no `alt` (`alt=""` for decoration), and `:focus {
@@ -9726,7 +9739,11 @@ program's own checks, `ready("ledger", () => ...)` at the top level, a function 
 gives true. For an orchestrator's readiness probe. With a database per tenant (see [Many
 tenants](#many-tenants)) the database is `"ready (per tenant)"` when a tenant can be
 opened: the tenants' folder can be written, or their server answers (MySQL by a real
-login), and no database is opened or made to ask. Neither request is logged or counted
+login), and no database is opened or made to ask. A program with no folder of its own (one
+`quillo::eval_str` runs) makes its tenants' files in the working folder, so that is the
+folder looked at. A server's URL the driver would refuse (`postgres://q@[::1/app_{tenant}`,
+a port that is no number) is `"down"`, its reason written once to stderr (`quillo:
+/_quillo/ready: the tenants' database is down: ...`). Neither request is logged or counted
 (a route of the program's own at a path ending in `/_quillo/ready` is).
 
 A program with nothing to serve over HTTP (only `every`, `udp.listen` or jobs) listens on
@@ -9734,7 +9751,10 @@ the default port, or `$PORT`, when it is free, for its health and metrics (`quil
 to serve over HTTP; health and metrics listening on ...`). When that port is taken and
 nothing asked for one, it runs without a port, and says so (`quillo: 8080 is taken; this
 program serves nothing over HTTP, so it runs without a port (give --port for
-/_quillo/health)`): give it `--port` to reach `/_quillo/health` and the metrics. A port
+/_quillo/health)`): give it `--port` to reach `/_quillo/health` and the metrics. Its
+ticks, packets and jobs then reach it through a socket in a folder of its own under the
+temporary folder, which only the user running it may enter (0700, whatever the umask),
+removed as it stops. A port
 asked for (`--port`, `$PORT`, `--host`, `--listen`, `--metrics`) that is taken stops it, as
 for any program.
 

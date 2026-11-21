@@ -78,7 +78,9 @@ It also warns of what a page does:
   route, mount, service, file route or file under `public/` or `files()` answers, with
   the nearest one: ``no route answers `/abuot`, so this link is a 404 (did you mean
   `/about`?)``; and a redirect to a path only another method answers, as a redirect is
-  followed with `GET` (a 307 or 308 keeps the method, and is not warned of).
+  followed with `GET` (a 307 or 308 keeps the method, and is not warned of). The nearest
+  route is measured on the address the browser asks for: `/docs/../abuot` is `/abuot`, as
+  is `/%61buot`.
 - Markup a keyboard can't reach: a click on an element with no role, `tabindex` or key
   handler around it (`` a `<div>` with onclick can't be reached with the keyboard: use a
   `<button>` ``), an `<img>` with no `alt` (`alt=""` for decoration), and `:focus {

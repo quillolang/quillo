@@ -451,9 +451,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   `<Receipt total={1234.5} at="2026-11-03"/>` shows `1,234.5 on 2026-11-03, ref` and a
   uuid, the same on the server and in the browser. `random()`, `random_int` and `uuid()`
   written in the body or the markup would be drawn again when the component wakes in the
-  browser, and the page would change under the visitor (`quillo check` warns): a `state`
-  keeps the server's, and a prop (`ref={order.ref}`) works too. `env("PUBLIC_SHOP")` may
-  join them; `env("DB_URL")` may not.
+  browser, and the page would change under the visitor (`quillo check` warns, in markup
+  given with `return` too): a `state` keeps the server's, and a prop (`ref={order.ref}`)
+  works too. `env("PUBLIC_SHOP")` may join them; `env("DB_URL")` may not.
 - There is nothing built in for `document`, `window`, `localStorage`, the clipboard,
   focus or scrolling: reach them through the page, `js("localStorage.getItem", k)`,
   `js("navigator.clipboard.writeText", s)`, `js("window.innerWidth")` (no arguments

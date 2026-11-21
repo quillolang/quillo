@@ -1,5 +1,356 @@
 # Changelog
 
+## 0.8.10 (2026-11-22)
+
+Found making the videos and courses about Quillo: thirty small apps for videos (FEEDBACK72.md,
+Q-1010 to Q-1019 and Q-1030 to Q-1032), thirty YouTube Shorts (FEEDBACK73.md, Q-1020 to
+Q-1026; Q-1025 is Q-1270, found first), the comparison videos against six other stacks
+(FEEDBACK79.md, Q-1250 to Q-1259), the courses (FEEDBACK80.md, Q-1260 to Q-1269) and the React
+Quirks videos (FEEDBACK81.md, Q-1270 to Q-1272); by the review of Q-1250's trusted CSS
+(Q-1274); and by this release's CI (a race in the offline worker, a follow-up to FEEDBACK67.md's
+B.2). Q-1014, Q-1026, Q-1253 and Q-1263 are answered in the guide (and an editor's hover),
+Q-1024 and Q-1264 in the guide and the code.
+
+### Security
+
+- **A visitor's value in a style is one CSS value.** `` style={`color: ${n.color}`} `` wrote a
+  visitor's `red; position: fixed; inset: 0; background: red` as it came, and that note
+  covered the whole page in red; Go's html/template, given the same template, writes
+  `ZgotmplZ`. Each value interpolated into a `style` template is escaped as one CSS value (its
+  `{ } ; \` as CSS's escapes, its `&` as `\26 `), wherever it stands in the expression: in a
+  `? :`, `if`, `match`, `??`, `&&` or `||`, through `+`, `trim`, `join`, a list, a pipe, a
+  block's `let`s, a function declared in the block, a lambda's defaults, a spread map's `style`
+  key and a component's or view's `style` prop; the text the program writes stays as written,
+  on the server and in the browser alike. With `c` as `red; background: blue`,
+  `` style={`color: ${c}; padding: 4px`} `` is written
+  `color: red\3b  background: blue; padding: 4px`, a colour the browser drops: a value can
+  take away the declarations after it, never add one. An error's contents are escaped while
+  it stays an error, so `??` still chooses. A template made in a `let` or a helper and given
+  whole, `style={s}`, is the program's own text, as before (FEEDBACK79.md, Q-1250).
+- **Only the program makes trusted CSS.** What `` css`...` `` makes (see Added) is written as
+  it is in a style, so nothing from outside is taken for it: a request's data, the arguments
+  a page sends a `server fn` (JSON and multipart), channel and MCP messages, the session,
+  split services, other sites, the database, files, `env` and `run_script` (what it is given
+  and what it gives back) are all plain text. In the browser, an answer the program wrote
+  itself (`respond`, `reply`) carries none, nested marks included: a page takes the mark only
+  from Quillo's own answers, by the `x-quillo-marked` header, unredirected and from the page's
+  origin; a program's `respond`, `stream` or `events` drops that header in any spelling, and
+  `site_headers` refuses it at load; a Quillo answer passed on by a proxy works as on 0.8.9,
+  with no mark. A channel message pushed to pages stays text (decided). Each forgery two
+  security reviews tried has its test (FEEDBACK79.md, Q-1250, the user's choice: "make it
+  secure with trusted css").
+- **A script's functions run only while their script does.** In 0.8.9 a function a
+  `run_script` script made could be kept and called once the script had ended: a kept closure
+  or a `parallel` branch ran 100,000 steps and more past the script's limits, one run by a
+  helper's own nested script, or rendered as a tag by a helper, ran with the program's
+  effects, and a script's code could be compiled into a page's JavaScript. While its script
+  runs, such a function runs as the script's (a helper of the program's may call it back),
+  with no effects and its steps and time counted against the script's; once the script has
+  ended, a call anywhere (kept in a variable, a list, a map or an error, from a tick, as a tag,
+  through `map` or `parallel`) gives the error value `a script's function runs only while its
+  script does`. What it gives back to the program's code is plain text (no trusted CSS), a
+  helper gets plain arguments, `parallel` inside a script runs in order under its budget,
+  concurrent requests on one thread keep their scripts apart, and a program whose global
+  holds a script's function that a component uses stops at start (Q-1274, found reviewing
+  Q-1250's trusted CSS).
+- **A sign-out stays a sign-out to the offline worker.** A session message a page sent before
+  its visitor signed out could reach Quillo's worker after the sign-out had dropped that
+  person's kept pages, and took them off the dropped list, so a late answer of theirs could be
+  kept again, for the next person on the device to see offline (a test caught it 10 times in
+  25 runs under load on 0.8.9). Where the worker has the Cookie Store API (Chrome), the cookie
+  says whose session it is; without one, the page's word is taken as before (a follow-up to
+  FEEDBACK67.md's B.2, found by this release's CI; in 0.8.9 too).
+- **`crypto.verify_password` takes a real hash's time for any hash it cannot verify**: a
+  `$scrypt$` hash and a broken `$argon2id$` one were answered in 0 ms. Any it cannot verify (an
+  unknown or malformed PHC string, other text, a 1 MB value) does the work a null hash does,
+  10 to 11 ms, as a real hash takes (FEEDBACK80.md, Q-1264).
+
+### Changed
+
+What a program may notice:
+
+- **Lowercase `onchange` is the DOM's `change`**, which comes when the field is left, and
+  `onfocus` and `onblur` are `focus` and `blur`: `onchange` on a field ran at each keystroke,
+  and `onfocus` and `onblur` as `focusin` and `focusout`. For each keystroke write `oninput`
+  (or React's `onChange`, still `input`) (Q-1270, Q-1025).
+- **An error value shown in markup shows nothing**, where it printed `err("...")`, and the log
+  says so; give it a fallback (`??`) or show its words with `error(r)`. A template string still
+  writes `err(...)` (Q-1272).
+- **A value in a `style` template is one CSS value**: one holding `;` or braces no longer adds
+  declarations. Compose declarations with a style map or `` css`...` ``; a component adds its
+  caller's to its own with `` style={`padding: 8px; ${style}`} ``. Text made in a `let` that
+  holds declarations (`` let look = `color: ${c}; font-size: 20px` ``) and given to such a
+  component is one value there, which the browser drops: make it with `` css`...` `` (Q-1250).
+- **`` css`...` `` makes a value of its own**: `type_of` gives `str`, and `==`, `json`, printing
+  and every builtin read its text, but `+` or a builtin gives plain text. The `x-quillo-marked`
+  header is Quillo's: a program's own is dropped, and `site_headers` refuses it (Q-1250).
+- **Voids inside an XML root are written as XML's**: inside `rss`, `feed`, `urlset`,
+  `sitemapindex`, `entry`, `item`, `url` or `sitemap`, or an outermost element with a
+  non-XHTML `xmlns`, `<link>` holds text and an empty one is `<link .../>`. HTML that uses
+  custom elements named `item`, `entry`, `url` or `sitemap`, or an outermost element with a
+  non-XHTML `xmlns:*`, has `<br/>`-style voids inside them (the DOM the same). A helper whose
+  root is `<link/>` does not know it is in a feed: write the `<link>` in the entry's own
+  literal (Q-1259).
+- **A program with nothing to serve over HTTP runs without a port when its port is taken** and
+  nothing asked for one, saying so; give `--port` to reach `/_quillo/health` and the metrics
+  (Q-1011).
+- **A clean stop closes each WebTransport session** (`server stopping`, at most 500 ms), so
+  pages connect again at once, **and each SQLite database**, so its `-wal` and `-shm` go
+  (Q-1265, Q-1260).
+- **WebTransport also listens on `[::1]`** when HTTP is on 127.0.0.1 (Q-1266).
+- **`/_quillo/ready` is neither logged nor in `quillo_requests_total`**, and an etag's 304 is
+  logged and counted as a `3xx`, where it was a 200 and a `2xx` (Q-1255, Q-1262).
+- **`/_quillo/ready` with a database per tenant can answer 200**, the database `"ready (per
+  tenant)"` (Q-1254).
+- **`site_headers`' `"server"`** takes away `server: Quillo` (null) or replaces it (Q-1256).
+- **The 400 of several routes on one path names the closest route's miss**, not the first
+  written's (Q-1257), and a file sent in a text field is named as a file (Q-1252).
+- **A script's function called after its script has ended gives an error value**: test what
+  one gives with `is_err`, as `if !deny(x)` reads the error as false (Q-1274).
+- **`run_script` says what it leaves out**: `db`, `now`, `random`, `range` and `vec` are `not
+  available in a script`, where they were an `unknown name` (Q-1013).
+- **The REPL prints `null`** for a bare name, field, index or literal that is null (Q-1023).
+- **`date.format` warns** of a locale it has no names for, and still writes English (Q-1021).
+- **`quillo new` writes `onclick`, `onsubmit`, `oninput` and `value={x}`**, and so do the hover
+  and `quillo check`'s hints (Q-1030).
+- **New `quillo check` warnings**: a guarded group's page that calls a `server fn` through a
+  helper (Q-1258); an effect a page needs that its route does not declare, an error where it
+  always runs (Q-1261); a new value or an error dropped at the end of a branch (Q-1018,
+  Q-1267); a plain `let` a handler changes (Q-1268); a value that can fail shown in markup
+  (Q-1272); a link no route answers (Q-1251); `pages // 2` (Q-1016); CSS built with `+` or a
+  plain template (Q-1017); a click a keyboard can't reach, an `<img>` with no `alt` and a
+  focus ring taken away (Q-1019); Vue's and Svelte's spellings (Q-1031, Q-1032); an event
+  attribute that never runs (Q-1020); a random value drawn in a component's body (Q-1015).
+  Fewer: a program that serves no pages is not told of its folder's sheets (Q-1012), and the
+  classes of the HTML it serves count (Q-1022).
+- **Speed**: against 0.8.9 built the same way, whole-process instructions, best of 5 to 9.
+  `quillo check` of quillolang.org's site takes 7.6% fewer (cycles 5.5%): the editor's hover
+  text and references are made only for `quillo lsp`, and `quillo run`'s own check gains the
+  same. A program starts with 4.9% fewer (`print(0)`): runtime.js is cut into its declarations
+  with a quarter of the work. `map` and `filter` given a lambda take 3.6% fewer, vs-python's
+  "filter map sum" 4.0%: a lambda's shortcuts are asked once. A request costs what it did: text
+  +0.5%, json +0.2%, fortunes -0.8%, db -0.6%, compute 0.0% (one process; six, -0.1% to -0.8%).
+  Plain markup -0.32%, a style's `${v}` +0.51%, a value with `;` +2.33% (the escape's own work);
+  trusted CSS cost -0.41% to +0.51% (a template `style` prop, its path) against the build before
+  it. 50,000 `run_script` calls take 61 ms where 0.8.9 took 203; a call inside a script costs
+  2.6% more (its run's check) (Q-1250, Q-1013, Q-1274).
+
+### Added
+
+- **Trusted CSS, `` css`...` ``.** Its `${...}` values are escaped where it is written, and a
+  style writes the rest as written wherever the value reaches one: through a name, a `let`, a
+  prop, a spread, a list or a map, a function's answer, an island's props and state, a `live`
+  or `server fn` answer, and a hot reload; a style map takes it as written too
+  (`` style={{ color: css`red; font-weight: bold` }} ``). A template or text written straight in
+  a component's or view's `style` prop, or in a spread literal's `style` key, is trusted too,
+  its values escaped there. So a component adds its caller's declarations to its own with
+  `` <div style={`padding: 8px; ${style}`}> ``: given
+  `` <Card style={css`color: ${c}; font-size: 20px`}/> ``, with `c` as `red; background:
+  blue`, it writes `padding: 8px; color: red\3b  background: blue; font-size: 20px`, `c` one
+  value and the caller's `font-size` kept. Everywhere else it is the `str` it says, on the
+  server and in the browser, and a count given to `t()` as one is a count on both sides
+  (FEEDBACK79.md, Q-1250, the user's choice).
+- **`run_script` has `math`, `stats`, `re`, `bit`, `dec` and `format_number`, and spreads**
+  (`[...xs, 4]`, `{ ...m }`, refused past 1 MB): `` run_script("format_number(stats.mean(xs),
+  \"de-DE\", 2)", { xs: [1, 2, 4] }) `` gives `"2,33"`. A script's `re` is held to its 1 MB
+  while a replacement is built (one match times many `$0` asked for 1.9 GB), and its matches
+  count by what each costs, groups included; `stats.histogram` takes a whole float's bins as
+  an int's. The world is built once a thread and copied for each script, so 50,000 calls take
+  61 ms where 0.8.9 took 203 (FEEDBACK72.md, Q-1013).
+- **`check::Options::references` and `Options::plain()`**, for a program that embeds
+  Quillo's checker: a check that leaves out what only an editor reads (each name's uses and
+  their hover text, the scopes' names), as `quillo check`, `quillo run`, `quillo mcp`, `quillo fix`
+  and `check_program` now do. `Options::default()` still gathers them.
+
+### Fixed
+
+- **A component that listens only to scrolls loads on a scroll.** Its code came when someone
+  pointed at, touched, focused or typed in it, so a box scrolled by a script, a link into it
+  or the browser putting a place back never ran its `onscroll`, and the page kept what the
+  server rendered. A scroll loads it too, and that scroll is given to it once it has loaded
+  (FEEDBACK72.md, Q-1010).
+- **A form's reset sets the states its fields show.** A reset emptied a field bound with
+  `value={name}`, but the state kept the old text, which the page went on showing beside the
+  empty field; after a reset each two-way bound field's state is set from the field, and a
+  prevented reset changes nothing (FEEDBACK80.md, Q-1269).
+- **Lowercase `onchange` waits until the field is left**, as in HTML: on a text field it ran at
+  each keystroke, as React's `onChange` does. Only React's camel-case names are renamed
+  (`onChange` is `input`, `onFocus` `focusin`, `onDoubleClick` `dblclick`), so `onchange`,
+  `onfocus` and `onblur` are the DOM's own events, as the guide's "compared as written" says
+  (FEEDBACK73.md, Q-1025; FEEDBACK81.md, Q-1270).
+- **An error value in markup no longer prints its source.** A failing `server fn`'s value,
+  shown as it was, put `err("503 Service Unavailable")` into the page. As a child, an
+  attribute, a class or a class list's item, a style map's declaration or a `<style>`'s text
+  it shows nothing, on the server and in the browser alike, and the log says so once a request
+  (`` an error no statement took, made at main.qwe:1, shown in <News> as nothing: 503 Service
+  Unavailable ``); `<select value={err}>` chooses nothing (FEEDBACK81.md, Q-1272).
+- **`state` inside a block says where it goes**: `if show { state extra = "extra" }` was a parse
+  error that did not say why. Inside an `if`, `for`, `while`, a function or a block it says
+  `` `state` goes at the top of a component's body, not inside an `if`: declare `state extra =
+  ""` there and set it in the `if` ``, the first value of the kind given (FEEDBACK81.md,
+  Q-1271).
+- **A feed's `<link>` is XML's.** In an Atom feed `<link href="..."/>` was written as HTML's
+  `<link href="...">`, so the answer was no XML and a feed reader refused it, and an RSS
+  channel's `<link>https://example.com/</link>` failed `quillo check`. Inside an XML root a
+  void name holds text and an empty one is written `<link .../>`; HTML pages are written byte
+  for byte as before (FEEDBACK79.md, Q-1259).
+- **A clean stop closes each SQLite database.** A stop left each database's `-wal` and `-shm`,
+  and the main file without what the WAL held, so a copy of the file alone had lost tables, and
+  a backup copied over it was undone at the next start without a word. After the drain each
+  database (but one in a transaction) is closed without waiting on SQLite's busy timeout, so
+  its `-wal` and `-shm` go and a restore copied over the file is what the next start opens;
+  they stay while another process (Litestream, a `sqlite3` shell, a sibling instance) has the
+  file open, and that process's writes are not held up (a stop 0.01 s) (FEEDBACK80.md,
+  Q-1260).
+- **A clean stop closes each WebTransport session**, with `server stopping` (500 ms at most,
+  nothing when there are none), so its pages notice at once and connect to the next server:
+  after a restart, a page that only listened heard nothing for 10 to 20 s, until the
+  keep-alive gave up, and what was broadcast meanwhile was lost to it (FEEDBACK80.md, Q-1265).
+- **WebTransport works at `http://localhost`**: with HTTP on 127.0.0.1, WebTransport listens on
+  `[::1]` too, where Chrome dials `localhost` over QUIC; it was refused there, so a page in
+  development took the WebSocket for good (FEEDBACK80.md, Q-1266).
+- **`/_quillo/ready` with a database per tenant**: it said `"database": "down"`, 503, so the
+  app was never ready. The database is `"ready (per tenant)"` when a tenant can be opened: the
+  tenants' folder can be written, or their server answers (`select 1` on the tenant used last,
+  else a TCP or Unix-socket connect, PostgreSQL's socket folder and MySQL's `?socket=`
+  included; MySQL by a real login, so a probe never counts toward its `max_connect_errors`),
+  with no database opened or made to ask. A probe has 2 s, DNS included, one runs at a time,
+  and its answer is kept 30 s when up and 2 s when down (FEEDBACK79.md, Q-1254).
+- **`/_quillo/ready` is neither logged nor counted**, as the guide says: two probes made two log
+  lines and `quillo_requests_total{status="2xx"} 2`. Quillo's own answer (`/_quillo/ready`, or
+  a mount's prefix and it) is left out; a route of the program's own at a path ending so is
+  still logged and counted (FEEDBACK79.md, Q-1255).
+- **`site_headers({ "server": null })` takes away `server: Quillo`**, which stayed; a text
+  replaces it, and a route's own value wins (FEEDBACK79.md, Q-1256).
+- **An etag's 304 is logged and counted as a 304**: the log said 200 and `--metrics` counted a
+  `2xx` (FEEDBACK80.md, Q-1262).
+- **The 400 of several routes on one path names the closest route's miss.** It named the first
+  route's, however far off: a JSON post that left out `message` was told `` `form.name` is
+  missing ``. The closest is one whose body is of the kind the request's content-type says,
+  then the one that missed later (its body, after its query and its group's pattern), then the
+  one with the most fields sent that fit (a field left to its default counts as none), and on a
+  tie the first written (FEEDBACK79.md, Q-1257).
+- **A file sent in a field the pattern takes as text is named as a file**: `` `form.photo` is a
+  file (cat.png), not a str; it is in request.files.photo ``, in the 400 and the log, where it
+  was "missing"; when the field has a default, the route runs with it, as before, and the log
+  says the same, `(the route ran with its default)` (FEEDBACK79.md, Q-1252).
+- **A program with nothing to serve over HTTP starts beside the app it feeds.** A program of
+  `every`, `udp.listen` or jobs alone listened on 8080 and stopped when that was taken. It
+  still listens on the default port, or `$PORT`, when it is free, where orchestrators probe
+  its health and metrics, now saying so (`nothing to serve over HTTP; health and metrics
+  listening on ...`); when that port is taken and nothing asked for one (`--port`, `$PORT`,
+  `--host`, `--listen`, `--metrics`, `--watch`, `--split` and the like), it runs without one,
+  saying so, on a private Unix socket it removes when it stops (FEEDBACK72.md, Q-1011).
+- **`date.format` with a locale it has no names for warns**, on the server and in the browser,
+  as `format_number` and `money.format` do, and still writes English: `ja-JP`, `ru-RU` and
+  `xx-YY` gave English in silence (FEEDBACK73.md, Q-1021).
+- **The REPL prints `null`** for a bare literal, name, field or index whose value is null, so
+  `p.age` no longer looks like a line that did nothing; a call, `if`, `match` or block that
+  gives null prints nothing, as before (FEEDBACK73.md, Q-1023).
+- **`quillo new`, the hover and the hints write events as the guide does.** `quillo new`'s
+  programs, the hover over `component` and `quillo check`'s hints taught `@click`, `@submit`,
+  `bind:value` and `@change`; they write `onclick`, `onsubmit`, `oninput`, `onchange` (a
+  checkbox's) and `value={x}`, and a handler written as text is told it needs a function
+  (`` `onmouseover` needs a function, `onmouseover={() => ...}` ``) (FEEDBACK72.md, Q-1030).
+- **`run_script` keeps nothing after its run**: a lambda a script set to a name of its world
+  kept about 10 KB a call for good (40,000 calls: 377 MB, now 14 MB). The script's copy of its
+  world is emptied after each run, and a name a script sets never reaches the next
+  (FEEDBACK72.md, Q-1013).
+
+### `quillo check`
+
+- **The warning that a group guards its routes, not their pages' `server fn`s, follows the
+  page**: into the functions, views and components the route calls, and a top-level `let page
+  = () => ...`, however deep. It saw only the route's own body, so `route GET / with db =
+  team_home()`, whose `<TicketList/>` calls `live(load_tickets)`, got no warning, and anyone
+  could call that `server fn` (FEEDBACK79.md, Q-1258).
+- **An effect a page needs is asked of its route**: what the server runs while it makes the
+  page (a component's `state` values, its markup, components, plain helpers and builtins such
+  as `now()`; not a handler or a lambda, which runs in the browser) is checked against the
+  route's `with`. It is an error where the function that needs the effect declares it (or is
+  a builtin) and always runs, a warning where it runs only under an `if`, `match`, `&&`, `??`
+  or a loop, on the left of `??`, or for `state v = defer(...)`, said once a cause, `as are N
+  other routes`. A component's `state x = load()` whose call needs `time`, in a route `with
+  db`, passed the check and was a 500 (FEEDBACK80.md, Q-1261).
+- **A new value or an error dropped at the end of a branch is warned of**: `push` and the other
+  list and map functions that give a new value, or an error, at the end of an `if`, `else`,
+  `match`, `for` or `while` branch whose value nothing takes, in a component's `fn` or a
+  top-level one, as `push(xs, v)` and `xs | push(v)` too, where only an inline handler's
+  `xs.push(v)` was. A handler named by reference (`onclick={go}`) is judged by what `go` gives
+  (its `! E` or its result's type), and an inline one is told `?? ...`, `is_err` or `let _ =`,
+  not a `?` that changes nothing; a `server fn`'s error dropped in a handler is not warned of,
+  and a `?` inside a nested lambda no longer makes its function one that can fail, which gave
+  0.8.9 wrong warnings (FEEDBACK72.md, Q-1018; FEEDBACK80.md, Q-1267).
+- **A plain `let` that a handler changes and the markup shows**, which the page never
+  updates, gets `` isn't a state, so the page won't show it: write `state x = ...` ``, also
+  when it is changed through a function the component names, a timer, a channel's callback or
+  an `on...` callback given to a child (FEEDBACK80.md, Q-1268).
+- **A value that can fail, shown in markup** with no `??`, `?`, `match` or `is_err` test, is
+  warned of: one from a function that declares `! E`, uses `?` or `err(...)`, or a `let` or
+  `state` set from one, builtin conversions left out (FEEDBACK81.md, Q-1272).
+- **A link to an address no route answers**: a literal `href`, `redirect` or `navigate`, or a
+  template's literal start (`/todos/${id}` standing for one piece more), to a path no route,
+  mount, service, file route or file of `public/` or `files()` answers is warned of, with "did
+  you mean"; where only another method answers, it says 405 (307 and 308 keep the method).
+  `/` alone, other sites' URLs, `<base href>` and a component's `href` prop are left out, and
+  `.` and `..` pieces are read as browsers read them. With the class checks below, the
+  website's check costs 0.09% more, 3,000 routes with 9,000 links 1.9% to 2.6% (FEEDBACK79.md,
+  Q-1251).
+- **Classes, for a script and for the files a program serves**: the unused-class warnings of
+  `public/`'s sheets come only for a program that serves pages (a script kept beside an app was
+  told of every class the app writes), and the classes written in the HTML under `public/` and
+  in the `files()` folders' HTML and scripts (16 MB a check at most) count, a folder link
+  followed wherever it points, each real folder once (FEEDBACK72.md, Q-1012; FEEDBACK73.md,
+  Q-1022).
+- **`pages // 2`**, Python's whole-number division, after a name that holds a number, gets
+  `` `//` starts a comment here, so `// 2` is left out: whole-number division is `floor(a /
+  b)` ``; a comment that shows a result (`// 59.97`) gets nothing (FEEDBACK72.md, Q-1016).
+- **CSS built from a value with `+` or a plain template**, in a `<style>` or a `style=`, asks for
+  `` css`...` ``, numbers and their `str` and `format_number` being safe: SQL built so was
+  warned of, and this passed (FEEDBACK72.md, Q-1017).
+- **Markup a keyboard can't reach**: a click on an element with no role, `tabindex` or key
+  handler (not one that holds a button, a link, a field, a `summary` or a `[tabindex]`, nor one
+  whose handler takes the event, as delegation does), an `<img>` with no `alt`, and
+  `:focus { outline: none }` on `:focus`, `*:focus` or an element's type with no
+  `:focus-visible` and no rule that draws a ring again (FEEDBACK72.md, Q-1019).
+- **Vue's and Svelte's habits**: `@click.prevent`, `v-model={x}`, `v-on:` and `on:click`, which
+  passed in silence and did nothing, or (`on:click`) were told `takes only text written here`,
+  are each told the spelling to use (FEEDBACK72.md, Q-1031, Q-1032).
+- **An event attribute that never runs**: in a view, a route's own markup or a plain function's
+  markup that a page places outside any component, where the run drops it (FEEDBACK73.md,
+  Q-1020).
+- **`random`, `random_int` or `uuid` drawn in a component's body and shown** is told that it is
+  drawn again when the component wakes, the browser's value taking the server's place; `state
+  x = ...` keeps the server's (FEEDBACK72.md, Q-1015).
+- **`live` with its argument missing** shows `live(load, ...args)` (FEEDBACK73.md, Q-1024).
+- **What it costs**: the website's check took 9.284G instructions before the checks of Q-1258,
+  Q-1261, Q-1267, Q-1268 and Q-1272, 9.273G after; 150 guarded routes 3.3% more.
+
+### The guide
+
+- **The guide and the short guide say each change above**, and the examples the new warnings
+  found are fixed (headers as buttons, an `<img>`'s `alt`, `app/coop`'s dropped error and
+  transaction).
+- **Several routes' bodies on one path** are a `oneOf`, or an `anyOf` when one body could fit
+  two (a catch-all), as `quillo docs` gives them (FEEDBACK72.md, Q-1014).
+- **The short guide** (`llms.txt`) points to `llms-full.txt`, and has `while`, `quillo serve`,
+  `live(load, ...args)`, and that `ask` and `notify` are plain markup with `q-` classes for the
+  page to style; an editor's hover for `live` and `int` says the same (FEEDBACK73.md, Q-1024;
+  FEEDBACK79.md, Q-1253).
+- **A page's runtime as measured**: 139,198 B, 38,621 B gzipped, for one counter on 0.8.9, with
+  comments, blank lines and indentation taken out but not minified, where the guide said about
+  35 KB, 11 KB and minified; the README's 9 and 13 KB are 39 and 45 KB with the runtime
+  (FEEDBACK73.md, Q-1026).
+- **What `int()` and `float()` take**: white space at either end, a leading `+` and zeros,
+  looser than a route's `int`, with the pattern's rule for a check by hand; `int()` stays as
+  Q-542 decided (FEEDBACK79.md, Q-1253).
+- **A path inside SQL counts from the process's folder**: `vacuum into 'backups/b.db'` in a
+  program started from elsewhere fails; `pragma database_list` gives a path that works from
+  anywhere (FEEDBACK80.md, Q-1263).
+- **Sign-ins that take one time**: `verify_password` takes as long for a null hash, a null
+  check before it is what answers a stranger at once, and the guide verifies first and then
+  decides, in place of a stand-in hash (FEEDBACK80.md, Q-1264).
+
 ## 0.8.9 (2026-11-20)
 
 Found by the security audit of 0.8.7 (FEEDBACK75.md, Q-1050 to Q-1095, and Q-1120 and Q-1121

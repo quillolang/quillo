@@ -224,7 +224,11 @@ program's own checks, `ready("ledger", () => ...)` at the top level, a function 
 gives true. For an orchestrator's readiness probe. With a database per tenant (see [Many
 tenants](#many-tenants)) the database is `"ready (per tenant)"` when a tenant can be
 opened: the tenants' folder can be written, or their server answers (MySQL by a real
-login), and no database is opened or made to ask. Neither request is logged or counted
+login), and no database is opened or made to ask. A program with no folder of its own (one
+`quillo::eval_str` runs) makes its tenants' files in the working folder, so that is the
+folder looked at. A server's URL the driver would refuse (`postgres://q@[::1/app_{tenant}`,
+a port that is no number) is `"down"`, its reason written once to stderr (`quillo:
+/_quillo/ready: the tenants' database is down: ...`). Neither request is logged or counted
 (a route of the program's own at a path ending in `/_quillo/ready` is).
 
 A program with nothing to serve over HTTP (only `every`, `udp.listen` or jobs) listens on
@@ -232,7 +236,10 @@ the default port, or `$PORT`, when it is free, for its health and metrics (`quil
 to serve over HTTP; health and metrics listening on ...`). When that port is taken and
 nothing asked for one, it runs without a port, and says so (`quillo: 8080 is taken; this
 program serves nothing over HTTP, so it runs without a port (give --port for
-/_quillo/health)`): give it `--port` to reach `/_quillo/health` and the metrics. A port
+/_quillo/health)`): give it `--port` to reach `/_quillo/health` and the metrics. Its
+ticks, packets and jobs then reach it through a socket in a folder of its own under the
+temporary folder, which only the user running it may enter (0700, whatever the umask),
+removed as it stops. A port
 asked for (`--port`, `$PORT`, `--host`, `--listen`, `--metrics`) that is taken stops it, as
 for any program.
 

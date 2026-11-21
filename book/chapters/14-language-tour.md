@@ -614,7 +614,10 @@ as a function does (see [Scheduled jobs](#scheduled-jobs)).
 - **A connection's calls** need `db` as `db`'s do: `analytics.query(...)` in a `with
   http` function is an error. On a parameter with no type, `c.query(...)` (or `.one`,
   `.exec`, `.transaction`) is a warning, since `c` may be a connection: `` `c.query` reads
-  like a database call, which needs the db effect ``.
+  like a database call, which needs the db effect ``. A warning that what a page runs
+  while it is made needs `db` names a connection's call as it names `db.query`: `` `visits`
+  needs the db effect (it calls `analytics.query`), but `route GET /` is declared `with
+  time` ``.
 - **A Rust function** (a `.qwer` or `.rs` file) has the effects its file declares in
   its header, `//! effects: db, http` *(since 0.7)* (or `//! effects: none`). A file without that line
   may do anything, so its functions run outside any `with` as before, and are refused
@@ -653,6 +656,8 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   are joined with a space. So text and an element on lines of their own touch, as in JSX
   (`Hello,` then `<b>{name}</b>` on the next line is "Hello,Ann"), and `quillo check` says
   so for an inline element or a view *(since 0.7)*: write `{" "}` at the end of the line.
+  A view or component whose markup is a block element starts a line of its own, and is
+  not warned of: one that ends in `return <ul>...</ul>` counts as `= <ul>...</ul>` does.
   In a `<pre>`, a `<textarea>` and a `<listing>`, text keeps its lines and spaces as HTML
   has them, and a `//` line in it is text *(since 0.7)*; only the line break right after the
   start tag is dropped, and spaces alone across lines, between its tags, as code laid out

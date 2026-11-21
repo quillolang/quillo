@@ -250,7 +250,10 @@ Safety built in:
   the text the program writes stays as written: with `c` from a visitor as `red; background:
   blue`, `` style={`color: ${c}; padding: 4px`} `` is written `color: red\3b  background:
   blue; padding: 4px`, a colour the browser drops, and no declaration is added. A value can
-  only take away the declarations after it, never add one. Its `{ } ; \` are written as
+  only take away the declarations after it, never add one. What decides there decides as
+  outside a style (an `if` or `while` condition, a `match` subject or guard, a comparison,
+  `!`), while what it hands to a call, a block or a lambda is still one value, and a `reply`
+  there sends its body as written. Its `{ } ; \` are written as
   CSS's escapes and its `&` as `\26 `, as are css`...`'s `${...}`, and a style map's values
   have `{ } ; \` escaped (so a value adds no rule or declaration, in `<svg>` and `<math>`
   too), but for a css`...` value, below. Compose declarations with a style map,
