@@ -35,7 +35,7 @@ route GET /a/:id {
 route GET /b/:n = [1, 2] | map((n) => n * 2)
 route POST /c { json: body } = body
 route GET /d ? { q: name } = name
-view V() = <div><link rel="preload" href="/x.css" onload="this.rel='stylesheet'"/><img src="/a.png" ismap/><div x-data="{}"></div><svg><filter><feTurbulence seed="2"/><feDisplacementMap scale="3"/></filter></svg><p @changed={() => 1} @shown={() => 2}>p</p></div>
+view V() = <div><link rel="preload" href="https://cdn.example/x.css" onload="this.rel='stylesheet'"/><img src="/a.png" alt="" ismap/><div x-data="{}"></div><svg><filter><feTurbulence seed="2"/><feDisplacementMap scale="3"/></filter></svg><p @changed={() => 1} @shown={() => 2}>p</p></div>
 fn loops() {
     let done = false
     let set_done = () => { done = true }

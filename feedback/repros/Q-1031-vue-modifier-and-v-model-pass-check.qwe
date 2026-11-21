@@ -15,7 +15,7 @@ component Order() {
     <div>
         <button id="vue" @click.prevent={() => { n += 1 }}>Vue's way</button>
         <button id="plain" onclick={() => { n += 1 }}>Plain</button>
-        <input id="model" v-model="name"/>
+        <input id="model" v-model={name}/>
         <p id="out">{n}|{name}</p>
     </div>
 }

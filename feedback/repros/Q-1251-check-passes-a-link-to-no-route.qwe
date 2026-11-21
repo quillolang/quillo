@@ -1,6 +1,6 @@
 // Q-1251 `quillo check` passes a link to an address no route answers: `/trail/<id>` beside `route GET /trails/:id(int)` is a 404, found only when someone clicks it
 // mode: check
-// open-when: Q-1251-check-passes-a-link-to-no-route.qwe: ok
+// open-when: /: ok \(2 routes, 0 functions, 0 components\)\s*$/
 // fixed-when: /trail/
 // From FEEDBACK79.md §Q-1251 (found on 238dac2, 0.8.6; open on 68da426, 0.8.8).
 

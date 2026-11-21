@@ -914,31 +914,47 @@ fn route_bound(r: &RouteDef) -> HashSet<String> {
 /// function called (`f(...)`, `x | f`, a module's `db.query`), a component or view shown as a tag,
 /// or, in a `state`'s value, a server fn named (`live(load)`); its line, whether it runs only on a
 /// condition (in an `if`'s branch, a `match` arm, after `&&` or `??`, in a loop's body), and the
-/// `state` it sets, if it is one's value (FEEDBACK80.md, Q-1261; branch feedback72-81).
+/// `state` it sets, if it is one's value (FEEDBACK80.md, Q-1261; branch feedback72-81); and
+/// whether what it gives is caught or put off (`caught`).
 #[derive(Clone)]
 struct RenderRef {
     name: Arc<str>,
     line: u32,
     cond: bool,
+    caught: u8,
     state: Option<Arc<str>>,
     tag: bool,
 }
+
+/// A refused effect is an error value at run time, not a stop: the left side of `??` takes it and
+/// the page shows the fallback (`load_it() ?? "fallback"`, `now() ?? "no clock"`), and a state's
+/// value under `defer(...)` (`state v = defer(load_it())`) runs after the page is made, which keeps
+/// its placeholder and logs the error. Each is said as a warning, never an error. `defer(...)`
+/// anywhere else (`{defer(str(now()))}`, `{defer(<Footer/>)}`), `live(...)` and `is_err(...)` are
+/// not caught so, and the page is a 500 (0.8.9; found in review of FEEDBACK80.md's Q-1261; branch
+/// feedback72-81).
+const CAUGHT_FALLBACK: u8 = 1;
+const CAUGHT_DEFERRED: u8 = 2;
+/// What `render_effects` found for one route: (what needs it, the effects it lacks, how it is
+/// caught) -> an error, what to say, and the components and views that call it, the one said of
+/// first. A call caught by `??` and one not are said apart, each with its own end (found in review).
+type Found = HashMap<(Arc<str>, u8, u8), (bool, (String, String, String, String), Vec<String>)>;
 
 /// The calls and tags of `e` the server runs as it makes a page (`RenderRef`): not in a function
 /// written there, which runs later, in the browser (a handler's, a timer's), nor under a name `e`
 /// binds itself. One level deeper per node, with room on the stack looked at every eighth, as
 /// `Returns::deep` does.
-fn render_refs(e: &Expr, cond: bool, state: Option<&Arc<str>>, bound: &HashSet<String>, out: &mut Vec<RenderRef>, depth: u32) {
+fn render_refs(e: &Expr, cond: bool, caught: u8, state: Option<&Arc<str>>, bound: &HashSet<String>, out: &mut Vec<RenderRef>, depth: u32) {
     if (depth + 1) % 8 == 0 {
-        crate::stack::maybe_grow(256 << 10, 4 << 20, || render_refs_here(e, cond, state, bound, out, depth + 1))
+        crate::stack::maybe_grow(256 << 10, 4 << 20, || render_refs_here(e, cond, caught, state, bound, out, depth + 1))
     } else {
-        render_refs_here(e, cond, state, bound, out, depth + 1)
+        render_refs_here(e, cond, caught, state, bound, out, depth + 1)
     }
 }
 
-fn render_refs_here(e: &Expr, cond: bool, state: Option<&Arc<str>>, bound: &HashSet<String>, out: &mut Vec<RenderRef>, depth: u32) {
+fn render_refs_here(e: &Expr, cond: bool, caught: u8, state: Option<&Arc<str>>, bound: &HashSet<String>, out: &mut Vec<RenderRef>, depth: u32) {
     let call = |n: String, line: u32, out: &mut Vec<RenderRef>| {
-        out.push(RenderRef { name: Arc::from(n), line, cond, state: state.cloned(), tag: false });
+        out.push(RenderRef { name: Arc::from(n), line, cond, caught, state: state.cloned(), tag: false });
     };
     let named = |c: &Expr| -> Option<String> {
         match c {
@@ -950,7 +966,7 @@ fn render_refs_here(e: &Expr, cond: bool, state: Option<&Arc<str>>, bound: &Hash
             _ => None,
         }
     };
-    let go = |x: &Expr, c: bool, out: &mut Vec<RenderRef>| render_refs(x, c, state, bound, out, depth);
+    let go = |x: &Expr, c: bool, out: &mut Vec<RenderRef>| render_refs(x, c, caught, state, bound, out, depth);
     match e {
         Expr::Lit(_) | Expr::Lambda(_) => {}
         // In a `state`'s value a server fn named is run for its first value (`live(load)`).
@@ -967,8 +983,12 @@ fn render_refs_here(e: &Expr, cond: bool, state: Option<&Arc<str>>, bound: &Hash
         Expr::List(xs) => xs.iter().for_each(|x| go(x, cond, out)),
         Expr::Map(es) => es.iter().for_each(|(_, x)| go(x, cond, out)),
         Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => go(x, cond, out),
-        Expr::Binary(BinOp::And | BinOp::Or, a, b, _) | Expr::Coalesce(a, b) => {
+        Expr::Binary(BinOp::And | BinOp::Or, a, b, _) => {
             go(a, cond, out);
+            go(b, true, out);
+        }
+        Expr::Coalesce(a, b) => {
+            render_refs(a, cond, caught.max(CAUGHT_FALLBACK), state, bound, out, depth);
             go(b, true, out);
         }
         Expr::Binary(_, a, b, _) | Expr::Index(a, b, _) => {
@@ -1031,7 +1051,18 @@ fn render_refs_here(e: &Expr, cond: bool, state: Option<&Arc<str>>, bound: &Hash
         Expr::Block(stmts) => {
             for st in stmts.iter() {
                 match st {
-                    Stmt::State(n, x, _) => render_refs(x, cond, Some(&Arc::from(n.as_str())), bound, out, depth),
+                    // Only a state's value is put off by `defer(...)`: `{defer(str(now()))}` in
+                    // markup runs as the page is made, a 500 on 0.8.9 (found in review).
+                    Stmt::State(n, x, _) => {
+                        let name: Arc<str> = Arc::from(n.as_str());
+                        match x {
+                            Expr::Call(c, args, line) if matches!(&**c, Expr::Ident(d, _) if d == "defer") && !bound.contains("defer") => {
+                                out.push(RenderRef { name: Arc::from("defer"), line: *line, cond, caught, state: Some(name.clone()), tag: false });
+                                args.iter().for_each(|a| render_refs(a, cond, caught.max(CAUGHT_DEFERRED), Some(&name), bound, out, depth));
+                            }
+                            _ => render_refs(x, cond, caught, Some(&name), bound, out, depth),
+                        }
+                    }
                     Stmt::Let(_, x, _) | Stmt::Expr(x) | Stmt::Assign(_, _, x, _) | Stmt::Return(Some(x), _) => go(x, cond, out),
                     Stmt::SetField(o, _, _, x, _) => {
                         go(o, cond, out);
@@ -1041,37 +1072,37 @@ fn render_refs_here(e: &Expr, cond: bool, state: Option<&Arc<str>>, bound: &Hash
                 }
             }
         }
-        Expr::Html(el, _) => render_refs_html(el, cond, state, bound, out, depth),
+        Expr::Html(el, _) => render_refs_html(el, cond, caught, state, bound, out, depth),
     }
 }
 
 /// `render_refs` of an element: its tag, if a view's or a component's, its attributes' values but
 /// its handlers', and its children.
-fn render_refs_html(el: &HtmlEl, cond: bool, state: Option<&Arc<str>>, bound: &HashSet<String>, out: &mut Vec<RenderRef>, depth: u32) {
+fn render_refs_html(el: &HtmlEl, cond: bool, caught: u8, state: Option<&Arc<str>>, bound: &HashSet<String>, out: &mut Vec<RenderRef>, depth: u32) {
     if el.tag.starts_with(|c: char| c.is_uppercase()) {
-        out.push(RenderRef { name: Arc::from(el.tag.as_str()), line: el.line, cond, state: state.cloned(), tag: true });
+        out.push(RenderRef { name: Arc::from(el.tag.as_str()), line: el.line, cond, caught, state: state.cloned(), tag: true });
     }
     for x in el.id.iter().chain(el.classes.iter()) {
-        render_refs(x, cond, state, bound, out, depth);
+        render_refs(x, cond, caught, state, bound, out, depth);
     }
     for (a, v) in &el.attrs {
         if a.starts_with('@') {
             continue;
         }
         if let AttrVal::Expr(x) | AttrVal::Spread(x) = v {
-            render_refs(x, cond, state, bound, out, depth);
+            render_refs(x, cond, caught, state, bound, out, depth);
         }
     }
     for c in &el.children {
         match c {
             HtmlChild::El(child) => {
                 if (depth + 1) % 8 == 0 {
-                    crate::stack::maybe_grow(256 << 10, 4 << 20, || render_refs_html(child, cond, state, bound, out, depth + 1))
+                    crate::stack::maybe_grow(256 << 10, 4 << 20, || render_refs_html(child, cond, caught, state, bound, out, depth + 1))
                 } else {
-                    render_refs_html(child, cond, state, bound, out, depth + 1)
+                    render_refs_html(child, cond, caught, state, bound, out, depth + 1)
                 }
             }
-            HtmlChild::Expr(x) => render_refs(x, cond, state, bound, out, depth),
+            HtmlChild::Expr(x) => render_refs(x, cond, caught, state, bound, out, depth),
         }
     }
 }
@@ -1107,12 +1138,94 @@ fn dropped_subject(e: &Expr) -> Option<&str> {
     }
 }
 
+/// The functions `body` gives what they give of: called last in it, or in a `return`, through its
+/// `if`s, `match`es, loops and blocks, not in a lambda written there, whose `return` is its own
+/// (`Checker::gives_program_error`). Read with lists, not by recursion.
+fn returned_calls(body: &Expr) -> Vec<String> {
+    let mut ends: Vec<&Expr> = vec![body];
+    // Each `return`'s value, wherever its block is.
+    let mut todo: Vec<&Expr> = vec![body];
+    while let Some(e) = todo.pop() {
+        match e {
+            Expr::Block(stmts) => {
+                for st in stmts.iter() {
+                    match st {
+                        Stmt::Return(Some(x), _) => {
+                            ends.push(x);
+                            todo.push(x);
+                        }
+                        Stmt::Let(_, x, _) | Stmt::Expr(x) | Stmt::Assign(_, _, x, _) | Stmt::State(_, x, _) => todo.push(x),
+                        _ => {}
+                    }
+                }
+            }
+            Expr::If(c, a, b) => {
+                todo.push(c);
+                todo.push(a);
+                if let Some(b) = b {
+                    todo.push(b);
+                }
+            }
+            Expr::Match(x, arms, _) => {
+                todo.push(x);
+                todo.extend(arms.iter().map(|a| &a.body));
+            }
+            Expr::For(_, i, b, _) | Expr::While(i, b, _) => {
+                todo.push(i);
+                todo.push(b);
+            }
+            _ => {}
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    while let Some(e) = ends.pop() {
+        match e {
+            Expr::Call(f, _, _) => {
+                if let Expr::Ident(n, _) = &**f {
+                    if !out.iter().any(|o| o == n.as_str()) {
+                        out.push(n.to_string());
+                    }
+                }
+            }
+            Expr::If(_, a, b) => {
+                ends.push(a);
+                if let Some(b) = b {
+                    ends.push(b);
+                }
+            }
+            Expr::Match(_, arms, _) => ends.extend(arms.iter().map(|a| &a.body)),
+            Expr::Block(stmts) => {
+                if let Some(Stmt::Expr(x)) = stmts.last() {
+                    ends.push(x);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Whether a function of the program can give an error: it declares `! T`, or its body makes one
 /// or passes one on with `?` (`Checker::error_dropped`'s, and Q-1272's, FEEDBACK81.md; branch
 /// feedback72-81).
+/// A lambda written in it is its own: a `?` or an `err(...)` there leaves that lambda, not this
+/// function (`[n].map((x) => int(str(x))?)`; found in review; branch feedback72-81).
 fn can_fail(d: &FnDef) -> bool {
-    let mut found = d.err.is_some();
+    if d.err.is_some() {
+        return true;
+    }
+    let mut found = false;
+    let mut inner: HashSet<*const Expr> = HashSet::new();
     walk_expr(&d.body, &mut |e| {
+        if inner.contains(&(e as *const Expr)) {
+            return;
+        }
+        if let Expr::Lambda(l) = e {
+            walk_fn(l, &mut |x| {
+                inner.insert(x as *const Expr);
+            });
+            return;
+        }
         found |= matches!(e, Expr::Try(_)) || matches!(e, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "err"));
     });
     found
@@ -2469,7 +2582,9 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
     c.overrides = overrides;
     let main: Arc<str> = Arc::from(file);
     let mut parser = Parser::new(src);
-    let parsed = parser.parse_program();
+    // And the comments right after a value (FEEDBACK72.md, Q-1016; branch feedback72-81).
+    let (parsed, noted) = crate::lexer::noting_value_comments(|| parser.parse_program());
+    c.value_comments.extend(noted.into_iter().map(|(l, w, n)| (main.clone(), l, w, n)));
     let parse_failed = parsed.is_err();
     c.plain_dollars.extend(parser.plain_dollars().into_iter().map(|(text, n)| (file.to_string(), text, n)));
     // `use` paths count from the folder of the file a main file that is a link leads to; the
@@ -2483,14 +2598,17 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
             }
             let mut order = Vec::new();
             c.expand(stmts, main, &src_dir, &mut seen, &mut order);
-            c.out.classes = class_rules(&order, base_dir);
+            // A script beside an app is not the app (FEEDBACK72.md, Q-1012; branch feedback72-81).
+            let serves = serves_pages(&order);
+            let mut focus = Vec::new();
+            c.out.classes = class_rules(&order, base_dir, serves, &mut focus);
             for it in &order {
                 if !c.out.files.iter().any(|f| **f == *it.file) {
                     c.out.files.push(it.file.to_string());
                 }
             }
             if opts.css {
-                for (file, line, msg) in unused_classes(&order, base_dir, &c.unparsed_texts) {
+                for (file, line, msg) in unused_classes(&order, base_dir, &c.unparsed_texts, serves) {
                     c.diag_at(file, line, Severity::Warning, msg);
                 }
             }
@@ -2500,10 +2618,28 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
                         c.diag_at(file, line, sev, msg);
                     }
                 }
+                // (FEEDBACK72.md, Q-1019; branch feedback72-81)
+                for (file, line) in focus {
+                    c.diag_at(file, line, Severity::Warning, "`outline: none` on `:focus` takes the keyboard's ring away everywhere: style `:focus-visible` instead");
+                }
             }
             c.route_reach(&order);
+            // The top-level names given a whole number, for a comment that says one's value
+            // (`let total = pages // 7`; FEEDBACK72.md, Q-1016, found in review).
+            let consts: HashMap<String, i64> = if c.value_comments.is_empty() {
+                HashMap::new()
+            } else {
+                order
+                    .iter()
+                    .filter_map(|it| match &it.stmt {
+                        Stmt::Let(Pattern::Bind(n), Expr::Lit(Lit::Int(v)), _) => Some((n.to_string(), *v)),
+                        _ => None,
+                    })
+                    .collect()
+            };
             c.run(order);
             c.unused_said();
+            c.value_comments_said(&consts);
             c.state_details();
             c.as_written();
             // The tools' types, for their schemas (FEEDBACK56.md, Q-858; branch feedback56).
@@ -2651,6 +2787,21 @@ struct Checker {
     path_params: Vec<String>,
     /// `${name}` written in plain strings, by file and line (FEEDBACK45.md, Q-510).
     plain_dollars: HashSet<(String, String, String)>,
+    /// `//` comments right after a value that hold only a number or a name, by file and line
+    /// (FEEDBACK72.md, Q-1016; branch feedback72-81).
+    value_comments: Vec<(Arc<str>, u32, String, String)>,
+    /// The top-level names holding text written in the program, or `` css`...` ``: CSS put
+    /// together from them adds no rule a visitor wrote (FEEDBACK72.md, Q-1017; branch feedback72-81).
+    css_texts: HashSet<String>,
+    /// Each link, `redirect` and `navigate` the walk met, for `dead_links`: the file, the line, the
+    /// address's literal start, whether that is all of it, and what it is (FEEDBACK79.md, Q-1251;
+    /// branch feedback72-81).
+    page_links: Vec<(Arc<str>, u32, String, bool, &'static str)>,
+    /// Whether the walk met a call of `random`, `random_int` or `uuid` anywhere: with none, no
+    /// component is read for one (FEEDBACK72.md, Q-1015; branch feedback72-81). And the functions
+    /// and components whose code makes one, for those that call them.
+    draws_seen: bool,
+    drawers: HashSet<String>,
     /// The functions being read in their own `let`.
     letting: Vec<String>,
     /// The route's fields checked against values written in its pattern, which bind no name:
@@ -2731,6 +2882,9 @@ struct Checker {
     early: Vec<Early>,
     /// Elements around this one with `@input` or `@change` (Checker::shown_only).
     input_above: usize,
+    /// Elements around this one that take keys or focus themselves: a key handler, `tabindex`, or
+    /// a `role` (FEEDBACK72.md, Q-1019, found in review; branch feedback72-81).
+    keys_above: usize,
     /// Each scope's number, and the last given (Checker::push).
     scope_ids: Vec<u64>,
     scope_serial: u64,
@@ -2976,6 +3130,7 @@ impl Checker {
             told: HashSet::new(),
             early: Vec::new(),
             input_above: 0,
+            keys_above: 0,
             scope_ids: Vec::new(),
             scope_serial: 0,
             gone: Vec::new(),
@@ -3005,6 +3160,11 @@ impl Checker {
             letting: Vec::new(),
             set_fields: Vec::new(),
             plain_dollars: HashSet::new(),
+            value_comments: Vec::new(),
+            css_texts: HashSet::new(),
+            page_links: Vec::new(),
+            draws_seen: false,
+            drawers: HashSet::new(),
             text_params: Vec::new(),
             text_params_depth: 0,
             path_params: Vec::new(),
@@ -3112,6 +3272,8 @@ impl Checker {
         let (confined, overrides, root) = (self.confined, &self.overrides, self.root.clone());
         // The `${name}` each file's plain strings hold (Q-510), by the file.
         let mut dollars: Vec<(String, String, String)> = Vec::new();
+        // And the comments right after a value (FEEDBACK72.md, Q-1016; branch feedback72-81).
+        let mut comments: Vec<(Arc<str>, u32, String, String)> = Vec::new();
         self.links = crate::modules::link(Path::new(file), stmts.clone(), base, &mut |path, full| {
             // As `file_at` judges it (FEEDBACK55.md, Q-703; branch feedback55).
             if confined && (!Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_))) || !crate::builtins::stays_in(&root, full) || !confined_reads(&root, path, full, false)) {
@@ -3119,12 +3281,15 @@ impl Checker {
             }
             let text = overrides.get(full).cloned().map_or_else(|| crate::error::read_source(full), Ok).ok()?;
             let mut p = Parser::new(&text);
-            let parsed = p.parse_program().ok().map(Arc::new);
+            let (parsed, noted) = crate::lexer::noting_value_comments(|| p.parse_program().ok().map(Arc::new));
             let shown = full.display().to_string();
             dollars.extend(p.plain_dollars().into_iter().map(|(t, n)| (shown.clone(), t, n)));
+            let shown: Arc<str> = Arc::from(shown);
+            comments.extend(noted.into_iter().map(|(l, w, n)| (shown.clone(), l, w, n)));
             parsed
         });
         self.plain_dollars.extend(dollars);
+        self.value_comments.extend(comments);
         // Said at the import line, by the path the program wrote, and once: the name it could
         // not take is not said again where it is used (FEEDBACK45.md, Q-523).
         let main_key = Path::new(file).canonicalize().ok();
@@ -3546,6 +3711,22 @@ impl Checker {
             }
             global_assigned(std::slice::from_ref(&it.stmt), &mut self.assigned_globals);
         }
+        // `let theme = css`...``, and a name or a `+` of such, never changed: what CSS joined from
+        // it holds, as far as eight rounds find (FEEDBACK72.md, Q-1017; branch feedback72-81).
+        for _ in 0..8 {
+            let mut grew = false;
+            for it in &order {
+                if let Stmt::Let(Pattern::Bind(n), e, _) = &it.stmt {
+                    if !self.css_texts.contains(n.as_str()) && !self.assigned.contains(n.as_str()) && css_written(e, &self.css_texts) {
+                        self.css_texts.insert(n.to_string());
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
         // Helpers such as `fn table_of(id) = sql_name(`obj_${id}`)`, found
         // again until no more are: one may call another.
         let defs: Vec<&FnDef> = order.iter().filter_map(|it| if let Stmt::Fn(d) = &it.stmt { Some(&**d) } else { None }).collect();
@@ -3857,6 +4038,12 @@ impl Checker {
         // What the components a route's page shows run under its `with` (FEEDBACK80.md, Q-1261;
         // branch feedback72-81).
         self.render_effects(&order);
+        // Links to no route, handlers in markup the server alone makes, and what a component draws
+        // again as it wakes (FEEDBACK79.md, Q-1251; FEEDBACK73.md, Q-1020; FEEDBACK72.md, Q-1015;
+        // branch feedback72-81).
+        self.dead_links(&order);
+        self.page_handlers(&order);
+        self.drawn_twice(&defs, &callers);
         // A GET that writes, run from another site with the visitor's session (FEEDBACK70.md,
         // Q-965; branch security).
         self.get_writes_said(&order, &top_lets);
@@ -6485,30 +6672,36 @@ impl Checker {
                 _ => None,
             })
             .collect();
-        // (what needs it, the effects it lacks, an error) -> what to say, and the routes.
+        // (what needs it, the effects it lacks, an error) -> what to say, the components that call
+        // it and the routes: once for each, naming one of each (found in review: 400 cards calling
+        // `now()` were said of one card).
         struct Said {
             msg: (String, String, String, String),
+            components: Vec<String>,
             routes: Vec<(Arc<str>, u32, String, String)>,
         }
-        let mut said: Vec<((Arc<str>, u8, bool), Said)> = Vec::new();
+        let mut said: Vec<((Arc<str>, u8, bool, u8), Said)> = Vec::new();
         for (file, r) in routes {
             let decl = r.effects.clone().unwrap_or_default();
             let allowed = effect_mask(&decl);
             if !self.render_effects_possible(allowed) {
                 continue;
             }
-            let mut found: HashMap<(Arc<str>, u8), (bool, (String, String, String, String))> = HashMap::new();
-            // (function, runs every time, inside a component): what is reached, each once, and once
-            // more when first reached on a condition and then for sure.
+            let mut found: Found = HashMap::new();
+            // (code, runs every time, the component or view it is in, caught): what is reached,
+            // each once for each way it is reached.
             let bound = route_bound(&r);
             let mut root = Vec::new();
-            render_refs(&r.body, false, None, &bound, &mut root, 0);
-            let mut todo: Vec<(Arc<[RenderRef]>, bool, Option<Arc<FnDef>>)> = vec![(root.into(), true, None)];
-            let mut seen: HashSet<(usize, bool)> = HashSet::new();
-            while let Some((refs, sure, component)) = todo.pop() {
+            render_refs(&r.body, false, 0, None, &bound, &mut root, 0);
+            // In the order the page writes them, so the first said of is the first shown.
+            let mut todo: std::collections::VecDeque<(Arc<[RenderRef]>, bool, Option<Arc<FnDef>>, u8)> = std::collections::VecDeque::from([(root.into(), true, None, 0)]);
+            let mut seen: HashSet<(usize, bool, u8)> = HashSet::new();
+            while let Some((refs, sure, component, caught)) = todo.pop_front() {
                 for rf in refs.iter() {
+                    let s = sure && !rf.cond;
+                    let k = caught.max(rf.caught);
                     let Some(sig) = self.globals.get(&*rf.name).and_then(|v| v.sig.clone()) else {
-                        // A module's function or a service's, called in a component.
+                        // A module's function or a service's, called in a component or a view.
                         if let (Some(c), Some((m, _))) = (&component, rf.name.split_once('.')) {
                             let needs = if MODULES.contains(&m) {
                                 builtin_effect(&rf.name)
@@ -6517,30 +6710,29 @@ impl Checker {
                             } else {
                                 0
                             };
-                            self.render_need(&mut found, &file, rf, c, needs & !allowed, true, sure, Vec::new());
+                            self.render_need(&mut found, &file, rf, c, needs & !allowed, true, sure, k, Vec::new());
                         }
                         continue;
                     };
                     let def = sig.def.clone().filter(|_| !sig.builtin);
                     if sig.component || (rf.tag && def.is_some()) {
-                        // A component or a view shown: its own code is read, a component's as one.
+                        // A component or a view shown: its own code is read and said of as its,
+                        // a view the route's page shows too (found in review: `<Footer/>` with
+                        // `{str(now())}` was a 500 check said nothing of).
                         let Some(d) = def else { continue };
-                        let s = sure && !rf.cond;
-                        if seen.insert((def_key(&d), s)) {
+                        if seen.insert((def_key(&d), s, k)) {
                             let refs = self.render_refs_of(&d);
-                            let inside = if sig.component { Some(d.clone()) } else { component.clone() };
-                            todo.push((refs, s, inside));
+                            todo.push_back((refs, s, Some(d.clone()), k));
                         }
                         continue;
                     }
                     let Some(c) = &component else {
                         // The route's own calls are checked where it is; a function it calls is
-                        // read for the components it shows.
+                        // read for the components and views it shows.
                         if let Some(d) = def.filter(|d| !d.server) {
-                            let s = sure && !rf.cond;
-                            if seen.insert((def_key(&d), s)) {
+                            if seen.insert((def_key(&d), s, k)) {
                                 let refs = self.render_refs_of(&d);
-                                todo.push((refs, s, None));
+                                todo.push_back((refs, s, None, k));
                             }
                         }
                         continue;
@@ -6560,62 +6752,70 @@ impl Checker {
                             }
                         }
                     }
-                    self.render_need(&mut found, &file, rf, c, missing, declared, sure, through);
+                    self.render_need(&mut found, &file, rf, c, missing, declared, sure, k, through);
                     // A plain function called there is read for the components it shows.
                     if let Some(d) = def.filter(|d| !d.server) {
-                        let s = sure && !rf.cond;
-                        if seen.insert((def_key(&d), s)) {
+                        if seen.insert((def_key(&d), s, k)) {
                             let refs: Vec<RenderRef> = self.render_refs_of(&d).iter().filter(|x| x.tag).cloned().collect();
-                            todo.push((refs.into(), s, component.clone()));
+                            todo.push_back((refs.into(), s, component.clone(), k));
                         }
                     }
                 }
             }
-            let mut found: Vec<((Arc<str>, u8), (bool, (String, String, String, String)))> = found.into_iter().collect();
-            found.sort_by(|a, b| (&a.0 .0, a.0 .1).cmp(&(&b.0 .0, b.0 .1)));
-            for ((n, missing), (error, msg)) in found {
+            let mut found: Vec<((Arc<str>, u8, u8), (bool, (String, String, String, String), Vec<String>))> = found.into_iter().collect();
+            found.sort_by(|a, b| (&a.0 .0, a.0 .1, a.0 .2).cmp(&(&b.0 .0, b.0 .1, b.0 .2)));
+            for ((n, missing, kind), (error, msg, components)) in found {
                 let route = (file.clone(), r.line, r.shown(), decl.join(", "));
-                match said.iter_mut().find(|(k, _)| *k == (n.clone(), missing, error)) {
-                    Some((_, s)) => s.routes.push(route),
-                    None => said.push(((n, missing, error), Said { msg, routes: vec![route] })),
+                match said.iter_mut().find(|(k, _)| *k == (n.clone(), missing, error, kind)) {
+                    Some((_, s)) => {
+                        s.routes.push(route);
+                        for c in components {
+                            if !s.components.contains(&c) {
+                                s.components.push(c);
+                            }
+                        }
+                    }
+                    None => said.push(((n, missing, error, kind), Said { msg, components, routes: vec![route] })),
                 }
             }
         }
-        for ((_, _, error), s) in said {
-            let (what, calls, component, site) = s.msg;
+        for ((_, _, error, _), s) in said {
+            let (what, calls, site, tail) = s.msg;
             let (file, line, route, decl) = s.routes[0].clone();
             let others = match s.routes.len() - 1 {
                 0 => String::new(),
                 1 => ", as is 1 other route whose page runs it".to_string(),
                 k => format!(", as are {} other routes whose pages run it", k),
             };
+            let also = match s.components.len() - 1 {
+                0 => String::new(),
+                1 => ", as does 1 other component".to_string(),
+                k => format!(", as do {} other components", k),
+            };
             let msg = format!(
-                "{}{}, but `route {}` is declared `with {}`{}: <{}> calls it {}, which the server runs while it makes the page",
-                what, calls, route, decl, others, component, site
+                "{}{}, but `route {}` is declared `with {}`{}: <{}> calls it {}{}, {}",
+                what, calls, route, decl, others, s.components[0], site, also, tail
             );
             self.diag_at(file, line, if error { Severity::Error } else { Severity::Warning }, msg);
         }
     }
 
     /// One call of `render_effects` that lacks `missing`: kept, with what to say, the error
-    /// winning over the warning for one route.
-    fn render_need(
-        &mut self,
-        found: &mut HashMap<(Arc<str>, u8), (bool, (String, String, String, String))>,
-        route_file: &Arc<str>,
-        rf: &RenderRef,
-        c: &Arc<FnDef>,
-        missing: u8,
-        declared: bool,
-        sure: bool,
-        through: Vec<String>,
-    ) {
+    /// winning over the warning for one route, and every component or view that calls it.
+    #[allow(clippy::too_many_arguments)]
+    fn render_need(&mut self, found: &mut Found, route_file: &Arc<str>, rf: &RenderRef, c: &Arc<FnDef>, missing: u8, declared: bool, sure: bool, caught: u8, through: Vec<String>) {
         if missing == 0 {
             return;
         }
-        let error = declared && sure && !rf.cond;
-        if found.get(&(rf.name.clone(), missing)).is_some_and(|(e, _)| *e || !error) {
-            return;
+        let error = declared && sure && !rf.cond && caught == 0;
+        let key = (rf.name.clone(), missing, caught);
+        if let Some((e, _, components)) = found.get_mut(&key) {
+            if !components.contains(&c.name) {
+                components.push(c.name.clone());
+            }
+            if *e || !error {
+                return;
+            }
         }
         let names = effect_names(missing);
         let what = format!("`{}` needs the {} effect{}", rf.name, names.join(", "), if names.len() == 1 { "" } else { "s" });
@@ -6633,7 +6833,15 @@ impl Checker {
             Some(s) => format!("in `state {}` ({})", s, at),
             None => format!("as it renders ({})", at),
         };
-        found.insert((rf.name.clone(), missing), (error, (what, calls, c.name.clone(), site)));
+        let tail = match caught {
+            CAUGHT_FALLBACK => "which the server runs while it makes the page, where `??` gives its fallback every time",
+            CAUGHT_DEFERRED => "which the server runs after the page is sent (`defer`), so the page keeps its placeholder and the error is logged",
+            _ => "which the server runs while it makes the page",
+        };
+        let mut components = found.remove(&key).map(|(_, _, cs)| cs).unwrap_or_default();
+        components.retain(|n| *n != c.name);
+        components.insert(0, c.name.clone());
+        found.insert(key, (error, (what, calls, site, tail.to_string()), components));
     }
 
     /// `render_refs` of a function's body, read once.
@@ -6642,7 +6850,7 @@ impl Checker {
             return refs.clone();
         }
         let mut out = Vec::new();
-        render_refs(&d.body, false, None, &fn_bound(d), &mut out, 0);
+        render_refs(&d.body, false, 0, None, &fn_bound(d), &mut out, 0);
         let refs: Arc<[RenderRef]> = out.into();
         self.render_refs_cache.insert(def_key(d), refs.clone());
         refs
@@ -6655,7 +6863,12 @@ impl Checker {
         if let Some(b) = self.render_possible.get(&allowed) {
             return *b;
         }
-        let components: Vec<Arc<FnDef>> = self.globals.values().filter_map(|v| v.sig.as_ref().filter(|s| s.component).and_then(|s| s.def.clone())).collect();
+        // Views too, which a route's page may show (Q-1261, found in review).
+        let components: Vec<Arc<FnDef>> = self
+            .globals
+            .values()
+            .filter_map(|v| v.sig.as_ref().filter(|s| !s.builtin && (s.component || s.def.as_ref().is_some_and(|d| is_view(d)))).and_then(|s| s.def.clone()))
+            .collect();
         let mut possible = false;
         'all: for c in components {
             for rf in self.render_refs_of(&c).iter().filter(|r| !r.tag) {
@@ -8145,15 +8358,16 @@ impl Checker {
 
     /// An error a handler's last call gives, which goes nowhere: said with what a handler can do
     /// about it, not `?`, which leaves the handler with it (FEEDBACK72.md, Q-1018, found in review;
-    /// branch feedback72-81).
+    /// branch feedback72-81). Only of the program's own functions that make an error themselves
+    /// (`err(...)`, `?`, `! E`): not a server fn's, whose failed call the runtime reports in the
+    /// console, as `onclick={() => pay(o.id)}` is the guide's own way (decided in review), nor one
+    /// a builtin gives, as elsewhere.
     fn handler_error_dropped(&mut self, e: &Expr) {
         let Expr::Call(f, _, line) = e else { return };
         let Expr::Ident(name, _) = &**f else { return };
-        if self.is_local(name) {
-            return;
-        }
-        let Some(d) = self.globals.get(name.as_str()).filter(|v| &*v.file != "<builtin>").and_then(|v| v.sig.as_ref()).filter(|s| !s.builtin && !s.component).and_then(|s| s.def.clone()) else { return };
-        if self.can_fail(&d) {
+        // The component's own function too, as `onclick={go}` reads it (found in review).
+        let Some(d) = self.handler_fn(name) else { return };
+        if self.gives_program_error(&d) {
             self.line = *line;
             self.warn(format!("`{0}` can give an error, and this handler drops it: give a value with `{0}(...) ?? ...`, test it with `is_err`, or write `let _ = {0}(...)` if it does not matter", name));
         }
@@ -8172,8 +8386,9 @@ impl Checker {
 
     /// A function given to a handler by name, `onclick={go}`, the component's own `fn` or
     /// `let go = () => ...`, or the program's: what `go()` gives goes nowhere. Said at the handler,
-    /// not in `go`, whose other callers may take it: an error `go` can give (it declares `! E`, or
-    /// its type says so), and a new value its last line drops, `items.push(1)`,
+    /// not in `go`, whose other callers may take it: an error `go` makes itself (`err(...)`, `?`,
+    /// `! E`; not a server fn's, nor a builtin's, as `handler_error_dropped` has it for
+    /// `onclick={() => go()}`), and a new value its last line drops, `items.push(1)`,
     /// unless that names what `go` binds itself. Read with `go`'s file, and none of this
     /// component's names when `go` is the program's; the line is put back after (FEEDBACK80.md,
     /// Q-1267, and FEEDBACK72.md, Q-1018, found in review; branch feedback72-81).
@@ -8188,10 +8403,9 @@ impl Checker {
         let Some(sig) = local.or(global).and_then(|v| v.sig.clone()).filter(|s| !s.builtin && !s.component && s.native.is_none()) else { return };
         let Some(d) = sig.def.clone() else { return };
         let global = global.map(|v| v.file.clone());
-        let ret = sig.ret.unwrap_or_else(|| self.fn_ret(&sig));
-        // By what it gives, not by an `err(...)` anywhere in it: one a lambda inside it hands on
-        // is not its own (`done(err("no answer"))`, found in the website's components).
-        if d.err.is_some() || sig.err.is_some() || (!ret.vague() && ret.bits & ERR != 0) {
+        // As the inline handler is judged: `onclick={save}` and `onclick={() => save()}` agree
+        // (found in review).
+        if !sig.server && self.gives_program_error(&d) {
             self.warn(format!(
                 "`on{0}={{{1}}}` drops the error `{1}` can give: handle it in `{1}`, or write `on{0}={{() => {{ {1}() ?? ... }}}}`",
                 ev, n
@@ -8940,6 +9154,44 @@ impl Checker {
         *self.fails.borrow_mut().entry(def_key(d)).or_insert_with(|| can_fail(d))
     }
 
+    /// Whether a call of `d` can give an error the program makes, for a handler that drops it: `d`
+    /// makes one itself (`can_fail`: `err(...)`, `?`, `! E`), or gives what a program function that
+    /// can calls (`fn go() { save(1) }`, `save` declared `! str`), as far as that goes. Not a server
+    /// fn's, whose failed call the runtime reports, nor one only a builtin gives (decided in review
+    /// of FEEDBACK72.md's Q-1018; branch feedback72-81). Read with a list, not by recursion.
+    fn gives_program_error(&self, d: &Arc<FnDef>) -> bool {
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut todo: Vec<Arc<FnDef>> = vec![d.clone()];
+        while let Some(d) = todo.pop() {
+            if d.server || !seen.insert(def_key(&d)) {
+                continue;
+            }
+            if self.can_fail(&d) {
+                return true;
+            }
+            let bound = fn_bound(&d);
+            for n in returned_calls(&d.body) {
+                if bound.contains(&n) {
+                    continue;
+                }
+                let next = self.globals.get(n.as_str()).filter(|v| &*v.file != "<builtin>").and_then(|v| v.sig.as_ref()).filter(|s| !s.builtin && !s.component && !s.server).and_then(|s| s.def.clone());
+                todo.extend(next);
+            }
+        }
+        false
+    }
+
+    /// The function a handler names or calls last, `onclick={go}` or `onclick={() => go()}`: the
+    /// component's own, or the program's (not a builtin's).
+    fn handler_fn(&self, n: &str) -> Option<Arc<FnDef>> {
+        let local = self.scopes.iter().rev().find_map(|s| s.get(n));
+        let found = match local {
+            Some(v) => v,
+            None => self.globals.get(n).filter(|v| &*v.file != "<builtin>")?,
+        };
+        found.sig.as_ref().filter(|s| !s.builtin && !s.component && !s.server && s.native.is_none()).and_then(|s| s.def.clone())
+    }
+
     /// Whether a value shown in markup comes from a call that can fail, not handled: the program's
     /// function or server fn that can (`can_fail`: `server fn load() -> str ! str`, `?`,
     /// `err(...)`), called there, or a `let` or `state` set from one (`failing_vars`). Not a
@@ -9003,6 +9255,27 @@ impl Checker {
     fn call(&mut self, callee: &Expr, args: &[Expr], pre: Option<T>) -> T {
         self.pattern_runs_in_runs(callee, args);
         let line = self.line;
+        // Where `redirect` and `navigate` send the visitor (FEEDBACK79.md, Q-1251; branch
+        // feedback72-81).
+        if let (Expr::Ident(n, _), None) = (callee, &pre) {
+            if DRAWS.contains(&n.as_str()) && self.builtin_in_scope(n) {
+                self.draws_seen = true;
+                let names: Vec<String> = self.fns.iter().map(|f| f.name.clone()).collect();
+                self.drawers.extend(names);
+            }
+            if (n == "redirect" || n == "navigate") && self.builtin_in_scope(n) {
+                if let Some((t, whole)) = args.first().and_then(link_start) {
+                    // A 307 or 308 is followed with the request's own method (found in review).
+                    let same = matches!(args.get(1), Some(Expr::Lit(Lit::Int(307 | 308))));
+                    let what = match (n.as_str(), same) {
+                        ("navigate", _) => "navigate",
+                        (_, true) => "redirect-same",
+                        _ => "redirect",
+                    };
+                    self.page_links.push((self.file.clone(), line, t, whole, what));
+                }
+            }
+        }
         // `User({ ... })`: a field the record does not have is a mistake.
         if let (Expr::Ident(n, _), Some(Expr::Map(entries)), None) = (callee, args.first(), &pre) {
             if let Some(td) = record(n).filter(|td| td.is_record() && !self.is_local(n)) {
@@ -10456,7 +10729,15 @@ impl Checker {
         }
         let n = sig.params.len();
         // A builtin's call as its docs write it: `reduce(xs, start, f)` (Q-525).
-        let shape = || format!("{}({})", name, sig.params.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", "));
+        // A builtin whose docs write its last parameter `args...` takes the rest one by one:
+        // `live(load, ...args)`, as `live(load, args)` read as a list (FEEDBACK73.md, Q-1024;
+        // branch feedback72-81).
+        let spread_last = sig.builtin && sig.variadic && crate::builtin_docs::DOCS.iter().any(|(n, p, _)| *n == name && p.trim_end().ends_with("..."));
+        let shape = || {
+            let last = sig.params.len().saturating_sub(1);
+            let ps: Vec<String> = sig.params.iter().enumerate().map(|(i, p)| if spread_last && i == last { format!("...{}", p.name) } else { p.name.clone() }).collect();
+            format!("{}({})", name, ps.join(", "))
+        };
         let too_many = args.len() > n && !sig.variadic;
         if too_many {
             // `max(1, 2)`: one list, said once, not also as argument 1's type.
@@ -10923,6 +11204,16 @@ impl Checker {
         }
         if !is_view {
             self.shown_only(el);
+            self.markup_habits(el);
+        }
+        // Where a link goes (FEEDBACK79.md, Q-1251; branch feedback72-81): an element's `href`, not a
+        // view's or component's prop of that name, which may be anything (found in review).
+        for (n, v) in el.attrs.iter().filter(|_| !is_view) {
+            if let (true, AttrVal::Expr(x)) = (n.eq_ignore_ascii_case("href"), v) {
+                if let Some((t, whole)) = link_start(x) {
+                    self.page_links.push((self.file.clone(), el.line, t, whole, "link"));
+                }
+            }
         }
         let mut given: Vec<(String, T)> = Vec::new();
         let mut spread = false;
@@ -10971,7 +11262,12 @@ impl Checker {
                     self.error(format!("<{}> is a view; `@{}` handlers go on HTML elements", el.tag, ev));
                 } else if t.bits != 0 && t.bits & FN == 0 {
                     // `onclick={text}` is read as this too: say what a handler is.
-                    self.error(format!("`@{}` needs a function, got {}: a handler is a function, `on{}={{() => ...}}`; text is never run as code", ev, bits_text(t.bits), ev));
+                    // Alpine's `@click.prevent="..."`: one message, the modifier's (FEEDBACK72.md,
+                    // Q-1031, found in review; branch feedback72-81).
+                    match ev.split_once('.').and_then(|(b, m)| modifier_advice(&format!("on{}", b), m)) {
+                        Some(how) => self.error(format!("`@{}` never fires: {}", ev, how)),
+                        None => self.error(format!("`@{}` needs a function, got {}: a handler is a function, `on{}={{() => ...}}`; text is never run as code", ev, bits_text(t.bits), ev)),
+                    }
                 }
             } else if let Some(prop) = name.strip_prefix("bind:") {
                 if crate::ast::bind_event(&el.tag, prop).is_none() {
@@ -10993,6 +11289,15 @@ impl Checker {
         let bubbles = el.attrs.iter().any(|(a, _)| a == "@input" || a == "@change");
         if bubbles {
             self.input_above += 1;
+        }
+        // A table that takes focus and keys, a dialog that hears Escape: a click inside it has the
+        // keyboard's way already (Q-1019, found in review).
+        let keys = !is_view && el.attrs.iter().any(|(a, v)| {
+            matches!(a.as_str(), "@keydown" | "@keyup" | "@keypress" | "tabindex")
+                || (a == "role" && !matches!(v, AttrVal::Expr(Expr::Lit(Lit::Str(r))) if &**r == "presentation" || &**r == "none"))
+        });
+        if keys {
+            self.keys_above += 1;
         }
         for c in &el.children {
             match c {
@@ -11073,6 +11378,9 @@ impl Checker {
         if bubbles {
             self.input_above -= 1;
         }
+        if keys {
+            self.keys_above -= 1;
+        }
         if !is_view {
             return;
         }
@@ -11136,6 +11444,856 @@ impl Checker {
             if sig.server {
                 self.error(format!("<{}> is a server fn, not a view (in <{}>)", el.tag, c));
             }
+        }
+    }
+
+    // ---- markup, links and habits (FEEDBACK72.md, FEEDBACK73.md and FEEDBACK79.md; branch
+    // feedback72-81) --------------------------------------------------------------------------
+
+    /// What an element's attributes say of a habit from elsewhere, each with what to write: Vue's
+    /// modifiers, `v-model` and `v-on:` (FEEDBACK72.md, Q-1031), a click on an element the keyboard
+    /// never reaches and an image with no `alt` (Q-1019), and CSS put together from values with `+`
+    /// or a template (Q-1017; branch feedback72-81).
+    fn markup_habits(&mut self, el: &HtmlEl) {
+        let has = |n: &str| el.attrs.iter().any(|(a, _)| a.eq_ignore_ascii_case(n));
+        let spread = el.attrs.iter().any(|(_, v)| matches!(v, AttrVal::Spread(_)));
+        for (name, v) in &el.attrs {
+            self.line = el.line;
+            // A function given; text is refused where the handler is checked, with this advice.
+            let code = matches!(v, AttrVal::Expr(e) if !matches!(e, Expr::Lit(_) | Expr::Template(_)));
+            if let (Some((ev, mods)), true) = (name.strip_prefix('@').and_then(|e| e.split_once('.')), code) {
+                if let Some(how) = modifier_advice(&format!("on{}", ev), mods) {
+                    self.warn(format!("`{}` never fires: {}", name, how));
+                }
+            } else if name == "v-model" && code {
+                // `v-model="msg"`, text, is petite-vue's or Alpine's attribute, read by that
+                // library; braces are Quillo's (found in review).
+                let shown = match v {
+                    AttrVal::Expr(Expr::Ident(n, _)) => n.to_string(),
+                    _ => "...".to_string(),
+                };
+                let checkbox = el.tag == "input"
+                    && el.attrs.iter().any(|(a, t)| a == "type" && matches!(t, AttrVal::Expr(Expr::Lit(Lit::Str(s))) if s.eq_ignore_ascii_case("checkbox")));
+                self.warn(format!("`v-model` is Vue's: write `{}={{{}}}`, which is two-way by itself", if checkbox { "checked" } else { "value" }, shown));
+            } else if let (Some(ev), true) = (name.strip_prefix("v-on:"), code) {
+                self.warn(format!("`{}` is Vue's: write `on{}={{...}}`", name, ev.split('.').next().unwrap_or(ev)));
+            } else if name == "style" {
+                // A template string's values are written as CSS values; text joined with `+` is
+                // one string, which nothing can take apart.
+                if let AttrVal::Expr(x @ Expr::Binary(BinOp::Add, ..)) = v {
+                    if self.css_from_values(x) {
+                        self.warn("`style` built from values with `+`: a value containing `;` can add declarations (CSS injection); write a style map, `style={{ color: c }}`, whose values are written as CSS values");
+                    }
+                }
+            }
+        }
+        self.line = el.line;
+        // What a click alone reaches: a mouse, not the keyboard, nor a screen reader's list of what
+        // can be pressed.
+        const STILL: &[&str] = &[
+            "div", "span", "p", "li", "td", "th", "tr", "img", "section", "article", "header", "footer", "main", "aside", "nav", "ul", "ol",
+            "dl", "dt", "dd", "h1", "h2", "h3", "h4", "h5", "h6", "figure", "figcaption", "strong", "em", "b", "i", "small", "pre", "code",
+            "blockquote", "table", "tbody", "thead", "tfoot",
+        ];
+        // Not a click on what is around the content, read by its `e.target` (a backdrop, a list
+        // handling its items' clicks, a box focusing its field), nor an element hidden from a
+        // screen reader or with a key handler of its own: in the website's kit 12 of 17 were such.
+        let clicked = || {
+            el.attrs.iter().any(|(a, v)| {
+                a == "@click"
+                    && match v {
+                        AttrVal::Expr(Expr::Lambda(d)) => {
+                            let mut target = false;
+                            walk_fn(d, &mut |x| target |= matches!(x, Expr::Field(_, f, _) if f == "target" || f == "currentTarget"));
+                            !target
+                        }
+                        AttrVal::Expr(_) => true,
+                        _ => false,
+                    }
+            })
+        };
+        let still = || ["role", "tabindex", "contenteditable", "aria-hidden", "@keydown", "@keyup", "@keypress"].iter().all(|a| !has(a));
+        if el.attrs.iter().any(|(a, _)| a == "@click") && !spread && self.keys_above == 0 && STILL.contains(&el.tag.as_str()) && still() && clicked() {
+            let an = if el.tag.starts_with(['a', 'e', 'i', 'o']) || (el.tag.len() == 2 && el.tag.starts_with('h')) { "an" } else { "a" };
+            self.warn(format!("{} `<{}>` with onclick can't be reached with the keyboard: use a `<button>`", an, el.tag));
+        }
+        if el.tag == "img" && !spread && !["alt", "role", "aria-label", "aria-labelledby", "aria-hidden", "hidden"].iter().any(|a| has(a)) {
+            self.warn("this `<img>` has no `alt`: `alt=\"\"` if it is decoration, or words for what it shows");
+        }
+        // `<style>{`p { color: ${c} }`}</style>`: the SQL warning's twin.
+        if el.tag.eq_ignore_ascii_case("style") {
+            for c in &el.children {
+                if let HtmlChild::Expr(x @ (Expr::Template(_) | Expr::Binary(BinOp::Add, ..))) = c {
+                    if self.css_from_values(x) {
+                        self.warn("`<style>` with CSS built from values: a value containing `}` can add rules (CSS injection); write `` css`...` ``, which writes each `${...}` as one CSS value");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether CSS put together with `+` or a template holds a value that may be anyone's text: not
+    /// a literal, a `` css`...` `` (whose values it writes as CSS values) or a name holding one, text
+    /// written in the program, or a number (FEEDBACK72.md, Q-1017; branch feedback72-81). Read with
+    /// a list of what is left, not by recursion, so a long chain of `+` takes no stack.
+    fn css_from_values(&mut self, e: &Expr) -> bool {
+        let mut todo = vec![e];
+        while let Some(x) = todo.pop() {
+            match x {
+                Expr::Lit(_) => {}
+                Expr::Template(parts) => todo.extend(parts.iter().filter_map(|p| if let TPart::Expr(y) = p { Some(y) } else { None })),
+                Expr::Binary(BinOp::Add, a, b, _) => {
+                    todo.push(a);
+                    todo.push(b);
+                }
+                Expr::Call(f, _, _) if self.builtin_named(f, "css") => {}
+                // A number's text: `str(pct)`, `format_number(pct)` (found in review).
+                Expr::Call(f, args, _)
+                    if (self.builtin_named(f, "str") || self.builtin_named(f, "format_number"))
+                        && args.first().is_some_and(|a| {
+                            let t = self.quiet_expr_type(a);
+                            t.bits != 0 && t.bits & !(INT | FLOAT | DEC) == 0
+                        }) => {}
+                Expr::Ident(n, _) if !self.is_local(n) && self.css_texts.contains(n.as_str()) => {}
+                _ if self.url_fixed(x) => {}
+                _ => {
+                    let t = self.quiet_expr_type(x);
+                    if t.bits == 0 || t.bits & !(INT | FLOAT | DEC | BOOL | NIL) != 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// A link, `redirect` or `navigate` to an address of the program's that no route answers: a 404
+    /// found only when someone follows it, where Dioxus's build fails (FEEDBACK79.md, Q-1251; branch
+    /// feedback72-81). Only what is written is read: a literal, or the literal start of a template
+    /// or of a `+`, from `/` (not `//`), its `?query` and `#hash` left out; a `mount`'s or a
+    /// `service`'s prefix takes what is under it, and a route ending in `*rest` all below it. Not in
+    /// a program checked inside another (a mounted one's addresses are under its prefix), nor in one
+    /// with no routes (a file of views for other programs).
+    fn dead_links(&mut self, order: &[Item]) {
+        if DEPTH.with(|d| d.get()) > 1 {
+            return;
+        }
+        let mut routes: Vec<&RouteDef> = Vec::new();
+        let mut prefixes: Vec<Vec<String>> = Vec::new();
+        for it in order {
+            match &it.stmt {
+                Stmt::Route(r) if r.method != crate::ast::GUARD_METHOD => routes.push(r),
+                Stmt::Mount(p, _, _) | Stmt::Service(_, Some(p), _, _, _, _) => prefixes.push(p.split('/').filter(|s| !s.is_empty()).map(String::from).collect()),
+                _ => {}
+            }
+        }
+        if routes.is_empty() {
+            return;
+        }
+        // The routes by their first piece, written out; those that start with a parameter or
+        // `*rest` are tried for every address. And by how many pieces they have, for "did you
+        // mean": every link against every route, and an edit distance for each, made 3,000 routes
+        // and 9,000 links 39% slower to check (found in review).
+        let mut by_first: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut open: Vec<usize> = Vec::new();
+        // By how many pieces, and the first letter of the first piece written out.
+        let mut by_shape: HashMap<(usize, Option<char>), Vec<usize>> = HashMap::new();
+        let mut by_len: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, r) in routes.iter().enumerate() {
+            let initial = match r.path.first() {
+                Some(Seg::Lit(l)) => {
+                    by_first.entry(l.as_str()).or_default().push(i);
+                    l.chars().next()
+                }
+                _ => {
+                    open.push(i);
+                    None
+                }
+            };
+            let len = r.path.iter().position(|s| matches!(s, Seg::Rest(_))).unwrap_or(r.path.len());
+            by_shape.entry((len, initial)).or_default().push(i);
+            by_len.entry(len).or_default().push(i);
+        }
+        // What the suggestions may cost: routes looked at for one dead link, and edit distances in
+        // all; past them, a dead link is said with none (found in review).
+        const LOOKED_AT: usize = 64;
+        let mut budget: u32 = 5_000;
+        // As the walk met them; one met twice is said once (`diag_at`).
+        for (file, line, text, whole, what) in std::mem::take(&mut self.page_links) {
+            if !text.starts_with('/') || text.starts_with("//") || text.starts_with("/\\") {
+                continue;
+            }
+            let (path, whole) = match text.find(['?', '#']) {
+                Some(i) => (&text[..i], true),
+                None => (text.as_str(), whole),
+            };
+            if path == "/_quillo" || path.starts_with("/_quillo/") || path == "/manifest.webmanifest" || path == "/apple-touch-icon.png" {
+                continue;
+            }
+            let mut pieces: Vec<std::borrow::Cow<str>> =
+                path.split('/').skip(1).map(|s| if s.contains('%') { std::borrow::Cow::Owned(crate::server::percent_decode(s, false)) } else { std::borrow::Cow::Borrowed(s) }).collect();
+            let partial = if whole { None } else { pieces.pop() };
+            pieces.retain(|s| !s.is_empty());
+            // A program with no `/` of its own is part of a site whose home is elsewhere (behind a
+            // proxy, or a fragment such as a guard's `redirect("/")`): its home is not said.
+            if pieces.is_empty() && partial.is_none() {
+                continue;
+            }
+            if prefixes.iter().any(|p| pieces.len() >= p.len() && pieces[..p.len()] == p[..]) {
+                continue;
+            }
+            // The routes that could take it: those of its first piece, or of a first piece that
+            // starts as a template's does, and those that start with a parameter.
+            let (first, start) = (pieces.first(), partial.as_deref());
+            let by_start = by_first.iter().filter(|(k, _)| first.is_none() && start.is_some_and(|s| k.starts_with(s))).flat_map(|(_, v)| v.iter());
+            let firsts = first.and_then(|f| by_first.get(&**f)).into_iter().flatten();
+            // A 307 or 308 keeps the method, so any route of the path takes it (found in review).
+            let gets = |r: &RouteDef| what == "redirect-same" || r.method == "GET" || r.method == "ANY";
+            let mut other: Option<&RouteDef> = None;
+            let mut taken = false;
+            for &i in firsts.chain(open.iter()).chain(if first.is_none() && start.is_some() { Some(by_start) } else { None }.into_iter().flatten()) {
+                let r = routes[i];
+                if link_fits(&r.path, &pieces, partial.as_deref()) {
+                    if gets(r) {
+                        taken = true;
+                        break;
+                    }
+                    other = other.or(Some(r));
+                }
+            }
+            if taken {
+                continue;
+            }
+            let shown = if whole { path.to_string() } else { format!("{}…", path) };
+            let asks = match what {
+                "link" => "a link asks with GET",
+                "redirect" => "a redirect is followed with GET",
+                _ => "`navigate` asks with GET",
+            };
+            if let Some(r) = other {
+                self.diag_at(file, line, Severity::Warning, format!("only `{} {}` answers `{}`, and {}, so it gets a 405", r.method, route_path(r), shown, asks));
+                continue;
+            }
+            let most = (path.chars().count() / 4).clamp(1, 3);
+            let written = path.chars().filter(|c| *c != '/').count();
+            // Routes of about as many pieces: first those of the same first piece, then of the same
+            // first letter, then the rest, as far as the limits go.
+            let n = pieces.len();
+            let lens = if whole { n.saturating_sub(1)..=n + 1 } else { n..=n + 2 };
+            let first_len = pieces.first().map(|p| p.chars().count());
+            let initial = pieces.first().and_then(|p| p.chars().next());
+            let same_first = pieces.first().and_then(|f| by_first.get(&**f)).into_iter().flatten();
+            let same_initial = lens.clone().flat_map(|len| by_shape.get(&(len, initial)).into_iter().flatten());
+            let rest = lens.clone().flat_map(|len| by_len.get(&len).into_iter().flatten());
+            let mut near: Option<(usize, usize, &RouteDef)> = None;
+            let mut looked: HashSet<usize> = HashSet::new();
+            for i in same_first.chain(same_initial).chain(rest) {
+                if budget == 0 || looked.len() >= LOOKED_AT {
+                    break;
+                }
+                if !looked.insert(*i) {
+                    continue;
+                }
+                {
+                    let r = routes[*i];
+                    if !gets(r) {
+                        continue;
+                    }
+                    if let (Some(Seg::Lit(l)), Some(fl)) = (r.path.first(), first_len) {
+                        if l.chars().count().abs_diff(fl) > most {
+                            continue;
+                        }
+                    }
+                    budget -= 1;
+                    // Not one that keeps nothing of what was written (`/@` for `/`).
+                    if let Some(d) = link_distance(&r.path, &pieces, partial.as_deref()).filter(|d| *d <= most && *d < written) {
+                        // The nearest; of those as near, the first written.
+                        if near.is_none_or(|(b, j, _)| (d, *i) < (b, j)) {
+                            near = Some((d, *i, r));
+                        }
+                    }
+                }
+            }
+            let near = near
+                .map(|(_, _, r)| {
+                    // The link's own piece where a parameter takes it, the parameter as written
+                    // where it does not, and `…` for what the template gives.
+                    let mut s = String::new();
+                    for (i, seg) in r.path.iter().enumerate() {
+                        s.push('/');
+                        match (seg, pieces.get(i)) {
+                            (Seg::Lit(l), _) => s.push_str(l),
+                            (Seg::Param(n, ty, prefix), Some(p)) => {
+                                let p: &str = p;
+                                let v = p.strip_prefix(prefix.as_str()).unwrap_or(p);
+                                if v.is_empty() || ty.as_ref().is_some_and(|t| crate::interp::coerce(t, v).is_none()) {
+                                    s.push_str(&format!("{}:{}{}", prefix, n, ty.as_ref().map_or(String::new(), |t| format!("({})", t))));
+                                } else {
+                                    s.push_str(&format!("{}{}", prefix, v));
+                                }
+                            }
+                            _ => s.push('…'),
+                        }
+                    }
+                    if s.is_empty() {
+                        s.push('/');
+                    }
+                    s
+                })
+                .filter(|s| *s != shown)
+                .map(|s| format!(" (did you mean `{}`?)", s))
+                .unwrap_or_default();
+            let ends = match what {
+                "link" => "this link is a 404",
+                "navigate" => "this `navigate` ends at a 404",
+                _ => "this redirect ends at a 404",
+            };
+            self.diag_at(file, line, Severity::Warning, format!("no route answers `{}`, so {}{}", shown, ends, near));
+        }
+    }
+
+    /// An event handler in a view a page places outside any component, itself or through the
+    /// functions and views that make the page's markup: the server writes the bare element, and only
+    /// a component's code reaches the browser, so the handler never runs (FEEDBACK73.md, Q-1020;
+    /// branch feedback72-81). A view placed both in a page and in a component is said of for the
+    /// page. Each function is read once, with a list of what is left to read. A route's own markup,
+    /// and a plain function's that a page places so, lose their handlers the same way (decided in
+    /// review).
+    fn page_handlers(&mut self, order: &[Item]) {
+        let components: HashSet<String> = self.globals.iter().filter(|(_, v)| v.sig.as_ref().is_some_and(|s| s.component)).map(|(n, _)| n.clone()).collect();
+        // A function or view reached, with where the page first reached it.
+        let mut todo: Vec<(String, Arc<str>, u32, String)> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut said: Vec<(Arc<str>, u32, String)> = Vec::new();
+        for it in order {
+            let Stmt::Route(r) = &it.stmt else { continue };
+            if r.method == crate::ast::GUARD_METHOD {
+                continue;
+            }
+            let route = format!("{} {}", r.method, route_path(r));
+            let mut marks = PageMarks::default();
+            page_marks(&r.body, &components, &HashSet::new(), &mut marks, 0);
+            for (ev, line) in marks.handlers {
+                said.push((it.file.clone(), line, format!("`on{}` here never runs: the page of `{}` is made on the server, and only a component's handlers reach the browser: put this markup in a component", ev, route)));
+            }
+            for (n, line) in marks.reached {
+                if seen.insert(n.clone()) {
+                    todo.push((n, it.file.clone(), line, route.clone()));
+                }
+            }
+            while let Some((n, file, line, route)) = todo.pop() {
+                let body = match self.globals.get(&n).and_then(|v| v.sig.as_ref()).and_then(|s| s.def.clone().filter(|_| !s.builtin && !s.server && !s.component)) {
+                    Some(d) => d,
+                    None => match self.bodies.get(&n) {
+                        Some(d) if !d.server && !d.component => d.clone(),
+                        _ => continue,
+                    },
+                };
+                let mut marks = PageMarks::default();
+                let params: HashSet<String> = body.params.iter().map(|p| p.name.to_string()).collect();
+                page_marks(&body.body, &components, &params, &mut marks, 0);
+                let home = self.globals.get(&n).map_or_else(|| file.clone(), |v| v.file.clone());
+                if !marks.handlers.is_empty() {
+                    let at = self.shown_at(&file, line);
+                    let view = is_view(&body);
+                    for (ev, l) in marks.handlers {
+                        let msg = if view {
+                            format!("`on{}` in view {} never runs: {} is placed in a page ({}), not in a component. Make it a component, or place it inside one", ev, n, n, at)
+                        } else {
+                            format!("`on{}` in `{}` never runs: `{}` makes markup for the page of `{}` ({}), on the server, and only a component's handlers reach the browser: put it in a component", ev, n, n, route, at)
+                        };
+                        said.push((home.clone(), l, msg));
+                    }
+                }
+                for (m, l) in marks.reached {
+                    if seen.insert(m.clone()) {
+                        todo.push((m, home.clone(), l, route.clone()));
+                    }
+                }
+            }
+        }
+        for (file, line, msg) in said {
+            self.diag_at(file, line, Severity::Warning, msg);
+        }
+    }
+
+    /// A component's `let`, or its markup, that draws `random`, `random_int` or `uuid`, itself
+    /// or through a function or a view it calls: the browser runs the component's body again when
+    /// the component wakes, draws again, and puts its value in place of the one the server showed
+    /// (FEEDBACK72.md, Q-1015; branch feedback72-81). A `state`'s value is worked out once, on the
+    /// server, and the browser keeps it (tried in Chrome); a handler's code is the browser's alone.
+    fn drawn_twice(&mut self, defs: &[&FnDef], callers: &HashMap<&str, Vec<usize>>) {
+        if !self.draws_seen {
+            return;
+        }
+        // The functions that draw, themselves or by calling one that does: a component that is
+        // none of them, and places no view that draws, draws nothing, and is not read again (the
+        // website's 1,133 components each read once had cost its check 1%; found in review).
+        let mut drawing: HashSet<String> = self.drawers.clone();
+        let mut todo: Vec<String> = drawing.iter().cloned().collect();
+        while let Some(n) = todo.pop() {
+            for &i in callers.get(n.as_str()).into_iter().flatten() {
+                if drawing.insert(defs[i].name.clone()) {
+                    todo.push(defs[i].name.clone());
+                }
+            }
+        }
+        let views_draw = drawing.iter().any(|n| self.globals.get(n).and_then(|v| v.sig.as_ref()).and_then(|s| s.def.as_ref()).is_some_and(|d| is_view(d) && !d.component));
+        let mut comps: Vec<(Arc<FnDef>, Arc<str>)> = self
+            .globals
+            .values()
+            .filter_map(|v| v.sig.as_ref().filter(|s| s.component).and_then(|s| s.def.clone()).map(|d| (d, v.file.clone())))
+            .collect();
+        comps.sort_by(|a, b| (&a.1, a.0.line).cmp(&(&b.1, b.0.line)));
+        let mut memo: HashMap<usize, Option<&'static str>> = HashMap::new();
+        for (c, file) in comps {
+            if !views_draw && !drawing.contains(&c.name) {
+                continue;
+            }
+            // Most components draw nothing: their calls, read once, say so.
+            let refs = self.render_refs_of(&c);
+            if !refs.iter().any(|r| r.state.is_none() && !form_key_at(&c, r) && self.draws(&r.name, &mut memo).is_some()) {
+                continue;
+            }
+            // What the page shows: the markup the body ends with, and each `let` it reads, or that
+            // a `let` it reads reads (a value drawn and used only in a handler, or not at all,
+            // changes nothing shown; found in review). A `let` reads only those before it, so one
+            // pass from the end finds them.
+            let (lets, markup): (Vec<(&str, &Expr)>, Option<&Expr>) = match &c.body {
+                Expr::Block(stmts) => (
+                    stmts.iter().filter_map(|s| if let Stmt::Let(Pattern::Bind(n), e, _) = s { Some((n.as_str(), e)) } else { None }).collect(),
+                    match stmts.last() {
+                        Some(Stmt::Expr(e)) => Some(e),
+                        _ => None,
+                    },
+                ),
+                e => (Vec::new(), Some(e)),
+            };
+            let read_now = |e: &Expr, out: &mut HashSet<String>| {
+                let later = runs_later(e);
+                walk_expr(e, &mut |x| {
+                    if let Expr::Ident(n, _) = x {
+                        if !later.contains(&(x as *const Expr)) {
+                            out.insert(n.to_string());
+                        }
+                    }
+                });
+            };
+            let mut shown: HashSet<String> = HashSet::new();
+            if let Some(m) = markup {
+                read_now(m, &mut shown);
+            }
+            for (n, e) in lets.iter().rev() {
+                if shown.contains(*n) {
+                    read_now(e, &mut shown);
+                }
+            }
+            let mut own: Vec<(Option<&str>, &Expr)> = lets.into_iter().filter(|(n, _)| shown.contains(*n)).map(|(n, e)| (Some(n), e)).collect();
+            own.extend(markup.map(|m| (None, m)));
+            let bound = fn_bound(&c);
+            for (name, e) in own {
+                let mut refs = Vec::new();
+                render_refs(e, false, 0, None, &bound, &mut refs, 0);
+                for rf in refs.iter().filter(|r| r.state.is_none() && !form_key_at(&c, r)) {
+                    let Some((through, drawn)) = self.draws(&rf.name, &mut memo) else { continue };
+                    let how = if through.is_empty() || rf.tag { String::new() } else { format!(" (`{}` calls `{}`)", through, drawn) };
+                    let msg = match name {
+                        Some(n) => format!(
+                            "`{}` is drawn again in the browser when <{}> wakes{}, so what the page shows changes under the visitor: `state {} = ...` draws once, on the server, and the browser keeps it",
+                            n, c.name, how, n
+                        ),
+                        None if rf.tag => format!(
+                            "<{}> here calls `{}`, drawn again in the browser when <{}> wakes, so what the page shows changes under the visitor: give it the value from a state, `state x = {}()`, which draws once, on the server, and the browser keeps it",
+                            through, drawn, c.name, drawn
+                        ),
+                        None => {
+                            let f = if through.is_empty() { drawn } else { through.as_str() };
+                            format!(
+                                "`{}()` here is drawn again in the browser when <{}> wakes{}, so what the page shows changes under the visitor: keep it in a state, `state x = {}()`, which draws once, on the server, and the browser keeps it",
+                                f, c.name, how, f
+                            )
+                        }
+                    };
+                    self.diag_at(file.clone(), rf.line, Severity::Warning, msg);
+                }
+            }
+        }
+    }
+
+    /// Whether calling `name` draws a new value each time (Q-1015): one of the builtins that do, or
+    /// a plain function or view that calls one, as far as their calls go; the name it is reached
+    /// through (empty for the builtin itself) and the builtin.
+    fn draws(&mut self, name: &str, memo: &mut HashMap<usize, Option<&'static str>>) -> Option<(String, &'static str)> {
+        let sig = self.globals.get(name).and_then(|v| v.sig.clone())?;
+        if sig.builtin {
+            return DRAWS.iter().find(|d| **d == name).map(|d| (String::new(), *d));
+        }
+        let d = sig.def.clone().filter(|_| !sig.server && !sig.component)?;
+        self.draws_def(&d, memo).map(|b| (name.to_string(), b))
+    }
+
+    /// The builtin that draws which `d`'s code, or code it calls, calls (Q-1015): each function read
+    /// once for the whole check, depth first with a list of what is being read, not by recursion; one
+    /// being read counts as drawing nothing, so a recursive one ends.
+    fn draws_def(&mut self, d: &Arc<FnDef>, memo: &mut HashMap<usize, Option<&'static str>>) -> Option<&'static str> {
+        if let Some(r) = memo.get(&def_key(d)) {
+            return *r;
+        }
+        memo.insert(def_key(d), None);
+        let refs = self.render_refs_of(d);
+        let mut stack: Vec<(Arc<FnDef>, Arc<[RenderRef]>, usize)> = vec![(d.clone(), refs, 0)];
+        let mut found: Option<&'static str> = None;
+        while let Some(top) = stack.last_mut() {
+            if let Some(b) = found {
+                memo.insert(def_key(&top.0), Some(b));
+                stack.pop();
+                continue;
+            }
+            let Some(rf) = top.1.get(top.2).cloned() else {
+                stack.pop();
+                continue;
+            };
+            top.2 += 1;
+            let Some(s) = self.globals.get(&*rf.name).and_then(|v| v.sig.clone()) else { continue };
+            if s.builtin {
+                found = DRAWS.iter().find(|b| **b == &*rf.name).copied().filter(|_| !form_key_at(&top.0, &rf));
+            } else if let Some(g) = s.def.clone().filter(|_| !s.server && !s.component) {
+                match memo.get(&def_key(&g)) {
+                    Some(r) => found = *r,
+                    None => {
+                        memo.insert(def_key(&g), None);
+                        let refs = self.render_refs_of(&g);
+                        stack.push((g, refs, 0));
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// `pages // 2`, Python's whole-number division, is `pages` and a comment: said of a `//`
+    /// comment right after a value on its line that holds only a number, or a name the program has
+    /// there (FEEDBACK72.md, Q-1016; branch feedback72-81). A comment of words is left alone.
+    /// A whole number the name it follows is given at the top level is that name's value, written
+    /// as a result (`consts`; found in review).
+    fn value_comments_said(&mut self, consts: &HashMap<String, i64>) {
+        for (file, line, word, after) in std::mem::take(&mut self.value_comments) {
+            let number = word.starts_with(|c: char| c.is_ascii_digit());
+            if number && consts.get(&after).is_some_and(|v| word.parse::<i64>().ok() == Some(*v)) {
+                continue;
+            }
+            let named = !number
+                && (self.out.locals.iter().any(|l| l.name == word && l.file == *file && l.line <= line && line <= l.end)
+                    || self.out.symbols.iter().any(|s| s.name == word && s.kind != SymbolKind::Route));
+            if number || named {
+                self.diag_at(file, line, Severity::Warning, format!("`//` starts a comment here, so `// {}` is left out: whole-number division is `floor(a / b)`", word));
+            }
+        }
+    }
+}
+
+/// The builtins that give another value at each call, which a component's body draws again in the
+/// browser (Q-1015). Not `now`: what a page shows of it (`ago(t, now())`, a year, a day) is the same
+/// text a moment later, so the browser takes the component up as it is; in app/ and the website
+/// its 46 warnings were all such (survey of branch feedback72-81).
+const DRAWS: &[&str] = &["random", "random_int", "uuid"];
+
+/// Whether `rf`, a `uuid` call of `d`'s, is the key Quillo writes into a `<form idempotent>` on that
+/// line, which the program never wrote (Q-1015).
+fn form_key_at(d: &FnDef, rf: &RenderRef) -> bool {
+    if &*rf.name != "uuid" {
+        return false;
+    }
+    let mut found = false;
+    walk_fn(d, &mut |e| {
+        if let Expr::Html(el, _) = e {
+            walk_html_els(el, &mut |h| {
+                found |= h.tag == "input"
+                    && h.line == rf.line
+                    && h.attrs.iter().any(|(n, v)| n == "name" && matches!(v, AttrVal::Expr(Expr::Lit(Lit::Str(s))) if &**s == crate::idempotency::FORM_FIELD));
+            });
+        }
+    });
+    found
+}
+
+/// What to write for a handler with modifiers, Vue's `@click.prevent` (`handler` as the guide
+/// writes it, `onclick`; `mods`, what follows its first dot): there are none, and the event
+/// object does what they do (FEEDBACK72.md, Q-1031 and Q-1032; branch feedback72-81).
+pub(crate) fn modifier_advice(handler: &str, mods: &str) -> Option<String> {
+    if mods.is_empty() {
+        return None;
+    }
+    let mods: Vec<&str> = mods.split('.').collect();
+    if handler == "onsubmit" && mods.contains(&"prevent") {
+        return Some("there are no modifiers, and `onsubmit` already keeps the page from reloading: write `onsubmit={...}`".to_string());
+    }
+    let mut does: Vec<&str> = Vec::new();
+    for m in &mods {
+        match *m {
+            "prevent" => does.push("e.preventDefault();"),
+            "stop" => does.push("e.stopPropagation();"),
+            _ => {}
+        }
+    }
+    does.push("...");
+    Some(format!("there are no modifiers; write `{}={{(e) => {{ {} }}}}`", handler, does.join(" ")))
+}
+
+/// Whether `e` is text the program writes (Q-1017): a literal, a `` css`...` ``, a name of
+/// `known`, or a template or a `+` of those. Read with a list of what is left, not by recursion.
+fn css_written(e: &Expr, known: &HashSet<String>) -> bool {
+    let mut todo = vec![e];
+    while let Some(x) = todo.pop() {
+        match x {
+            Expr::Lit(Lit::Str(_)) => {}
+            Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(c, _) if c == "css") => {}
+            Expr::Ident(n, _) if known.contains(n.as_str()) => {}
+            Expr::Template(parts) => todo.extend(parts.iter().filter_map(|p| if let TPart::Expr(y) = p { Some(y) } else { None })),
+            Expr::Binary(BinOp::Add, a, b, _) => {
+                todo.push(a);
+                todo.push(b);
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// What a link's value says of its address (Q-1251): a literal, whole, or the literal start of a
+/// template or of a `+` (not whole).
+fn link_start(e: &Expr) -> Option<(String, bool)> {
+    match e {
+        Expr::Lit(Lit::Str(s)) => Some((s.to_string(), true)),
+        Expr::Template(parts) => match parts.first() {
+            Some(TPart::Lit(s)) => Some((s.clone(), parts.len() == 1)),
+            _ => None,
+        },
+        Expr::Binary(BinOp::Add, a, _, _) => {
+            let mut left = &**a;
+            while let Expr::Binary(BinOp::Add, x, _, _) = left {
+                left = x;
+            }
+            match left {
+                Expr::Lit(Lit::Str(s)) => Some((s.to_string(), false)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a route's path can take an address whose pieces are `pieces` (Q-1251): all of it, or,
+/// with `partial`, those and then a piece starting with `partial` and anything after, as the
+/// rest of a template may be. As `server::match_path` matches, a typed parameter by its type.
+fn link_fits<S: AsRef<str>>(def: &[Seg], pieces: &[S], partial: Option<&str>) -> bool {
+    for (i, seg) in def.iter().enumerate() {
+        match (pieces.get(i).map(AsRef::as_ref), partial) {
+            (Some(p), _) => match seg {
+                Seg::Rest(_) => return true,
+                Seg::Lit(l) => {
+                    if l != p {
+                        return false;
+                    }
+                }
+                Seg::Param(_, ty, prefix) => {
+                    let Some(v) = p.strip_prefix(prefix.as_str()) else { return false };
+                    if (v.is_empty() && !prefix.is_empty()) || ty.as_ref().is_some_and(|t| crate::interp::coerce(t, v).is_none()) {
+                        return false;
+                    }
+                }
+            },
+            // What the template gives from here on is not known: this piece starts with `start`.
+            (None, Some(start)) => {
+                return match seg {
+                    Seg::Rest(_) => true,
+                    Seg::Lit(l) => l.starts_with(start),
+                    Seg::Param(_, _, prefix) => start.starts_with(prefix.as_str()) || prefix.starts_with(start),
+                };
+            }
+            (None, None) => return matches!(seg, Seg::Rest(_)),
+        }
+    }
+    def.len() == pieces.len() && partial.map_or(true, str::is_empty)
+}
+
+/// How far an address is from a route's path, piece by piece (Q-1251): a literal by its edits, a
+/// parameter nothing when the piece fits its type, and a piece one has and the other lacks by its
+/// length; none past a `*rest`.
+fn link_distance<S: AsRef<str>>(def: &[Seg], pieces: &[S], partial: Option<&str>) -> Option<usize> {
+    // A template's start is a piece too, though empty (`/trail/${id}`).
+    let n = pieces.len() + usize::from(partial.is_some());
+    let mut d = 0;
+    for i in 0..def.len().max(n) {
+        let piece = pieces.get(i).map(AsRef::as_ref).or(if i == pieces.len() { partial } else { None });
+        d += match (def.get(i), piece) {
+            (Some(Seg::Rest(_)), _) => return Some(d),
+            // The start of a piece, against as much of the literal.
+            (Some(Seg::Lit(l)), Some(p)) if i == pieces.len() => edit_distance(&l.chars().take(p.chars().count()).collect::<String>(), p),
+            (Some(Seg::Lit(l)), Some(p)) => edit_distance(l, p),
+            // The start of a piece: its prefix, if any, can still follow.
+            (Some(Seg::Param(_, _, prefix)), Some(p)) if i == pieces.len() => usize::from(!(p.starts_with(prefix.as_str()) || prefix.starts_with(p))),
+            // A prefix left out is an edit; a value that does not fit two.
+            (Some(Seg::Param(_, ty, prefix)), Some(p)) => {
+                let (v, miss) = p.strip_prefix(prefix.as_str()).map_or((p, 1), |v| (v, 0));
+                miss + if v.is_empty() || ty.as_ref().is_some_and(|t| crate::interp::coerce(t, v).is_none()) { 2 } else { 0 }
+            }
+            // What a template gives after its start may be this piece.
+            (Some(_), None) if partial.is_some() => 0,
+            (Some(Seg::Lit(l)), None) => l.chars().count().max(1),
+            (Some(Seg::Param(..)), None) => 2,
+            (None, Some(p)) if i == pieces.len() => p.chars().count().max(1),
+            (None, Some(p)) => p.chars().count().max(1),
+            (None, None) => 0,
+        };
+    }
+    Some(d)
+}
+
+/// What `page_marks` found in a page's markup (Q-1020): the handlers on its elements, by event and
+/// line, and the views and functions it places or calls, by name and line.
+#[derive(Default)]
+struct PageMarks {
+    handlers: Vec<(String, u32)>,
+    reached: Vec<(String, u32)>,
+}
+
+/// The handlers on the elements of markup the server makes, and the views and functions it places
+/// or calls (Q-1020): not inside a component's element (its own, or given to it), nor in a function
+/// written there, which runs later or is given to code that may run it in the browser. One level
+/// deeper per node, with room on the stack looked at every eighth, as `render_refs` does.
+fn page_marks(e: &Expr, components: &HashSet<String>, params: &HashSet<String>, out: &mut PageMarks, depth: u32) {
+    if (depth + 1) % 8 == 0 {
+        crate::stack::maybe_grow(256 << 10, 4 << 20, || page_marks_here(e, components, params, out, depth + 1))
+    } else {
+        page_marks_here(e, components, params, out, depth + 1)
+    }
+}
+
+fn page_marks_here(e: &Expr, components: &HashSet<String>, params: &HashSet<String>, out: &mut PageMarks, depth: u32) {
+    let go = |x: &Expr, out: &mut PageMarks| page_marks(x, components, params, out, depth);
+    match e {
+        Expr::Lit(_) | Expr::Ident(..) | Expr::Lambda(_) => {}
+        Expr::Template(parts) => parts.iter().for_each(|p| {
+            if let TPart::Expr(x) = p {
+                go(x, out)
+            }
+        }),
+        Expr::List(xs) => xs.iter().for_each(|x| go(x, out)),
+        Expr::Map(es) => es.iter().for_each(|(_, x)| go(x, out)),
+        Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => go(x, out),
+        Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) | Expr::Index(a, b, _) => {
+            go(a, out);
+            go(b, out);
+        }
+        Expr::Call(c, args, line) => {
+            match &**c {
+                Expr::Ident(n, _) => out.reached.push((n.to_string(), *line)),
+                other => go(other, out),
+            }
+            args.iter().for_each(|x| go(x, out));
+        }
+        Expr::Pipe(a, b, line) => {
+            go(a, out);
+            match &**b {
+                Expr::Ident(n, _) => out.reached.push((n.to_string(), *line)),
+                Expr::Call(c, args, _) => {
+                    match &**c {
+                        Expr::Ident(n, _) => out.reached.push((n.to_string(), *line)),
+                        other => go(other, out),
+                    }
+                    args.iter().for_each(|x| go(x, out));
+                }
+                other => go(other, out),
+            }
+        }
+        Expr::If(c, a, b) => {
+            go(c, out);
+            go(a, out);
+            if let Some(b) = b {
+                go(b, out);
+            }
+        }
+        Expr::Match(x, arms, _) => {
+            go(x, out);
+            for a in arms {
+                if let Some(g) = &a.guard {
+                    go(g, out);
+                }
+                go(&a.body, out);
+            }
+        }
+        Expr::For(_, i, b, _) | Expr::While(i, b, _) => {
+            go(i, out);
+            go(b, out);
+        }
+        Expr::Reply(a, b, _) => {
+            go(a, out);
+            if let Some(b) = b {
+                go(b, out);
+            }
+        }
+        Expr::Block(stmts) => {
+            for st in stmts.iter() {
+                match st {
+                    Stmt::Let(_, x, _) | Stmt::Expr(x) | Stmt::Assign(_, _, x, _) | Stmt::Return(Some(x), _) | Stmt::State(_, x, _) => go(x, out),
+                    Stmt::SetField(o, _, _, x, _) => {
+                        go(o, out);
+                        go(x, out);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Expr::Html(el, _) => page_marks_html(el, components, params, out, depth),
+    }
+}
+
+fn page_marks_html(el: &HtmlEl, components: &HashSet<String>, params: &HashSet<String>, out: &mut PageMarks, depth: u32) {
+    if components.contains(&el.tag) {
+        return;
+    }
+    let element = el.tag.starts_with(|c: char| c.is_ascii_lowercase());
+    if !element {
+        out.reached.push((el.tag.clone(), el.line));
+    }
+    for x in el.id.iter().chain(el.classes.iter()) {
+        page_marks(x, components, params, out, depth);
+    }
+    for (a, v) in &el.attrs {
+        match (a.strip_prefix('@'), v) {
+            // One that only hands the event to what the view was given (`on_click && on_click()`)
+            // loses nothing where it is given nothing, as a kit's views are in a page (app/stays).
+            (Some(ev), AttrVal::Expr(x)) if element => {
+                let forwards = match x {
+                    Expr::Ident(n, _) => params.contains(n.as_str()),
+                    // Nothing set, and no name read but its own and the view's parameters.
+                    Expr::Lambda(d) if !assigns_any(&d.body) => {
+                        let bound = fn_bound(d);
+                        let mut own = true;
+                        walk_fn(d, &mut |y| own &= !matches!(y, Expr::Ident(n, _) if !bound.contains(n.as_str()) && !params.contains(n.as_str())));
+                        own
+                    }
+                    _ => false,
+                };
+                if !forwards {
+                    out.handlers.push((ev.to_string(), el.line));
+                }
+            }
+            (_, AttrVal::Expr(x) | AttrVal::Spread(x)) => page_marks(x, components, params, out, depth),
+            _ => {}
+        }
+    }
+    for c in &el.children {
+        match c {
+            HtmlChild::El(child) => {
+                if (depth + 1) % 8 == 0 {
+                    crate::stack::maybe_grow(256 << 10, 4 << 20, || page_marks_html(child, components, params, out, depth + 1))
+                } else {
+                    page_marks_html(child, components, params, out, depth + 1)
+                }
+            }
+            HtmlChild::Expr(x) => page_marks(x, components, params, out, depth),
         }
     }
 }
@@ -12847,8 +14005,10 @@ fn sheet_text(e: &Expr) -> Option<String> {
 
 /// Every class a rule is written for, and where: in `css(...)`, in a
 /// component's or view's `style`, and in the CSS files under public/
-/// (branch class-links).
-fn class_rules(order: &[Item], base: &Path) -> Vec<(String, String, u32)> {
+/// (branch class-links). And each rule that takes the keyboard's focus ring away, in `focus`
+/// (FEEDBACK72.md, Q-1019; branch feedback72-81): of the sheets under public/ only for a program
+/// that `serves` pages, as a script kept beside an app is not the app (Q-1012).
+fn class_rules(order: &[Item], base: &Path, serves: bool, focus: &mut Vec<(Arc<str>, u32)>) -> Vec<(String, String, u32)> {
     let mut sheets: Vec<(Arc<str>, u32, String)> = Vec::new();
     for it in order {
         walk_stmts(std::slice::from_ref(&it.stmt), &mut |e| {
@@ -12861,19 +14021,8 @@ fn class_rules(order: &[Item], base: &Path) -> Vec<(String, String, u32)> {
             }
         });
     }
-    fn css_files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() && depth < 8 {
-                css_files(&p, out, depth + 1);
-            } else if p.extension().is_some_and(|x| x == "css") {
-                out.push(p);
-            }
-        }
-    }
-    let mut files = Vec::new();
-    css_files(&base.join("public"), &mut files, 0);
+    let own = sheets.len();
+    let mut files = program_files(base, &base.join("public"), usize::MAX, false, &|p| p.extension().is_some_and(|x| x == "css"));
     files.sort();
     for p in files {
         // A regular file of a bounded size, as a program's own file is read: a style sheet that
@@ -12889,7 +14038,190 @@ fn class_rules(order: &[Item], base: &Path) -> Vec<(String, String, u32)> {
         }
     }
     out.dedup();
+    focus.extend(focus_rings_removed(if serves { &sheets } else { &sheets[..own] }));
     out
+}
+
+/// The files under `dir` that `keep` takes, as deep as eight folders and at most `most` of them,
+/// `hidden` leaving out folders named with a dot and node_modules. A folder that is a symbolic link
+/// is followed only to a place inside the program's folder `base` not yet read, and `dir` itself
+/// only when it is inside it: `files("site")` with `site -> ~/dev` read 4,096 files outside the
+/// program, and five links `site/sN -> .` took two minutes, 5^8 folders (found in review of
+/// FEEDBACK73.md's Q-1022; branch feedback72-81). A file that is a link is read as before. Read
+/// with a list of what is left, not by recursion.
+fn program_files(base: &Path, dir: &Path, most: usize, hidden: bool, keep: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let home = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    let Ok(root) = dir.canonicalize() else { return out };
+    if !root.starts_with(&home) {
+        return out;
+    }
+    let mut seen: HashSet<PathBuf> = HashSet::from([root.clone()]);
+    let mut todo: Vec<(PathBuf, PathBuf, u32)> = vec![(dir.to_path_buf(), root, 0)];
+    while let Some((at, real, depth)) = todo.pop() {
+        let Ok(rd) = std::fs::read_dir(&at) else { continue };
+        for e in rd.flatten() {
+            if out.len() >= most {
+                return out;
+            }
+            let p = e.path();
+            let name = e.file_name();
+            let Ok(ft) = e.file_type() else { continue };
+            let is_dir = if ft.is_symlink() { std::fs::metadata(&p).is_ok_and(|m| m.is_dir()) } else { ft.is_dir() };
+            if !is_dir {
+                if keep(&p) {
+                    out.push(p);
+                }
+                continue;
+            }
+            let n = name.to_string_lossy();
+            if depth >= 8 || (hidden && (n.starts_with('.') || n == "node_modules")) {
+                continue;
+            }
+            let inner = if ft.is_symlink() {
+                match p.canonicalize() {
+                    Ok(c) if c.starts_with(&home) => c,
+                    _ => continue,
+                }
+            } else {
+                real.join(&name)
+            };
+            if seen.insert(inner.clone()) {
+                todo.push((p, inner, depth + 1));
+            }
+        }
+    }
+    out
+}
+
+/// Whether a program serves pages: it has a route or a mount, and markup, a component, or a
+/// `files()`, `file()` or `markdown_page()` to answer with. Only such a program's checks read the
+/// sheets under `public/`: `quillo check tool.qwe`, a script kept beside an app, was told of every
+/// class the app's sheets style (FEEDBACK72.md, Q-1012; branch feedback72-81).
+fn serves_pages(order: &[Item]) -> bool {
+    let mut routes = false;
+    for it in order {
+        match &it.stmt {
+            Stmt::Route(r) if r.method != crate::ast::GUARD_METHOD => {
+                if matches!(r.body, Expr::Html(..)) {
+                    return true;
+                }
+                routes = true;
+            }
+            Stmt::Mount(..) => routes = true,
+            _ => {}
+        }
+    }
+    if !routes {
+        return false;
+    }
+    if order.iter().any(|it| matches!(&it.stmt, Stmt::Fn(d) if d.component)) {
+        return true;
+    }
+    let mut pages = false;
+    for it in order {
+        walk_stmts(std::slice::from_ref(&it.stmt), &mut |e| match e {
+            Expr::Html(..) => pages = true,
+            Expr::Call(f, _, _) => pages |= matches!(&**f, Expr::Ident(n, _) if n == "files" || n == "file" || n == "markdown_page"),
+            _ => {}
+        });
+        if pages {
+            return true;
+        }
+    }
+    false
+}
+
+/// Each rule of `sheets` that takes the focus ring away, `:focus { outline: none }`, where no rule
+/// styles `:focus-visible`: the keyboard then shows nothing of where it is, on every element
+/// (FEEDBACK72.md, Q-1019; branch feedback72-81). By file and line.
+fn focus_rings_removed(sheets: &[(Arc<str>, u32, String)]) -> Vec<(Arc<str>, u32)> {
+    if sheets.iter().any(|(_, _, t)| t.contains(":focus-visible")) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (file, line, text) in sheets {
+        if !text.contains(":focus") {
+            continue;
+        }
+        // Comments blanked, their line breaks kept.
+        let mut src = String::with_capacity(text.len());
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find("/*") {
+            src.push_str(&rest[..i]);
+            let end = rest[i + 2..].find("*/").map_or(rest.len(), |k| i + 2 + k + 2);
+            src.extend(rest[i..end].chars().map(|c| if c == '\n' { '\n' } else { ' ' }));
+            rest = &rest[end..];
+        }
+        src.push_str(rest);
+        let mut boundary = 0;
+        for (i, c) in src.char_indices() {
+            match c {
+                '{' => {
+                    let selector = &src[boundary..i];
+                    let body_end = src[i + 1..].find(['{', '}']).map_or(src.len(), |k| i + 1 + k);
+                    let body: String = src[i + 1..body_end].chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
+                    let focus = selector.match_indices(":focus").any(|(k, _)| !selector[k + 6..].starts_with('-'));
+                    let none = |d: &str| d.strip_prefix("outline:").is_some_and(|v| matches!(v.trim_end_matches("!important"), "none" | "0" | "0px"));
+                    // A ring of its own in the same rule (a shadow, a border, an outline set again)
+                    // is a ring still (found in review).
+                    let ring = |d: &str| {
+                        !none(d) && !d.ends_with(":none") && !d.ends_with(":0") && (d.starts_with("box-shadow:") || d.starts_with("border") || d.starts_with("outline-offset:") || (d.starts_with("outline") && d.contains(':')))
+                    };
+                    let gone = body.split(';').any(none) && !body.split(';').any(ring);
+                    if focus && gone {
+                        let at = boundary + (selector.len() - selector.trim_start().len());
+                        out.push((file.clone(), line + src[..at].matches('\n').count() as u32));
+                    }
+                    boundary = i + 1;
+                }
+                '}' | ';' => boundary = i + 1,
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// The classes a page of HTML writes: each `class` attribute's words, and the words of its
+/// scripts, which may set more, as a script under `public/` is read (FEEDBACK73.md, Q-1022;
+/// branch feedback72-81).
+fn html_classes(text: &str, into: &mut HashSet<String>) {
+    let lower = text.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let mut at = 0;
+    while let Some(k) = lower[at..].find("class") {
+        let i = at + k;
+        at = i + 5;
+        if i == 0 || !b[i - 1].is_ascii_whitespace() {
+            continue;
+        }
+        let mut j = at;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if b.get(j) != Some(&b'=') {
+            continue;
+        }
+        j += 1;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        let (from, to) = match b.get(j) {
+            Some(q @ (b'"' | b'\'')) => (j + 1, lower[j + 1..].find(*q as char).map_or(b.len(), |e| j + 1 + e)),
+            Some(_) => (j, lower[j..].find(|c: char| c.is_ascii_whitespace() || c == '>').map_or(b.len(), |e| j + e)),
+            None => break,
+        };
+        into.extend(text[from..to].split_whitespace().map(String::from));
+        at = to;
+    }
+    let mut at = 0;
+    while let Some(k) = lower[at..].find("<script") {
+        let start = at + k;
+        let end = lower[start..].find("</script").map_or(lower.len(), |e| start + e);
+        into.extend(text[start..end].split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_')).filter(|w| !w.is_empty()).map(String::from));
+        at = end;
+    }
 }
 
 /// The classes markup writes as they are written (`<span.chip>`,
@@ -12998,20 +14330,7 @@ fn unstyled_classes(order: &[Item], base: &Path, rules: &[(String, String, u32)]
     // What the app's scripts and sheets say of classes they set themselves.
     let mut scripts = String::new();
     let mut elsewhere = Vec::new();
-    fn files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() && depth < 8 {
-                files(&p, out, depth + 1);
-            } else {
-                out.push(p);
-            }
-        }
-    }
-    let mut public = Vec::new();
-    files(&base.join("public"), &mut public, 0);
-    for p in public {
+    for p in program_files(base, &base.join("public"), usize::MAX, false, &|_| true) {
         let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
         let Ok(text) = crate::error::read_text(&p) else { continue };
         match ext {
@@ -13105,7 +14424,7 @@ fn walk_html_els(el: &HtmlEl, f: &mut dyn FnMut(&HtmlEl)) {
     }
 }
 
-fn unused_classes(order: &[Item], base: &Path, unparsed: &[String]) -> Vec<(Arc<str>, u32, String)> {
+fn unused_classes(order: &[Item], base: &Path, unparsed: &[String], serves: bool) -> Vec<(Arc<str>, u32, String)> {
     let mut sheets: Vec<(Arc<str>, u32, String)> = Vec::new();
     let mut sheet_args: HashSet<*const Expr> = HashSet::new();
     let mut written: HashSet<String> = HashSet::new();
@@ -13115,12 +14434,22 @@ fn unused_classes(order: &[Item], base: &Path, unparsed: &[String]) -> Vec<(Arc<
             into.insert(w.to_string());
         }
     };
+    // The folders `files()` serves besides public/ (FEEDBACK73.md, Q-1022; branch feedback72-81).
+    let mut folders: Vec<String> = Vec::new();
     for it in order {
         walk_stmts(std::slice::from_ref(&it.stmt), &mut |e| match e {
             Expr::Call(f, args, line) if matches!(&**f, Expr::Ident(n, _) if n == "css") && args.len() == 1 => {
                 if let Some(text) = sheet_text(&args[0]) {
                     sheet_args.insert(&args[0] as *const Expr);
                     sheets.push((it.file.clone(), *line, text));
+                }
+            }
+            Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if n == "files") => {
+                if let Some(Expr::Lit(Lit::Str(d))) = args.first() {
+                    let d = d.trim_start_matches("./").trim_end_matches('/');
+                    if d != "public" && !d.contains("..") && !Path::new(d).is_absolute() && !folders.iter().any(|x| x == d) {
+                        folders.push(d.to_string());
+                    }
                 }
             }
             Expr::Lit(Lit::Str(s)) if !sheet_args.contains(&(e as *const Expr)) => words(s, &mut written),
@@ -13172,20 +14501,9 @@ fn unused_classes(order: &[Item], base: &Path, unparsed: &[String]) -> Vec<(Arc<
             }
         }
     }
-    // The app's own files under public/: its sheets, and what its scripts write.
-    fn files(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() && depth < 8 {
-                files(&p, out, depth + 1);
-            } else {
-                out.push(p);
-            }
-        }
-    }
-    let mut public = Vec::new();
-    files(&base.join("public"), &mut public, 0);
+    // The app's own files under public/: its sheets, and what its scripts write. Only a program
+    // that serves pages has them (FEEDBACK72.md, Q-1012; branch feedback72-81).
+    let mut public = if serves { program_files(base, &base.join("public"), usize::MAX, false, &|_| true) } else { Vec::new() };
     public.sort();
     for p in public {
         let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("");
@@ -13193,7 +14511,23 @@ fn unused_classes(order: &[Item], base: &Path, unparsed: &[String]) -> Vec<(Arc<
         match ext {
             "css" => sheets.push((Arc::from(p.display().to_string()), 1, text)),
             "js" | "mjs" => words(&text, &mut written),
+            // And what its pages write (FEEDBACK73.md, Q-1022; branch feedback72-81).
+            "html" | "htm" => html_classes(&text, &mut written),
             _ => {}
+        }
+    }
+    // The pages and scripts of the other folders `files()` serves, as written (Q-1022): at most
+    // 4096 files of each, not in a folder named with a dot or node_modules.
+    if !sheets.is_empty() {
+        for d in folders {
+            let found = program_files(base, &base.join(&d), 4096, true, &|p| p.extension().is_some_and(|x| x == "html" || x == "htm" || x == "js" || x == "mjs"));
+            for p in found {
+                let Ok(text) = crate::error::read_text(&p) else { continue };
+                match p.extension().and_then(|x| x.to_str()) {
+                    Some("js" | "mjs") => words(&text, &mut written),
+                    _ => html_classes(&text, &mut written),
+                }
+            }
         }
     }
     let elsewhere: Vec<String> = sheets.iter().flat_map(|(_, _, t)| crate::styles::set_elsewhere(t)).collect();

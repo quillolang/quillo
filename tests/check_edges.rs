@@ -358,7 +358,9 @@ fn a_spread_needs_what_it_spreads() {
 fn live_needs_a_server_fn_by_name_in_a_state() {
     says("fn g() = 1\ncomponent C() {\n  state a = live(g)\n  <p>{a}</p>\n}", &["3 `live` needs a server fn: `g` is not one"]);
     says("component C() {\n  state b = live(() => 1)\n  <p>{b}</p>\n}", &["2 `live` needs a server fn by name: state items = live(load_items, ...)"]);
-    says("component C() {\n  state c = live()\n  <p>{c}</p>\n}", &["2 missing argument `load` in call to `live`: live(load, args)"]);
+    // `live(load, ...args)`: the rest one by one, as `args` was read as a list (FEEDBACK73.md,
+    // Q-1024; branch feedback72-81).
+    says("component C() {\n  state c = live()\n  <p>{c}</p>\n}", &["2 missing argument `load` in call to `live`: live(load, ...args)"]);
     says("server fn s() = 1\ncomponent C() {\n  let x = live(s)\n  <p>{x}</p>\n}", &["3 in <C>, `live(...)` sets state: state items = live(load_items, ...)"]);
     clean("server fn s() = 1\nfn f() = live(s)");
 }
@@ -495,7 +497,7 @@ fn kind(x) = match x {
 }
 fn size(s) = `tmpl card-${s}`
 fn tail(s) = `${s} tail`
-route GET / = "plain"
+route GET / = <p>plain</p>
 "#,
         ),
         ("public/app.js", "el.classList.add('from-script')\n"),
@@ -503,6 +505,8 @@ route GET / = "plain"
         ("public/readme.txt", "never counted\n"),
         ("public/sheet.css", "/* set elsewhere: elsewhere- */\n.elsewhere-y { a: b }\n.lonely { a: b }\n"),
     ]);
+    // The route answers a page: the sheets under public/ are a program's that serves pages, where
+    // it answered text (FEEDBACK72.md, Q-1012; branch feedback72-81).
     assert_eq!(app.css(), ["public/sheet.css:3 warning: `.lonely` is styled here, but nothing in the program writes it"]);
 }
 
@@ -575,7 +579,9 @@ fn a_linked_sheet_may_style_anything() {
 fn a_local_link_does_not_stop_the_class_check() {
     let app = App::new("classes-local", &[(
         "main.qwe",
-        "css(\".chip { a: b }\")\nroute GET / = <html><head><link rel=\"stylesheet\" href=\"/x.css\"/></head><body><p.chipp>x</p></body></html>\n",
+        // With the route that serves the sheet it links: a link to no route is warned of (FEEDBACK79.md,
+        // Q-1251; branch feedback72-81).
+        "css(\".chip { a: b }\")\nroute GET / = <html><head><link rel=\"stylesheet\" href=\"/x.css\"/></head><body><p.chipp>x</p></body></html>\nroute GET /*path = files(\"public\", path)\n",
     )]);
     assert_eq!(app.classes(), ["main.qwe:2 warning: no style sheet has a rule for `.chipp` (did you mean `chip`?)"]);
 }

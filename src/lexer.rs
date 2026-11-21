@@ -120,6 +120,38 @@ pub struct Token {
     pub line: u32,
 }
 
+thread_local! {
+    /// While `quillo check` reads a file, the `//` comments right after a value that hold only a
+    /// number or a name, by line (see `Lexer::note_value_comment`); none is noted otherwise
+    /// (FEEDBACK72.md, Q-1016; branch feedback72-81).
+    static VALUE_COMMENTS: std::cell::RefCell<Option<Vec<(u32, String, String)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `f`, and the comments right after a value that it read holding only a number or a name, each
+/// once, by line: Python's whole-number division, `pages // 2`, which is `pages` and a comment
+/// (FEEDBACK72.md, Q-1016; branch feedback72-81). The text of a template's `${...}` is read by a
+/// parser of its own on the same thread, so its comments are among them.
+/// Each is the line, the comment's word, and the name it follows.
+pub fn noting_value_comments<R>(f: impl FnOnce() -> R) -> (R, Vec<(u32, String, String)>) {
+    // What was noted before, put back even when `f` panics (a parser's panic caught by a
+    // server's worker would leave its thread noting, and its list growing; found in review).
+    struct Outer(Option<Option<Vec<(u32, String, String)>>>);
+    impl Drop for Outer {
+        fn drop(&mut self) {
+            if let Some(outer) = self.0.take() {
+                VALUE_COMMENTS.with(|v| *v.borrow_mut() = outer);
+            }
+        }
+    }
+    let mut outer = Outer(Some(VALUE_COMMENTS.with(|v| v.borrow_mut().replace(Vec::new()))));
+    let r = f();
+    let before = outer.0.take().unwrap_or_default();
+    let mut noted = VALUE_COMMENTS.with(|v| std::mem::replace(&mut *v.borrow_mut(), before)).unwrap_or_default();
+    noted.sort();
+    noted.dedup();
+    (r, noted)
+}
+
 #[derive(Clone)]
 pub struct Lexer {
     chars: Arc<Vec<char>>,
@@ -181,6 +213,7 @@ impl Lexer {
     /// is a line of slashes, as in Rust (FEEDBACK56.md, Q-854; branch feedback56).
     fn note_comment(&self, start: usize, line: u32) {
         if !self.chars[..start].iter().rev().take_while(|c| **c != '\n').all(|c| matches!(c, ' ' | '\t')) {
+            self.note_value_comment(start, line);
             return;
         }
         let text = &self.chars[start..self.pos];
@@ -189,6 +222,46 @@ impl Lexer {
             t.strip_prefix(' ').unwrap_or(&t).trim_end().to_string()
         });
         self.comments.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(line, doc);
+    }
+
+    /// A `//` comment just read after code on its line: noted, while `quillo check` asks
+    /// (`noting_value_comments`), when it follows a value and holds only a number or a name, as
+    /// `pages // 2` does, Python's whole-number division (FEEDBACK72.md, Q-1016; branch
+    /// feedback72-81). `///` and words are not.
+    fn note_value_comment(&self, start: usize, line: u32) {
+        const NOT_VALUES: &[&str] = &[
+            "else", "in", "return", "let", "fn", "if", "for", "while", "match", "route", "routes", "component", "view", "state", "use",
+            "import", "server", "service", "mount", "type", "with", "true", "false", "null", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD",
+            "OPTIONS", "ANY",
+        ];
+        // Right after a name only (`pages // 2`, `n // k`): after `)`, `]`, a string or a number
+        // the comment says what the line gives (`print(f(2)) // 4`, `60 * 60 // 3600`), as the
+        // guide's examples do (found in review).
+        let Some(Tok::Ident(name)) = &self.last else { return };
+        if NOT_VALUES.contains(&name.as_str()) || !VALUE_COMMENTS.with(|v| v.borrow().is_some()) {
+            return;
+        }
+        // Nor on a line that takes names from a file or a script (`use b  // two`).
+        let from = self.chars[..start].iter().rposition(|c| *c == '\n').map_or(0, |i| i + 1);
+        let first: String = self.chars[from..start].iter().skip_while(|c| matches!(c, ' ' | '\t')).take_while(|c| c.is_alphabetic()).collect();
+        if matches!(first.as_str(), "use" | "import" | "client" | "preload" | "preconnect") {
+            return;
+        }
+        let text: String = self.chars[(start + 2).min(self.pos)..self.pos].iter().collect();
+        if text.starts_with('/') {
+            return;
+        }
+        let w = text.trim();
+        // A whole number, or a name.
+        let number = !w.is_empty() && w.bytes().all(|c| c.is_ascii_digit());
+        let word = w.starts_with(|c: char| c.is_alphabetic() || c == '_') && w.chars().all(|c| c.is_alphanumeric() || c == '_');
+        if number || word {
+            VALUE_COMMENTS.with(|v| {
+                if let Some(noted) = v.borrow_mut().as_mut() {
+                    noted.push((line, w.to_string(), name.clone()));
+                }
+            });
+        }
     }
 
     /// What the `///` lines right above `line` say, one line each, a `//` line among them

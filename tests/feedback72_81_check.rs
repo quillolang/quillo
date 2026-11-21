@@ -226,9 +226,62 @@ fn q1261_plain_functions_markup_builtins_and_one_saying_for_many_routes() {
         src,
         &[
             "15 warning: `helper` needs the time effect (it calls `load_it`), but `route GET /a` is declared `with db`: <A> calls it in `state v` (line 5), which the server runs while it makes the page",
-            "16 `stamp` needs the time effect, but `route GET /b` is declared `with db`, as are 2 other routes whose pages run it: <B> calls it in `state v` (line 9), which the server runs while it makes the page",
+            "16 `stamp` needs the time effect, but `route GET /b` is declared `with db`, as are 2 other routes whose pages run it: <B> calls it in `state v` (line 9), as does 1 other component, which the server runs while it makes the page",
             "17 `now` needs the time effect, but `route GET /c` is declared `with db`, as is 1 other route whose page runs it: <C> calls it as it renders (line 13), which the server runs while it makes the page",
         ],
+    );
+}
+
+// (FEEDBACK80.md, Q-1261, found in review; branch feedback72-81)
+#[test]
+fn q1261_a_fallback_or_defer_takes_the_error() {
+    // 0.8.9 answers 200 with the fallback, or the placeholder: a warning, never an error.
+    says(
+        "server fn load_it() -> str with time = str(now())\ncomponent Dialog() {\n    state v = load_it() ?? \"fallback\"\n    <p>{v}</p>\n}\nroute GET / with db = <html><body><Dialog/></body></html>\n",
+        &["6 warning: `load_it` needs the time effect, but `route GET /` is declared `with db`: <Dialog> calls it in `state v` (line 3), which the server runs while it makes the page, where `??` gives its fallback every time"],
+    );
+    says(
+        "component C() {\n    <p>{now() ?? \"no clock\"}</p>\n}\nroute GET / with db = <html><body><C/></body></html>\n",
+        &["4 warning: `now` needs the time effect, but `route GET /` is declared `with db`: <C> calls it as it renders (line 2), which the server runs while it makes the page, where `??` gives its fallback every time"],
+    );
+    says(
+        "server fn load_it() -> str with time = str(now())\ncomponent Dialog() {\n    state v = defer(load_it())\n    <p>{v ?? \"loading\"}</p>\n}\nroute GET / with db = <html><body><Dialog/></body></html>\n",
+        &["6 warning: `load_it` needs the time effect, but `route GET /` is declared `with db`: <Dialog> calls it in `state v` (line 3), which the server runs after the page is sent (`defer`), so the page keeps its placeholder and the error is logged"],
+    );
+}
+
+// (FEEDBACK80.md, Q-1261, found in review; branch feedback72-81)
+#[test]
+fn q1261_defer_in_markup_runs_as_the_page_is_made_and_kinds_are_said_apart() {
+    // Only a state's value is put off: 0.8.9 answers 500 for both of these.
+    says(
+        "component Wrap() {\n    <div>{defer(str(now()))}</div>\n}\nroute GET /f with db = <html><body><Wrap/></body></html>\n",
+        &["4 `now` needs the time effect, but `route GET /f` is declared `with db`: <Wrap> calls it as it renders (line 2), which the server runs while it makes the page"],
+    );
+    says(
+        "view Footer() = <footer>{str(now())}</footer>\nroute GET /g with db = <html><body>{defer(<Footer/>)}</body></html>\n",
+        &["2 `now` needs the time effect, but `route GET /g` is declared `with db`: <Footer> calls it as it renders (line 1), which the server runs while it makes the page"],
+    );
+    // A fallback and a condition: two sayings, each with its own end.
+    says(
+        "component F() {\n    <p>{str(now()) ?? \"no clock\"}</p>\n}\ncomponent G(show: bool) {\n    <p>{show ? str(now()) : \"x\"}</p>\n}\nroute GET /f with db = <html><body><F/></body></html>\nroute GET /g with db = <html><body><G show={true}/></body></html>\n",
+        &[
+            "7 warning: `now` needs the time effect, but `route GET /f` is declared `with db`: <F> calls it as it renders (line 2), which the server runs while it makes the page, where `??` gives its fallback every time",
+            "8 warning: `now` needs the time effect, but `route GET /g` is declared `with db`: <G> calls it as it renders (line 5), which the server runs while it makes the page",
+        ],
+    );
+}
+
+// (FEEDBACK80.md, Q-1261, found in review; branch feedback72-81)
+#[test]
+fn q1261_a_view_the_route_shows_and_many_components() {
+    says(
+        "view Footer() = <footer>{str(now())}</footer>\nroute GET / with db = <html><body><Footer/></body></html>\n",
+        &["2 `now` needs the time effect, but `route GET /` is declared `with db`: <Footer> calls it as it renders (line 1), which the server runs while it makes the page"],
+    );
+    says(
+        "component Card1() {\n    <p>{now()}</p>\n}\ncomponent Card2() {\n    <p>{now()}</p>\n}\ncomponent Card3() {\n    <p>{now()}</p>\n}\nroute GET / with db = <html><body><Card1/><Card2/><Card3/></body></html>\n",
+        &["10 `now` needs the time effect, but `route GET /` is declared `with db`: <Card1> calls it as it renders (line 2), as do 2 other components, which the server runs while it makes the page"],
     );
 }
 
@@ -517,10 +570,50 @@ fn q1018_a_match_arm_an_else_and_a_handler() {
     // handler can do, not `?`.
     says(
         &format!("{SAVE}component C() {{\n    fn go() {{ save(1) }}\n    <div><button onclick={{() => save(-1)}}>a</button><button onclick={{go}}>b</button></div>\n}}\nroute GET / = <html><body><C/></body></html>\n"),
+        // `go` gives `save`'s error, which a program function makes: said as inline (found in
+        // review).
         &[
             "4 warning: `save` can give an error, and this handler drops it: give a value with `save(...) ?? ...`, test it with `is_err`, or write `let _ = save(...)` if it does not matter",
             "4 warning: `onclick={go}` drops the error `go` can give: handle it in `go`, or write `onclick={() => { go() ?? ... }}`",
         ],
+    );
+    // And inline, `onclick={() => go()}`, the same.
+    says(
+        &format!("{SAVE}component C() {{\n    fn go() {{ save(1) }}\n    <button onclick={{() => go()}}>b</button>\n}}\nroute GET / = <html><body><C/></body></html>\n"),
+        &["4 warning: `go` can give an error, and this handler drops it: give a value with `go(...) ?? ...`, test it with `is_err`, or write `let _ = go(...)` if it does not matter"],
+    );
+}
+
+// (FEEDBACK72.md, Q-1018, decided in review; branch feedback72-81)
+#[test]
+fn q1018_a_server_fn_in_a_handler_is_the_runtimes_to_report() {
+    // The guide's own `onclick={() => pay(o.id)}`, inline and by name: a failed server call is
+    // reported in the console.
+    says(
+        "server fn pay(id: int) -> str ! str = id > 0 ? \"paid\" : err(\"no\")\nserver fn pay_all() -> str ! str = err(\"no\")\ncomponent C() {\n    <div><button onclick={() => pay(1)}>a</button><button onclick={pay_all}>b</button></div>\n}\nroute GET / = <html><body><C/></body></html>\n",
+        &[],
+    );
+    // A browser fn that makes its own error: said, inline and by name.
+    says(
+        "fn check(n: int) -> int ! str = n > 0 ? n : err(\"no\")\nfn go() -> int ! str = check(0)\ncomponent C() {\n    <div><button onclick={() => check(1)}>a</button><button onclick={go}>b</button></div>\n}\nroute GET / = <html><body><C/></body></html>\n",
+        &[
+            "4 warning: `check` can give an error, and this handler drops it: give a value with `check(...) ?? ...`, test it with `is_err`, or write `let _ = check(...)` if it does not matter",
+            "4 warning: `onclick={go}` drops the error `go` can give: handle it in `go`, or write `onclick={() => { go() ?? ... }}`",
+        ],
+    );
+    // An error only a builtin gives: named and inline agree, saying nothing.
+    says(
+        "fn save() {\n    http.post(\"https://example.com\", {})\n}\ncomponent C() {\n    <div><button onclick={save}>a</button><button onclick={() => save()}>b</button></div>\n}\nroute GET / = <html><body><C/></body></html>\n",
+        &[],
+    );
+}
+
+// (FEEDBACK72.md, Q-1018, found in review; branch feedback72-81)
+#[test]
+fn q1018_a_question_mark_in_a_lambda_is_the_lambdas() {
+    says(
+        "fn step(n: int) -> int {\n    let xs = [n].map((x) => {\n        let v = int(str(x))?\n        v + 1\n    })\n    len(xs)\n}\nfn f(ns: list) {\n    for n in ns { step(n) }\n    1\n}\nprint(f([1]))\n",
+        &[],
     );
 }
 

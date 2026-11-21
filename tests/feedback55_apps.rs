@@ -195,7 +195,10 @@ fn a_redirect_nothing_takes_is_warned_of() {
         ("route GET / {\n    match request.query.x {\n        \"a\" => redirect(\"/login\"),\n        _ => null,\n    }\n    \"page\"\n}\n", 3),
         ("fn guard(r) {\n    if r.query.x == null { redirect(\"/login\") }\n    1\n}\nroute GET / = guard(request)\n", 2),
     ] {
-        assert_eq!(warned(src), [says(line, "redirect", redirect)], "{}", src);
+        // With the page it sends the visitor to: a redirect to a page the program does not have is
+        // a warning of its own (FEEDBACK79.md, Q-1251; branch feedback72-81).
+        let src = format!("{}route GET /login = \"sign in\"\n", src);
+        assert_eq!(warned(&src), [says(line, "redirect", redirect)], "{}", src);
     }
     assert_eq!(warned("route GET / {\n    if request.query.x == null { respond(404, \"no\") }\n    \"page\"\n}\n"), [says(2, "respond", "return respond(...)")]);
 }

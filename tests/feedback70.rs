@@ -299,6 +299,9 @@ route GET /r19 {
                 // `/r2` and `/r16` hold their SQL and their method in a `let` of a literal, read as
                 // that literal (changed with FEEDBACK75.md, Q-1084; branch feedback75).
                 warned(19, "GET /r2", "`db.query(\"delete from notes\")`, SQL that writes", "`session()`"),
+                // `/r8`'s button is in the route's own markup, which the server alone makes: its
+                // handler never runs (FEEDBACK73.md, Q-1020, decided in review; branch feedback72-81).
+                "main.qwe:40: warning: `onclick` here never runs: the page of `GET /r8` is made on the server, and only a component's handlers reach the browser: put this markup in a component".to_string(),
                 warned(65, "ANY /r15", "`db.exec(\"delete from notes where owner = ?\")`", "`session()`"),
                 warned(69, "GET /r16", "`http.request(\"DELETE\", ...)`", "`cookie()`"),
             ]

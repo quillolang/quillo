@@ -890,6 +890,8 @@ fn live_says_its_arguments_are_passed_one_by_one() {
     assert_eq!(params, "load, args...");
     assert!(told.contains("given the rest one by one: `live(search, q)`, not `live(search, [q])`"), "{}", told);
     assert_eq!(quillo::check::call_shape("live"), "live(load, args...)");
+    // The checker's own shape of a call takes the rest one by one too (slice C2).
+    assert!(says("component C() {\n  state c = live()\n  <p>{c}</p>\n}").contains(&"2 missing argument `load` in call to `live`: live(load, ...args)".to_string()));
     // And so they are: `live(search, q)` calls `search(q)`.
     let mut it = loaded("server fn search(q: str) = upper(q)\nfn go() = live(search, \"é\")\n");
     assert_eq!(call(&mut it, "go", vec![]), "\"É\"");

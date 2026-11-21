@@ -4109,6 +4109,16 @@ impl Parser {
                 Some(ev) if !ev.is_empty() && ev.bytes().all(|b| b.is_ascii_lowercase() || b == b'-' || b == b'_') => {
                     format!("`{}` in <{}> takes only text written here, as it runs as code: `on{}` needs a function, `on{}={{() => ...}}`", name, tag, ev, ev)
                 }
+                // Svelte's `on:click`, and Vue's modifiers on an event (FEEDBACK72.md, Q-1031 and
+                // Q-1032; branch feedback72-81).
+                Some(ev) if ev.starts_with(':') || ev.contains('.') => {
+                    let ev = ev.trim_start_matches(':');
+                    let (base, mods) = ev.split_once('.').unwrap_or((ev, ""));
+                    match crate::check::modifier_advice(&format!("on{}", base), mods) {
+                        Some(how) if !mods.is_empty() => format!("`{}` never fires: {}", name, how),
+                        _ => format!("`{}` is Svelte's: write `on{}={{...}}`", name, base),
+                    }
+                }
                 Some(_) => format!("`{}` in <{}> takes only text written here, as the browser runs it as code", name, tag),
                 None => format!("`{}` in <{}> takes only text written here, unless the element also has a `sandbox` attribute without allow-same-origin", name, tag),
             };
