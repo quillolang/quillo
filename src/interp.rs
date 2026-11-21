@@ -1273,13 +1273,15 @@ fn display_escaped(v: &Value, out: &mut Held) {
 /// What `__css_value(v)` gives, escaped, appended to `out`: a value in a `style` attribute's
 /// template, as a CSS value, `{`, `}`, `;`, `\` and `&` as CSS's escapes (`css_escape_into`).
 /// Written straight into the page, the HTML's escapes with them: three texts were made for a value
-/// with `;` (FEEDBACK79.md, Q-1250; branch feedback72-81). A number, and a text with nothing to
-/// escape (found in one pass), as `display_escaped` writes them, asking nothing more.
+/// with `;` (FEEDBACK79.md, Q-1250; branch feedback72-81). A text with nothing to escape (found in
+/// one pass) as it is; null, a bool, a number and an error as a template writes them, as
+/// `__css_value` gives them back.
 #[inline(always)]
 fn css_escaped_into(v: &Value, out: &mut Held) {
     match v {
         Value::Int(n) => push_int(out, *n),
         Value::Str(s) if next_special_in::<true>(s.as_bytes(), 0) == s.len() => push_short(out, s),
+        Value::Nil | Value::Bool(_) | Value::Float(_) | Value::Dec(_) | Value::Err(..) => display_escaped(v, out),
         other => css_other_into(other, out),
     }
 }
@@ -7314,7 +7316,15 @@ impl Interp {
                         self.template_into(parts, env, &mut t)?;
                         Value::str(t.into_text().map_err(|o| o.at(el.line))?)
                     }
-                    AttrVal::Expr(e) => self.eval(e, env)?,
+                    AttrVal::Expr(e) => match self.eval(e, env)? {
+                        // An error chooses no option, and is said, as everywhere in markup
+                        // (FEEDBACK81.md, Q-1272, found in review; branch feedback72-81).
+                        v @ Value::Err(..) => {
+                            self.error_shown(&v, el.line);
+                            Value::Nil
+                        }
+                        v => v,
+                    },
                     _ => Value::Bool(true),
                 });
                 continue;

@@ -359,8 +359,9 @@ print(<p style={dark ? "color: black; top: 0" : `x`}>h</p>)
 }
 
 /// What the parser knows the program wrote writes its declarations: a string, a choice of strings
-/// (`? :`, `match`, `??`, `||`); a name stays one value, a top-level `let` of a string's too (a
-/// visitor's value could say the same: decided in review), and a parameter.
+/// (`? :`, `match`, `??`, `||`, `&&` whose other side is a value: it is escaped, the string stays);
+/// a name stays one value, a top-level `let` of a string's too (a visitor's value could say the
+/// same: decided in review), and a parameter.
 #[test]
 fn the_programs_own_text_in_a_style_template_writes_its_declarations() {
     let out = run(r#"let base = "display: flex; gap: 1px"
@@ -387,7 +388,7 @@ print(f("a; b"))
         r#"<p style="x: 1;">d</p>"#,
         r#"<p class="n" style="display: flex\3b  gap: 1px; width: 2px">e</p>"#,
         r#"<p style="x: 1; color: red">g</p>"#,
-        r#"<p style="x: 1\3b  color: red">h</p>"#,
+        r#"<p style="x: 1; color: red">h</p>"#,
         r#"<p style="a\3b  b; width: 2px">shadowed</p>"#,
     ] {
         assert!(out.contains(want), "{}\n{}", want, out);
@@ -432,6 +433,131 @@ route GET / = <html><body><C/></body></html>
     let want = serde_json::json!(["display: none; color: red", r"display: flex\3b  gap: 1px; color: red\3b  top: 0", r"color: red\3b  top: 0"]);
     assert_eq!(v["server"], want, "{}", v);
     assert_eq!(v["made"], want, "{}", v);
+    assert_eq!(v["remade"], 0, "{}", v);
+    assert_eq!(v["errors"], serde_json::json!([]), "{}", v);
+}
+
+/// Go's html/template's way: each value put into a template that reaches a style is one CSS value,
+/// each piece of text the program wrote stays: a template in a branch keeps its own text, `&&` and
+/// `??` keep their strings, a template inside `+`, `trim`, `join` or a block is looked into, a
+/// component's `style` prop and a spread's `style` are styles, css`...` passes; a template made in
+/// a helper and given whole is the program's value (second review).
+#[test]
+fn every_value_in_a_style_is_one_value_and_the_programs_text_stays() {
+    let out = run(r#"let v = trim(" red; background: blue ")
+let n = 20
+let big = true
+let small = false
+let hidden = true
+let c = "green"
+let extra = "; top: 0"
+fn box_style() = `color: ${v}`
+view Box(style) = <div style={style}>y</div>
+print(<p style={`${big ? `font-size: ${n}px;` : ""} color: ${c}`}>a</p>)
+print(<p style={`${big && "font-weight: 700;"} color: red`}>b</p>)
+print(<p style={`${small && "font-weight: 700;"} color: red`}>b2</p>)
+print(<p style={`${hidden ? "x: 1;" : v}`}>c</p>)
+print(<p style={`${hidden ? v : "x: 1;"}`}>c2</p>)
+print(<p style={`color: ${v};` + extra}>d</p>)
+print(<p style={trim(` color: ${v} `)}>e</p>)
+print(<p style={join([`color: ${v}`, "top: 0"], "; ")}>f</p>)
+print(<p style={{
+    let s = `color: ${v}`
+    s
+}}>g</p>)
+print(<p style={css`color: ${v}; top: 0`}>h</p>)
+print(<p style={`${css`margin: 0; padding: ${n}px;`} color: ${v}`}>i</p>)
+print(<p style={box_style()}>j</p>)
+print(<p style={`${v ?? "black"}`}>k</p>)
+print(<p style={`${null ?? "black;"}`}>l</p>)
+print(<Box style={`color: ${v}`}/>)
+print(<p {...{ style: `color: ${v}` }}>s</p>)
+"#);
+    for want in [
+        r#"<p style="font-size: 20px; color: green">a</p>"#,
+        r#"<p style="font-weight: 700; color: red">b</p>"#,
+        r#"<p style="false color: red">b2</p>"#,
+        r#"<p style="x: 1;">c</p>"#,
+        r#"<p style="red\3b  background: blue">c2</p>"#,
+        r#"<p style="color: red\3b  background: blue;; top: 0">d</p>"#,
+        r#"<p style="color: red\3b  background: blue">e</p>"#,
+        r#"<p style="color: red\3b  background: blue; top: 0">f</p>"#,
+        r#"<p style="color: red\3b  background: blue">g</p>"#,
+        r#"<p style="color: red\3b  background: blue; top: 0">h</p>"#,
+        r#"<p style="margin: 0; padding: 20px; color: red\3b  background: blue">i</p>"#,
+        // A template made apart and given whole: the program's own value.
+        r#"<p style="color: red; background: blue">j</p>"#,
+        r#"<p style="red\3b  background: blue">k</p>"#,
+        r#"<p style="black;">l</p>"#,
+        r#"<div style="color: red\3b  background: blue">y</div>"#,
+        r#"<p style="color: red\3b  background: blue">s</p>"#,
+    ] {
+        assert!(out.contains(want), "{}\n{}", want, out);
+    }
+}
+
+/// In Chrome, what the server wrote and what the browser makes say the same, byte for byte; the
+/// review's font size and color apply again; a visitor's `red; background: blue` through `+`,
+/// `trim`, `join`, a spread and a component's prop stays one value, which paints no background.
+#[test]
+fn the_browser_writes_every_style_as_the_server_does() {
+    let src = r#"component Card(style) {
+    <div class="card" style={`padding: 8px; ${style}`}>x</div>
+}
+component P() {
+    state v = "red; background: blue"
+    state n = 20
+    state big = true
+    state c = "green"
+    state shown = false
+    <div>
+        <section id="server">
+            <p style={`${big ? `font-size: ${n}px;` : ""} color: ${c}`}>a</p>
+            <p style={`color: ${v};` + " top: 0"}>d</p>
+            <p style={trim(` color: ${v} `)}>e</p>
+            <p style={join([`color: ${v}`, "top: 0"], "; ")}>f</p>
+            <p {...{ style: `color: ${v}` }}>s</p>
+            <Card style={`color: ${v}`}/>
+        </section>
+        <button id="t" onclick={() => { shown = true }}>t</button>
+        {shown ? <section id="browser">
+            <p style={`${big ? `font-size: ${n}px;` : ""} color: ${c}`}>a</p>
+            <p style={`color: ${v};` + " top: 0"}>d</p>
+            <p style={trim(` color: ${v} `)}>e</p>
+            <p style={join([`color: ${v}`, "top: 0"], "; ")}>f</p>
+            <p {...{ style: `color: ${v}` }}>s</p>
+            <Card style={`color: ${v}`}/>
+        </section> : null}
+    </div>
+}
+route GET / = <html><body><P/></body></html>
+"#;
+    let Some(v) = in_page(
+        "styles-all",
+        src,
+        "/",
+        r#"const look = (sec) => [...$(sec).querySelectorAll("p, .card")].map((e) => { const s = getComputedStyle(e); return [e.getAttribute("style"), s.fontSize, s.color, s.backgroundColor]; });
+  const server = look("server");
+  $("t").click();
+  await tick(100);
+  return { server, browser: look("browser") };"#,
+        true,
+    ) else {
+        return;
+    };
+    let none = "rgba(0, 0, 0, 0)";
+    let one = r"color: red\3b  background: blue";
+    let want = serde_json::json!([
+        ["font-size: 20px; color: green", "20px", "rgb(0, 128, 0)", none],
+        [format!("{}; top: 0", one), "16px", "rgb(0, 0, 0)", none],
+        [one, "16px", "rgb(0, 0, 0)", none],
+        [format!("{}; top: 0", one), "16px", "rgb(0, 0, 0)", none],
+        [one, "16px", "rgb(0, 0, 0)", none],
+        // Escaped at the call and again as the component's value: still one value.
+        [r"padding: 8px; color: red\5c 3b  background: blue", "16px", "rgb(0, 0, 0)", none],
+    ]);
+    assert_eq!(v["server"], want, "{}", v);
+    assert_eq!(v["browser"], want, "{}", v);
     assert_eq!(v["remade"], 0, "{}", v);
     assert_eq!(v["errors"], serde_json::json!([]), "{}", v);
 }
@@ -545,6 +671,14 @@ print(<feed><link href="y"></link><title>t</title></feed>)
     ] {
         assert!(out.contains(want), "{}\n{}", want, out);
     }
+}
+
+/// What is in braces is code, whose `<` is no tag: `<link>{1 < 2 ? "a" : "b"}</link>`.
+#[test]
+fn a_link_holding_code_with_a_less_than_is_read() {
+    let out = run("print(<rss><channel><item><link>{1 < 2 ? \"a\" : \"b\"}</link><title>{\"}<\"}</title></item></channel></rss>)\nprint(<feed><link href=\"x\"/><entry><link>{`a}${1 < 2}`}</link></entry></feed>)\n");
+    assert!(out.contains("<rss><channel><item><link>a</link><title>}&lt;</title></item></channel></rss>"), "{}", out);
+    assert!(out.contains("<feed><link href=\"x\"/><entry><link>a}true</link></entry></feed>"), "{}", out);
 }
 
 // ---- Q-1272: an error value in markup shows nothing ------------------------------------------
@@ -687,6 +821,16 @@ route GET / = <html><body><B/></body></html>
     assert_eq!(v["remade"], 0, "{}", v);
     let errors: Vec<&str> = v["errors"].as_array().unwrap().iter().filter_map(|e| e.as_str()).collect();
     assert!(!errors.is_empty() && errors.iter().all(|e| e.starts_with("an error no statement took, shown in <B> as nothing: nope")), "{:?}", errors);
+}
+
+/// A select given an error chooses nothing, and the log says so, as the browser's console does.
+#[test]
+fn a_select_given_an_error_is_said() {
+    let s = served("errs-select", "route GET / = <html><body><select value={err(\"pick\")}><option>a</option><option>b</option></select></body></html>\n");
+    let a = s.get("/");
+    assert!(a.body.contains("<select><option>a</option><option>b</option></select>"), "{}", a.body);
+    let log = s.log_with("an error no statement took", 1);
+    assert!(log.contains("main.qwe:1: an error no statement took, shown as nothing: pick"), "{}", log);
 }
 
 // ---- Q-1271: `state` in an `if` ---------------------------------------------------------------

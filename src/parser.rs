@@ -27,22 +27,82 @@ pub const TYPE_NAMES: &[&str] = &["int", "float", "dec", "num", "str", "date", "
 pub const VOID_TAGS: &[&str] =
     &["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track", "wbr"];
 
-/// The templates a `style` attribute's value gives, as written or from a branch of a `? :`, an
-/// `if`, a `match`, a `??`, an `&&` or an `||` (FEEDBACK79.md, Q-1250, found in review): each value
-/// put in them given to `__css_value`, which escapes it as a CSS value, but the program's own text
-/// known before the run (`program_text`), which may write declarations of its own (`${hidden ?
-/// "display: none;" : ""}`). In a loop, not by recursion.
+/// A `style`'s expression, as Go's html/template has it: every value put into a template that
+/// reaches the style is escaped as one CSS value (`__css_value`), and every piece of text the
+/// program wrote stays as written (FEEDBACK79.md, Q-1250, decided in the second review; branch
+/// feedback72-81). Each template reached as the style's value is looked for: through a branch,
+/// `+`, `&&`, `||`, `??`, a call's arguments (`trim(...)`, `join([...])`), a list, a pipe, a
+/// block's statements; not a lambda's body, nor a style map's values (escaped as they are written,
+/// Q-668), nor css`...`, whose own values are escaped already and which is the program's way to
+/// compose declarations. A template made apart (a `let`, a function) and given whole
+/// (`style={s}`) is the program's whole value. In a loop, not by recursion.
 fn style_values(v: &mut Expr, line: u32) {
     let mut todo = vec![v];
     while let Some(e) = todo.pop() {
+        if css_tag(e) {
+            continue;
+        }
         match e {
             Expr::Template(parts) => {
                 for p in parts.iter_mut() {
                     if let TPart::Expr(x) = p {
-                        if !program_text(x) {
-                            let y = std::mem::replace(x, Expr::Lit(Lit::Nil));
-                            *x = Expr::Call(Box::new(Expr::Ident("__css_value".into(), line)), vec![y], line);
-                        }
+                        css_leaves(x, line);
+                    }
+                }
+            }
+            Expr::Call(_, args, _) => todo.extend(args.iter_mut()),
+            Expr::If(_, a, b) => {
+                todo.push(&mut **a);
+                if let Some(b) = b {
+                    todo.push(&mut **b);
+                }
+            }
+            Expr::Match(_, arms, _) => todo.extend(arms.iter_mut().map(|a| &mut a.body)),
+            Expr::Coalesce(a, b) | Expr::Binary(_, a, b, _) | Expr::Pipe(a, b, _) => {
+                todo.push(&mut **a);
+                todo.push(&mut **b);
+            }
+            Expr::List(items) => todo.extend(items.iter_mut()),
+            Expr::Block(stmts) => {
+                for st in stmts.iter_mut() {
+                    match st {
+                        Stmt::Let(_, x, _) | Stmt::Expr(x) | Stmt::Assign(_, _, x, _) => todo.push(x),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What a `${...}` of a style's template puts in, down to its leaves: a string or `null` stays (the
+/// program's text), a template keeps its own text and goes on into its values, css`...` passes, a
+/// branch of a `? :`, `if`, `match`, `??`, `&&` or `||` is looked into (`${big && "x: 1;"}` keeps
+/// the string and escapes `big`, which may show as `false`); any other value (a name, a call, a
+/// field) is given to `__css_value`. In a loop, not by recursion.
+fn css_leaves(x: &mut Expr, line: u32) {
+    let mut todo = vec![x];
+    while let Some(e) = todo.pop() {
+        if css_tag(e) {
+            continue;
+        }
+        let looked_into = match &*e {
+            Expr::Lit(Lit::Str(_) | Lit::Nil) | Expr::Template(_) | Expr::If(..) | Expr::Match(..) | Expr::Coalesce(..) => true,
+            Expr::Binary(BinOp::And | BinOp::Or, ..) => true,
+            Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(_))),
+            _ => false,
+        };
+        if !looked_into {
+            let y = std::mem::replace(e, Expr::Lit(Lit::Nil));
+            *e = Expr::Call(Box::new(Expr::Ident("__css_value".into(), line)), vec![y], line);
+            continue;
+        }
+        match e {
+            Expr::Template(parts) => {
+                for p in parts.iter_mut() {
+                    if let TPart::Expr(y) = p {
+                        todo.push(y);
                     }
                 }
             }
@@ -53,11 +113,10 @@ fn style_values(v: &mut Expr, line: u32) {
                 }
             }
             Expr::Match(_, arms, _) => todo.extend(arms.iter_mut().map(|a| &mut a.body)),
-            Expr::Coalesce(a, b) | Expr::Binary(BinOp::Or, a, b, _) => {
+            Expr::Coalesce(a, b) | Expr::Binary(BinOp::And | BinOp::Or, a, b, _) => {
                 todo.push(&mut **a);
                 todo.push(&mut **b);
             }
-            Expr::Binary(BinOp::And, _, b, _) => todo.push(&mut **b),
             Expr::Block(stmts) => {
                 if let Some(Stmt::Expr(last)) = stmts.last_mut() {
                     todo.push(last);
@@ -68,36 +127,9 @@ fn style_values(v: &mut Expr, line: u32) {
     }
 }
 
-/// Whether `e` gives only text the program wrote, as the parser knows for certain: a string (or
-/// `null`), or a `? :`, `if`, `match`, `??`, `&&` or `||` each of whose branches is one. Not data
-/// from outside, so a `style` template writes it as it is; a name, a top-level `let`'s too, is
-/// escaped as any value (FEEDBACK79.md, Q-1250, decided in review; branch feedback72-81). In a
-/// loop, not by recursion.
-fn program_text(e: &Expr) -> bool {
-    let mut todo = vec![e];
-    while let Some(e) = todo.pop() {
-        match e {
-            Expr::Lit(Lit::Str(_) | Lit::Nil) => {}
-            Expr::If(_, a, b) => {
-                todo.push(a);
-                match b {
-                    Some(b) => todo.push(b),
-                    None => {}
-                }
-            }
-            Expr::Match(_, arms, _) => todo.extend(arms.iter().map(|a| &a.body)),
-            Expr::Coalesce(a, b) | Expr::Binary(BinOp::And | BinOp::Or, a, b, _) => {
-                todo.push(a);
-                todo.push(b);
-            }
-            Expr::Block(stmts) => match stmts.as_slice() {
-                [Stmt::Expr(x)] => todo.push(x),
-                _ => return false,
-            },
-            _ => return false,
-        }
-    }
-    true
+/// css`...` as the parser writes it: `css(`...`)`, its values given to `__css_value` already.
+fn css_tag(e: &Expr) -> bool {
+    matches!(e, Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if n == "css") && matches!(args.as_slice(), [Expr::Template(_)]))
 }
 
 /// Whether an element starts an XML answer's markup, where HTML's void names are XML's elements
@@ -3803,8 +3835,28 @@ impl Parser {
     /// Whether what follows a start tag just read is text up to `</tag>` (any case), with nothing
     /// that starts another tag between (FEEDBACK79.md, Q-1259, found in review).
     fn holds_up_to_end(&self, tag: &str) -> bool {
-        let mut i = 0;
+        // What is in braces is code, whose `<` starts no tag (`{1 < 2 ? "a" : "b"}`), and its
+        // strings, whose braces count for nothing (found in review).
+        let (mut i, mut depth, mut quote) = (0, 0u32, None);
         while let Some(c) = self.lx.peek_char_at(i) {
+            if depth > 0 {
+                match (quote, c) {
+                    (Some(_), '\\') => i += 1,
+                    (Some(q), c) if c == q => quote = None,
+                    (Some(_), _) => {}
+                    (None, '"' | '`') => quote = Some(c),
+                    (None, '{') => depth += 1,
+                    (None, '}') => depth -= 1,
+                    _ => {}
+                }
+                i += 1;
+                continue;
+            }
+            if c == '{' {
+                depth = 1;
+                i += 1;
+                continue;
+            }
             if c == '<' {
                 let end: Vec<char> = format!("</{}", tag).chars().collect();
                 if !end.iter().enumerate().all(|(k, c)| self.lx.peek_char_at(i + k).is_some_and(|d| d.eq_ignore_ascii_case(c))) {
@@ -4068,6 +4120,22 @@ impl Parser {
                 attrs.insert(0, ("id".to_string(), AttrVal::Expr(i)));
             }
         }
+        // A `style`'s templates, on an element, on a component or view (its `style` prop, which its
+        // body may put in a style), and as a spread's literal map's `style` (`style_values`;
+        // FEEDBACK79.md, Q-1250; branch feedback72-81).
+        for (n, v) in attrs.iter_mut() {
+            match v {
+                AttrVal::Expr(e) if n.eq_ignore_ascii_case("style") => style_values(e, line),
+                AttrVal::Spread(Expr::Map(kvs)) => {
+                    for (k, e) in kvs.iter_mut() {
+                        if k.eq_ignore_ascii_case("style") {
+                            style_values(e, line);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         let mut renamed: Vec<(String, String)> = Vec::new();
         if tag.starts_with(|c: char| c.is_ascii_lowercase()) {
             for (n, v) in attrs.iter_mut() {
@@ -4084,11 +4152,6 @@ impl Parser {
                 // adds no declaration, on the server and in the browser alike. Its own text stays
                 // as written; a whole value (`style={s}`) cannot be cut so (FEEDBACK79.md, Q-1250;
                 // branch feedback72-81).
-                if lower == "style" {
-                    if let AttrVal::Expr(e) = v {
-                        style_values(e, line);
-                    }
-                }
             }
         }
         // One of the two would be lost: in a list, `key` and a view's own

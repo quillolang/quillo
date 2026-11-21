@@ -4422,13 +4422,15 @@ pub fn css_value(s: &str) -> String {
 ///
 /// Also in a `style` attribute's template, whose values the parser gives here (FEEDBACK79.md,
 /// Q-1250; branch feedback72-81): a text with nothing to escape given back as it is, the rest
-/// written once.
+/// written once. Null, a bool, a number and an error as they are, which nothing in them can make
+/// a declaration of: `${x ?? "black"}`, `${big && "x: 1;"}` and `${a || b}` choose as before,
+/// their values given here (found in the second review).
 fn css_value_fn(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let v = arg(&args, 0);
-    if let Value::Str(s) = &v {
-        if !crate::interp::css_special(s) {
-            return Ok(v);
-        }
+    match &v {
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Err(..) => return Ok(v),
+        Value::Str(s) if !crate::interp::css_special(s) => return Ok(v),
+        _ => {}
     }
     let t = v.display_held().map_err(|o| o.at(line))?;
     if !crate::interp::css_special(&t) {
