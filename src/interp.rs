@@ -2189,40 +2189,42 @@ fn same_file(a: &Option<Arc<str>>, b: &Option<Arc<str>>) -> bool {
     }
 }
 
-/// `(_i) => true`, as `map` is given to fill a list: always the same, so it is not called.
-fn constant_lambda(def: &FnDef) -> Option<&Lit> {
+/// What a one-parameter function gives without being called, when calling it can do nothing
+/// else (no types, defaults or effects to check, and not a script's, which runs only while its
+/// script does: Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250).
+enum Given<'a> {
+    /// `(x) => x`, as `count(flags, (f) => f)` and `filter` are given: what it is given, with
+    /// no scope to make (FEEDBACK29.md; branch feedback29-fixes).
+    Same,
+    /// `(_i) => true`, as `map` is given to fill a list: always the same.
+    Lit(&'a Lit),
+    /// `(x) => x.name`: the field it reads from its parameter.
+    Field(&'a str, u32),
+}
+
+/// Which `Given` a function is, its conditions asked once: asked apart for each kind, `call1`
+/// tested one of them twice, 3 instructions on each call of a lambda that is none (the 0.8.10
+/// release benchmark, vs-python's "filter map sum"; branch feedback72-81).
+fn given(def: &FnDef) -> Option<Given<'_>> {
     let [p] = def.params.as_slice() else { return None };
-    if p.ty.is_some() || p.default.is_some() || def.ret.is_some() || def.err.is_some() || def.effects.is_some() || def.server || def.component {
+    if p.ty.is_some() || p.default.is_some() || def.ret.is_some() || def.err.is_some() || def.effects.is_some() || def.server || def.run != 0 {
         return None;
     }
     match &def.body {
-        Expr::Lit(l) => Some(l),
+        Expr::Ident(n, _) if *n == p.name && !def.component => Some(Given::Same),
+        Expr::Lit(l) if !def.component => Some(Given::Lit(l)),
+        Expr::Field(obj, field, at) => match &**obj {
+            Expr::Ident(n, _) if *n == p.name => Some(Given::Field(field, *at)),
+            _ => None,
+        },
         _ => None,
     }
 }
 
-/// `(x) => x`, as `count(flags, (f) => f)` and `filter` are given: what it is given is what
-/// it gives, with no scope to make (FEEDBACK29.md; branch feedback29-fixes).
-fn identity(def: &FnDef) -> bool {
-    let [p] = def.params.as_slice() else { return false };
-    p.ty.is_none() && p.default.is_none() && def.ret.is_none() && def.err.is_none() && def.effects.is_none() && !def.server && !def.component
-        && matches!(&def.body, Expr::Ident(n, _) if *n == p.name)
-}
-
-/// The field a function only reads from its one parameter, as in
-/// `(x) => x.name`, when calling it can do nothing else (no types,
-/// defaults or effects to check).
+/// The field a function only reads from its one parameter (`Given::Field`).
 fn projection(def: &FnDef) -> Option<(&str, u32)> {
-    let [p] = def.params.as_slice() else { return None };
-    if p.ty.is_some() || p.default.is_some() || def.ret.is_some() || def.err.is_some() || def.effects.is_some() || def.server
-    {
-        return None;
-    }
-    match &def.body {
-        Expr::Field(obj, field, at) => match &**obj {
-            Expr::Ident(n, _) if *n == p.name => Some((field, *at)),
-            _ => None,
-        },
+    match given(def) {
+        Some(Given::Field(field, at)) => Some((field, at)),
         _ => None,
     }
 }
@@ -5658,7 +5660,7 @@ impl Interp {
         // field, without a scope for the call. Not a script's, which runs only while its script
         // does (`call_closure_with`; Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's
         // Q-1250; branch feedback72-81).
-        if let (Some((field, at)), [Some(_)], u64::MAX) = (projection(&c.def).filter(|_| c.def.run == 0), args.as_slice(), self.fuel) {
+        if let (Some((field, at)), [Some(_)], u64::MAX) = (projection(&c.def), args.as_slice(), self.fuel) {
             let v = args.into_iter().next().flatten().unwrap_or(Value::Nil);
             return in_file(self.get_field(v, field, &c.env, at), &c.def.file);
         }
@@ -5695,7 +5697,7 @@ impl Interp {
         }
         // As `call_closure` has it (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's
         // Q-1250; branch feedback72-81).
-        if let (Some((field, at)), 1, u64::MAX) = (projection(&c.def).filter(|_| c.def.run == 0), args.len(), self.fuel) {
+        if let (Some((field, at)), 1, u64::MAX) = (projection(&c.def), args.len(), self.fuel) {
             let v = args.into_iter().next().unwrap_or(Value::Nil);
             return in_file(self.get_field(v, field, &c.env, at), &c.def.file);
         }
@@ -5716,14 +5718,11 @@ impl Interp {
         // None of them a script's, which runs only while its script does (`call_closure_with`;
         // Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
         if self.fuel == u64::MAX {
-            if identity(&c.def) && c.def.run == 0 {
-                return Ok(x);
-            }
-            if let Some(l) = constant_lambda(&c.def).filter(|_| c.def.run == 0) {
-                return Ok(lit_value(l));
-            }
-            if let Some((field, at)) = projection(&c.def).filter(|_| c.def.run == 0) {
-                return in_file(self.get_field(x, field, &c.env, at), &c.def.file);
+            match given(&c.def) {
+                Some(Given::Same) => return Ok(x),
+                Some(Given::Lit(l)) => return Ok(lit_value(l)),
+                Some(Given::Field(field, at)) => return in_file(self.get_field(x, field, &c.env, at), &c.def.file),
+                None => {}
             }
         }
         if c.def.component {

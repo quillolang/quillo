@@ -4252,7 +4252,7 @@ impl App {
         let mut tools = None;
         let (_, mut tried) = crate::error::noting_reads(|| {
             if self.static_check {
-                let analysis = crate::check::check_file(&self.main_file);
+                let analysis = crate::check::check_file_opts(&self.main_file, Default::default(), crate::check::Options::plain());
                 for d in &analysis.diagnostics {
                     eprintln!("{}", d);
                 }

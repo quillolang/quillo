@@ -479,7 +479,7 @@ fn real_main(args: Vec<String>) -> i32 {
                     return code;
                 }
                 let strict_null = flags.iter().any(|a| a == "--strict-null");
-                check(f, quillo::check::Options { strict_null, css: true, ..Default::default() })
+                check(f, quillo::check::Options { strict_null, css: true, ..quillo::check::Options::plain() })
             })
         }
         // The program's API as OpenAPI, from its source (FEEDBACK10.md, Q-077;
@@ -744,7 +744,7 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
     let path = Path::new(file);
     // Checked as `quillo run` checks it, and a program with errors does not start the door. The
     // tools are the checker's reading of it (src/mcp.rs).
-    let analysis = quillo::check::check_file(path);
+    let analysis = quillo::check::check_file_opts(path, Default::default(), quillo::check::Options::plain());
     for d in &analysis.diagnostics {
         eprintln!("{}", d);
     }
@@ -1983,7 +1983,7 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
 /// text is empty because everything has been printed already.
 /// Its tools as the checker read them, for the MCP door (FEEDBACK56.md, C.2; branch feedback56).
 fn static_errors(path: &Path) -> Result<Vec<quillo::mcp::Tool>, String> {
-    let analysis = quillo::check::check_file(path);
+    let analysis = quillo::check::check_file_opts(path, Default::default(), quillo::check::Options::plain());
     for d in &analysis.diagnostics {
         eprintln!("{}", d);
     }

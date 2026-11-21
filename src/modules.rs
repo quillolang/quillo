@@ -639,7 +639,7 @@ fn script_line(all: &[Respell], file: &str, line: u32) -> Result<String, String>
 /// `quillo fix`: writes the `import` each file needs for the names it uses and does not
 /// take, and turns a `use` written as 0.6 did around. Says what it did, a line each.
 pub fn fix(main: &Path) -> Result<Vec<String>, String> {
-    let a = crate::check::check_file(main);
+    let a = crate::check::check_file_opts(main, Default::default(), crate::check::Options::plain());
     if let Some(d) = a.diagnostics.iter().find(|d| d.severity == Severity::Error) {
         return Err(format!("{}:{}: {}", d.file, d.line, d.message));
     }

@@ -445,8 +445,8 @@ fn runtime_from(it: &Interp, c: &Compiler, boots: bool) -> RuntimeFile {
     let mut exported: Vec<String> = rt
         .by_name
         .iter()
-        .filter(|(n, &i)| keep[i] && !n.contains('.') && wanted.contains(*n))
-        .map(|(n, _)| n.clone())
+        .filter(|(n, &i)| keep[i] && !n.contains('.') && wanted.contains(**n))
+        .map(|(n, _)| n.to_string())
         .collect();
     exported.sort();
     let mut js = String::from("(function () {\n");
@@ -481,7 +481,7 @@ impl RuntimeFile {
             .collect();
         let mut used: Vec<String> = names_in(program)
             .into_iter()
-            .filter(|n| !n.contains('.') && rt.by_name.contains_key(n) && !declared.contains(n))
+            .filter(|n| !n.contains('.') && rt.by_name.contains_key(n.as_str()) && !declared.contains(n))
             .collect();
         used.sort();
         used.dedup();
@@ -845,7 +845,7 @@ mod dev {
             let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
             (!n.is_empty()).then_some(n)
         };
-        let mut names: Vec<String> = runtime_units().by_name.keys().filter(|n| !n.contains('.')).cloned().collect();
+        let mut names: Vec<String> = runtime_units().by_name.keys().filter(|n| !n.contains('.')).map(|n| n.to_string()).collect();
         names.extend(RUNTIME.lines().filter(|l| l.trim_end().ends_with("// dev")).filter_map(decl));
         names.sort();
         names.dedup();
@@ -1231,7 +1231,7 @@ fn shake(rt: &Runtime, program: &str) -> Vec<bool> {
     let mut keep = vec![false; rt.units.len()];
     let mut todo: Vec<String> = names_in(program);
     while let Some(n) = todo.pop() {
-        if let Some(&i) = rt.by_name.get(&n) {
+        if let Some(&i) = rt.by_name.get(n.as_str()) {
             if !keep[i] {
                 keep[i] = true;
                 todo.extend(names_in(&rt.units[i].1));
@@ -1246,80 +1246,153 @@ fn shake(rt: &Runtime, program: &str) -> Vec<bool> {
 /// for development.
 struct Runtime {
     preamble: String,
-    units: Vec<(String, String)>,
+    /// Each declaration's name and text: runtime.js's own lines, borrowed, where none of them is
+    /// for development.
+    units: Vec<(&'static str, std::borrow::Cow<'static, str>)>,
     /// The line of runtime.js each unit starts on.
     starts: Vec<usize>,
-    by_name: HashMap<String, usize>,
+    by_name: HashMap<&'static str, usize>,
 }
 
 fn runtime_units() -> &'static Runtime {
     static RT: std::sync::OnceLock<Runtime> = std::sync::OnceLock::new();
-    RT.get_or_init(|| {
-        let mut preamble = String::new();
-        let mut units: Vec<(String, String)> = Vec::new();
-        let mut starts = Vec::new();
-        // Lines ending `// dev` are for development bundles only, which
-        // take the runtime as it is written.
-        for (n, line) in RUNTIME.lines().enumerate().filter(|(_, l)| !l.trim_end().ends_with("// dev")) {
-            let decl = ["async function ", "function ", "class ", "const ", "let "]
-                .iter()
-                .find_map(|p| line.strip_prefix(p))
-                .map(|rest| rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect::<String>())
-                .or_else(|| {
-                    ["B.", "W."].iter().find_map(|p| {
-                        line.strip_prefix(p).map(|rest| {
-                            let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-                            format!("{}{}", p, n)
-                        })
-                    })
-                });
-            match decl {
-                Some(name) if !name.is_empty() && !name.ends_with('.') => {
-                    units.push((name, format!("{}\n", line)));
-                    starts.push(n + 1);
-                }
-                _ => match units.last_mut() {
-                    Some(u) => {
-                        u.1.push_str(line);
-                        u.1.push('\n');
-                    }
-                    None => {
-                        preamble.push_str(line);
-                        preamble.push('\n');
-                    }
-                },
-            }
+    RT.get_or_init(|| units_of(RUNTIME))
+}
+
+/// The length of the name at the start of `s`: letters, digits, `_` and `$` (`$` left out where
+/// `dollar` is false).
+fn name_len(s: &str, dollar: bool) -> usize {
+    s.char_indices().find(|&(_, c)| !(c.is_alphanumeric() || c == '_' || (dollar && c == '$'))).map_or(s.len(), |(i, _)| i)
+}
+
+/// The name a line of the runtime declares, if it starts a declaration.
+fn declared_by(line: &'static str) -> Option<&'static str> {
+    // Most lines are indented, or a `}`: told by their first byte.
+    let prefix: &[&str] = match line.as_bytes().first()? {
+        b'a' => &["async function "],
+        b'f' => &["function "],
+        b'c' => &["class ", "const "],
+        b'l' => &["let "],
+        b'B' | b'W' => {
+            let rest = line.get(2..).filter(|_| line.as_bytes().get(1) == Some(&b'.'))?;
+            // `B.` with no name after it is none.
+            let n = name_len(rest, false);
+            return (n > 0).then(|| &line[..2 + n]);
         }
-        let mut by_name: HashMap<String, usize> = units.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
-        // `let a = null, b = 0`: each name it declares needs it (the commas
-        // between declarations, not those inside their values).
-        for (i, (_, text)) in units.iter().enumerate() {
-            let first = text.lines().next().unwrap_or("");
-            if !(first.starts_with("let ") || first.starts_with("const ")) {
+        _ => return None,
+    };
+    let rest = prefix.iter().find_map(|p| line.strip_prefix(p))?;
+    let n = name_len(rest, true);
+    (n > 0).then(|| &rest[..n])
+}
+
+/// `runtime_units` of `src`. Made once a process, at the program's load: it took 4.2 million
+/// instructions, two fifths of what `quillo run` does for `print(0)` besides starting the process,
+/// each line tried against seven prefixes and copied into its unit (7% more than 0.8.9's as
+/// runtime.js grew, which made a program's start dearer). Now a line is told by its first byte and
+/// a unit is runtime.js's own text, copied only where a development line comes out of it: about
+/// 1.1 million (the 0.8.10 release benchmark; branch feedback72-81).
+fn units_of(src: &'static str) -> Runtime {
+    use std::borrow::Cow;
+    let mut preamble = String::new();
+    let mut units: Vec<(&'static str, Cow<'static, str>)> = Vec::with_capacity(1024);
+    let mut starts = Vec::with_capacity(1024);
+    // Where each unit's line starts in `src`.
+    let mut offs: Vec<usize> = Vec::with_capacity(1024);
+    // The unit being read: its name, where its text starts in `src`, and its text when a line has
+    // come out of it (or a line that is not `src`'s as it is: one ending `\r\n`, or the last with no
+    // `\n`).
+    let mut open: Option<(&'static str, usize, Option<String>)> = None;
+    let mut end = 0;
+    let base = src.as_ptr() as usize;
+    let close = |open: &mut Option<(&'static str, usize, Option<String>)>, end: usize, units: &mut Vec<(&'static str, Cow<'static, str>)>| {
+        if let Some((name, from, text)) = open.take() {
+            units.push((
+                name,
+                match text {
+                    Some(t) => Cow::Owned(t),
+                    None => Cow::Borrowed(&src[from..end]),
+                },
+            ));
+        }
+    };
+    for (n, line) in src.lines().enumerate() {
+        let at = line.as_ptr() as usize - base;
+        // Lines ending `// dev` are for development bundles only, which take the runtime as it
+        // is written.
+        let t = line.trim_end();
+        let dev = t.as_bytes().last() == Some(&b'v') && t.ends_with("// dev");
+        // As `src` has it: the line and one `\n`.
+        let whole = src.as_bytes().get(at + line.len()) == Some(&b'\n');
+        if !dev {
+            if let Some(name) = declared_by(line) {
+                close(&mut open, end, &mut units);
+                starts.push(n + 1);
+                offs.push(at);
+                open = Some((name, at, None));
+                if !whole {
+                    open.as_mut().unwrap().2 = Some(format!("{}\n", line));
+                }
+                end = at + line.len() + 1;
                 continue;
             }
-            let (mut depth, mut quote) = (0i32, None);
-            for (k, c) in first.char_indices() {
-                match (quote, c) {
-                    (Some(q), _) if c == q => quote = None,
-                    (Some(_), _) => {}
-                    (None, '"' | '\'' | '`') => quote = Some(c),
-                    (None, '(' | '[' | '{') => depth += 1,
-                    (None, ')' | ']' | '}') => depth -= 1,
-                    (None, ';') if depth == 0 => break,
-                    (None, ',') if depth == 0 => {
-                        let rest = first[k + 1..].trim_start();
-                        let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
-                        if !n.is_empty() && rest[n.len()..].trim_start().starts_with('=') {
-                            by_name.entry(n).or_insert(i);
-                        }
+        }
+        match &mut open {
+            None => {
+                if !dev {
+                    preamble.push_str(line);
+                    preamble.push('\n');
+                }
+            }
+            Some((_, from, text)) => {
+                if text.is_none() && (dev || !whole) {
+                    *text = Some(src[*from..end].to_string());
+                }
+                match text {
+                    Some(t) if !dev => {
+                        t.push_str(line);
+                        t.push('\n');
                     }
-                    _ => {}
+                    Some(_) => {}
+                    None => end = at + line.len() + 1,
                 }
             }
         }
-        Runtime { preamble, units, starts, by_name }
-    })
+    }
+    close(&mut open, end, &mut units);
+    let mut by_name: HashMap<&'static str, usize> = HashMap::with_capacity(units.len() + 64);
+    for (i, (n, _)) in units.iter().enumerate() {
+        by_name.insert(n, i);
+    }
+    // `let a = null, b = 0`: each name it declares needs it (the commas
+    // between declarations, not those inside their values).
+    for (i, &off) in offs.iter().enumerate() {
+        // Its first line, as `src` has it, so that a name found in it is `src`'s.
+        let first: &'static str = src[off..].lines().next().unwrap_or("");
+        if !(first.starts_with("let ") || first.starts_with("const ")) {
+            continue;
+        }
+        let (mut depth, mut quote) = (0i32, None);
+        for (k, c) in first.char_indices() {
+            match (quote, c) {
+                (Some(q), _) if c == q => quote = None,
+                (Some(_), _) => {}
+                (None, '"' | '\'' | '`') => quote = Some(c),
+                (None, '(' | '[' | '{') => depth += 1,
+                (None, ')' | ']' | '}') => depth -= 1,
+                (None, ';') if depth == 0 => break,
+                (None, ',') if depth == 0 => {
+                    let rest = first[k + 1..].trim_start();
+                    let n = name_len(rest, true);
+                    if n > 0 && rest[n..].trim_start().starts_with('=') {
+                        by_name.entry(&rest[..n]).or_insert(i);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Runtime { preamble, units, starts, by_name }
 }
 
 /// The identifiers in some JavaScript, with `B.x` and `W.x` kept whole
@@ -5950,6 +6023,114 @@ mod minify_tests {
         let mut out = String::new();
         super::minify_into(js, &mut out);
         out
+    }
+
+    /// `units_of` as it was written before the 0.8.10 release benchmark (branch feedback72-81),
+    /// each line copied into its unit: what the faster one must give, unit for unit.
+    fn units_as_before(src: &str) -> (String, Vec<(String, String)>, Vec<usize>, std::collections::HashMap<String, usize>) {
+        let mut preamble = String::new();
+        let mut units: Vec<(String, String)> = Vec::new();
+        let mut starts = Vec::new();
+        for (n, line) in src.lines().enumerate().filter(|(_, l)| !l.trim_end().ends_with("// dev")) {
+            let decl = ["async function ", "function ", "class ", "const ", "let "]
+                .iter()
+                .find_map(|p| line.strip_prefix(p))
+                .map(|rest| rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect::<String>())
+                .or_else(|| {
+                    ["B.", "W."].iter().find_map(|p| {
+                        line.strip_prefix(p).map(|rest| {
+                            let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                            format!("{}{}", p, n)
+                        })
+                    })
+                });
+            match decl {
+                Some(name) if !name.is_empty() && !name.ends_with('.') => {
+                    units.push((name, format!("{}\n", line)));
+                    starts.push(n + 1);
+                }
+                _ => match units.last_mut() {
+                    Some(u) => {
+                        u.1.push_str(line);
+                        u.1.push('\n');
+                    }
+                    None => {
+                        preamble.push_str(line);
+                        preamble.push('\n');
+                    }
+                },
+            }
+        }
+        let mut by_name: std::collections::HashMap<String, usize> = units.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
+        for (i, (_, text)) in units.iter().enumerate() {
+            let first = text.lines().next().unwrap_or("");
+            if !(first.starts_with("let ") || first.starts_with("const ")) {
+                continue;
+            }
+            let (mut depth, mut quote) = (0i32, None);
+            for (k, c) in first.char_indices() {
+                match (quote, c) {
+                    (Some(q), _) if c == q => quote = None,
+                    (Some(_), _) => {}
+                    (None, '"' | '\'' | '`') => quote = Some(c),
+                    (None, '(' | '[' | '{') => depth += 1,
+                    (None, ')' | ']' | '}') => depth -= 1,
+                    (None, ';') if depth == 0 => break,
+                    (None, ',') if depth == 0 => {
+                        let rest = first[k + 1..].trim_start();
+                        let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect();
+                        if !n.is_empty() && rest[n.len()..].trim_start().starts_with('=') {
+                            by_name.entry(n).or_insert(i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        (preamble, units, starts, by_name)
+    }
+
+    fn same_units(src: &'static str) {
+        let rt = super::units_of(src);
+        let (preamble, units, starts, by_name) = units_as_before(src);
+        assert_eq!(rt.preamble, preamble, "{:?}", src);
+        let got: Vec<(String, String)> = rt.units.iter().map(|(n, t)| (n.to_string(), t.to_string())).collect();
+        assert_eq!(got, units, "{:?}", src);
+        assert_eq!(rt.starts, starts, "{:?}", src);
+        let got: std::collections::HashMap<String, usize> = rt.by_name.iter().map(|(n, &i)| (n.to_string(), i)).collect();
+        assert_eq!(got, by_name, "{:?}", src);
+    }
+
+    /// The runtime cut as it was, faster: runtime.js itself, and the lines that are not its kind
+    /// (FEEDBACK72-81's release benchmark; branch feedback72-81).
+    #[test]
+    fn the_runtime_is_cut_as_before() {
+        same_units(super::RUNTIME);
+        // Most units are runtime.js's own text, not copies.
+        let rt = super::runtime_units();
+        let borrowed = rt.units.iter().filter(|(_, t)| matches!(t, std::borrow::Cow::Borrowed(_))).count();
+        assert!(borrowed * 10 > rt.units.len() * 9, "{} of {}", borrowed, rt.units.len());
+        for src in [
+            "",
+            "\n",
+            "// a preamble\nlet a = 1\n",
+            "'use strict';\n// dev line // dev\nfunction f() {\n  return 1;\n}\n",
+            "function f() {\n  dev(); // dev\n  return 1;\n}\nconst g = 2;\n",
+            "function f() {\n  dev(); // dev   \n}\n",
+            "function last() { return 1; }",
+            "function f() {\n  return 1;\n}",
+            "function f() {\r\n  return 1;\r\n}\r\nconst x = 1;\r\n",
+            "function f() {\n  a();\r\n  b();\n}\n",
+            "function (x) {}\nfunction* g() {}\nfunction $f() {}\nasync function go() {}\nasync () => 1\n",
+            "class A {}\nclass {}\nconst B = 1, C = 2, D = [1, 2], E = f(1, 2), F = \"a,b\", G\nlet H = 1, I = 'x, y = 2'\nconst [J, K] = L;\n",
+            "B. = 1\nB.x = 1\nB.$y = 2\nW.z_1 = 3\nBx.q = 4\nB.\nW.\n",
+            "let a = 1, b = 2 // dev\nlet c = 1, c2 = 2\nconst a = 3\n",
+            "function f() {}\nfunction f() {}\nlet f2 = 1, f = 2\n",
+            "  function indented() {}\n}\nfunction é() {}\nfunction naïve_ü() {}\n",
+            "let x = 1\n// dev\nlet y = 2 // dev\n\n\nconst z = 3\n",
+        ] {
+            same_units(src);
+        }
     }
 
     /// The whole runtime, as production bundles take it (without the lines

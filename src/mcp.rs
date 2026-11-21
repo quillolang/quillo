@@ -123,7 +123,7 @@ pub fn tools(a: &Analysis) -> Vec<Tool> {
 /// The tools of the program in `path`, read without running it; its errors, as `quillo check`
 /// says them, when it has any: a program with errors does not run.
 pub fn of_source(path: &Path) -> Result<Vec<Tool>, String> {
-    let a = crate::check::check_file(path);
+    let a = crate::check::check_file_opts(path, Default::default(), crate::check::Options::plain());
     let errors: Vec<String> = a.errors().map(|d| d.to_string()).collect();
     if !errors.is_empty() {
         return Err(errors.join("\n"));
@@ -1114,7 +1114,7 @@ fn grouped(n: usize) -> String {
 /// under the policy set (`main.rs`, `with_policy`), where it has any; a program with no tools is
 /// told it has none.
 pub fn served(path: &Path) -> Result<J, String> {
-    let a = crate::check::check_file(path);
+    let a = crate::check::check_file_opts(path, Default::default(), crate::check::Options::plain());
     let errors: Vec<String> = a.errors().map(|d| d.to_string()).collect();
     if !errors.is_empty() {
         return Err(errors.join("\n"));

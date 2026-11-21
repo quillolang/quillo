@@ -2391,8 +2391,8 @@ pub fn builtin_signatures() -> Vec<(String, String)> {
     BUILTINS.iter().map(|(n, p, r)| (n.to_string(), Sig::builtin(n, p, r).text())).collect()
 }
 
-/// How strict a check is.
-#[derive(Clone, Copy, Default, Debug)]
+/// How strict a check is, and what it gathers.
+#[derive(Clone, Copy, Debug)]
 pub struct Options {
     /// Also warn where a value may be null and null does not work: an
     /// argument `str | null` for a `str` parameter, `count + 1` with
@@ -2411,6 +2411,25 @@ pub struct Options {
     /// How long a confined check may take: 2 s unless given (FEEDBACK75.md, Q-1053; branch
     /// feedback75).
     pub time: Option<std::time::Duration>,
+    /// Also gather each use of a name and the scopes' names, with their hover text, which only an
+    /// editor reads (`quillo lsp`): on unless turned off (`Options::plain`), as `quillo check`,
+    /// `quillo run`, `quillo mcp`, `quillo fix` and `check_program` do. Making the text was a
+    /// sixth of a check of quillolang.org's site (the 0.8.10 release benchmark found `quillo check`
+    /// 2.2% slower than 0.8.9's; branch feedback72-81).
+    pub references: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options { strict_null: false, confined: false, css: false, classes: false, time: None, references: true }
+    }
+}
+
+impl Options {
+    /// A check for its findings, with nothing only an editor reads (`references`).
+    pub fn plain() -> Options {
+        Options { references: false, ..Default::default() }
+    }
 }
 
 /// A problem the native parser found in a `.rs` file, as a confined check says it: the function's
@@ -2578,6 +2597,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
     let mut c = Checker::new(file);
     c.strict_null = opts.strict_null;
     c.confined = opts.confined;
+    c.references = opts.references;
     c.root = base_dir.to_path_buf();
     c.overrides = overrides;
     let main: Arc<str> = Arc::from(file);
@@ -2951,6 +2971,8 @@ struct Checker {
     hint: Option<Vec<T>>,
     /// Warn where a value may be null and null does not work (`--strict-null`).
     strict_null: bool,
+    /// See `Options::references`.
+    references: bool,
     /// See `Options::confined`.
     confined: bool,
     /// The folder of the file checked first: what a confined check stays in.
@@ -3161,6 +3183,7 @@ impl Checker {
             over_budget: false,
             hint: None,
             strict_null: false,
+            references: true,
             letting: Vec::new(),
             set_fields: Vec::new(),
             plain_dollars: HashSet::new(),
@@ -3248,7 +3271,8 @@ impl Checker {
     }
 
     fn options(&self) -> Options {
-        Options { strict_null: self.strict_null, confined: self.confined, css: false, classes: false, time: None }
+        // A sub-check's references are never read: no editor is shown them (see `Options::references`).
+        Options { strict_null: self.strict_null, confined: self.confined, css: false, classes: false, time: None, references: false }
     }
 
     /// The file a `use`, `mount` or `service` names; when confined, none
@@ -4805,7 +4829,7 @@ impl Checker {
         if let Some(scope) = popped {
             for (name, v) in scope {
                 // Quillo's own names (`__request`) are no editor's to offer (FEEDBACK47.md, Q-535).
-                if self.quiet == 0 && !name.starts_with("__") {
+                if self.quiet == 0 && self.references && !name.starts_with("__") {
                     let detail = var_detail(&name, &v);
                     let (file, line, end) = (v.file.to_string(), v.line, self.line.max(v.line));
                     let statement = matches!(v.kind, Kind::Let | Kind::State);
@@ -5045,6 +5069,11 @@ impl Checker {
         }
         let name = name.strip_suffix(OLD).unwrap_or(name);
         self.taken(name, v);
+        // Only an editor reads these (`Options::references`; the 0.8.10 release benchmark; branch
+        // feedback72-81).
+        if !self.references {
+            return;
+        }
         let def = if &*v.file == "<builtin>" { None } else { Some((v.file.to_string(), v.line)) };
         let detail = var_detail(name, v);
         if v.kind == Kind::State {
@@ -9811,7 +9840,7 @@ impl Checker {
             self.error(format!("`{}` has no function `{}`{}{}", m, f, near, crate::error::removed_note(&full)));
             return T::ANY;
         };
-        if !self.quiet_mode() {
+        if !self.quiet_mode() && self.references {
             self.out.references.push(Reference {
                 file: self.file.to_string(),
                 line,
