@@ -246,8 +246,11 @@ fn ready_per_tenant_reads_the_folder_tenants_need() {
 /// down while nothing listens there (FEEDBACK79.md, Q-1254; branch feedback72-81).
 #[test]
 fn ready_per_tenant_on_a_server_asks_whether_it_is_reachable() {
+    // Held, never accepting: the system completes the connection all the same.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let up = listener.local_addr().unwrap().port();
+    // A port that refuses: one let go just now. Another test could take it in between, a race this
+    // accepts; the Unix socket test below has none.
     let down = {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
@@ -262,9 +265,10 @@ fn ready_per_tenant_on_a_server_asks_whether_it_is_reachable() {
     drop(listener);
 }
 
-/// A server reached by its Unix socket (PostgreSQL's folder as the host, or `?host=`; MySQL's
-/// `?socket=`): ready while something listens on the socket, down when nothing does; it was dialed
-/// as a host name and said down (FEEDBACK79.md, Q-1254, found in review; branch feedback72-81).
+/// A PostgreSQL server reached by its Unix socket (its folder as the host, or `?host=`): ready while
+/// something listens on the socket, down with no socket or a stale one; it was dialed as a host
+/// name and said down (FEEDBACK79.md, Q-1254, found in review; branch feedback72-81). Each state
+/// is a server of its own: an answer is kept a while.
 #[cfg(unix)]
 #[test]
 fn ready_per_tenant_on_a_server_through_its_unix_socket() {
@@ -272,30 +276,41 @@ fn ready_per_tenant_on_a_server_through_its_unix_socket() {
     let dir = PathBuf::from(format!("/tmp/q1254-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let pg_sock = dir.join(".s.PGSQL.5432");
-    let my_sock = dir.join("mysqld.sock");
+    let sock = dir.join(".s.PGSQL.5432");
     let enc = dir.to_string_lossy().replace('/', "%2F");
-    let targets = [
-        format!("postgres://app@{}/app_{{tenant}}", enc),
-        format!("postgres:///app_{{tenant}}?host={}", dir.display()),
-        format!("mysql://app@localhost/app_{{tenant}}?socket={}", my_sock.display()),
-    ];
-    for target in &targets {
-        let d = Dir::new("tsock", &[("main.qwe", &tenants(target))]);
-        let r = run(&d.file("main.qwe"), &[], &[]);
-        assert_eq!(ready(&r), (503, serde_json::json!({ "ready": false, "checks": { "database": "down" } })), "{}", target);
-        let listeners = (std::os::unix::net::UnixListener::bind(&pg_sock).unwrap(), std::os::unix::net::UnixListener::bind(&my_sock).unwrap());
-        assert_eq!(ready(&r), (200, serde_json::json!({ "ready": true, "checks": { "database": "ready (per tenant)" } })), "{}", target);
-        drop(listeners);
-        let _ = std::fs::remove_file(&pg_sock);
-        let _ = std::fs::remove_file(&my_sock);
-        // A socket file nothing listens on any more: down.
-        let stale = std::os::unix::net::UnixListener::bind(&pg_sock).unwrap();
-        drop(stale);
-        assert_eq!(ready(&r).0, 503, "{}", target);
-        let _ = std::fs::remove_file(&pg_sock);
+    for target in [format!("postgres://app@{}/app_{{tenant}}", enc), format!("postgres:///app_{{tenant}}?host={}", dir.display())] {
+        let ask = || {
+            let d = Dir::new("tsock", &[("main.qwe", &tenants(&target))]);
+            let r = run(&d.file("main.qwe"), &[], &[]);
+            ready(&r)
+        };
+        assert_eq!(ask(), (503, serde_json::json!({ "ready": false, "checks": { "database": "down" } })), "no socket: {}", target);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert_eq!(ask(), (200, serde_json::json!({ "ready": true, "checks": { "database": "ready (per tenant)" } })), "{}", target);
+        drop(listener);
+        // The file stays, nothing listening on it.
+        assert!(sock.exists());
+        assert_eq!(ask().0, 503, "a stale socket: {}", target);
+        let _ = std::fs::remove_file(&sock);
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// MySQL's tenants with none open are asked by a login, never a bare connection, which the server
+/// counts toward `max_connect_errors` and then refuses the host for: a server that takes the
+/// connection and says nothing (no handshake) is down, within the probe's time (FEEDBACK79.md,
+/// Q-1254, found in review; branch feedback72-81).
+#[test]
+fn ready_per_tenant_on_mysql_logs_in_rather_than_connecting() {
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = silent.local_addr().unwrap().port();
+    let target = format!("mysql://quillo:secret@127.0.0.1:{}/app_{{tenant}}", port);
+    let d = Dir::new("tmy", &[("main.qwe", &tenants(&target))]);
+    let r = run(&d.file("main.qwe"), &[], &[]);
+    assert_eq!(ready(&r), (503, serde_json::json!({ "ready": false, "checks": { "database": "down" } })));
+    // Asked again at once: the answer kept, not a probe more.
+    assert_eq!(ready(&r).0, 503);
+    drop(silent);
 }
 
 /// One database, as before: `select 1` (FEEDBACK79.md, Q-1254; branch feedback72-81).
@@ -337,9 +352,8 @@ fn ready_is_neither_logged_nor_counted() {
     eventually(10, "the route's request logged", || logged(&r, "/api/_quillo/ready").first().cloned());
     assert_eq!(counted(&r, "2xx"), 2);
     assert!(logged(&r, "/m/_quillo/ready").is_empty(), "{}", r.log());
-    // A 503 from it: no 5xx either.
-    let down = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let d = Dir::new("rlog503", &[("main.qwe", &tenants(&format!("postgres://q:s@127.0.0.1:{}/app_{{tenant}}", down)))]);
+    // A 503 from it (a socket that is not there): no 5xx either.
+    let d = Dir::new("rlog503", &[("main.qwe", &tenants(&format!("postgres://q@%2Ftmp%2Fq1255-none-{}/app_{{tenant}}", std::process::id())))]);
     let r = run(&d.file("main.qwe"), &["--metrics"], &[]);
     assert_eq!(r.get("/_quillo/ready").status, 503);
     assert_eq!(ready(&r).0, 503);
@@ -439,6 +453,27 @@ fn a_400_names_the_closest_routes_miss() {
     assert_eq!(r.post("/q?page=x", &FORM, "page=1").status, 400);
     let said = eventually(10, "a 400 logged", || Some(misses(&r, "/q")).filter(|m| m.len() == 1));
     assert_eq!(said, ["main.qwe:6): `form.size` is missing, and must be an int"]);
+}
+
+/// A route whose fields are left to their defaults did not come close: a field sent of another type
+/// does (`json.id` is text), in either order of the routes, where the defaults counted as matched
+/// and the other route's `json.title` was named (FEEDBACK79.md, Q-1257, found in review; branch
+/// feedback72-81).
+#[test]
+fn defaults_left_out_do_not_make_a_route_closer() {
+    let a = "route POST /items { json: { id: int, name: str } } = \"by id\"\n";
+    let b = "route POST /items { json: { title: str, a: int = 0, b: int = 0, c: int = 0 } } = \"by title\"\n";
+    for (src, line) in [(format!("{}{}", a, b), 1), (format!("{}{}", b, a), 2)] {
+        let d = Dir::new("defaults", &[("main.qwe", &src)]);
+        let r = run(&d.file("main.qwe"), &[], &[]);
+        assert_eq!(r.post("/items", &JSON, r#"{"id":"7","name":"lamp"}"#).status, 400);
+        // One of its defaulted fields sent, its title of another type: the title's route.
+        assert_eq!(r.post("/items", &JSON, r#"{"title":5,"a":1}"#).status, 400);
+        assert_eq!(r.post("/items", &JSON, r#"{"title":"Lamp ✓"}"#).body, "by title");
+        let said = eventually(10, "two 400s logged", || Some(misses(&r, "/items")).filter(|m| m.len() == 2));
+        let other = 3 - line;
+        assert_eq!(said, [format!("main.qwe:{}): `json.id` is text, not an int", line), format!("main.qwe:{}): `json.title` is an int, not a str", other)]);
+    }
 }
 
 /// The routes the other way round: each request is told its own kind's miss still (FEEDBACK79.md,
@@ -693,6 +728,58 @@ fn tenants_and_a_drain_cut_short_close_their_databases() {
     assert_eq!(rows_in_copy(&d, "library.db", "loans"), "1");
 }
 
+/// A reader in another process (a backup tool, a shell) holding a read transaction: the stop takes
+/// about what one without it takes, and that process's write is not held up, where the stop waited
+/// out the busy timeout (5 s) with writes blocked; its -wal stays, rightly, as another has the file
+/// open (FEEDBACK80.md, Q-1260, found in review; branch feedback72-81).
+#[test]
+fn a_clean_stop_waits_for_no_other_process_reading_the_database() {
+    if !Command::new("python3").args(["-c", "import sqlite3"]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success()) {
+        eprintln!("no python3 with sqlite3 here: skipped");
+        return;
+    }
+    let stop_of = |d: &Dir| {
+        let mut r = run(&d.file("main.qwe"), &[], &[]);
+        for _ in 0..3 {
+            assert_eq!(r.post("/loan", &[], "").body, "ok");
+        }
+        let began = Instant::now();
+        assert!(r.stop("-TERM").success());
+        began.elapsed()
+    };
+    let alone = stop_of(&Dir::new("wal-alone", &[("main.qwe", WAL)]));
+    let d = Dir::new("wal-reader", &[("main.qwe", WAL)]);
+    let mut r = run(&d.file("main.qwe"), &[], &[]);
+    for _ in 0..3 {
+        assert_eq!(r.post("/loan", &[], "").body, "ok");
+    }
+    // Reads, holding its transaction till told; then writes, timed.
+    let script = "import sqlite3, sys, time\nc = sqlite3.connect(sys.argv[1], isolation_level=None, timeout=30)\nc.execute('begin')\nprint(c.execute('select count(*) from loans').fetchone()[0], flush=True)\nsys.stdin.readline()\nc.execute('commit')\nt = time.time()\nc.execute(\"insert into loans (book) values ('other')\")\nprint('wrote %.3f' % (time.time() - t), flush=True)\n";
+    let mut reader = Command::new("python3")
+        .args(["-I", "-c", script, d.file("library.db").to_str().unwrap()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = std::io::BufReader::new(reader.stdout.take().unwrap());
+    let mut line = String::new();
+    std::io::BufRead::read_line(&mut out, &mut line).unwrap();
+    assert_eq!(line.trim(), "3");
+    let began = Instant::now();
+    assert!(r.stop("-TERM").success());
+    let with_reader = began.elapsed();
+    // Its write, at once after the stop.
+    std::io::Write::write_all(reader.stdin.as_mut().unwrap(), b"\n").unwrap();
+    line.clear();
+    std::io::BufRead::read_line(&mut out, &mut line).unwrap();
+    let _ = wait_for(&mut reader, Duration::from_secs(60));
+    let wrote: f64 = line.trim().strip_prefix("wrote ").and_then(|t| t.parse().ok()).unwrap_or_else(|| panic!("{:?}", line));
+    assert!(with_reader < alone * 4 + Duration::from_secs(1), "the stop took {:?} with a reader, {:?} without", with_reader, alone);
+    // Well under the busy timeout's 5 s it waited out.
+    assert!(wrote < 2.5, "the other process's write took {} s", wrote);
+    assert_eq!(rows_in_copy(&d, "library.db", "loans"), "4");
+}
+
 // ---- Q-1011: no port for a program with nothing to serve over HTTP --------------------------
 
 /// `quillo run` on `file` with `extra` (and `env`), its output in a file; the process and the file.
@@ -747,54 +834,59 @@ fn says(p: &mut support::Guard, log: &Path, what: &str) {
     });
 }
 
-/// A program that only ticks, with no port asked for: it runs, says nothing of a port, listens on
-/// none, serves itself through a socket in a folder of its own, and a stop removes the folder
-/// (FEEDBACK72.md, Q-1011; branch feedback72-81).
-#[test]
-fn a_program_that_only_ticks_opens_no_port() {
-    let d = Dir::new("tick", &[("main.qwe", "every(100, () => { print(\"tick\") })\n")]);
-    let (mut p, log) = start(&d.file("main.qwe"), &[], &[]);
-    says(&mut p, &log, "tick\ntick\ntick");
-    let said = std::fs::read_to_string(&log).unwrap();
-    assert!(!said.contains("listening") && !said.contains("cannot listen") && !said.contains("in use"), "{}", said);
+/// What `start` wrote, so far.
+fn output(log: &Path) -> String {
+    std::fs::read_to_string(log).unwrap_or_default()
+}
+
+/// Runs a program that serves nothing over HTTP with the default port taken: it runs without a
+/// port, says so, listens on none, and serves itself through a folder of its own, which every way
+/// out removes. Gives the output and the folder seen while it ran (None without lsof).
+fn runs_without_a_port(p: &mut support::Guard, log: &Path, what: &str) -> Option<PathBuf> {
+    says(p, log, what);
+    let said = output(log);
+    assert!(said.contains("8080 is taken; this program serves nothing over HTTP, so it runs without a port (give --port for /_quillo/health)"), "{}", said);
+    assert!(!said.contains("listening") && !said.contains("cannot listen"), "{}", said);
     if let Some(ports) = tcp_listening(p.0.id()) {
         assert!(ports.is_empty(), "{:?}", ports);
     }
-    let own = own_socket(p.0.id());
+    eventually(60, "its own socket", || own_socket(p.0.id()).map(Some).or_else(|| tcp_listening(p.0.id()).is_none().then_some(None)))
+}
+
+/// The one test that uses the default port, 8080: held by the test (or by anyone else), a program
+/// with nothing to serve over HTTP and no port asked for runs without one, a tick's, a UDP echo's, a
+/// job's, with a temporary folder too long for a socket's path; a stop removes its folder, a second
+/// Ctrl-C's and a `--drain` cut's too. A program that serves over HTTP, or one that asks for
+/// `--metrics`, still stops on the taken port, as 0.8.9 did. Let go, the port is listened on again
+/// (or, taken by another meanwhile, run without) (FEEDBACK72.md, Q-1011, the decision after review;
+/// branch feedback72-81).
+#[test]
+fn with_the_default_port_taken_a_program_that_serves_nothing_runs_without_one() {
+    let held = std::net::TcpListener::bind("127.0.0.1:8080").ok();
+    let tick = Dir::new("tick", &[("main.qwe", "every(100, () => { print(\"tick\") })\n")]);
+    let (mut p, log) = start(&tick.file("main.qwe"), &[], &[]);
+    let own = runs_without_a_port(&mut p, &log, "tick\ntick\ntick");
     assert!(terminate(&mut p).success());
     if let Some(own) = own {
         assert!(!own.parent().unwrap().exists(), "{} left behind", own.display());
     }
-    let _ = std::fs::remove_file(&log);
-}
-
-/// `$PORT` asks for a port, as a platform that sets it probes `/_quillo/health` there (FEEDBACK72.md,
-/// Q-1011, review; branch feedback72-81).
-#[test]
-fn port_in_the_environment_asks_for_one() {
-    let d = Dir::new("tick-port", &[("main.qwe", "every(100, () => null)\n")]);
-    let port = support::free_port();
-    let (mut p, log) = start(&d.file("main.qwe"), &[], &[("PORT", &port.to_string())]);
-    says(&mut p, &log, &format!("0 routes listening on http://127.0.0.1:{}", port));
-    assert_eq!(support::send(port, "GET", "/_quillo/health", &[], "").status, 200);
+    // A UDP echo answers; a job keeps it running.
+    let udp_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let d = Dir::new("udp", &[("main.qwe", &format!("udp.listen({}, (p) => udp.reply(p, `echo ${{p.text ?? \"\"}}`))\nprint(\"up\")\n", udp_port))]);
+    let (mut p, log) = start(&d.file("main.qwe"), &[], &[]);
+    runs_without_a_port(&mut p, &log, "up");
+    assert_eq!(echo(udp_port), "echo ü ✓");
     assert!(terminate(&mut p).success());
-    let _ = std::fs::remove_file(&log);
-}
-
-/// A temporary folder too long for a socket's path: a short folder under /tmp instead, removed on
-/// stop, where the program stopped at once (FEEDBACK72.md, Q-1011, review; branch feedback72-81).
-#[cfg(unix)]
-#[test]
-fn a_long_temporary_folder_still_runs_without_a_port() {
-    let d = Dir::new("tick-tmp", &[("main.qwe", "every(100, () => { print(\"tick\") })\n")]);
-    let long = d.file(&"t".repeat(90));
+    let d = Dir::new("job", &[("main.qwe", "fn work() = print(\"ran\")\nschedule(\"1h\", work)\nprint(\"up\")\n")]);
+    let (mut p, log) = start(&d.file("main.qwe"), &[], &[]);
+    runs_without_a_port(&mut p, &log, "up");
+    assert!(p.0.try_wait().unwrap().is_none(), "{}", output(&log));
+    assert!(terminate(&mut p).success());
+    // A temporary folder too long for a socket's path: one under /tmp, removed on stop.
+    let long = tick.file(&"t".repeat(90));
     std::fs::create_dir_all(&long).unwrap();
-    let (mut p, log) = start(&d.file("main.qwe"), &[], &[("TMPDIR", long.to_str().unwrap())]);
-    says(&mut p, &log, "tick\ntick");
-    if let Some(ports) = tcp_listening(p.0.id()) {
-        assert!(ports.is_empty(), "{:?}", ports);
-    }
-    let own = own_socket(p.0.id());
+    let (mut p, log) = start(&tick.file("main.qwe"), &[], &[("TMPDIR", long.to_str().unwrap())]);
+    let own = runs_without_a_port(&mut p, &log, "tick\ntick");
     if let Some(own) = &own {
         assert!(own.starts_with("/tmp") || own.starts_with("/private/tmp"), "{}", own.display());
     }
@@ -803,85 +895,96 @@ fn a_long_temporary_folder_still_runs_without_a_port() {
         assert!(!own.parent().unwrap().exists(), "{} left behind", own.display());
     }
     assert!(std::fs::read_dir(&long).unwrap().next().is_none(), "nothing made in the long folder");
-    let _ = std::fs::remove_file(&log);
-}
-
-/// A UDP echo alone answers its packets with no port; given `--port`, it listens there too, and
-/// `/_quillo/health` answers; a job alone takes no port either (FEEDBACK72.md, Q-1011; branch
-/// feedback72-81).
-#[test]
-fn udp_alone_answers_without_a_port_and_with_one_given() {
-    let udp_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-    let src = format!("udp.listen({}, (p) => udp.reply(p, `echo ${{p.text ?? \"\"}}`))\n", udp_port);
-    let d = Dir::new("udp", &[("main.qwe", &src)]);
-    let echo = || {
-        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        s.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
-        let mut b = [0u8; 64];
-        eventually(60, "an echo", || {
-            s.send_to("ü ✓".as_bytes(), ("127.0.0.1", udp_port)).ok()?;
-            let n = s.recv(&mut b).ok()?;
-            Some(String::from_utf8_lossy(&b[..n]).into_owned())
-        })
-    };
-    let (mut p, log) = start(&d.file("main.qwe"), &[], &[]);
-    assert_eq!(echo(), "echo ü ✓");
-    if let Some(ports) = tcp_listening(p.0.id()) {
-        assert!(ports.is_empty(), "{:?}", ports);
+    // A stop that waits for a tick computing: a second SIGTERM, and `--drain` over, end it at once,
+    // and the folder goes too.
+    let spin = "let started = false\nevery(200, () => {\n    print(\"tick\")\n    if !started {\n        started = true\n        let n = 0\n        for i in 0..100000000000 { n = n + i % 7 }\n        print(n)\n    }\n})\n";
+    let d = Dir::new("spin", &[("main.qwe", spin)]);
+    for extra in [&[][..], &["--drain", "300ms"][..]] {
+        let (mut p, log) = start(&d.file("main.qwe"), extra, &[]);
+        let own = runs_without_a_port(&mut p, &log, "tick");
+        let _ = Command::new("kill").args(["-TERM", &p.0.id().to_string()]).status();
+        says(&mut p, &log, "stopping once the requests in progress are answered");
+        if extra.is_empty() {
+            let _ = Command::new("kill").args(["-TERM", &p.0.id().to_string()]).status();
+        }
+        let status = wait_for(&mut p.0, Duration::from_secs(60)).expect("it did not stop");
+        assert_eq!(status.code(), Some(if extra.is_empty() { 130 } else { 0 }), "{}", output(&log));
+        if let Some(own) = own {
+            assert!(!own.parent().unwrap().exists(), "{} left behind ({:?})", own.display(), extra);
+        }
     }
-    assert!(!std::fs::read_to_string(&log).unwrap().contains("listening"));
-    let own = own_socket(p.0.id());
-    assert!(terminate(&mut p).success());
-    if let Some(own) = own {
-        assert!(!own.parent().unwrap().exists(), "{} left behind", own.display());
-    }
-    let _ = std::fs::remove_file(&log);
-    // `--port` asks for one.
-    let r = run(&d.file("main.qwe"), &[], &[]);
-    assert_eq!(echo(), "echo ü ✓");
-    assert_eq!(r.get("/_quillo/health").status, 200);
-    assert!(r.log().contains("0 routes listening on http://127.0.0.1:"), "{}", r.log());
-    drop(r);
-    let d = Dir::new("job", &[("main.qwe", "fn work() = print(\"ran\")\nschedule(\"1h\", work)\nprint(\"up\")\n")]);
-    let (mut p, log) = start(&d.file("main.qwe"), &[], &[]);
-    says(&mut p, &log, "up");
-    // Running, not ended: a job keeps it, with no port.
-    let own = eventually(60, "its own socket", || own_socket(p.0.id()).or_else(|| tcp_listening(p.0.id()).is_none().then(PathBuf::new)));
-    assert!(p.0.try_wait().unwrap().is_none(), "{}", std::fs::read_to_string(&log).unwrap());
-    if let Some(ports) = tcp_listening(p.0.id()) {
-        assert!(ports.is_empty(), "{:?}", ports);
-    }
-    assert!(terminate(&mut p).success());
-    if own.parent().is_some() {
-        assert!(!own.parent().unwrap().exists(), "{} left behind", own.display());
-    }
-    let _ = std::fs::remove_file(&log);
-}
-
-/// What does serve over HTTP still opens its port with none asked for (no `--port`, no `$PORT`): a
-/// channel's handler alone (a page's WebSocket); and with `--metrics` asked; it listens on the
-/// default port, or says the default port is taken. A script still ends on its own, and so does a
-/// program with only a public folder, which no route serves (FEEDBACK72.md, Q-1011; branch
-/// feedback72-81).
-#[test]
-fn what_serves_over_http_listens_and_a_script_ends() {
+    // What serves over HTTP, or asks for a port's flag, stops on the taken port, as before.
     for (name, src, extra) in [("chan", "channel.on(\"room\", (msg, peer) => null)\n", &[][..]), ("metrics", "every(100, () => null)\n", &["--metrics"][..])] {
         let d = Dir::new(name, &[("main.qwe", src)]);
         let (mut p, log) = start(&d.file("main.qwe"), extra, &[]);
-        let said = eventually(60, "the HTTP port opened, or said taken", || {
-            let t = std::fs::read_to_string(&log).unwrap_or_default();
-            (t.contains("listening on http://127.0.0.1:8080") || t.contains("cannot listen on 127.0.0.1:8080")).then_some(t)
-        });
-        if said.contains("listening") {
-            assert!(terminate(&mut p).success(), "{}", said);
-        }
-        let _ = std::fs::remove_file(&log);
+        let status = wait_for(&mut p.0, Duration::from_secs(60)).expect("it did not stop");
+        assert!(!status.success() && output(&log).contains("cannot listen on 127.0.0.1:8080"), "{}: {}", name, output(&log));
     }
+    // Let go: the port is listened on, for health and metrics, as 0.8.9 had it.
+    if held.is_some() {
+        drop(held);
+        let (mut p, log) = start(&tick.file("main.qwe"), &[], &[]);
+        let said = eventually(60, "listening, or taken by another meanwhile", || {
+            let t = output(&log);
+            (t.contains("listening on") || t.contains("is taken")).then_some(t)
+        });
+        if said.contains("listening on") {
+            assert!(said.contains("quillo: nothing to serve over HTTP; health and metrics listening on http://127.0.0.1:8080"), "{}", said);
+            assert_eq!(support::send(8080, "GET", "/_quillo/health", &[], "").status, 200);
+        }
+        assert!(terminate(&mut p).success());
+    }
+}
+
+/// A UDP packet's echo, asked until it comes.
+fn echo(udp_port: u16) -> String {
+    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    s.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    let mut b = [0u8; 64];
+    eventually(60, "an echo", || {
+        s.send_to("ü ✓".as_bytes(), ("127.0.0.1", udp_port)).ok()?;
+        let n = s.recv(&mut b).ok()?;
+        Some(String::from_utf8_lossy(&b[..n]).into_owned())
+    })
+}
+
+/// A port asked for (`$PORT`, `--port`) is listened on by a program with nothing to serve over HTTP,
+/// which says what the port is for; taken, it is an error, as before (FEEDBACK72.md, Q-1011, review;
+/// branch feedback72-81).
+#[test]
+fn a_port_asked_for_is_listened_on_or_its_being_taken_said() {
+    let d = Dir::new("tick-port", &[("main.qwe", "every(100, () => null)\n")]);
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = held.local_addr().unwrap().port().to_string();
+    let free = support::free_port().to_string();
+    let (mut p, log) = start(&d.file("main.qwe"), &[], &[("PORT", &free)]);
+    says(&mut p, &log, &format!("quillo: nothing to serve over HTTP; health and metrics listening on http://127.0.0.1:{}", free));
+    assert_eq!(support::send(free.parse().unwrap(), "GET", "/_quillo/health", &[], "").status, 200);
+    assert!(terminate(&mut p).success());
+    for (extra, env) in [(&["--port", taken.as_str()][..], &[][..]), (&[][..], &[("PORT", taken.as_str())][..])] {
+        let (mut p, log) = start(&d.file("main.qwe"), extra, env);
+        let status = wait_for(&mut p.0, Duration::from_secs(60)).expect("it did not stop");
+        assert!(!status.success() && output(&log).contains(&format!("cannot listen on 127.0.0.1:{}", taken)), "{}", output(&log));
+    }
+    // A UDP echo with `--port`: listening there, and answering its packets.
+    let udp_port = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let d = Dir::new("udp-port", &[("main.qwe", &format!("udp.listen({}, (p) => udp.reply(p, `echo ${{p.text ?? \"\"}}`))\n", udp_port))]);
+    let r = run(&d.file("main.qwe"), &[], &[]);
+    assert_eq!(echo(udp_port), "echo ü ✓");
+    assert_eq!(r.get("/_quillo/health").status, 200);
+    assert!(r.log().contains("quillo: nothing to serve over HTTP; health and metrics listening on http://127.0.0.1:"), "{}", r.log());
+    drop(held);
+}
+
+/// A script still ends on its own, and so does a program with only a public folder, which no route
+/// serves: no port either way (FEEDBACK72.md, Q-1011; branch feedback72-81).
+#[test]
+fn a_script_ends_on_its_own() {
     for (name, files) in [("ends", vec![("main.qwe", "print(\"done\")\n")]), ("public", vec![("main.qwe", "print(\"done\")\n"), ("public/index.html", "<p>hi</p>")])] {
         let d = Dir::new(name, &files);
         let (mut p, log) = start(&d.file("main.qwe"), &[], &[]);
         let status = wait_for(&mut p.0, Duration::from_secs(60)).expect("the script did not end");
-        let said = std::fs::read_to_string(&log).unwrap();
+        let said = output(&log);
         assert!(status.success() && said.contains("done") && !said.contains("listening"), "{}: {}", name, said);
         let _ = std::fs::remove_file(&log);
     }

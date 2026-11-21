@@ -1640,6 +1640,8 @@ fn begin_stop(again: bool) {
         // The services first: `--with`'s commands are waited for (found in review).
         quillo::service::kill_split_now();
         with::stop_all();
+        // FEEDBACK72.md, Q-1011, found in review; branch feedback72-81.
+        quillo::server::leave_private();
         std::process::exit(130);
     }
     // A message that cannot be written no longer panics (the `eprintln!` above), so the
@@ -1679,6 +1681,7 @@ fn begin_stop(again: bool) {
                 // whole (FEEDBACK80.md, Q-1260 and Q-1265; branch feedback72-81).
                 quillo::wt::close_all();
                 quillo::db::close_all(std::time::Duration::from_millis(200));
+                quillo::server::leave_private();
                 quillo::service::kill_split_now();
                 std::process::exit(0);
             }
@@ -1869,13 +1872,15 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
     if o.instances > 1 {
         return run_instances(path, o, &format!("{}:{}", host, port));
     }
-    // A port asked for: `--port`, `--host`, `--listen`, `$PORT` (a platform that sets it probes
-    // `/_quillo/health` there: Cloud Run, Heroku, Render, Kubernetes), a flag that answers over
-    // HTTP, a way of running that others reach it by (`--watch`'s pages, `--split`'s services
-    // calling back, `--register`, `--join`, `--as-service`, `quillo fcgi`) (FEEDBACK72.md, Q-1011;
-    // branch feedback72-81).
+    // A port asked for: `--port`, `--host`, `--listen`, `$PORT` (a platform that sets it, as Cloud
+    // Run, Heroku and Render do, probes there), a flag or setting that answers over HTTP
+    // (`--metrics`, `--describe`, `--query-stats`, `QUILLO_QUERY_STATS`), `--reload` (a program it
+    // loads again may gain routes), a way of running that others reach it by (`--watch`'s pages,
+    // `--split`'s services calling back, `--register`, `--join`, `--as-service`, `quillo fcgi`):
+    // taken, it is an error, as it was (FEEDBACK72.md, Q-1011; branch feedback72-81).
     let port_env = std::env::var_os("PORT").is_some_and(|p| !p.is_empty());
-    let asked = o.port.is_some() || o.host.is_some() || o.listen.is_some() || port_env || o.asks_port || o.watch || o.split || o.register.is_some() || o.join.is_some() || o.as_service || fcgi;
+    let stats_env = std::env::var("QUILLO_QUERY_STATS").is_ok_and(|v| v == "1" || v == "true");
+    let asked = o.port.is_some() || o.host.is_some() || o.listen.is_some() || port_env || stats_env || o.asks_port || o.reload || o.watch || o.split || o.register.is_some() || o.join.is_some() || o.as_service || fcgi;
     let mut app = match load(path, &o) {
         Ok(Some(app)) => app,
         Ok(None) => return 0,
@@ -1929,16 +1934,27 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
             }
         };
     }
-    // Nothing to serve over HTTP and no port asked for: none (FEEDBACK72.md, Q-1011; branch
-    // feedback72-81).
-    if !asked && !app.serves_http() {
-        return match quillo::server::serve_portless(app, o.workers) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("quillo: {}", e);
-                1
+    // Nothing to serve over HTTP and no port asked for: the default port all the same while it is
+    // free, as 0.8.9 had it, so health and metrics are where a deployment's probe looks
+    // (Kubernetes, Docker's HEALTHCHECK, Fly.io and ECS set no `$PORT`); taken, the program runs
+    // without one, where it stopped at once beside the app on 8080 it fed (FEEDBACK72.md, Q-1011,
+    // the decision after review; branch feedback72-81).
+    if !asked && listen.is_none() && bound.is_none() && !app.serves_http() {
+        match std::net::TcpListener::bind(format!("{}:{}", host, port)) {
+            Ok(listener) => bound = Some(listener),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                eprintln!("quillo: {} is taken; this program serves nothing over HTTP, so it runs without a port (give --port for /_quillo/health)", port);
+                return match quillo::server::serve_portless(app, o.workers) {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        eprintln!("quillo: {}", e);
+                        1
+                    }
+                };
             }
-        };
+            // Said as before, by the listen below.
+            Err(_) => {}
+        }
     }
     #[cfg(unix)]
     if let Some(sock) = &listen {

@@ -6094,8 +6094,8 @@ impl Interp {
     }
 
     /// How many of a route's pattern's fields `v` holds as the pattern takes them, by type and
-    /// shape as `why_no_match` reads them (a field with a default counts when missing): how close
-    /// a route that missed came, for the 400 (FEEDBACK79.md, Q-1257; branch feedback72-81).
+    /// shape as `why_no_match` reads them, counting only what was sent: how close a route that
+    /// missed came, for the 400 (FEEDBACK79.md, Q-1257; branch feedback72-81).
     pub fn fields_matched(&self, p: &Pattern, v: &Value, mode: Mode) -> usize {
         let Pattern::Record(fields) = p else { return 0 };
         let mut n = 0;
@@ -6106,7 +6106,7 @@ impl Interp {
                 m => m,
             };
             n += match get_path(v, &f.path) {
-                None | Some(Value::Nil) => usize::from(f.default.is_some() || matches!(&f.pat, Pattern::Alt(ps) if ps.iter().any(|q| matches!(q, Pattern::Lit(Lit::Nil))))),
+                None | Some(Value::Nil) => 0,
                 Some(x @ Value::Map(_)) if matches!(f.pat, Pattern::Record(_)) => self.fields_matched(&f.pat, &x, sub),
                 Some(x) => usize::from(self.pattern_fits(&f.pat, &x, sub == Mode::Lenient)),
             };
@@ -6183,6 +6183,9 @@ impl Interp {
             Pattern::Type(t) if t == "dec" => as_dec(x).is_some(),
             Pattern::Type(t) if t == "money" => crate::money::from_data(x).is_ok(),
             Pattern::Type(t) => type_name_matches(t, x) || (lenient && matches!(x, Value::Str(s) if coerce(t, s).is_some())),
+            // Only what the request sent and fits: a field left to its default is not sent, and a
+            // route with three such fields came before one whose sent field was of another type
+            // (found in review).
             Pattern::Lit(l) => {
                 let lv = lit_value(l);
                 equal(&lv, x) || (lenient && matches!(x, Value::Str(s) if coerce(lv.type_name(), s).is_some_and(|c| equal(&c, &lv))))

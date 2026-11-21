@@ -962,13 +962,16 @@ fn kept(c: Connection) -> Arc<Backend> {
 }
 
 /// On a clean stop, once the requests in progress are answered: each SQLite database the program
-/// has open is checkpointed (TRUNCATE) and closed, its last connection's close removing its `-wal`
-/// and `-shm`, so the file is whole once the program has ended. Before, the process ended with
-/// its connections open: the WAL kept what the file did not have, and a backup copied over the
-/// file was undone at the next start by the stale WAL (FEEDBACK80.md, Q-1260; branch
-/// feedback72-81). One in a transaction still (a request `--drain` cut off), or held past
-/// `wait`, is left as it is: what it has not committed is not the file's. The connection's place
-/// holds an empty in-memory database after, which nothing reads, the program ending.
+/// has open is closed. SQLite's last connection to a file, in any process, checkpoints the WAL into
+/// it and removes its `-wal` and `-shm`, so the file is whole once the program has ended. Before,
+/// the process ended with its connections open: the WAL kept what the file did not have, and a
+/// backup copied over the file was undone at the next start by the stale WAL (FEEDBACK80.md,
+/// Q-1260; branch feedback72-81). Closing never waits: no checkpoint of its own under the busy
+/// timeout, which held a stop 5 s and another process's writes with it while that process (a
+/// backup tool, a shell, a sibling instance) read the file, whose `-wal` then rightly stays (found
+/// in review). One in a transaction still (a request `--drain` cut off), or held past `wait`, is
+/// left as it is: what it has not committed is not the file's. The connection's place holds an
+/// empty in-memory database after, which nothing reads, the program ending.
 pub fn close_all(wait: std::time::Duration) {
     let open: Vec<Arc<Backend>> = SQLITE_OPEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain(..).filter_map(|w| w.upgrade()).collect();
     let until = std::time::Instant::now() + wait;
@@ -986,7 +989,9 @@ pub fn close_all(wait: std::time::Duration) {
             continue;
         }
         let path = c.path().filter(|p| !p.is_empty()).map(str::to_string);
-        let _ = c.query_row("pragma wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        // Its close's own checkpoint takes the file only when no one else has it, and waits for no
+        // one (found in review).
+        let _ = c.busy_timeout(std::time::Duration::ZERO);
         let Ok(none) = Connection::open_in_memory() else { continue };
         let was = std::mem::replace(&mut *c, none);
         if let Err((_, e)) = was.close() {
@@ -1155,9 +1160,8 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
 /// (FEEDBACK79.md, Q-1254; branch feedback72-81). SQLite files: their folder there and writable, or
 /// not there yet with the folder above it writable, as `new_tenant` makes it (a first signup
 /// would otherwise wait for a ready that waited for it). A server: the tenant used last answers
-/// `select 1`, or with none open yet, the server takes a connection (at its host, or its Unix
-/// socket). A function's: the tenant used
-/// last, or nothing to ask before one. None when the program's database is not one per tenant.
+/// `select 1`, or with none open yet, `server_ready`. A function's: the tenant used last, or
+/// nothing to ask before one. None when the program's database is not one per tenant.
 pub(crate) fn tenants_ready(it: &mut Interp) -> Option<bool> {
     let Some(DbSlot::PerTenant(dbs)) = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() else { return None };
     let last = dbs.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().last().cloned();
@@ -1166,8 +1170,8 @@ pub(crate) fn tenants_ready(it: &mut Interp) -> Option<bool> {
         Target::Text(t) if is_server_url(t) => match last {
             Some(b) => answers(it, &b),
             None => {
-                let at = server_reach(t);
-                it.unlocked(move || at.is_none_or(|at| at.reachable()))
+                let t = t.clone();
+                it.unlocked(move || server_ready(&t))
             }
         },
         Target::Text(t) => tenants_folder_ready(&it.base_dir, t),
@@ -1258,21 +1262,132 @@ fn server_reach(url: &str) -> Option<Reach> {
     Some(Reach::Tcp(host, port))
 }
 
+/// The most a probe of a server takes, its name's lookup included (FEEDBACK79.md, Q-1254, found in
+/// review: none bounded it, and each probe held a worker).
+const PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether the server a tenants' URL names takes a connection, with no tenant open to ask: kept 30 s
+/// when it does and 2 s when it does not, one probe at a time, each within `PROBE_WAIT` (a probe
+/// still running is waited for no longer, and its answer kept when it comes), so that an
+/// orchestrator's probes neither pile up nor flood the database's log. PostgreSQL: a connection
+/// to its host or its Unix socket, which blocks no one. MySQL: a login, with the URL's user and no
+/// database, as the driver connects: a connection closed before its login counts toward the
+/// server's `max_connect_errors` (100 by default), past which it refuses the app's host, and a
+/// probe a second would have had it do so (FEEDBACK79.md, Q-1254, found in review; branch
+/// feedback72-81).
+fn server_ready(url: &str) -> bool {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    /// By URL: when last answered, the answer, and whether a probe runs now.
+    static KEPT: Mutex<Option<HashMap<String, (Option<Instant>, bool, bool)>>> = Mutex::new(None);
+    let kept = || KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    {
+        let mut k = kept();
+        let e = k.get_or_insert_with(HashMap::new).entry(url.to_string()).or_insert((None, false, false));
+        let fresh = e.0.is_some_and(|at| at.elapsed() < if e.1 { Duration::from_secs(30) } else { Duration::from_secs(2) });
+        if fresh || e.2 {
+            return e.1;
+        }
+        e.2 = true;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probed = url.to_string();
+    let started = std::thread::Builder::new().name("quillo-ready".into()).spawn(move || {
+        let ok = if is_mysql_url(&probed) {
+            mysql_logs_in(&probed)
+        } else {
+            server_reach(&probed).is_none_or(|at| at.reachable(Instant::now() + PROBE_WAIT))
+        };
+        if let Some(e) = kept().as_mut().and_then(|k| k.get_mut(&probed)) {
+            *e = (Some(Instant::now()), ok, false);
+        }
+        let _ = tx.send(ok);
+    });
+    if started.is_err() {
+        if let Some(e) = kept().as_mut().and_then(|k| k.get_mut(url)) {
+            e.2 = false;
+        }
+        return false;
+    }
+    rx.recv_timeout(PROBE_WAIT + Duration::from_millis(100)).unwrap_or(false)
+}
+
+/// Whether a MySQL server lets the URL's user in (a database the server says is not there, after
+/// the login, counts: the server is up).
+fn mysql_logs_in(url: &str) -> bool {
+    #[cfg(feature = "mysql")]
+    {
+        crate::my::logs_in(&url.replace("{tenant}", "quillo_ready"))
+    }
+    #[cfg(not(feature = "mysql"))]
+    {
+        let _ = url;
+        false
+    }
+}
+
 impl Reach {
-    /// Whether it takes a connection, within a second and a half for a host (FEEDBACK79.md,
-    /// Q-1254).
-    fn reachable(&self) -> bool {
+    /// Whether it takes a connection before `until` (FEEDBACK79.md, Q-1254).
+    fn reachable(&self, until: std::time::Instant) -> bool {
+        let left = || until.saturating_duration_since(std::time::Instant::now());
         match self {
             Reach::Tcp(host, port) => {
                 use std::net::ToSocketAddrs;
                 let Ok(addrs) = (host.as_str(), *port).to_socket_addrs() else { return false };
-                addrs.into_iter().any(|a| std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(1500)).is_ok())
+                addrs.into_iter().any(|a| !left().is_zero() && std::net::TcpStream::connect_timeout(&a, left()).is_ok())
             }
             #[cfg(unix)]
-            Reach::Unix(path) => std::os::unix::net::UnixStream::connect(path).is_ok(),
+            Reach::Unix(path) => unix_connects(path, left()),
             #[cfg(not(unix))]
             Reach::Unix(path) => path.exists(),
         }
+    }
+}
+
+/// A Unix socket connection to `path` within `wait`, without blocking: one whose queue of
+/// connections is full answers at once (busy, so there), and none waits past `wait`
+/// (FEEDBACK79.md, Q-1254, found in review).
+#[cfg(unix)]
+fn unix_connects(path: &Path, wait: std::time::Duration) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: a zeroed sockaddr_un is a valid one, filled in below.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.is_empty() || bytes.len() >= addr.sun_path.len() {
+        return false;
+    }
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (d, b) in addr.sun_path.iter_mut().zip(bytes) {
+        *d = *b as libc::c_char;
+    }
+    let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+    // SAFETY: `fd` is a socket made here and closed before returning; `addr` and `err` live
+    // through the calls that read or write them.
+    unsafe {
+        let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+        if fd < 0 {
+            return false;
+        }
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        let ok = if libc::connect(fd, &addr as *const libc::sockaddr_un as *const libc::sockaddr, len) == 0 {
+            true
+        } else {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EAGAIN) => true,
+                Some(libc::EINPROGRESS) => {
+                    let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+                    let mut err: libc::c_int = 0;
+                    let mut l = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+                    libc::poll(&mut p, 1, wait.as_millis().min(i32::MAX as u128) as libc::c_int) == 1
+                        && libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut libc::c_int as *mut libc::c_void, &mut l) == 0
+                        && err == 0
+                }
+                _ => false,
+            }
+        };
+        libc::close(fd);
+        ok
     }
 }
 

@@ -121,6 +121,25 @@ fn run<T>(f: impl std::future::Future<Output = T>) -> T {
     crate::pg::runtime().block_on(f)
 }
 
+/// Whether the server lets the URL's user in, with no database: what `/_quillo/ready` asks of a
+/// database per tenant with none open. A login, not a connection closed before it, which the
+/// server counts toward `max_connect_errors` and then refuses the host for; a database it says is
+/// not there, after the login, counts as in (FEEDBACK79.md, Q-1254, found in review; branch
+/// feedback72-81).
+pub fn logs_in(url: &str) -> bool {
+    let Ok(opts) = opts_of(url) else { return false };
+    let server = OptsBuilder::from_opts(opts).db_name(None::<String>);
+    run(async {
+        match mysql_async::Conn::new(server).await {
+            Ok(c) => {
+                let _ = c.disconnect().await;
+                true
+            }
+            Err(e) => e.to_string().contains("Unknown database"),
+        }
+    })
+}
+
 /// The database's connections.
 pub struct Pool {
     pool: Option<mysql_async::Pool>,

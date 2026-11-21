@@ -1545,13 +1545,21 @@ impl Interp {
             // Which route came closest, and its first miss: in the log always, and under `--watch`
             // in the answer too, as a 400 nobody can explain is a guess (Q-544). Closest: a route
             // whose body is of the kind the request's content-type says (`form`, `json`) before one
-            // whose is not, then the one whose missed pattern matched the most fields; on a tie the
-            // first written (FEEDBACK79.md, Q-1257; branch feedback72-81).
+            // whose is not, then the one that missed later (its body, after its query), then the one
+            // whose missed pattern has the most fields sent and fitting; on a tie the first written
+            // (FEEDBACK79.md, Q-1257; branch feedback72-81).
             let kind = body_kind_sent(req);
-            let mut closest: Option<((bool, usize), &(Arc<crate::ast::RouteDef>, usize, Value, &'static str, Mode))> = None;
+            // Like with like: a route that missed its body got past its query and its groups'
+            // patterns, and fields are counted against those of the same part (found in review).
+            let mut closest: Option<((bool, u8, usize), &(Arc<crate::ast::RouteDef>, usize, Value, &'static str, Mode))> = None;
             for m in &misses {
                 let Some(pat) = check_pattern(&m.0, m.1) else { continue };
-                let score = (kind.is_some() && route_body_kind(&m.0) == kind, self.fields_matched(pat, &m.2, m.4));
+                let part = match m.1 {
+                    0 => 0,
+                    n if n <= m.0.guards.len() => 1,
+                    _ => 2,
+                };
+                let score = (kind.is_some() && route_body_kind(&m.0) == kind, part, self.fields_matched(pat, &m.2, m.4));
                 if closest.as_ref().is_none_or(|(best, _)| score > *best) {
                     closest = Some((score, m));
                 }
@@ -5967,8 +5975,9 @@ pub fn serve_portless(app: App, workers: usize) -> Result<(), String> {
         if let Some((dir, own, listener)) = mine {
             crate::jobs::listening_at(&own);
             let stand_in: std::net::SocketAddr = ([127, 0, 0, 1], 0).into();
+            *PRIVATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir.clone());
             let r = serve_from(app, crate::httpd::Listener::Other(crate::httpd::unix_connections(listener)), Some(stand_in), "", workers, |_| {});
-            let _ = std::fs::remove_dir_all(&dir);
+            leave_private();
             return r;
         }
     }
@@ -5978,6 +5987,18 @@ pub fn serve_portless(app: App, workers: usize) -> Result<(), String> {
 }
 
 /// A FastCGI socket at `path`, for `quillo fcgi --listen unix:PATH`.
+/// The folder of `serve_portless`'s socket, while it serves.
+static PRIVATE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// Removes `serve_portless`'s folder, if it made one: also on the ways out that end the process at
+/// once (a second Ctrl-C, `--drain` over), which left it behind (FEEDBACK72.md, Q-1011, found in
+/// review; branch feedback72-81).
+pub fn leave_private() {
+    if let Some(dir) = PRIVATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 #[cfg(unix)]
 pub fn fcgi_unix(path: &Path, mode: u32) -> Result<crate::fcgi::Source, String> {
     unix_listener(path, mode).map(crate::fcgi::Source::Unix)
@@ -6059,10 +6080,15 @@ fn serve_from(
     let app = Arc::new(app);
     if let Loaded::Ready(it) = &*app.current().1 {
         let n = it.routes.iter().filter(|r| r.method != crate::ast::GUARD_METHOD).count();
-        // No port, nothing said of one (`serve_portless`; FEEDBACK72.md, Q-1011; branch
+        // No port, nothing said of one (`serve_portless`); a program with nothing to serve over
+        // HTTP says what its port is for, not "0 routes" (FEEDBACK72.md, Q-1011; branch
         // feedback72-81).
         if !shown.is_empty() {
-            eprintln!("quillo: {} route{} listening on {}", n, if n == 1 { "" } else { "s" }, shown);
+            if app.current().1.serves_http() {
+                eprintln!("quillo: {} route{} listening on {}", n, if n == 1 { "" } else { "s" }, shown);
+            } else {
+                eprintln!("quillo: nothing to serve over HTTP; health and metrics listening on {}", shown);
+            }
         }
         if let Some(db) = &*crate::db::OPENED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) {
             eprintln!("quillo: database {}", db);
