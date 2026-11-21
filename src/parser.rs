@@ -95,14 +95,27 @@ fn style_values(v: &mut Expr, line: u32) {
                             todo.push(o);
                             todo.push(x);
                         }
+                        // A fn declared in the block, its parameters' defaults and its body: a
+                        // template there is style text too (`{ fn mk(x) = `color: ${x}`; mk(v) }`
+                        // let a value add a declaration; found verifying 10bf35a, FEEDBACK79.md,
+                        // Q-1250; branch feedback72-81). Made while the source is read: no one
+                        // else holds it yet.
+                        Stmt::Fn(d) => {
+                            if let Some(FnDef { params, body, .. }) = Arc::get_mut(d) {
+                                todo.extend(params.iter_mut().filter_map(|p| p.default.as_mut()));
+                                todo.push(body);
+                            }
+                        }
                         _ => {}
                     }
                 }
             }
-            // Made while the source is read: no one else holds it yet.
+            // Made while the source is read: no one else holds it yet. Its parameters' defaults
+            // as well as its body (`((x = `color: ${v}`) => x)()`; found verifying 10bf35a).
             Expr::Lambda(d) => {
-                if let Some(d) = Arc::get_mut(d) {
-                    todo.push(&mut d.body);
+                if let Some(FnDef { params, body, .. }) = Arc::get_mut(d) {
+                    todo.extend(params.iter_mut().filter_map(|p| p.default.as_mut()));
+                    todo.push(body);
                 }
             }
             Expr::Reply(s, b, _) => {

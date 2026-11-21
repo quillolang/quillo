@@ -622,6 +622,38 @@ print(<style>{css`.a { color: ${err("x} body { display: none } .y {")} }`}</styl
     }
 }
 
+/// A fn declared inside a style's block (or inside a lambda there) and a lambda's parameter
+/// defaults are style text too: 10bf35a walked neither, so a visitor's value added a declaration
+/// (found verifying 10bf35a; FEEDBACK79.md, Q-1250; branch feedback72-81). The program's own text
+/// through the same paths is written as before.
+#[test]
+fn a_fn_declared_in_a_style_and_a_lambdas_defaults_are_style_text() {
+    let out = run(r#"let v = trim(" red; background: blue ")
+let ok = "green"
+print(<p style={{
+    fn mk(x) = `color: ${x}`
+    mk(v)
+}}>fnblock</p>)
+print(<p style={((x = `color: ${v}`) => x)()}>default</p>)
+print(<p style={[1].map((n) => {
+    fn mk(x) = `color: ${x}`
+    mk(v)
+}).join("")}>fninlambda</p>)
+print(<p style={{
+    fn mk(x) = `color: ${x}; top: 0`
+    mk(ok)
+}}>legit</p>)
+"#);
+    for want in [
+        r#"<p style="color: red\3b  background: blue">fnblock</p>"#,
+        r#"<p style="color: red\3b  background: blue">default</p>"#,
+        r#"<p style="color: red\3b  background: blue">fninlambda</p>"#,
+        r#"<p style="color: green; top: 0">legit</p>"#,
+    ] {
+        assert!(out.contains(want), "{}\n{}", want, out);
+    }
+}
+
 /// The browser writes the same as the server, byte for byte, for each of those it can make.
 #[test]
 fn the_browser_writes_those_styles_as_the_server_does() {
