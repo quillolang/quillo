@@ -978,7 +978,7 @@ fn values(rows: &[postgres::Row], limit: Option<usize>, digits: u32) -> Result<V
         let mut m = Map::with_capacity(row.len());
         for (i, col) in row.columns().iter().enumerate() {
             let v: PgValue = row.try_get(i).map_err(|e| describe(&e))?;
-            if let Value::Str(t) = &v.0 {
+            if let Value::Str(t) | Value::Css(t) = &v.0 {
                 crate::httpd::making(t.len()).map_err(|_| crate::db::ROWS_OVER.to_string())?;
             }
             m.insert(col.name().into(), v.0);
@@ -1459,7 +1459,7 @@ fn pg_text(v: &Value) -> String {
 /// feedback55).
 fn pg_text_as(v: &Value, inferred: &Type, assigned: bool) -> String {
     match (v, inferred) {
-        (Value::Str(s), t) if matches!(*t, Type::DATE | Type::TIMESTAMP | Type::TIMESTAMPTZ) => bc_text(s).unwrap_or_else(|| s.to_string()),
+        (Value::Str(s) | Value::Css(s), t) if matches!(*t, Type::DATE | Type::TIMESTAMP | Type::TIMESTAMPTZ) => bc_text(s).unwrap_or_else(|| s.to_string()),
         (Value::List(items), t) if matches!(*t, Type::JSON_ARRAY | Type::JSONB_ARRAY) => {
             let quote = |t: &str| format!("\"{}\"", t.replace('\\', "\\\\").replace('"', "\\\""));
             let parts: Vec<String> = items
@@ -1467,7 +1467,7 @@ fn pg_text_as(v: &Value, inferred: &Type, assigned: bool) -> String {
                 .map(|x| match x {
                     Value::Nil => "NULL".to_string(),
                     // JSON text, as a json column's value takes it (Q-733).
-                    Value::Str(s) if assigned => quote(s),
+                    Value::Str(s) | Value::Css(s) if assigned => quote(s),
                     other => quote(&crate::db::json_text(other)),
                 })
                 .collect();
@@ -1519,7 +1519,7 @@ fn float_for(v: &Value, ty: &Type) -> Result<f64, BoxErr> {
         Value::Int(n) => (*n as f64, *n != 0),
         Value::Float(f) => (*f, *f != 0.0),
         Value::Dec(d) => (d.to_f64(), !d.is_zero()),
-        Value::Str(s) => {
+        Value::Str(s) | Value::Css(s) => {
             let t = s.trim();
             let f: f64 = t.parse().map_err(|_| bad(v, ty))?;
             if !f.is_finite() && !t.bytes().any(|c| c.is_ascii_digit()) {
@@ -1555,7 +1555,7 @@ impl ToSql for PgParam<'_> {
                 // one wrote (FEEDBACK16.md, Q-110; branch feedback20-fixes).
                 Value::Float(f) if f.fract() == 0.0 && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(f) => Ok(*f as i64),
                 Value::Dec(d) if d.round(0, crate::decimal::Rounding::Down).ok() == Some(*d) => d.trunc_i64().ok_or_else(|| bad(v, ty)),
-                Value::Str(s) => s.trim().parse().map_err(|_| bad(v, ty)),
+                Value::Str(s) | Value::Css(s) => s.trim().parse().map_err(|_| bad(v, ty)),
                 _ => Err(bad(v, ty)),
             }
         };
@@ -1578,7 +1578,7 @@ impl ToSql for PgParam<'_> {
                     out.put_u8(1);
                 }
                 match v {
-                    Value::Str(s) if self.2 => out.put_slice(s.as_bytes()),
+                    Value::Str(s) | Value::Css(s) if self.2 => out.put_slice(s.as_bytes()),
                     _ => out.put_slice(crate::db::json_text(v).as_bytes()),
                 }
             }

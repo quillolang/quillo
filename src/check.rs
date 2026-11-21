@@ -7603,6 +7603,9 @@ impl Checker {
                         }
                         T::of(t.bits & (NUM | DEC))
                     }
+                    // A component's `style` template the parser marked: a str (FEEDBACK79.md,
+                    // Q-1250; branch feedback72-81).
+                    UnOp::Css => T::of(STR),
                 }
             }
             Expr::Binary(op, a, b, line) => {

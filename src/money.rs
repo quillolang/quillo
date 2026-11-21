@@ -459,7 +459,7 @@ fn tn(v: Option<&Value>) -> String {
 /// for an unknown one (it may come from data); a non-string is a mistake.
 fn currency(args: &[Value], i: usize, f: &str, line: u32) -> Result<Result<(String, u32), Value>, Ctrl> {
     match args.get(i) {
-        Some(Value::Str(s)) => {
+        Some(Value::Str(s) | Value::Css(s)) => {
             let code = s.trim().to_ascii_uppercase();
             Ok(units_of(&code).map(|u| (code, u)).ok_or_else(|| Value::err(Value::str(format!("unknown currency {}", Value::Str(s.clone()).repr())))))
         }
@@ -483,14 +483,14 @@ fn read(v: Option<&Value>, i: usize, f: &str, line: u32, exact: bool) -> Result<
     let bad = |why: String| fail(line, format!("`{}` expects money ({{ amount, currency }}) as argument {}, got {}{}", f, i + 1, tn(v), why));
     let Some(Value::Map(m)) = v else { return bad(String::new()) };
     let code = match m.get("currency") {
-        Some(Value::Str(s)) => s.trim().to_ascii_uppercase(),
+        Some(Value::Str(s) | Value::Css(s)) => s.trim().to_ascii_uppercase(),
         _ => return bad(": no currency".into()),
     };
     let Some(units) = units_of(&code) else { return bad(": unknown currency".into()) };
     let amount = match m.get("amount") {
         Some(Value::Dec(d)) => *d,
         Some(Value::Int(n)) => Dec::from_i64(*n),
-        Some(Value::Str(s)) => match Dec::parse(s.trim()).filter(|_| !s.contains(['e', 'E'])) {
+        Some(Value::Str(s) | Value::Css(s)) => match Dec::parse(s.trim()).filter(|_| !s.contains(['e', 'E'])) {
             Some(d) => d,
             None => return bad(format!(": its amount {} is not an amount", Value::Str(s.clone()).repr())),
         },
@@ -516,7 +516,7 @@ fn read(v: Option<&Value>, i: usize, f: &str, line: u32, exact: bool) -> Result<
 fn mode(args: &[Value], i: usize, f: &str, line: u32) -> Result<Rounding, Ctrl> {
     match args.get(i) {
         None | Some(Value::Nil) => Ok(Rounding::HalfEven),
-        Some(Value::Str(s)) => match Rounding::parse(s) {
+        Some(Value::Str(s) | Value::Css(s)) => match Rounding::parse(s) {
             Some(m) => Ok(m),
             None => fail(line, format!("`{}`: unknown rounding {:?} (one of {})", f, &**s, Rounding::NAMES)),
         },
@@ -555,7 +555,7 @@ fn of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(Value::Int(n)) => Dec::from_i64(*n),
         // Text is an amount as people write one: "1e3" is not 1,000
         // (FEEDBACK14.md, Q-096; branch feedback14-fixes).
-        Some(Value::Str(s)) => match Dec::parse(s.trim()).filter(|_| !s.contains(['e', 'E'])) {
+        Some(Value::Str(s) | Value::Css(s)) => match Dec::parse(s.trim()).filter(|_| !s.contains(['e', 'E'])) {
             Some(d) => d,
             None => return Ok(Value::err(Value::str(format!("not an amount: {}", Value::Str(s.clone()).repr())))),
         },
@@ -597,7 +597,7 @@ fn of_amount(amount: Dec, code: String, units: u32, args: &[Value], m: usize, f:
 fn parse(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     const F: &str = "money.parse";
     let text = match args.first() {
-        Some(Value::Str(s)) => s.clone(),
+        Some(Value::Str(s) | Value::Css(s)) => s.clone(),
         other => return fail(line, format!("`{}` expects text as argument 1, got {}", F, tn(other))),
     };
     let (code, units) = match currency(&args, 1, F, line)? {
@@ -718,7 +718,7 @@ fn in_range(m: Money) -> Value {
 pub fn from_data(v: &Value) -> Result<Value, String> {
     let Value::Map(m) = v else { return Err("must be money, { amount, currency }".into()) };
     let code = match m.get("currency") {
-        Some(Value::Str(s)) => s.trim().to_ascii_uppercase(),
+        Some(Value::Str(s) | Value::Css(s)) => s.trim().to_ascii_uppercase(),
         Some(_) => return Err("has a currency that is not text".into()),
         None => return Err("has no currency".into()),
     };
@@ -727,7 +727,7 @@ pub fn from_data(v: &Value) -> Result<Value, String> {
         Some(Value::Dec(d)) => Some(*d),
         Some(Value::Int(n)) => Some(Dec::from_i64(*n)),
         Some(Value::Float(f)) => Dec::from_f64(*f),
-        Some(Value::Str(s)) => Dec::parse(s.trim()).filter(|_| !s.contains(['e', 'E'])),
+        Some(Value::Str(s) | Value::Css(s)) => Dec::parse(s.trim()).filter(|_| !s.contains(['e', 'E'])),
         Some(_) => None,
         None => return Err("has no amount".into()),
     };
@@ -910,7 +910,7 @@ fn allocate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// with `translations`), else en-US.
 fn locale_arg(it: &mut Interp, args: &[Value], i: usize, f: &str, line: u32) -> Result<String, Ctrl> {
     match args.get(i) {
-        Some(Value::Str(s)) => Ok(s.to_string()),
+        Some(Value::Str(s) | Value::Css(s)) => Ok(s.to_string()),
         None | Some(Value::Nil) => {
             it.note_locale();
             Ok(it.locale().map_or_else(|| "en-US".to_string(), |l| l.to_string()))

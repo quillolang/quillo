@@ -66,7 +66,9 @@ impl Styles {
             }
             for (k, (e, global)) in stmts.iter().filter_map(style_parts).enumerate() {
                 let css = match it.eval(e, &env) {
-                    Ok(Value::Str(s)) => s.to_string(),
+                    // css`...` is trusted CSS since the user's decision, the `str` it is here
+                    // (FEEDBACK79.md, Q-1250; branch feedback72-81).
+                    Ok(Value::Str(s) | Value::Css(s)) => s.to_string(),
                     Ok(other) => {
                         return Err(QuilloError::new(
                             format!("`style` in `{}` takes CSS text (css`...`), got {}", f.def.name, other.type_name()),
@@ -94,7 +96,8 @@ impl Styles {
             };
             let mut run = |input: &str| -> Result<String, String> {
                 match it.call(&f, vec![Value::str(input)], 0) {
-                    Ok(Value::Str(s)) => Ok(s.to_string()),
+                    // Its css`...` too (FEEDBACK79.md, Q-1250; branch feedback72-81).
+                    Ok(Value::Str(s) | Value::Css(s)) => Ok(s.to_string()),
                     Ok(Value::Err(e, ..)) => Err(e.display()),
                     Ok(other) => Err(format!("it gave {}, not CSS text", other.type_name())),
                     Err(Ctrl::Error(e)) => Err(e.msg.clone()),

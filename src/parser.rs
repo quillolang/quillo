@@ -217,13 +217,23 @@ fn css_wrapped(e: &Expr) -> bool {
 /// not escaped yet, and its template is walked as any other (third review).
 fn css_tag(e: &Expr) -> bool {
     match e {
-        Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if n == "css") => match args.as_slice() {
-            [Expr::Template(parts)] => parts.iter().all(|p| match p {
-                TPart::Expr(x) => css_wrapped(x),
-                TPart::Lit(_) => true,
-            }),
-            _ => false,
-        },
+        Expr::Call(f, args, _) if matches!(&**f, Expr::Ident(n, _) if n == "css") => matches!(args.as_slice(), [a] if css_tag_arg(a)),
+        _ => false,
+    }
+}
+
+/// What a tagged css`...` gives `css`: a template whose every value is given to `__css_value`, or
+/// the text of one with none (css`color: red` is `css("color: red")`). Such a call of the builtin
+/// `css` makes trusted CSS, on the server (`Interp::eval_call`) and in the browser (`W.csst`), as
+/// both its text and its values are safe in a style; any other, `css(v)` say, makes plain text
+/// (FEEDBACK79.md, Q-1250, the user's decision; branch feedback72-81).
+pub fn css_tag_arg(a: &Expr) -> bool {
+    match a {
+        Expr::Lit(Lit::Str(_)) => true,
+        Expr::Template(parts) => parts.iter().all(|p| match p {
+            TPart::Expr(x) => css_wrapped(x),
+            TPart::Lit(_) => true,
+        }),
         _ => false,
     }
 }
@@ -4221,11 +4231,28 @@ impl Parser {
         // FEEDBACK79.md, Q-1250; branch feedback72-81).
         for (n, v) in attrs.iter_mut() {
             match v {
-                AttrVal::Expr(e) if n.eq_ignore_ascii_case("style") => style_values(e, line),
+                AttrVal::Expr(e) if n.eq_ignore_ascii_case("style") => {
+                    style_values(e, line);
+                    // A component's or view's `style` written here as a template or a text: trusted
+                    // CSS, as css`...` is, for each value put into it is escaped now and its text is
+                    // the program's (`UnOp::Css`, which no program can write). Decided here, where it
+                    // is written, so that rendering the tag asks nothing (FEEDBACK79.md, Q-1250, the user's decision; branch feedback72-81).
+                    if tag.starts_with(|c: char| c.is_ascii_uppercase()) && matches!(e, Expr::Template(_) | Expr::Lit(Lit::Str(_))) {
+                        let written = std::mem::replace(e, Expr::Lit(Lit::Nil));
+                        *e = Expr::Unary(UnOp::Css, Box::new(written), line);
+                    }
+                }
                 AttrVal::Spread(Expr::Map(kvs)) => {
                     for (k, e) in kvs.iter_mut() {
                         if k.eq_ignore_ascii_case("style") {
                             style_values(e, line);
+                            // At a component's or view's tag, trusted CSS as the attribute is
+                            // (FEEDBACK79.md, Q-1250, found in the review of the trusted CSS;
+                            // branch feedback72-81).
+                            if tag.starts_with(|c: char| c.is_ascii_uppercase()) && matches!(e, Expr::Template(_) | Expr::Lit(Lit::Str(_))) {
+                                let written = std::mem::replace(e, Expr::Lit(Lit::Nil));
+                                *e = Expr::Unary(UnOp::Css, Box::new(written), line);
+                            }
                         }
                     }
                 }

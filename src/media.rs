@@ -702,7 +702,7 @@ fn track_opt(v: &Value, kind: &str, line: u32) -> Result<(u16, Codec), Ctrl> {
             let Some(p) = m.get("port").and_then(port) else { return bad() };
             match m.get("codec") {
                 None | Some(Value::Nil) => Ok((p, want)),
-                Some(Value::Str(c)) if c.eq_ignore_ascii_case(name) => Ok((p, want)),
+                Some(Value::Str(c) | Value::Css(c)) if c.eq_ignore_ascii_case(name) => Ok((p, want)),
                 Some(c) => fail(line, format!("`media.rtp`: {} in {} is not supported ({} is)", c.display(), kind, name)).map(|_: Value| (0, want)),
             }
         }
@@ -716,7 +716,7 @@ fn track_opt(v: &Value, kind: &str, line: u32) -> Result<(u16, Codec), Ctrl> {
 /// `media.rtp(name, { video, audio, host })`, at the top of a program.
 fn rtp(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = match args.first() {
-        Some(Value::Str(s)) if crate::wt::name_ok(s) => s.to_string(),
+        Some(Value::Str(s) | Value::Css(s)) if crate::wt::name_ok(s) => s.to_string(),
         other => return fail(line, format!("`media.rtp` takes a stream's name first (letters, digits, `_`, `-`, `.` and `:`), got {}", other.map_or("nothing".into(), |v| v.repr()))),
     };
     let Some(Value::Map(o)) = args.get(1) else {
@@ -787,7 +787,7 @@ pub fn frame_stream(wire: &[u8]) -> Option<&str> {
 /// tenant has its own streams of a name, unless `tenants: "shared"`.
 fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = match args.first() {
-        Some(Value::Str(s)) if crate::wt::name_ok(s.trim_end_matches('*')) && s.len() <= 58 => s.to_string(),
+        Some(Value::Str(s) | Value::Css(s)) if crate::wt::name_ok(s.trim_end_matches('*')) && s.len() <= 58 => s.to_string(),
         other => return fail(line, format!("`media.on` takes a stream's name first (or one ending in `*`), got {}", other.map_or("nothing".into(), |v| v.repr()))),
     };
     let (mut publish, mut watch, mut everyone) = (None, None, false);
@@ -832,7 +832,7 @@ fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// ports until the program stops (FEEDBACK6.md, Q-061; branch feedback6-fixes).
 fn close(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = match args.first() {
-        Some(Value::Str(s)) => s.to_string(),
+        Some(Value::Str(s) | Value::Css(s)) => s.to_string(),
         other => return fail(line, format!("`media.close` takes a stream's name, got {}", other.map_or("nothing".into(), |v| v.repr()))),
     };
     // Its tenant's; from a job, a tick or the top level, every tenant's of that name, as

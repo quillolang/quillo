@@ -585,7 +585,7 @@ fn to_my(v: &Value) -> Result<My, String> {
         Value::Dec(d) if d.scale() == 0 && i64::try_from(d.mantissa()).is_ok() => My::Int(d.mantissa() as i64),
         Value::Dec(d) if d.scale() == 0 && u64::try_from(d.mantissa()).is_ok() => My::UInt(d.mantissa() as u64),
         Value::Dec(d) => My::Bytes(d.to_string().into_bytes()),
-        Value::Str(s) => My::Bytes(s.as_bytes().to_vec()),
+        Value::Str(s) | Value::Css(s) => My::Bytes(s.as_bytes().to_vec()),
         Value::Html(h) => My::Bytes(h.as_bytes().to_vec()),
         Value::List(_) | Value::Map(_) => My::Bytes(crate::db::json_text(v).into_bytes()),
         other => return Err(format!("a {} cannot be stored in the database", other.type_name())),

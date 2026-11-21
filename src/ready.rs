@@ -129,7 +129,7 @@ fn remote_ready(url: &str) -> bool {
 /// gives true. Made where the program starts, at the top level.
 pub fn add_check(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
     match (args.first(), args.get(1)) {
-        (Some(Value::Str(name)), Some(f @ (Value::Func(_) | Value::Builtin(..)))) => {
+        (Some(Value::Str(name) | Value::Css(name)), Some(f @ (Value::Func(_) | Value::Builtin(..)))) => {
             let checks = std::sync::Arc::make_mut(&mut it.ready_checks);
             checks.retain(|(n, _)| **n != **name);
             checks.push((name.to_string(), f.clone()));

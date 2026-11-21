@@ -1407,8 +1407,8 @@ fn mounted<'a>(it: &'a mut Interp, path: &[usize]) -> &'a mut Interp {
 
 fn name_arg(args: &[Value], f: &str, line: u32) -> Result<String, Ctrl> {
     match args.first() {
-        Some(Value::Str(s)) if name_ok(s) => Ok(s.to_string()),
-        Some(Value::Str(s)) => fail(line, format!("`{}`: a channel's name is letters, digits, `_`, `-`, `.` and `:`, up to 64, got {:?}", f, &**s)).map(|_: Value| String::new()),
+        Some(Value::Str(s) | Value::Css(s)) if name_ok(s) => Ok(s.to_string()),
+        Some(Value::Str(s) | Value::Css(s)) => fail(line, format!("`{}`: a channel's name is letters, digits, `_`, `-`, `.` and `:`, up to 64, got {:?}", f, &**s)).map(|_: Value| String::new()),
         other => fail(line, format!("`{}` takes a channel's name first, got {}", f, other.map_or("nothing", |v| v.type_name()))).map(|_: Value| String::new()),
     }
 }
@@ -1450,8 +1450,8 @@ fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `tenants: "shared"`: one room for every tenant, where each has its own.
 pub fn shared_opt(v: &Value, f: &str, line: u32) -> Result<bool, Ctrl> {
     match v {
-        Value::Str(s) if &**s == "shared" => Ok(true),
-        Value::Str(s) if &**s == "own" => Ok(false),
+        Value::Str(s) | Value::Css(s) if &**s == "shared" => Ok(true),
+        Value::Str(s) | Value::Css(s) if &**s == "own" => Ok(false),
         other => fail(line, format!("`{}`: `tenants` is \"shared\" (one room for every tenant) or \"own\", got {}", f, other.repr())).map(|_: Value| false),
     }
 }
@@ -1460,10 +1460,10 @@ pub fn shared_opt(v: &Value, f: &str, line: u32) -> Result<bool, Ctrl> {
 fn peer_of(v: Option<&Value>) -> Option<u64> {
     let id = match v? {
         Value::Map(m) => match m.get("id") {
-            Some(Value::Str(s)) => s.clone(),
+            Some(Value::Str(s) | Value::Css(s)) => s.clone(),
             _ => return None,
         },
-        Value::Str(s) => s.clone(),
+        Value::Str(s) | Value::Css(s) => s.clone(),
         _ => return None,
     };
     u64::from_str_radix(&id, 16).ok()

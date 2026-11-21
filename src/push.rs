@@ -698,7 +698,7 @@ fn message(it: &Interp, o: &Map, line: u32) -> Result<Message, Ctrl> {
     let text = |k: &str| -> Result<Option<String>, Ctrl> {
         match o.get(k) {
             None | Some(Value::Nil) => Ok(None),
-            Some(Value::Str(s)) => Ok(Some(s.to_string())),
+            Some(Value::Str(s) | Value::Css(s)) => Ok(Some(s.to_string())),
             Some(v) => fail(line, format!("`notification.send`'s `{}` is text, got {}", k, v.type_name())),
         }
     };

@@ -109,8 +109,8 @@ pub fn every_ms(v: &Value) -> Result<u64, String> {
 /// (or a tab) or starts with `@`; anything else is a duration.
 pub fn when_of(v: &Value) -> Result<When, String> {
     match v {
-        Value::Str(s) if s.contains(char::is_whitespace) || s.starts_with('@') => Cron::parse(s).map(When::Cron).map_err(|e| format!("`schedule`: {}", e)),
-        Value::Str(_) | Value::Int(_) => match crate::builtins::duration_seconds(v) {
+        Value::Str(s) | Value::Css(s) if s.contains(char::is_whitespace) || s.starts_with('@') => Cron::parse(s).map(When::Cron).map_err(|e| format!("`schedule`: {}", e)),
+        Value::Str(_) | Value::Css(_) | Value::Int(_) => match crate::builtins::duration_seconds(v) {
             Some(n) if n > 0 => Ok(When::Every(n)),
             _ => Err(format!("`schedule` takes a duration such as \"5m\" or a cron line such as \"0 3 * * *\", got {}", v.repr())),
         },
@@ -122,7 +122,7 @@ pub fn when_of(v: &Value) -> Result<When, String> {
 pub fn name_opt(f: &str, o: Option<&Value>) -> Result<Option<String>, String> {
     match o {
         Some(Value::Map(o)) => match o.get("name") {
-            Some(Value::Str(n)) => Ok(Some(n.to_string())),
+            Some(Value::Str(n) | Value::Css(n)) => Ok(Some(n.to_string())),
             None | Some(Value::Nil) => Ok(None),
             Some(v) => Err(format!("`{}`'s name is a str, got {}", f, v.type_name())),
         },

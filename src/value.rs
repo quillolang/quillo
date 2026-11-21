@@ -183,6 +183,15 @@ pub enum Value {
     /// marked, as the text cannot tell them apart (FEEDBACK21.md, Q-171; branch
     /// feedback20-fixes). The place is where it was made (FEEDBACK21.md, Q-174).
     Err(Arc<Value>, bool, Place),
+    /// Trusted CSS: what a css`...` written in the program makes, whose values the parser gave
+    /// to `__css_value` (or a literal's text). A style's `__css_value` writes it as it is, through
+    /// names, props, lists, maps, a fn's answer and an island's props; anywhere else it is a
+    /// `str`, its text, and what anything makes of it (`+`, a builtin, a template) is a plain
+    /// `str`. Nothing read from outside is one: a request's, a page's, a store's or a script's
+    /// values are plain text (FEEDBACK79.md, Q-1250, the user's decision; branch feedback72-81).
+    /// Last, beside `Err`: every other value's tag is as it was, and one test finds either
+    /// (`Interp::call`).
+    Css(Arc<str>),
 }
 
 /// Where an error value was made, for the log: a file and a line in four bytes, which fit
@@ -271,6 +280,24 @@ impl Value {
         Value::Html(Arc::from(s.as_ref()))
     }
 
+    /// Trusted CSS as plain text, its text shared; any other value as it is (FEEDBACK79.md,
+    /// Q-1250; branch feedback72-81).
+    #[inline]
+    pub fn plain(self) -> Value {
+        match self {
+            Value::Css(s) => Value::Str(s),
+            v => v,
+        }
+    }
+
+    /// `v` with every trusted CSS in it, however deep, plain text: what enters or leaves a
+    /// script's world (`run_script`). None where it holds none: shared, not copied (FEEDBACK79.md,
+    /// Q-1250; branch feedback72-81). Deep values on a new piece of stack (`deeper`), as
+    /// `marks_in` reads them.
+    pub fn plain_deep(v: &Value) -> Option<Value> {
+        plain_at(v, 0)
+    }
+
     pub fn err(v: Value) -> Value {
         Value::Err(Arc::new(v), false, Place::NONE)
     }
@@ -287,7 +314,8 @@ impl Value {
             Value::Int(_) => "int",
             Value::Float(_) => "float",
             Value::Dec(_) => "dec",
-            Value::Str(_) => "str",
+            // A `str` to the program (FEEDBACK79.md, Q-1250; branch feedback72-81).
+            Value::Str(_) | Value::Css(_) => "str",
             Value::List(_) => "list",
             Value::Map(_) => "map",
             Value::Func(_) | Value::Builtin(..) => "fn",
@@ -313,7 +341,7 @@ impl Value {
     /// did not write stays hidden in it, on a server (see `hiding`).
     pub fn display(&self) -> String {
         match self {
-            Value::Str(s) => s.to_string(),
+            Value::Str(s) | Value::Css(s) => s.to_string(),
             Value::Html(h) => h.to_string(),
             Value::Dec(d) => d.to_string(),
             _ => self.repr(),
@@ -341,7 +369,7 @@ impl Value {
     /// `join`'s item.
     pub fn display_into<O: Text>(&self, out: &mut O) {
         match self {
-            Value::Str(s) | Value::Html(s) => out.push_str(s),
+            Value::Str(s) | Value::Html(s) | Value::Css(s) => out.push_str(s),
             Value::Dec(d) => out.push_str(&d.to_string()),
             _ => self.repr_at(out, 0),
         }
@@ -442,7 +470,8 @@ impl Value {
                 out.push('m');
             }
             // Quoted as JSON quotes it, written where it goes: a long text was copied first.
-            Value::Str(s) => quoted_into(s, out),
+            // Trusted CSS as the `str` it is (FEEDBACK79.md, Q-1250; branch feedback72-81).
+            Value::Str(s) | Value::Css(s) => quoted_into(s, out),
             Value::Func(c) => {
                 out.push_str("<fn ");
                 out.push_str(&c.def.name);
@@ -485,7 +514,7 @@ impl Value {
             Value::Float(f) => serde_json::Number::from_f64(*f).map(J::Number).unwrap_or(J::Null),
             // As text, so nothing that reads it rounds it to a float.
             Value::Dec(d) => J::String(d.to_string()),
-            Value::Str(s) => J::String(s.to_string()),
+            Value::Str(s) | Value::Css(s) => J::String(s.to_string()),
             Value::Html(h) => J::String(h.to_string()),
             Value::List(l) => J::Array(l.iter().map(|v| v.to_json_at(depth + 1)).collect()),
             Value::Map(m) => J::Object(m.iter().map(|(k, v)| (k.to_string(), v.to_json_at(depth + 1))).collect()),
@@ -526,7 +555,7 @@ impl Value {
         // A scalar, held: room made for all it writes first, so its write grows nothing.
         fn scalar_held(v: &Value, out: &mut Vec<u8>) -> Result<(), String> {
             match v {
-                Value::Str(s) | Value::Html(s) => {
+                Value::Str(s) | Value::Html(s) | Value::Css(s) => {
                     if !json_str_held(s, out) {
                         return Err(OVER_IN_JSON.into());
                     }
@@ -777,7 +806,19 @@ impl Value {
                 let _ = serde_json::to_writer(&mut *out, f);
             }
             Value::Dec(d) => return text(&d.to_string(), out),
-            Value::Str(s) | Value::Html(s) => return text(s, out),
+            // Trusted CSS on an island's wire (props, state, a server fn's or a `live` answer):
+            // `{"$css": text}`, which the browser makes its trusted CSS again (`untag`); the same
+            // mark from a page, a store or another site is read back as plain text (`marks_in`,
+            // `from_island_json`). Elsewhere its text (FEEDBACK79.md, Q-1250; branch
+            // feedback72-81).
+            Value::Css(s) if island => {
+                lit!(b"{\"$css\":");
+                if !text(s, out) {
+                    return false;
+                }
+                lit!(b"}");
+            }
+            Value::Str(s) | Value::Html(s) | Value::Css(s) => return text(s, out),
             Value::Response(r) => {
                 room!(24);
                 out.extend_from_slice(format!("{{\"status\":{}}}", r.status).as_bytes());
@@ -839,7 +880,7 @@ impl Value {
                 }
                 json_str_into(&t, out)
             }
-            Value::Str(s) | Value::Html(s) => {
+            Value::Str(s) | Value::Html(s) | Value::Css(s) => {
                 if HELD {
                     return json_str_held(s, out);
                 }
@@ -1044,6 +1085,46 @@ fn take_room(left: &mut usize, n: usize) -> Result<(), crate::httpd::OverMemory>
 }
 
 /// `island_marks_held`, or none where `v` has no mark.
+/// `Value::plain_deep`, `depth` levels down (FEEDBACK79.md, Q-1250; branch feedback72-81).
+fn plain_at(v: &Value, depth: usize) -> Option<Value> {
+    let next = |x: &Value| deeper(depth, || plain_at(x, depth + 1));
+    match v {
+        Value::Css(s) => Some(Value::Str(s.clone())),
+        Value::List(l) => {
+            let mut out: Option<Vec<Value>> = None;
+            for (i, x) in l.iter().enumerate() {
+                match (next(x), &mut out) {
+                    (Some(y), Some(o)) => o.push(y),
+                    (Some(y), None) => {
+                        let mut o = Vec::with_capacity(l.len());
+                        o.extend_from_slice(&l[..i]);
+                        o.push(y);
+                        out = Some(o);
+                    }
+                    (None, Some(o)) => o.push(x.clone()),
+                    (None, None) => {}
+                }
+            }
+            out.map(Value::list)
+        }
+        Value::Map(m) => {
+            let changed: Vec<(usize, Value)> = m.values().enumerate().filter_map(|(i, x)| next(x).map(|y| (i, y))).collect();
+            if changed.is_empty() {
+                return None;
+            }
+            let mut o = (**m).clone();
+            for (i, y) in changed {
+                if let Some((_, slot)) = o.get_index_mut(i) {
+                    *slot = y;
+                }
+            }
+            Some(Value::map(o))
+        }
+        Value::Err(e, own, at) => next(e).map(|y| Value::Err(Arc::new(y), *own, *at)),
+        _ => None,
+    }
+}
+
 fn marks_in(v: &Value, files: Option<&Map>, depth: usize, left: &mut usize) -> Result<Option<Value>, crate::httpd::OverMemory> {
     let next = |x: &Value, files: Option<&Map>, left: &mut usize| deeper(depth, || marks_in(x, files, depth + 1, left));
     match v {
@@ -1083,6 +1164,9 @@ fn marks_in(v: &Value, files: Option<&Map>, depth: usize, left: &mut usize) -> R
                     }
                     ("$dec", Value::Str(t), _) => return Ok(Some(crate::decimal::Dec::parse(t).map_or_else(|| Value::Str(t.clone()), Value::Dec))),
                     ("$int", Value::Str(t), _) => return Ok(Some(t.parse::<i64>().map_or_else(|_| Value::Str(t.clone()), Value::Int))),
+                    // Trusted CSS's mark, from a page: its text, plain, so that no visitor can
+                    // make one (FEEDBACK79.md, Q-1250; branch feedback72-81).
+                    ("$css", Value::Str(t), _) => return Ok(Some(Value::Str(t.clone()))),
                     ("$quillo_err", x, _) => {
                         take_room(left, TEXT_HEAD + ITEM_BYTES)?;
                         return Ok(Some(Value::err(next(x, None, left)?.unwrap_or_else(|| x.clone()))));
@@ -2079,6 +2163,8 @@ fn scalar_equal(a: &Value, b: &Value) -> bool {
             dec_pair(a, b).map_or(false, |(x, y)| x == y)
         }
         (Str(x), Str(y)) => x == y,
+        // Trusted CSS is the `str` it is, to `==` (FEEDBACK79.md, Q-1250; branch feedback72-81).
+        (Css(x), Str(y) | Css(y)) | (Str(x), Css(y)) => x == y,
         (Html(x), Html(y)) => x == y,
         (Func(x), Func(y)) => Arc::ptr_eq(x, y),
         (Builtin(x, _), Builtin(y, _)) => x == y,
@@ -2096,6 +2182,8 @@ fn compare_at(a: &Value, b: &Value, depth: usize) -> Option<Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Some(x.cmp(y)),
         (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+        // Trusted CSS as the `str` it is (FEEDBACK79.md, Q-1250; branch feedback72-81).
+        (Value::Css(x), Value::Str(y) | Value::Css(y)) | (Value::Str(x), Value::Css(y)) => Some(x.cmp(y)),
         (Value::Dec(x), Value::Dec(y)) => Some(x.cmp(*y)),
         (Value::Dec(x), Value::Int(y)) => Some(x.cmp(crate::decimal::Dec::from_i64(*y))),
         (Value::Int(x), Value::Dec(y)) => Some(crate::decimal::Dec::from_i64(*x).cmp(*y)),
@@ -2278,7 +2366,7 @@ pub fn unique_of(items: &[Value]) -> Vec<Value> {
                         let t = Self::dec_tok(*d, self.key);
                         (t, t)
                     }
-                    Value::Str(s) | Value::Html(s) => {
+                    Value::Str(s) | Value::Html(s) | Value::Css(s) => {
                         let t = self.key.hash_one(&**s);
                         (t, t)
                     }

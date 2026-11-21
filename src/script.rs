@@ -62,7 +62,7 @@ pub fn too_big(v: &Value) -> Result<usize, &'static str> {
             return Err("the script nested lists or maps too deeply");
         }
         match v {
-            Value::Str(s) | Value::Html(s) => n += s.len(),
+            Value::Str(s) | Value::Html(s) | Value::Css(s) => n += s.len(),
             Value::List(l) => {
                 n = n.saturating_add(8 * l.len());
                 if n <= SCRIPT_BYTES {
@@ -93,7 +93,7 @@ pub fn too_big(v: &Value) -> Result<usize, &'static str> {
 /// cost no list to count with.
 pub fn read_size(v: &Value, most: usize) -> usize {
     match v {
-        Value::Str(s) | Value::Html(s) => return s.len(),
+        Value::Str(s) | Value::Html(s) | Value::Css(s) => return s.len(),
         Value::List(_) | Value::Map(_) | Value::Err(..) => {}
         _ => return 8,
     }
@@ -101,15 +101,15 @@ pub fn read_size(v: &Value, most: usize) -> usize {
     let mut todo = vec![v];
     while let Some(v) = todo.pop() {
         match v {
-            Value::Str(s) | Value::Html(s) => n = n.saturating_add(s.len()),
+            Value::Str(s) | Value::Html(s) | Value::Css(s) => n = n.saturating_add(s.len()),
             Value::List(l) => {
                 n = n.saturating_add(l.len().saturating_mul(8));
-                todo.extend(l.iter().filter(|x| matches!(x, Value::Str(_) | Value::Html(_) | Value::List(_) | Value::Map(_) | Value::Err(..))));
+                todo.extend(l.iter().filter(|x| matches!(x, Value::Str(_) | Value::Html(_) | Value::Css(_) | Value::List(_) | Value::Map(_) | Value::Err(..))));
             }
             Value::Map(m) => {
                 for (k, x) in m.iter() {
                     n = n.saturating_add(8 + k.len());
-                    if matches!(x, Value::Str(_) | Value::Html(_) | Value::List(_) | Value::Map(_) | Value::Err(..)) {
+                    if matches!(x, Value::Str(_) | Value::Html(_) | Value::Css(_) | Value::List(_) | Value::Map(_) | Value::Err(..)) {
                         todo.push(x);
                     }
                 }
@@ -134,7 +134,7 @@ pub fn looks_into(name: &str, args: &[Value]) -> bool {
     match name {
         "get" | "has" | "first" | "last" | "type_of" | "is_err" | "unwrap" | "err" | "filled" => true,
         "push" | "set" | "merge" | "remove" | "sort" | "reverse" | "upper" | "lower" => true,
-        "len" | "count" => !matches!(args.first(), Some(Value::Str(_))) && args.len() == 1,
+        "len" | "count" => !matches!(args.first(), Some(Value::Str(_) | Value::Css(_))) && args.len() == 1,
         _ => false,
     }
 }
@@ -150,7 +150,7 @@ pub fn timeout_of(opts: Option<&Map>) -> Result<u64, String> {
     let ms = match m.get("timeout") {
         None | Some(Value::Nil) => return Ok(SCRIPT_MS),
         Some(Value::Int(n)) => Some(*n as f64),
-        Some(Value::Str(t)) => {
+        Some(Value::Str(t) | Value::Css(t)) => {
             let t = t.trim();
             let (num, scale) = match t.strip_suffix("ms") {
                 Some(n) => (n, 1.0),
@@ -171,7 +171,7 @@ pub fn timeout_of(opts: Option<&Map>) -> Result<u64, String> {
 /// than they are given.
 pub fn would_be_too_big(name: &str, args: &[Value]) -> bool {
     let text = |i: usize| match args.get(i) {
-        Some(Value::Str(s)) => Some(&**s),
+        Some(Value::Str(s) | Value::Css(s)) => Some(&**s),
         _ => None,
     };
     let times = |s: &str, part: &str| if part.is_empty() { s.chars().count() + 1 } else { s.matches(part).count() + 1 };
@@ -270,7 +270,7 @@ pub fn run_script_for(it: &mut Interp, src: &str, vars: Option<&Map>, ms: u64) -
     // into the log with each request (FEEDBACK75.md, Q-1076, found in review; branch feedback75).
     // Quillo's own messages, not an error value the script made itself.
     Ok(match &out {
-        Value::Err(e, own, _) if matches!(&**e, Value::Str(_)) && (!names.is_empty() || (!own && e.display().len() > 100)) => {
+        Value::Err(e, own, _) if matches!(&**e, Value::Str(_) | Value::Css(_)) && (!names.is_empty() || (!own && e.display().len() > 100)) => {
             let msg = e.display();
             let msg = if names.is_empty() { msg } else { said_as_written(&msg, &names) };
             if !own && msg.len() > 100 {
@@ -328,11 +328,13 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
     // program's effects (FEEDBACK51.md, Q-648; branch feedback51-fixes).
     let root = ROOT.with(Scope::root_copy);
     let env = Scope::child(&root);
-    // A variable the script never names is none of its business, and makes no name.
+    // A variable the script never names is none of its business, and makes no name. Trusted CSS
+    // in one is text in the script's world, where css`...` makes text too (`Interp::eval_call`):
+    // the script's source may be a visitor's (FEEDBACK79.md, Q-1250; branch feedback72-81).
     if let Some(m) = vars {
         for (k, v) in m.iter() {
             if let Some(n) = names.get(k.as_str()).copied().or_else(|| Sym::known(k.as_str())) {
-                define(&env, n, v.clone());
+                define(&env, n, Value::plain_deep(v).unwrap_or_else(|| v.clone()));
             }
         }
     }
@@ -392,7 +394,9 @@ fn run_parsed(it: &mut Interp, stmts: &[Stmt], names: &std::collections::HashMap
     if holds_function(&out) {
         return Ok(bad("a script gives back no function (it would run without the script's limits): give back what it computes"));
     }
-    Ok(out)
+    // Nothing trusted leaves it: a helper the program gave it may have handed it trusted CSS
+    // (FEEDBACK79.md, Q-1250; branch feedback72-81).
+    Ok(Value::plain_deep(&out).unwrap_or(out))
 }
 
 /// `format_number` in a script: the program's, but its locale is the script's to give, en-US

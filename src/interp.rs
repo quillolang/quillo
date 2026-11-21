@@ -658,9 +658,10 @@ pub fn type_name_matches(t: &str, v: &Value) -> bool {
         "float" => matches!(v, Value::Float(_)),
         "dec" => matches!(v, Value::Dec(_)),
         "num" => matches!(v, Value::Int(_) | Value::Float(_)),
-        "str" => matches!(v, Value::Str(_)),
+        // Trusted CSS is a `str` (FEEDBACK79.md, Q-1250; branch feedback72-81).
+        "str" => matches!(v, Value::Str(_) | Value::Css(_)),
         // Text that is a date, not a date-time (FEEDBACK13.md, Q-093; branch open-fixes).
-        "date" => matches!(v, Value::Str(s) if crate::dates::parse_date(s).is_some()),
+        "date" => matches!(v, Value::Str(s) | Value::Css(s) if crate::dates::parse_date(s).is_some()),
         // Money every `money` function takes (FEEDBACK50.md, Q-621; branch feedback50-fixes).
         "money" => crate::money::is_money(v),
         "bool" => matches!(v, Value::Bool(_)),
@@ -703,7 +704,7 @@ pub fn as_dec(v: &Value) -> Option<Dec> {
         Value::Dec(d) => Some(*d),
         Value::Int(n) => Some(Dec::from_i64(*n)),
         Value::Float(f) => Dec::from_f64(*f),
-        Value::Str(s) => Dec::parse(s.trim()),
+        Value::Str(s) | Value::Css(s) => Dec::parse(s.trim()),
         _ => None,
     }
 }
@@ -1261,7 +1262,7 @@ fn push_int<O: Text>(out: &mut O, n: i64) {
 /// `--max-memory`, where the page stops (FEEDBACK71.md, Q-977; branch security).
 fn display_escaped(v: &Value, out: &mut Held) {
     match v {
-        Value::Str(s) => escape_into(s, out),
+        Value::Str(s) | Value::Css(s) => escape_into(s, out),
         Value::Int(n) => push_int(out, *n),
         other => match other.display_held() {
             Ok(t) => escape_into(&t, out),
@@ -1280,7 +1281,9 @@ fn display_escaped(v: &Value, out: &mut Held) {
 fn css_escaped_into(v: &Value, out: &mut Held) {
     match v {
         Value::Int(n) => push_int(out, *n),
-        Value::Str(s) if next_special_in::<true>(s.as_bytes(), 0) == s.len() => push_short(out, s),
+        // Trusted CSS with nothing to escape too, as it is (FEEDBACK79.md, Q-1250; branch
+        // feedback72-81).
+        Value::Str(s) | Value::Css(s) if next_special_in::<true>(s.as_bytes(), 0) == s.len() => push_short(out, s),
         Value::Nil | Value::Bool(_) | Value::Float(_) | Value::Dec(_) => display_escaped(v, out),
         other => css_other_into(other, out),
     }
@@ -1290,6 +1293,10 @@ fn css_escaped_into(v: &Value, out: &mut Held) {
 fn css_other_into(v: &Value, out: &mut Held) {
     match v {
         Value::Str(s) => css_escape_into(s, out, true),
+        // Trusted CSS, a css`...` of the program's (whose values were escaped where it was made):
+        // as it is, escaped for HTML alone (FEEDBACK79.md, Q-1250, the user's decision; branch
+        // feedback72-81).
+        Value::Css(s) => escape_into(s, out),
         // An error, its contents escaped, as `__css_value` gives it (`builtins::css_value_of`).
         Value::Err(..) => match crate::builtins::css_value_of(v.clone(), 0) {
             Ok(e) => display_escaped(&e, out),
@@ -1302,11 +1309,51 @@ fn css_other_into(v: &Value, out: &mut Held) {
     }
 }
 
+/// A builtin's arguments with trusted CSS made plain text, but where the builtin is `__css_value`,
+/// which writes it as it is, or `push` or `set`, which hold it (FEEDBACK79.md, Q-1250; branch
+/// feedback72-81).
+#[inline]
+fn plain_args(name: &str, args: &mut [Value]) {
+    if args.iter().any(|a| matches!(a, Value::Css(_))) {
+        plain_css_args(name, args);
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn plain_css_args(name: &str, args: &mut [Value]) {
+    if matches!(name, "__css_value" | "push" | "set") {
+        return;
+    }
+    for a in args.iter_mut() {
+        if let Value::Css(s) = a {
+            *a = Value::Str(s.clone());
+        }
+    }
+}
+
+/// `a + b` with trusted CSS on a side, as the text it is: plain text (FEEDBACK79.md, Q-1250; branch
+/// feedback72-81). Out of `binop`'s way, as `large_plus` is.
+#[cold]
+#[inline(never)]
+fn css_plus(a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
+    binop(BinOp::Add, a.plain(), b.plain(), line)
+}
+
 /// The parser's `__css_value`, as a callee: its name's length first, which most callees' is not.
 #[inline(always)]
 fn css_value_call(callee: &Expr) -> bool {
     matches!(callee, Expr::Ident(n, _) if n.len() == 11 && &**n == "__css_value")
 }
+
+/// A call of a function named `css`, which css`...` is (`Interp::css_tagged`): its first letter
+/// first, as many builtins' names are three long (`len`, `str`, `get`) (FEEDBACK79.md, Q-1250;
+/// branch feedback72-81).
+#[inline(always)]
+fn css_named(callee: &Expr) -> bool {
+    matches!(callee, Expr::Ident(n, _) if n.len() == 3 && n.as_bytes()[0] == b'c' && &**n == "css")
+}
+
 
 /// Whether `s` has a byte `css_escape_into` writes otherwise.
 #[inline]
@@ -1419,7 +1466,9 @@ enum DocumentTakes {
 
 /// Whether `v`, a text, is a property of `document` (`DOCUMENT_NAMES`).
 fn names_document(v: &Value) -> bool {
-    matches!(v, Value::Str(s) if DOCUMENT_NAMES.binary_search(&&**s).is_ok())
+    // Trusted CSS too, whose text a visitor's value may be (FEEDBACK79.md, Q-1250; branch
+    // feedback72-81).
+    matches!(v, Value::Str(s) | Value::Css(s) if DOCUMENT_NAMES.binary_search(&&**s).is_ok())
 }
 
 /// The names of `document`'s properties, its prototypes' and its own (`location`), as Chrome 157
@@ -1574,7 +1623,9 @@ fn render_other(v: &Value, out: &mut Held) -> bool {
             }
             return left;
         }
-        Value::Str(s) => escape_into(s, out),
+        // Trusted CSS shown as text is the text it is (FEEDBACK79.md, Q-1250; branch
+        // feedback72-81).
+        Value::Str(s) | Value::Css(s) => escape_into(s, out),
         Value::Int(n) => push_int(out, *n),
         other => match crate::server::hidden(other).as_ref().unwrap_or(other).display_held() {
             Ok(t) => escape_into(&t, out),
@@ -1698,6 +1749,12 @@ pub fn style_text(m: &Map) -> Result<String, crate::httpd::OverMemory> {
             Value::Dec(d) => {
                 out.push_str(&v.display());
                 !d.is_zero()
+            }
+            // Trusted CSS as it is, as in a style's template (FEEDBACK79.md, Q-1250, the user's
+            // decision; branch feedback72-81).
+            Value::Css(s) => {
+                out.push_str(s);
+                false
             }
             other => {
                 out.push_str(&crate::builtins::css_value(&other.display_held()?));
@@ -2022,6 +2079,8 @@ pub fn island_json(v: &Value) -> serde_json::Value {
         Value::Err(e, _, _) => serde_json::json!({ "$quillo_err": island_json(e) }),
         Value::Dec(d) => serde_json::json!({ "$dec": d.to_string() }),
         Value::Int(n) if n.unsigned_abs() > JS_SAFE => serde_json::json!({ "$int": n.to_string() }),
+        // As `tree_json_into` writes it (FEEDBACK79.md, Q-1250; branch feedback72-81).
+        Value::Css(s) => serde_json::json!({ "$css": &**s }),
         Value::List(l) => serde_json::Value::Array(l.iter().map(island_json).collect()),
         Value::Map(m) => match m.iter().next() {
             Some((k, x)) if m.len() == 1 && k.starts_with('$') => serde_json::json!({ "$": [k.to_string(), island_json(x)] }),
@@ -2057,25 +2116,43 @@ pub(crate) const JS_SAFE: u64 = (1 << 53) - 1;
 
 /// `island_json` read back: what the browser sent a server fn.
 pub fn from_island_json(j: &serde_json::Value) -> Value {
+    island_value(j, false)
+}
+
+/// `from_island_json` of what this server wrote itself of its own values and kept, a `live`
+/// answer's cache: its trusted CSS is trusted CSS again, as when it was made (FEEDBACK79.md,
+/// Q-1250; branch feedback72-81).
+pub fn from_own_island_json(j: &serde_json::Value) -> Value {
+    island_value(j, true)
+}
+
+/// `from_island_json`; `own`, `from_own_island_json`.
+fn island_value(j: &serde_json::Value, own: bool) -> Value {
     use serde_json::Value as J;
+    let next = |x: &J| island_value(x, own);
     match j {
-        J::Array(a) => Value::list(a.iter().map(from_island_json).collect()),
+        J::Array(a) => Value::list(a.iter().map(next).collect()),
         J::Object(o) if o.len() == 1 => {
             let (k, x) = o.iter().next().unwrap();
             match (k.as_str(), x) {
                 ("$dec", J::String(s)) => Dec::parse(s).map_or_else(|| Value::str(s), Value::Dec),
                 ("$int", J::String(s)) => s.parse::<i64>().map_or_else(|_| Value::str(s), Value::Int),
-                ("$quillo_err", x) => Value::err(from_island_json(x)),
+                // Trusted CSS's mark, read back from a store, a service or a page: its text,
+                // plain; from the server's own cache, trusted CSS (FEEDBACK79.md, Q-1250; branch
+                // feedback72-81).
+                ("$css", J::String(s)) if own => Value::Css(Arc::from(s.as_str())),
+                ("$css", J::String(s)) => Value::str(s),
+                ("$quillo_err", x) => Value::err(next(x)),
                 // A map of one key that starts with `$` (see `island_json`).
                 ("$", J::Array(a)) if a.len() == 2 && a[0].is_string() => {
                     let mut m = Map::new();
-                    m.insert(a[0].as_str().unwrap_or_default().into(), from_island_json(&a[1]));
+                    m.insert(a[0].as_str().unwrap_or_default().into(), next(&a[1]));
                     Value::map(m)
                 }
-                _ => Value::map(o.iter().map(|(k, v)| (k.into(), from_island_json(v))).collect()),
+                _ => Value::map(o.iter().map(|(k, v)| (k.into(), next(v))).collect()),
             }
         }
-        J::Object(o) => Value::map(o.iter().map(|(k, v)| (k.into(), from_island_json(v))).collect()),
+        J::Object(o) => Value::map(o.iter().map(|(k, v)| (k.into(), next(v))).collect()),
         other => Value::from_json(other),
     }
 }
@@ -2083,7 +2160,7 @@ pub fn from_island_json(j: &serde_json::Value) -> Value {
 /// Why a value cannot travel to the browser as JSON, if it cannot.
 pub fn not_sendable(v: &Value) -> Option<&'static str> {
     match v {
-        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) => None,
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) | Value::Css(_) => None,
         Value::List(l) => l.iter().find_map(not_sendable),
         Value::Map(m) => m.values().find_map(not_sendable),
         Value::Func(_) | Value::Builtin(..) => Some("a function"),
@@ -2496,9 +2573,16 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
                 }
                 Ok(Value::map(m))
             }
-            (x @ Dec(_), y) | (x, y @ Dec(_)) => dec_op(op, &x, &y, line),
+            // Trusted CSS adds as the text it is, and what `+` makes of it is plain text; with text
+            // on the other side, as above (FEEDBACK79.md, Q-1250, the user's decision; branch
+            // feedback72-81). Looked for where nothing else is, out of the way of the rest.
+            (x @ Dec(_), y) | (x, y @ Dec(_)) => match (&x, &y) {
+                (Css(_), _) | (_, Css(_)) => css_plus(x, y, line),
+                _ => dec_op(op, &x, &y, line),
+            },
             (x, y) => match (x.as_f64(), y.as_f64()) {
                 (Some(p), Some(q)) => Ok(Float(p + q)),
+                _ if matches!(x, Css(_)) || matches!(y, Css(_)) => css_plus(x, y, line),
                 _ => fail(line, format!("cannot add {} and {}", x.type_name(), y.type_name())),
             },
         },
@@ -3105,7 +3189,9 @@ impl Interp {
             || !self.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty();
         // And in a tool's call that may ask its user: its questions come in the order its code
         // asks them, on this handle (FEEDBACK56.md, Part E; branch feedback56).
-        if fs.len() < 2 || in_tx || self.reads.is_some() || !self.tracks.is_empty() || !self.islands.is_empty() || self.asking.is_some() {
+        // And in a script: its functions under its steps, time and world, where a fork's had none of
+        // them (Q-1274, found in the second review of the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+        if fs.len() < 2 || in_tx || self.reads.is_some() || !self.tracks.is_empty() || !self.islands.is_empty() || self.asking.is_some() || self.fuel != u64::MAX {
             let mut out = Vec::with_capacity(fs.len());
             for f in &fs {
                 out.push(self.call(f, Vec::new(), line)?);
@@ -3312,7 +3398,9 @@ impl Interp {
                 host.strip_suffix(domain.as_str()).and_then(|s| s.strip_suffix('.')).map(str::to_string)
             }
             crate::site::TenantRule::Function(f) => match self.call(&f, vec![Value::Map(req)], 0) {
-                Ok(Value::Str(s)) => Some(s.to_string()),
+                // Trusted CSS too, which is the `str` it is (FEEDBACK79.md, Q-1250; branch
+                // feedback72-81).
+                Ok(Value::Str(s) | Value::Css(s)) => Some(s.to_string()),
                 _ => None,
             },
         };
@@ -4556,6 +4644,12 @@ impl Interp {
                 Value::Dec(d) => Ok(Value::Dec(d.neg())),
                 o => fail(line, format!("cannot negate {}", o.type_name())),
             },
+            // A component's `style` the parser marked: trusted CSS; text in a script, where
+            // nothing trusted is made (FEEDBACK79.md, Q-1250, the user's decision; branch feedback72-81).
+            UnOp::Css => Ok(match v {
+                Value::Str(s) if self.fuel == u64::MAX => Value::Css(s),
+                v => v,
+            }),
         }
     }
 
@@ -4879,11 +4973,13 @@ impl Interp {
                 let n = if *n < 0 { l.len() as i64 + n } else { *n };
                 Ok(if n >= 0 { l.get(n as usize).cloned().unwrap_or(Value::Nil) } else { Value::Nil })
             }
-            (Value::Map(m), Value::Str(k)) => Ok(m.get(&**k).cloned().unwrap_or(Value::Nil)),
+            // Trusted CSS indexes and is indexed as the text it is (FEEDBACK79.md, Q-1250; branch
+            // feedback72-81).
+            (Value::Map(m), Value::Str(k) | Value::Css(k)) => Ok(m.get(&**k).cloned().unwrap_or(Value::Nil)),
             // Keys are text: a number is the key it is written as, as for
             // `set` and `get`.
             (Value::Map(m), Value::Int(n)) => Ok(m.get(n.to_string().as_str()).cloned().unwrap_or(Value::Nil)),
-            (Value::Str(s), Value::Int(n)) => Ok(self.char_at(s, *n)),
+            (Value::Str(s) | Value::Css(s), Value::Int(n)) => Ok(self.char_at(s, *n)),
             (Value::Nil, _) => Ok(Value::Nil),
             _ => fail(line, format!("cannot index {} with {}", o.type_name(), i.type_name())),
         }
@@ -4979,7 +5075,9 @@ impl Interp {
                     made = m.iter().map(|(k, v)| Value::list(vec![Value::str(k), v.clone()])).collect();
                     &made
                 }
-                Value::Str(s) => {
+                // Trusted CSS's characters, plain text each (FEEDBACK79.md, Q-1250; branch
+                // feedback72-81).
+                Value::Str(s) | Value::Css(s) => {
                     made = s.chars().map(|c| Value::str(c.to_string())).collect();
                     &made
                 }
@@ -5126,6 +5224,25 @@ impl Interp {
     /// argument. `x.name(args)` calls a function stored in map `x` under
     /// `name`, or else the function `name` with `x` first: `xs.sort()`.
     fn eval_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        pre: Option<Value>,
+        env: &Env,
+        line: u32,
+    ) -> Result<Value, Ctrl> {
+        // css`...` looked for first, and worked out apart (`css_tagged`): where it was looked for
+        // later, after the callee, every call cost more (FEEDBACK79.md, Q-1250, speed check; branch
+        // feedback72-81).
+        if args.len() == 1 && pre.is_none() && css_named(callee) {
+            return self.css_tagged(callee, args, env, line);
+        }
+        self.eval_call_as(callee, args, pre, env, line)
+    }
+
+    /// `eval_call` itself, written into it and into `css_tagged`.
+    #[inline(always)]
+    fn eval_call_as(
         &mut self,
         callee: &Expr,
         args: &[Expr],
@@ -5371,6 +5488,7 @@ impl Interp {
         }
         match f {
             Value::Builtin(name, func) => {
+                let mut args = args;
                 // More than it takes: said, as `check` says it where it knows the function; the rest
                 // were dropped, and `xs.sort((a, b) => b - a)` sorted up (FEEDBACK55.md, Q-786;
                 // branch feedback55).
@@ -5410,41 +5528,32 @@ impl Interp {
                 if self.asking.is_some() {
                     crate::mcp::noted(self, name, line)?;
                 }
+                // Trusted CSS given to a builtin is the text it is, plain, to what the builtin reads,
+                // keeps or makes of it; `__css_value` sees it, and `push` and `set`, which hold it in
+                // a list or a map (FEEDBACK79.md, Q-1250, the user's decision; branch feedback72-81).
+                // The checks above take it by its name, or as a change.
                 if name.starts_with("native:") {
+                    plain_args(name, &mut args);
                     return crate::native::call(self, name, args, line);
                 }
                 if self.fuel != u64::MAX {
+                    plain_args(name, &mut args);
                     return self.script_builtin(name, *func, args, line);
                 }
                 // An error given to a builtin that cannot take one: what it was is said, as
                 // the builtin's own refusal names only its type (FEEDBACK27.md, Q-333; branch
-                // feedback27-35-fixes).
-                let given = args.iter().find_map(|a| if let Value::Err(e, _, at) = a { Some((e.clone(), *at)) } else { None });
-                // The usual call, given no error, takes the path it always took.
-                let Some(given) = given else {
+                // feedback27-35-fixes). Looked for with trusted CSS, made plain there (see above):
+                // the usual call has neither.
+                if !args.iter().any(|a| matches!(a, Value::Err(..) | Value::Css(_))) {
+                    // The usual call, given no error, takes the path it always took.
                     return match func(self, args, line) {
                         // All an error value is made by: `err` and the builtins that fail
                         // (FEEDBACK21.md, Q-174; branch feedback20-fixes).
                         Ok(Value::Err(e, own, Place::NONE)) => Ok(Value::Err(e, own, Place::new(self.cur_file.as_ref(), line))),
                         r => r,
                     };
-                };
-                let given = Some(given);
-                let r = match func(self, args, line) {
-                    Ok(Value::Err(e, own, Place::NONE)) => Ok(Value::Err(e, own, Place::new(self.cur_file.as_ref(), line))),
-                    r => r,
-                };
-                match (given, r) {
-                    (Some(g), Err(Ctrl::Error(mut e))) if refused_an_error(&e.msg) => {
-                        e.msg = format!("{} ({})", e.msg, earlier(&g));
-                        Err(Ctrl::Error(e))
-                    }
-                    (Some(g), Ok(Value::Err(e, own, at))) if matches!(&*e, Value::Str(m) if refused_an_error(m)) => {
-                        let m = format!("{} ({})", e.display(), earlier(&g));
-                        Ok(Value::Err(Arc::new(Value::str(m)), own, at))
-                    }
-                    (_, r) => r,
                 }
+                self.call_given_odd(name, *func, args, line)
             }
             Value::Func(c) => {
                 // The pipe's quotient is no function's to take (see `eval_pipe`).
@@ -5458,6 +5567,51 @@ impl Interp {
                 self.exact_div = None;
                 fail(line, format!("cannot call {}: it is not a function", other.type_name()))
             }
+        }
+    }
+
+    /// `css(x)` by that name: css`...` as the parser writes it, the builtin's (`parser::css_tag_arg`),
+    /// makes trusted CSS; any other call is made as any call is. Not in a script, whose css`...` is
+    /// text, so that nothing trusted leaves it (FEEDBACK79.md, Q-1250, the user's decision; branch
+    /// feedback72-81).
+    #[inline(never)]
+    #[cold]
+    fn css_tagged(&mut self, callee: &Expr, args: &[Expr], env: &Env, line: u32) -> Result<Value, Ctrl> {
+        if self.fuel == u64::MAX && crate::parser::css_tag_arg(&args[0]) {
+            let f = self.eval(callee, env)?;
+            if matches!(f, Value::Builtin("css", _)) {
+                let v = self.eval(&args[0], env)?;
+                return match self.call(&f, vec![v], line)? {
+                    Value::Str(s) => Ok(Value::Css(s)),
+                    v => Ok(v),
+                };
+            }
+        }
+        self.eval_call_as(callee, args, None, env, line)
+    }
+
+    /// A builtin's call given an error or trusted CSS (`call`): the CSS made plain text, and an
+    /// error it cannot take said with what it was (FEEDBACK27.md, Q-333; FEEDBACK79.md, Q-1250;
+    /// branch feedback72-81).
+    #[cold]
+    #[inline(never)]
+    fn call_given_odd(&mut self, name: &str, func: BuiltinFn, mut args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+        plain_css_args(name, &mut args);
+        let given = args.iter().find_map(|a| if let Value::Err(e, _, at) = a { Some((e.clone(), *at)) } else { None });
+        let r = match func(self, args, line) {
+            Ok(Value::Err(e, own, Place::NONE)) => Ok(Value::Err(e, own, Place::new(self.cur_file.as_ref(), line))),
+            r => r,
+        };
+        match (given, r) {
+            (Some(g), Err(Ctrl::Error(mut e))) if refused_an_error(&e.msg) => {
+                e.msg = format!("{} ({})", e.msg, earlier(&g));
+                Err(Ctrl::Error(e))
+            }
+            (Some(g), Ok(Value::Err(e, own, at))) if matches!(&*e, Value::Str(m) if refused_an_error(m)) => {
+                let m = format!("{} ({})", e.display(), earlier(&g));
+                Ok(Value::Err(Arc::new(Value::str(m)), own, at))
+            }
+            (_, r) => r,
         }
     }
 
@@ -5591,8 +5745,51 @@ impl Interp {
     }
 
     fn call_closure_with(&mut self, c: &Closure, args: impl IntoIterator<Item = Option<Value>>, nargs: usize, line: u32) -> Result<Value, Ctrl> {
-        let def = c.def.clone();
         let mask = if self.fuel != u64::MAX { self.script_mask(c) } else { None };
+        // A helper the program gave a script, called from it: looked at apart (`helper_called`).
+        if let Some((_, true)) = mask {
+            return self.helper_called(c, args.into_iter().collect(), line);
+        }
+        self.call_closure_masked(c, mask, args, nargs, line)
+    }
+
+    /// A helper the program gave a script, called from the script: a function the script made never
+    /// leaves it, given to the helper whole or in a list, a map or an error, which could keep it
+    /// and call it later with no limit of steps or time: refused, an error value. Builtins the
+    /// script calls take its functions, and run them under its limits (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+    #[cold]
+    #[inline(never)]
+    fn helper_called(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32) -> Result<Value, Ctrl> {
+        if args.iter().flatten().any(|v| self.holds_script_fn(v)) {
+            return Ok(Value::own_err(Value::str("a script's function stays in the script")));
+        }
+        // Trusted CSS the script hands a helper is text to it, as to a builtin (Q-1274, found in the second review of the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+        let args: Vec<Option<Value>> = args.into_iter().map(|a| a.map(|v| Value::plain_deep(&v).unwrap_or(v))).collect();
+        let n = args.len();
+        let mask = self.script_mask(c);
+        self.call_closure_masked(c, mask, args.into_iter(), n, line)
+    }
+
+    /// Whether `v` holds, however deep, a function the running script made (its scope within the
+    /// script's: `script_mask`) (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
+    fn holds_script_fn(&self, v: &Value) -> bool {
+        let Some((root, ..)) = self.script.as_ref() else { return false };
+        let mut todo = vec![v];
+        while let Some(x) = todo.pop() {
+            match x {
+                Value::Func(f) if within(&f.env, root) => return true,
+                Value::List(l) => todo.extend(l.iter()),
+                Value::Map(m) => todo.extend(m.values()),
+                Value::Err(e, ..) => todo.push(e),
+                _ => {}
+            }
+        }
+        false
+    }
+
+    #[inline(always)]
+    fn call_closure_masked(&mut self, c: &Closure, mask: Option<(u8, bool)>, args: impl IntoIterator<Item = Option<Value>>, nargs: usize, line: u32) -> Result<Value, Ctrl> {
+        let def = c.def.clone();
         let outer = mask.map(|(m, _)| std::mem::replace(&mut self.allowed, m));
         let r = self.enter_call(&def, nargs, line, |this| this.call_closure_inner(c, &def, args, line));
         if let Some(a) = outer {
@@ -6221,7 +6418,8 @@ impl Interp {
                     each(self, &Value::list(vec![Value::str(k), v.clone()]))?;
                 }
             }
-            Value::Str(s) => {
+            // As `for` has it (FEEDBACK79.md, Q-1250; branch feedback72-81).
+            Value::Str(s) | Value::Css(s) => {
                 for c in s.chars() {
                     each(self, &Value::str(c.to_string()))?;
                 }
@@ -6306,7 +6504,7 @@ impl Interp {
                 }
                 Some(x) if !matches!(x, Value::Nil) && !self.pattern_fits(&f.pat, &x, sub == Mode::Lenient) => {
                     let kind = match &x {
-                        Value::Str(_) => "text".to_string(),
+                        Value::Str(_) | Value::Css(_) => "text".to_string(),
                         other => format!("{} {}", article(other.type_name()), other.type_name()),
                     };
                     return format!("`{}` is {}, not {}", name, kind, wanted);
@@ -6389,7 +6587,8 @@ impl Interp {
             || td.ty.names.iter().any(|n| {
                 if n.starts_with('"') {
                     let want: String = serde_json::from_str(n).unwrap_or_default();
-                    matches!(x, Value::Str(s) if **s == *want)
+                    // Trusted CSS is the text it is (FEEDBACK79.md, Q-1250; branch feedback72-81).
+                    matches!(x, Value::Str(s) | Value::Css(s) if **s == *want)
                 } else if self.types.contains_key(n) {
                     self.named_fits(n, x, lenient, depth + 1)
                 } else {
@@ -7167,7 +7366,7 @@ impl Interp {
                     || entries.iter().any(|(n, v)| {
                         attr_key(n) == "name"
                             && match v {
-                                Value::Str(s) => !s.is_empty(),
+                                Value::Str(s) | Value::Css(s) => !s.is_empty(),
                                 Value::Html(h) => !h.is_empty(),
                                 Value::Nil | Value::Bool(_) => false,
                                 _ => true,
@@ -7208,7 +7407,7 @@ impl Interp {
             let v = match (&v, name) {
                 _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
                 _ if anim_value_attr(&el.tag, name) && shows_script_url_in_list(&v) => Value::str(BLOCKED_URL),
-                (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
+                (Value::Str(s) | Value::Css(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
                     Value::str(self.with_base(s))
                 }
                 _ => v,
@@ -7236,7 +7435,7 @@ impl Interp {
             if name.eq_ignore_ascii_case("class") {
                 match &v {
                     Value::Nil | Value::Bool(false) | Value::Func(_) | Value::Builtin(..) => {}
-                    Value::Str(s) => classes.push(s.to_string()),
+                    Value::Str(s) | Value::Css(s) => classes.push(s.to_string()),
                     // A map's keys that are true and a list's words, as clsx gives them
                     // (FEEDBACK48.md, Q-566; branch main).
                     Value::List(_) | Value::Map(_) | Value::Bool(true) => {
@@ -7432,7 +7631,9 @@ impl Interp {
                         x => self.eval(x, env)?,
                     };
                     match v {
-                        Value::Str(t) => out.push_str(&t),
+                        // Trusted CSS a style's value gave back too (FEEDBACK79.md, Q-1250; branch
+                        // feedback72-81).
+                        Value::Str(t) | Value::Css(t) => out.push_str(&t),
                         Value::Int(n) => push_int(out, n),
                         v if self.printing => out.push_str(&crate::value::told(|| v.display())),
                         v => v.display_into(out),
@@ -7472,7 +7673,7 @@ impl Interp {
         let v = match (&v, name) {
             _ if url_attr(name) && shows_script_url(&v) => Value::str(BLOCKED_URL),
             _ if anim_value_attr(tag, name) && shows_script_url_in_list(&v) => Value::str(BLOCKED_URL),
-            (Value::Str(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
+            (Value::Str(s) | Value::Css(s), "href" | "src" | "action" | "formaction" | "poster") if !self.base.is_empty() => {
                 Value::str(self.with_base(s))
             }
             _ => v,
@@ -8057,6 +8258,9 @@ fn changed_fields(old: &Value, new: &Value) -> Vec<String> {
             (Value::List(x), Value::List(y)) => Arc::ptr_eq(x, y) || (x.len() <= 32 && crate::value::equal(a, b)),
             (Value::Str(x), Value::Str(y)) => Arc::ptr_eq(x, y) || x == y,
             (Value::Func(x), Value::Func(y)) => Arc::ptr_eq(x, y),
+            // Trusted CSS and text are written apart in a style, however equal (FEEDBACK79.md,
+            // Q-1250; branch feedback72-81).
+            (Value::Css(_), Value::Str(_)) | (Value::Str(_), Value::Css(_)) => false,
             _ => crate::value::equal(a, b),
         }
     }

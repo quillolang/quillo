@@ -40,6 +40,10 @@ pub enum BinOp {
 pub enum UnOp {
     Neg,
     Not,
+    /// Trusted CSS of the text its value is: what the parser puts around a component's or view's
+    /// `style` written at its tag as a template or a text, whose values it escaped
+    /// (`parser::style_values`). No program can write it (FEEDBACK79.md, Q-1250, the user's decision; branch feedback72-81).
+    Css,
 }
 
 #[derive(Debug, Clone)]

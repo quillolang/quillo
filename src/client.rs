@@ -2551,7 +2551,8 @@ fn value_js(v: &Value) -> String {
             // is put first (FEEDBACK55.md, Q-875; branch feedback55).
             Value::Map(m) => m.iter().all(|(k, x)| &**k != "__proto__" && !array_index(k) && exact(x)),
             // JSON makes an error value a map (FEEDBACK55.md, Q-875's review; branch feedback55).
-            Value::Err(..) => false,
+            // And trusted CSS a text (FEEDBACK79.md, Q-1250; branch feedback72-81).
+            Value::Err(..) | Value::Css(_) => false,
             _ => true,
         }
     }
@@ -2579,6 +2580,10 @@ fn value_js(v: &Value) -> String {
         // (FEEDBACK55.md, Q-875's review; branch feedback55). Markup and functions never come
         // here (`not_sendable`: they are made in the browser from their definition).
         Value::Err(e, own, _) => format!("new W.Err({}, {})", value_js(e), own),
+        // Trusted CSS as the runtime's, as the server holds it: a top-level `let` of css`...`
+        // went as text, and a component made in the browser escaped it (FEEDBACK79.md, Q-1250;
+        // branch feedback72-81).
+        Value::Css(t) => format!("W.csst({})", js_str(t)),
         other => other.to_json().to_string(),
     }
 }
@@ -4174,6 +4179,9 @@ impl<'a> Compiler<'a> {
                 match op {
                     UnOp::Not => format!("!W.truthy({})", v),
                     UnOp::Neg => format!("W.neg({})", v),
+                    // A component's `style` template the parser marked: trusted CSS, as on the
+                    // server (FEEDBACK79.md, Q-1250, the user's decision; branch feedback72-81).
+                    UnOp::Css => format!("W.csst({})", v),
                 }
             }
             Expr::Binary(op @ (BinOp::Eq | BinOp::Ne), a, b, line) if self.state_of(a).is_some() || self.state_of(b).is_some() => {
@@ -4762,6 +4770,15 @@ impl<'a> Compiler<'a> {
                 return self.err(format!("`waiting` takes a component's live state by its name (`state {} = live(...)`)", var));
             }
         }
+        // The parser's `__css_value` is the builtin's whatever the program names so, as the server
+        // has it by its name (`Interp::eval`): a program's own `fn __css_value(x) = x` let a value
+        // through unescaped here, now into trusted CSS (FEEDBACK79.md, Q-1250; branch
+        // feedback72-81).
+        if let (Expr::Ident(n, _), [a], true) = (callee, args, argv.is_empty()) {
+            if n == "__css_value" {
+                return Ok(format!("B.__css_value({})", self.expr(a)?));
+            }
+        }
         let (f, is_async, known) = self.callee_value(callee)?;
         // What it reads is followed whichever way the call is made below (found in review: the
         // `divCall` way left it out, and a component's `show(7 / 2)` kept its first unit).
@@ -4817,6 +4834,12 @@ impl<'a> Compiler<'a> {
         } else {
             format!("W.call({}, [{}])", f, argv.join(", "))
         };
+        // css`...` as the parser writes it, the builtin's: trusted CSS, as on the server
+        // (`parser::css_tag_arg`; FEEDBACK79.md, Q-1250, the user's decision; branch
+        // feedback72-81).
+        if f == "B.css" && argv.len() == 1 && matches!(args, [a] if crate::parser::css_tag_arg(a)) {
+            return Ok(format!("W.csst({})", call));
+        }
         // A Promise from the page's function is waited for where code can
         // wait (an event handler, @mount, a state's initializer), as a
         // `server fn` is: its rejection an error value (FEEDBACK6.md, Q-057;

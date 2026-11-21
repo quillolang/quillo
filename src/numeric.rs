@@ -147,7 +147,7 @@ fn int_or(args: &[Value], i: usize, f: &str, line: u32, default: i64) -> Result<
 fn text_or<'a>(args: &'a [Value], i: usize, f: &str, line: u32, default: &'a str) -> Result<&'a str, Ctrl> {
     match given(args, i) {
         None => Ok(default),
-        Some(Value::Str(s)) => Ok(s),
+        Some(Value::Str(s) | Value::Css(s)) => Ok(s),
         other => fail(line, format!("`{}` expects a str as argument {}, got {}", f, i + 1, tn(other))),
     }
 }
@@ -1462,7 +1462,7 @@ fn tally(l: &[Value]) -> Vec<(usize, usize)> {
         let at = match v {
             // 1 and 1.0 are the same value, and so are 0.0 and -0.0.
             Value::Int(_) | Value::Float(_) => nums.entry((v.as_f64().unwrap() + 0.0).to_bits()),
-            Value::Str(s) => {
+            Value::Str(s) | Value::Css(s) => {
                 let n = out.len();
                 let j = *others.entry(format!("s{}", s)).or_insert(n);
                 if j == n {
@@ -2436,7 +2436,7 @@ fn v_transpose(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn v_column(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let rows = list(&args, 0, "vec.column", line)?;
     let out = match args.get(1) {
-        Some(Value::Str(k)) => {
+        Some(Value::Str(k) | Value::Css(k)) => {
             let key = Key::new(k);
             rows.iter()
                 .map(|r| match r {

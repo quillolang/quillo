@@ -266,7 +266,7 @@ pub mod fuzzing {
 
 fn got(v: Option<&Value>) -> String {
     match v {
-        Some(v @ Value::Str(_)) => v.repr(),
+        Some(v @ (Value::Str(_) | Value::Css(_))) => v.repr(),
         Some(v) => v.type_name().into(),
         None => "nothing".into(),
     }
@@ -278,7 +278,7 @@ fn given(args: &[Value], i: usize) -> Option<&Value> {
 
 fn date_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<i64, Ctrl> {
     match args.get(i) {
-        Some(Value::Str(s)) => match parse_date(s) {
+        Some(Value::Str(s) | Value::Css(s)) => match parse_date(s) {
             Some(z) => Ok(z),
             None if parse_stamp(s).is_some() => {
                 fail(line, format!("`{}` expects a date (YYYY-MM-DD) as argument {}, got the date-time {} (`date.date_in` gives its date)", f, i + 1, got(args.get(i))))
@@ -291,7 +291,7 @@ fn date_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<i64, Ctrl> {
 
 fn stamp_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Stamp, Ctrl> {
     match args.get(i) {
-        Some(Value::Str(s)) => match parse_stamp(s) {
+        Some(Value::Str(s) | Value::Css(s)) => match parse_stamp(s) {
             Some(t) => Ok(t),
             None => fail(line, format!("`{}` expects a date-time (like 2026-10-27T14:30:00Z) as argument {}, got {}", f, i + 1, got(args.get(i)))),
         },
@@ -301,7 +301,7 @@ fn stamp_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Stamp, Ctrl
 
 /// A date, or a date-time (with its time and offset).
 fn either_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<(i64, Option<Stamp>), Ctrl> {
-    if let Some(Value::Str(s)) = args.get(i) {
+    if let Some(Value::Str(s) | Value::Css(s)) = args.get(i) {
         if let Some(z) = parse_date(s) {
             return Ok((z, None));
         }
@@ -322,7 +322,7 @@ fn int_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<i64, Ctrl> {
 
 fn str_arg<'a>(args: &'a [Value], i: usize, f: &str, line: u32) -> Result<&'a str, Ctrl> {
     match args.get(i) {
-        Some(Value::Str(s)) => Ok(s),
+        Some(Value::Str(s) | Value::Css(s)) => Ok(s),
         other => fail(line, format!("`{}` expects a str as argument {}, got {}", f, i + 1, got(other))),
     }
 }
@@ -347,17 +347,17 @@ fn day_value(z: Option<i64>, f: &str, line: u32) -> R {
 /// `date.valid_zone(z)`: a zone is what people type (FEEDBACK25.md, Q-317; branch
 /// feedback26-fixes).
 fn valid_zone(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    Ok(Value::Bool(matches!(args.first(), Some(Value::Str(_))) && zone(&args, 0, "date.valid_zone", line).is_ok()))
+    Ok(Value::Bool(matches!(args.first(), Some(Value::Str(_) | Value::Css(_))) && zone(&args, 0, "date.valid_zone", line).is_ok()))
 }
 
 fn valid(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (date, stamp) = match args.get(1) {
         None | Some(Value::Nil) => (true, true),
-        Some(Value::Str(k)) if &**k == "date" => (true, false),
-        Some(Value::Str(k)) if &**k == "date-time" => (false, true),
+        Some(Value::Str(k) | Value::Css(k)) if &**k == "date" => (true, false),
+        Some(Value::Str(k) | Value::Css(k)) if &**k == "date-time" => (false, true),
         Some(other) => return fail(line, format!("`date.valid` takes \"date\" or \"date-time\" as argument 2, got {}", got(Some(other)))),
     };
-    Ok(Value::Bool(matches!(args.first(), Some(Value::Str(s)) if (date && parse_date(s).is_some()) || (stamp && parse_stamp(s).is_some()))))
+    Ok(Value::Bool(matches!(args.first(), Some(Value::Str(s) | Value::Css(s)) if (date && parse_date(s).is_some()) || (stamp && parse_stamp(s).is_some()))))
 }
 
 fn of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -392,7 +392,7 @@ fn weekday_fn(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// A year: an int, or the year of a date.
 fn year_arg(args: &[Value], f: &str, line: u32) -> Result<i64, Ctrl> {
     match args.first() {
-        Some(Value::Str(_)) => Ok(civil(either_arg(args, 0, f, line)?.0).0),
+        Some(Value::Str(_) | Value::Css(_)) => Ok(civil(either_arg(args, 0, f, line)?.0).0),
         _ => int_arg(args, 0, f, line),
     }
 }
@@ -405,7 +405,7 @@ fn is_leap_year(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn days_in_month(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = "date.days_in_month";
     let (y, m) = match args.first() {
-        Some(Value::Str(_)) => {
+        Some(Value::Str(_) | Value::Css(_)) => {
             let (y, m, _) = civil(either_arg(&args, 0, f, line)?.0);
             (y, m)
         }
@@ -481,7 +481,7 @@ enum Zone {
 
 fn zone(args: &[Value], i: usize, f: &str, line: u32) -> Result<Zone, Ctrl> {
     let Some(v) = given(args, i) else { return Ok(Zone::Fixed(0)) };
-    let Value::Str(name) = v else {
+    let (Value::Str(name) | Value::Css(name)) = v else {
         return fail(line, format!("`{}` expects a time zone (like \"Europe/Paris\") as argument {}, got {}", f, i + 1, got(Some(v))));
     };
     if name.eq_ignore_ascii_case("UTC") || &**name == "Z" {
@@ -664,7 +664,7 @@ fn date_in(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn at(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = "date.at";
     let one_text = match args.first() {
-        Some(Value::Str(s)) => local_date_time(s),
+        Some(Value::Str(s) | Value::Css(s)) => local_date_time(s),
         _ => None,
     };
     if let Some((day, sec)) = one_text {
@@ -674,7 +674,7 @@ fn at(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let day = date_arg(&args, 0, f, line)?;
     let sec = match given(&args, 1) {
         None => 0,
-        Some(Value::Str(s)) => {
+        Some(Value::Str(s) | Value::Css(s)) => {
             let b = s.as_bytes();
             let t = match b.len() {
                 5 => hms(&[b, b":00"].concat()),
@@ -711,8 +711,8 @@ fn at_local(z: &Zone, local: i64, opts: Option<&Value>, f: &str, line: u32, n: u
         Some(Value::Map(m)) => {
             for (k, v) in m.iter() {
                 match (&**k, v) {
-                    ("repeated", Value::Str(w)) if &**w == "earlier" || &**w == "later" => later = &**w == "later",
-                    ("skipped", Value::Str(w)) if matches!(&**w, "later" | "earlier" | "error") => {
+                    ("repeated", Value::Str(w) | Value::Css(w)) if &**w == "earlier" || &**w == "later" => later = &**w == "later",
+                    ("skipped", Value::Str(w) | Value::Css(w)) if matches!(&**w, "later" | "earlier" | "error") => {
                         skipped = match &**w {
                             "later" => Skipped::Later,
                             "earlier" => Skipped::Earlier,
@@ -994,20 +994,20 @@ fn format(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = "date.format";
     let (z, t) = either_arg(&args, 0, f, line)?;
     let (pattern, n): (String, &Names) = match given(&args, 1) {
-        Some(Value::Str(p)) => (p.to_string(), &LOCALES[0]),
+        Some(Value::Str(p) | Value::Css(p)) => (p.to_string(), &LOCALES[0]),
         Some(Value::Map(o)) => {
             let n = match o.get("locale") {
                 None | Some(Value::Nil) => &LOCALES[0],
-                Some(Value::Str(l)) => names(l),
+                Some(Value::Str(l) | Value::Css(l)) => names(l),
                 Some(other) => return fail(line, format!("`{}`: locale is a str, like \"de-DE\", got {}", f, got(Some(other)))),
             };
             if let Some(k) = o.keys().find(|k| !matches!(k.as_str(), "locale" | "style" | "pattern")) {
                 return fail(line, format!("`{}`: the options are locale, style and pattern, not `{}`", f, k.as_str()));
             }
             match (o.get("pattern"), o.get("style")) {
-                (Some(Value::Str(p)), _) => (p.to_string(), n),
+                (Some(Value::Str(p) | Value::Css(p)), _) => (p.to_string(), n),
                 (None | Some(Value::Nil), None | Some(Value::Nil)) => (n.styles[1].to_string(), n),
-                (None | Some(Value::Nil), Some(Value::Str(s))) => match ["short", "medium", "long", "full"].iter().position(|x| **x == **s) {
+                (None | Some(Value::Nil), Some(Value::Str(s) | Value::Css(s))) => match ["short", "medium", "long", "full"].iter().position(|x| **x == **s) {
                     Some(k) => (n.styles[k].to_string(), n),
                     None => return fail(line, format!("`{}`: style is short, medium, long or full, got {}", f, got(o.get("style")))),
                 },
@@ -1234,7 +1234,7 @@ fn parse(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         // write (FEEDBACK30.md, Q-376; branch feedback27-35-fixes).
         None if local_date_time(s.trim()).is_some() => Err(format!("{} has no offset, so it is a wall-clock time and names no instant: read it in its zone with date.at(v, zone)", got(args.first()))),
         None => read_iso(s.trim()).or_else(|| read_http(s.trim())).ok_or_else(|| format!("not a date or a date-time: {}", got(args.first()))),
-        Some(Value::Str(p)) => {
+        Some(Value::Str(p) | Value::Css(p)) => {
             let (s, p): (Vec<char>, Vec<char>) = (s.trim().chars().collect(), p.chars().collect());
             read(&s, &p).ok_or_else(|| format!("{} is not a date in the form {}", got(args.first()), got(args.get(1))))
         }

@@ -91,7 +91,7 @@ pub fn options(v: &Value, f: &str, line: u32) -> Result<Options, Ctrl> {
     }
     match m.get("isolation") {
         None | Some(Value::Nil) => {}
-        Some(Value::Str(s)) => {
+        Some(Value::Str(s) | Value::Css(s)) => {
             o.isolation = Some(match &**s {
                 "serializable" => Isolation::Serializable,
                 "repeatable_read" => Isolation::RepeatableRead,

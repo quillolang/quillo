@@ -163,7 +163,7 @@ fn owner_in(id: Option<&str>, data: &Value) -> Option<String> {
     let Value::Map(m) = data else { return None };
     match m.get("user") {
         _ if m.is_empty() => None,
-        Some(u @ (Value::Str(_) | Value::Int(_))) => Some(format!("user {}", u.display())),
+        Some(u @ (Value::Str(_) | Value::Css(_) | Value::Int(_))) => Some(format!("user {}", u.display())),
         _ => Some(format!("session {}", crate::interp::island_json(data))),
     }
 }
@@ -339,17 +339,17 @@ fn cookie_line(it: &mut Interp, name: &str, value: &str, age: Option<u64>, opts:
         if p == "__Host-" && opt("domain").is_some() {
             return fail(line, format!("`{}`: a `__Host-` cookie has no domain, as browsers take it only from the host that sets it; leave `domain` out", f));
         }
-        if p == "__Host-" && opt("path").is_some_and(|v| !matches!(v, Value::Str(p) if &*p == "/")) {
+        if p == "__Host-" && opt("path").is_some_and(|v| !matches!(v, Value::Str(p) | Value::Css(p) if &*p == "/")) {
             return fail(line, format!("`{}`: a `__Host-` cookie's path is /, as browsers take it no other way, got {}", f, opt("path").map_or(String::new(), |v| v.repr())));
         }
     }
     // What is wrong with a path, said: "starts with /" was said of `/a b` (FEEDBACK55.md, Q-726;
     // branch feedback55).
     let path = match opt("path") {
-        Some(Value::Str(p)) if !p.starts_with('/') => return fail(line, format!("`{}`'s path starts with /, got {}", f, Value::Str(p).repr())),
+        Some(Value::Str(p) | Value::Css(p)) if !p.starts_with('/') => return fail(line, format!("`{}`'s path starts with /, got {}", f, Value::Str(p).repr())),
         // Visible characters only: a line break would start another header.
-        Some(Value::Str(p)) if p.bytes().all(|b| (b'!'..=b'~').contains(&b) && b != b';') => p.to_string(),
-        Some(v @ Value::Str(_)) => {
+        Some(Value::Str(p) | Value::Css(p)) if p.bytes().all(|b| (b'!'..=b'~').contains(&b) && b != b';') => p.to_string(),
+        Some(v @ (Value::Str(_) | Value::Css(_))) => {
             return fail(line, format!("`{}`'s path cannot hold a space, a `;`, a control character or a letter past ASCII (percent-encode them), got {}", f, v.repr()))
         }
         Some(v) => return fail(line, format!("`{}`'s path is a str that starts with /, got {}", f, v.type_name())),
@@ -368,7 +368,7 @@ fn cookie_line(it: &mut Interp, name: &str, value: &str, age: Option<u64>, opts:
     let mut s = format!("{}; Path={}", pair, path);
     if let Some(d) = opt("domain") {
         match d {
-            Value::Str(d) if !d.is_empty() && d.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') => {
+            Value::Str(d) | Value::Css(d) if !d.is_empty() && d.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') => {
                 s.push_str("; Domain=");
                 s.push_str(&d);
             }
@@ -390,7 +390,7 @@ fn cookie_line(it: &mut Interp, name: &str, value: &str, age: Option<u64>, opts:
     }
     let same_site = match opt("same_site") {
         None => "Lax".to_string(),
-        Some(Value::Str(v)) => match v.to_ascii_lowercase().as_str() {
+        Some(Value::Str(v) | Value::Css(v)) => match v.to_ascii_lowercase().as_str() {
             "lax" => "Lax".into(),
             "strict" => "Strict".into(),
             "none" => "None".into(),
@@ -441,7 +441,7 @@ fn https_by(req: &Map) -> bool {
 /// A value of the request map as the text it is.
 fn text_of(v: Option<&Value>) -> Option<&str> {
     match v {
-        Some(Value::Str(s)) => Some(s),
+        Some(Value::Str(s) | Value::Css(s)) => Some(s),
         _ => None,
     }
 }
@@ -542,7 +542,7 @@ fn opts(args: &[Value], i: usize, f: &str, line: u32) -> Result<Option<Map>, Ctr
 
 fn name_arg(args: &[Value], f: &str, line: u32) -> Result<String, Ctrl> {
     match args.first() {
-        Some(Value::Str(n)) if token_ok(n) => Ok(n.to_string()),
+        Some(Value::Str(n) | Value::Css(n)) if token_ok(n) => Ok(n.to_string()),
         Some(v) => fail(line, format!("`{}` needs a cookie name of letters, digits and -_.!#$%&'*+^`|~, got {}", f, v.repr())),
         None => fail(line, format!("`{}` needs a cookie name", f)),
     }
@@ -553,7 +553,7 @@ fn name_arg(args: &[Value], f: &str, line: u32) -> Result<String, Ctrl> {
 fn set_cookie(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = name_arg(&args, "set_cookie", line)?;
     let value = match args.get(1) {
-        Some(Value::Str(s)) => s.to_string(),
+        Some(Value::Str(s) | Value::Css(s)) => s.to_string(),
         Some(Value::Nil) | None => String::new(),
         Some(v) => v.display(),
     };
@@ -675,7 +675,7 @@ fn session(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
 /// `request` by each caller.
 fn cookie(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = match args.first() {
-        Some(Value::Str(s)) => s.clone(),
+        Some(Value::Str(s) | Value::Css(s)) => s.clone(),
         other => return fail(line, format!("`cookie` expects a cookie's name, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
     it.visitor_read = true;
@@ -692,7 +692,9 @@ fn cookie(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `set_session(map, { max_age })`: replaces the session.
 fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let data = match args.first() {
-        Some(v @ Value::Map(_)) => v.clone(),
+        // Trusted CSS in it kept as the text it is: read back from the cookie it is text, and so
+        // it is for the rest of this request (FEEDBACK79.md, Q-1250; branch feedback72-81).
+        Some(v @ Value::Map(_)) => Value::plain_deep(v).unwrap_or_else(|| v.clone()),
         Some(Value::Nil) => return end_session(it, Vec::new(), line),
         other => return fail(line, format!("`set_session` expects a map, got {}", other.map_or("nothing", |v| v.type_name()))),
     };

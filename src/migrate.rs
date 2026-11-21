@@ -321,7 +321,7 @@ fn my_run(c: &mut crate::my::Conn, todo: &[(String, String)]) -> Result<Vec<Stri
             let hash = digest(text);
             let had = c.query("select sha256 from _quillo_migrations where name = ?", &[Value::str(name)], Some(1))?;
             if let Some(Value::Map(row)) = had.first() {
-                if !matches!(row.get("sha256"), Some(Value::Str(s)) if **s == *hash) {
+                if !matches!(row.get("sha256"), Some(Value::Str(s) | Value::Css(s)) if **s == *hash) {
                     eprintln!("quillo: warning: migration {} changed after it was applied; it is not run again", name);
                 }
                 continue;
@@ -363,7 +363,7 @@ fn pg_run(c: &mut pg::Conn, todo: &[(String, String)]) -> Result<Vec<String>, St
             let hash = digest(text);
             let had = c.query("select sha256 from _quillo_migrations where name = $1", &[Value::str(name)], Some(1))?;
             if let Some(Value::Map(row)) = had.first() {
-                if !matches!(row.get("sha256"), Some(Value::Str(s)) if **s == *hash) {
+                if !matches!(row.get("sha256"), Some(Value::Str(s) | Value::Css(s)) if **s == *hash) {
                     eprintln!("quillo: warning: migration {} changed after it was applied; it is not run again", name);
                 }
                 continue;

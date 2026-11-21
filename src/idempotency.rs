@@ -139,7 +139,7 @@ fn options(v: Option<&Value>, line: u32) -> Result<Options, Ctrl> {
     o.user = m.get("user").cloned();
     // A namespace has one name: a record the work changes would be a new one, and the work would
     // run again (FEEDBACK55.md, Q-887; branch feedback55).
-    if let Some(u) = o.user.as_ref().filter(|u| !matches!(u, Value::Nil | Value::Str(_) | Value::Int(_))) {
+    if let Some(u) = o.user.as_ref().filter(|u| !matches!(u, Value::Nil | Value::Str(_) | Value::Css(_) | Value::Int(_))) {
         return fail(line, user_not_a_name(u.type_name()));
     }
     o.required = matches!(m.get("required"), Some(Value::Bool(true)));
@@ -182,7 +182,7 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return run_plain(it);
     };
     let text = |k: &str| match req.get(k) {
-        Some(Value::Str(s)) => s.to_string(),
+        Some(Value::Str(s) | Value::Css(s)) => s.to_string(),
         _ => String::new(),
     };
     let header = |name: &str| match req.get("headers") {
@@ -461,8 +461,8 @@ fn render(rpc: Option<&str>, r: R) -> Result<HttpResponse, Ctrl> {
     Ok(match r {
         Ok(v) | Err(Ctrl::Return(v)) => match crate::server::for_visitor(v) {
             v @ Value::Response(_) => crate::server::finish(Ok(v)),
-            Value::Err(e, _, _) => json(200, serde_json::json!({ "err": crate::interp::island_json(&e) })),
-            v => json(200, serde_json::json!({ "ok": crate::interp::island_json(&v) })),
+            Value::Err(e, _, _) => marked(json(200, serde_json::json!({ "err": crate::interp::island_json(&e) }))),
+            v => marked(json(200, serde_json::json!({ "ok": crate::interp::island_json(&v) }))),
         },
         Err(Ctrl::Reply(x)) => crate::server::finish(Err(Ctrl::Reply(x))),
         Err(Ctrl::Error(e)) => {
@@ -740,7 +740,7 @@ fn row_int(row: &Map, k: &str) -> i64 {
     match row.get(k) {
         Some(Value::Int(n)) => *n,
         Some(Value::Bool(b)) => *b as i64,
-        Some(Value::Str(s)) => s.parse().unwrap_or(0),
+        Some(Value::Str(s) | Value::Css(s)) => s.parse().unwrap_or(0),
         _ => 0,
     }
 }
@@ -833,4 +833,11 @@ pub fn used_by_defs(defs: &std::collections::HashMap<String, std::sync::Arc<crat
 pub fn holds_form_key(body: &[u8]) -> bool {
     let name = FORM_FIELD.as_bytes();
     body.windows(name.len()).any(|w| w == name)
+}
+
+/// A server fn's own answer, marked as the server marks it (`server::MARKED`; FEEDBACK79.md,
+/// Q-1250, found in the review of the trusted CSS; branch feedback72-81).
+fn marked(mut r: HttpResponse) -> HttpResponse {
+    r.headers.push((crate::server::MARKED.into(), "1".into()));
+    r
 }

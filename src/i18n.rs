@@ -47,11 +47,11 @@ fn flatten(prefix: &str, m: &Map, out: &mut HashMap<String, Value>) -> Result<()
     for (k, v) in m.iter() {
         let key = if prefix.is_empty() { k.to_string() } else { format!("{}.{}", prefix, k) };
         match v {
-            Value::Str(_) => {
+            Value::Str(_) | Value::Css(_) => {
                 out.insert(key, v.clone());
             }
             Value::Map(inner) if inner.contains_key("other") && inner.keys().all(|k| PLURALS.contains(&&**k)) => {
-                if !inner.values().all(|v| matches!(v, Value::Str(_))) {
+                if !inner.values().all(|v| matches!(v, Value::Str(_) | Value::Css(_))) {
                     return Err(format!("the plural forms of `{}` must be text", key));
                 }
                 out.insert(key, v.clone());
@@ -99,7 +99,7 @@ fn load_dir(dir: &std::path::Path) -> Result<Vec<(String, Map)>, String> {
 /// {...} })`, at the top of the program.
 fn translations(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let sources = match args.first() {
-        Some(Value::Str(p)) => {
+        Some(Value::Str(p) | Value::Css(p)) => {
             let rel = std::path::Path::new(&**p);
             if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
                 return fail(line, format!("`translations` needs a folder inside the program's, got {:?}", &**p));
@@ -139,8 +139,8 @@ fn translations(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         keys.sort();
         for k in keys {
             let texts: Vec<&Arc<str>> = match &flat[k] {
-                Value::Str(t) => vec![t],
-                Value::Map(forms) => forms.values().filter_map(|v| if let Value::Str(t) = v { Some(t) } else { None }).collect(),
+                Value::Str(t) | Value::Css(t) => vec![t],
+                Value::Map(forms) => forms.values().filter_map(|v| if let Value::Str(t) | Value::Css(t) = v { Some(t) } else { None }).collect(),
                 _ => Vec::new(),
             };
             if let Some(what) = texts.into_iter().find_map(|t| not_plain(t)) {
@@ -161,7 +161,7 @@ fn translations(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     let default: Arc<str> = match args.get(1) {
         Some(Value::Map(o)) => match o.get("default") {
-            Some(Value::Str(d)) => match locales.keys().find(|k| k.eq_ignore_ascii_case(d)) {
+            Some(Value::Str(d) | Value::Css(d)) => match locales.keys().find(|k| k.eq_ignore_ascii_case(d)) {
                 Some(k) => k.clone(),
                 None => return fail(line, format!("`translations`: the default {:?} is not among the locales", &**d)),
             },
@@ -347,7 +347,9 @@ impl Interp {
         if in_request {
             if let Some(rule) = self.site.locale_rule.clone() {
                 if let Some(Value::Map(req)) = self.request_value() {
-                    if let Ok(Value::Str(s)) = self.call(&rule, vec![Value::Map(req)], 0) {
+                    // Trusted CSS too, which is the `str` it is (FEEDBACK79.md, Q-1250; branch
+                    // feedback72-81).
+                    if let Ok(Value::Str(s) | Value::Css(s)) = self.call(&rule, vec![Value::Map(req)], 0) {
                         found = i18n.best(&s);
                     }
                 }
@@ -379,7 +381,7 @@ fn locale(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
 fn with_locale(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(i18n) = it.site.i18n.clone() else { return fail(line, "`with_locale` needs `translations` first") };
     let name = match args.first() {
-        Some(Value::Str(s)) => s.clone(),
+        Some(Value::Str(s) | Value::Css(s)) => s.clone(),
         other => return fail(line, format!("`with_locale` expects a locale name, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
     let Some(f) = args.get(1).cloned() else { return fail(line, "`with_locale` needs a function to run") };
@@ -405,7 +407,7 @@ pub fn t_html(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn translate(it: &mut Interp, args: Vec<Value>, line: u32, html: bool) -> R {
     let key = match args.first() {
-        Some(Value::Str(s)) => s.clone(),
+        Some(Value::Str(s) | Value::Css(s)) => s.clone(),
         other => return fail(line, format!("`t` expects a key, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
     let vars = match args.get(1) {
@@ -419,7 +421,7 @@ fn translate(it: &mut Interp, args: Vec<Value>, line: u32, html: bool) -> R {
     // `table`: the text is the table's own, which `attr_spans` may keep its reading of.
     let mut table = true;
     let text: Arc<str> = match i18n.entry(&l, &key) {
-        Some(Value::Str(s)) => s.clone(),
+        Some(Value::Str(s) | Value::Css(s)) => s.clone(),
         Some(Value::Map(forms)) => {
             // A count read from a form or a query is text, and an amount is a decimal: each is
             // taken at its number, a decimal's written digits counting as CLDR counts them
@@ -434,7 +436,7 @@ fn translate(it: &mut Interp, args: Vec<Value>, line: u32, html: bool) -> R {
                 None => "other",
             };
             match forms.get(cat).or_else(|| forms.get("other")) {
-                Some(Value::Str(s)) => s.clone(),
+                Some(Value::Str(s) | Value::Css(s)) => s.clone(),
                 Some(v) => {
                     table = false;
                     Arc::from(v.display().as_ref())
@@ -1047,7 +1049,7 @@ fn count_of(v: &Value) -> Option<Operands> {
         Value::Int(i) => Some(Operands::of_int(i.unsigned_abs())),
         Value::Float(f) if f.is_finite() => Operands::of_text(&v.display()),
         Value::Dec(d) => Operands::of_text(&d.to_string()),
-        Value::Str(s) => Operands::of_text(s.trim()),
+        Value::Str(s) | Value::Css(s) => Operands::of_text(s.trim()),
         _ => None,
     }
 }

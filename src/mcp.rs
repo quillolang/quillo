@@ -480,7 +480,7 @@ enum Unsent {
 /// `v`'s JSON, held to what the door takes (`Unsent`); its depth too where `deep`, as an error's
 /// payload and a reply's body go out as text alone.
 fn held(v: &Value, deep: bool) -> Result<Vec<u8>, Unsent> {
-    if let Value::Str(s) = v {
+    if let Value::Str(s) | Value::Css(s) = v {
         // Its JSON is longer than it is, by its quotes at least.
         if s.len() + 2 > MOST {
             return Err(Unsent::Large);
@@ -522,8 +522,8 @@ fn size_text(n: usize) -> String {
 /// its JSON; held to `MOST` bytes, as a result is.
 fn text_of(tool: &str, v: &Value) -> Result<String, J> {
     match v {
-        Value::Str(s) if s.len() <= MOST => Ok(s.to_string()),
-        Value::Str(_) => Err(unsent(tool, Unsent::Large)),
+        Value::Str(s) | Value::Css(s) if s.len() <= MOST => Ok(s.to_string()),
+        Value::Str(_) | Value::Css(_) => Err(unsent(tool, Unsent::Large)),
         other => held(other, false).map(|b| String::from_utf8(b).unwrap_or_default()).map_err(|why| unsent(tool, why)),
     }
 }
@@ -1261,7 +1261,8 @@ fn result_of(tool: &Tool, v: Value) -> J {
         Value::Err(e, _, _) => return text_of(&tool.name, e).map_or_else(|e| e, tool_error),
         Value::Response(r) => return replied(&tool.name, r),
         Value::Html(_) => return tool_error(NOT_A_PAGE),
-        Value::Str(s) if tool.output_schema.is_none() => {
+        // Trusted CSS is the text it is (FEEDBACK79.md, Q-1250; branch feedback72-81).
+        Value::Str(s) | Value::Css(s) if tool.output_schema.is_none() => {
             return match s.len() <= MOST {
                 true => json!({ "content": [{ "type": "text", "text": &**s }] }),
                 false => unsent(&tool.name, Unsent::Large),
@@ -2008,8 +2009,8 @@ fn shown(s: &str) -> String {
 /// A question's text, as `f` takes it: text, not empty.
 fn question_of(args: &[Value], f: &str, line: u32) -> Result<String, Ctrl> {
     match args.first() {
-        Some(Value::Str(s)) if !s.trim().is_empty() => Ok(s.to_string()),
-        Some(Value::Str(_)) => crate::interp::fail(line, format!("`{}`'s question is empty: say what the user is asked", f)),
+        Some(Value::Str(s) | Value::Css(s)) if !s.trim().is_empty() => Ok(s.to_string()),
+        Some(Value::Str(_) | Value::Css(_)) => crate::interp::fail(line, format!("`{}`'s question is empty: say what the user is asked", f)),
         other => crate::interp::fail(line, format!("`{}`'s question is text the user reads, got {}", f, other.map_or("nothing", |v| v.type_name()))),
     }
 }
@@ -2254,7 +2255,7 @@ fn about_here(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctr
     let mut pairs = Vec::with_capacity(choices.len());
     for (k, v) in choices.iter() {
         match v {
-            Value::Str(s) => pairs.push((k.as_str().to_string(), s.to_string())),
+            Value::Str(s) | Value::Css(s) => pairs.push((k.as_str().to_string(), s.to_string())),
             other => return crate::interp::fail(line, format!("`about`'s choice `{}` is {}: each choice is the text the user reads, under the key `about` gives", k.as_str(), other.type_name())),
         }
     }
@@ -2265,7 +2266,7 @@ fn about_here(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctr
         // decision 2026-11-09; branch feedback56).
         None => return crate::interp::fail(line, format!("`about` takes its default as its third argument, one of its choices' keys ({}) or null: about(question, choices, default)", keys())),
         Some(Value::Nil) => None,
-        Some(Value::Str(s)) if choices.contains_key(&**s) => Some(s.to_string()),
+        Some(Value::Str(s) | Value::Css(s)) if choices.contains_key(&**s) => Some(s.to_string()),
         Some(v) => return crate::interp::fail(line, format!("`about`'s default is one of its choices' keys ({}) or null, got {}", keys(), v.repr())),
     };
     let place = place_of(it, line);
@@ -3245,7 +3246,7 @@ fn mcp_tokens(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctr
 /// finds them) or `user`'s ends: whether there was one.
 fn revoke_mcp_token(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
     let id = match args.first() {
-        Some(Value::Str(s)) => s.to_string(),
+        Some(Value::Str(s) | Value::Css(s)) => s.to_string(),
         other => return crate::interp::fail(line, format!("`revoke_mcp_token` takes a token's id, as `mcp_tokens()` gives it, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
     let o = options_of(args.get(1), "revoke_mcp_token", &["user"], line)?;

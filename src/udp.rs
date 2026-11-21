@@ -213,7 +213,7 @@ fn listen(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(Value::Map(o)) => {
             for (k, v) in o.iter() {
                 match (k.as_str(), v) {
-                    ("host", Value::Str(h)) => host = h.to_string(),
+                    ("host", Value::Str(h) | Value::Css(h)) => host = h.to_string(),
                     ("queue", Value::Int(n)) if *n > 0 => cap = *n as usize,
                     ("host", _) | ("queue", _) => return fail(line, format!("`udp.listen`: `{}` is {}", k.as_str(), if k.as_str() == "host" { "an address, as a str" } else { "a number of packets above 0" })),
                     _ => return fail(line, format!("`udp.listen` has no option `{}` (it takes host and queue)", k.as_str())),
@@ -611,7 +611,7 @@ fn packet_value(p: Packet, port: u16) -> Value {
 /// bytes, anything else as JSON.
 fn payload(v: &Value, f: &str, line: u32) -> Result<Vec<u8>, Ctrl> {
     let out = match v {
-        Value::Str(s) => s.as_bytes().to_vec(),
+        Value::Str(s) | Value::Css(s) => s.as_bytes().to_vec(),
         Value::List(xs) if !xs.is_empty() && xs.iter().all(|x| matches!(x, Value::Int(0..=255))) => {
             xs.iter().map(|x| if let Value::Int(n) = x { *n as u8 } else { 0 }).collect()
         }
@@ -669,7 +669,7 @@ fn send_from(it: &mut Interp, from: Option<u16>, host: &str, port: u16, data: Ve
 /// `udp.send(host, port, data, { from })`.
 fn send(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let host = match args.first() {
-        Some(Value::Str(h)) => h.to_string(),
+        Some(Value::Str(h) | Value::Css(h)) => h.to_string(),
         other => return fail(line, format!("`udp.send` takes a host first, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
     let port = match args.get(1) {
@@ -695,7 +695,7 @@ fn reply(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let bad = || fail(line, "`udp.reply` takes a packet that `udp.listen` gave, then what to send".to_string());
     let Some(Value::Map(p)) = args.first() else { return bad() };
     let (Some(Value::Int(port)), Some(Value::Map(from))) = (p.get("port"), p.get("from")) else { return bad() };
-    let (Some(Value::Str(host)), Some(Value::Int(to))) = (from.get("host"), from.get("port")) else { return bad() };
+    let (Some(Value::Str(host) | Value::Css(host)), Some(Value::Int(to))) = (from.get("host"), from.get("port")) else { return bad() };
     let (port, host, to) = (*port as u16, host.to_string(), *to as u16);
     let data = payload(args.get(1).unwrap_or(&Value::Nil), "udp.reply", line)?;
     send_from(it, Some(port), &host, to, data, "udp.reply", line)

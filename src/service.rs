@@ -427,7 +427,7 @@ fn given_duration(v: &Value) -> Option<Duration> {
     match v {
         Value::Int(n) if *n >= 0 => Some(Duration::from_millis(*n as u64)),
         Value::Float(f) if *f >= 0.0 => Duration::try_from_secs_f64(f / 1000.0).ok(),
-        Value::Str(s) => {
+        Value::Str(s) | Value::Css(s) => {
             let s = s.trim();
             let (num, unit) = s.split_at(s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len()));
             let n: f64 = num.trim().parse().ok().filter(|n: &f64| *n >= 0.0)?;
@@ -609,7 +609,7 @@ fn functions_of(it: &mut Interp, name: &str, urls: &[String]) -> Result<(Vec<Arc
     let mut contracts = Vec::new();
     for f in list.iter() {
         let Value::Map(m) = f else { continue };
-        let (Some(Value::Str(header)), Some(Value::Str(contract))) = (m.get("header"), m.get("contract")) else { continue };
+        let (Some(Value::Str(header) | Value::Css(header)), Some(Value::Str(contract) | Value::Css(contract))) = (m.get("header"), m.get("contract")) else { continue };
         let stmts = Parser::new(header).parse_program().map_err(|e| format!("cannot read `{}`: {}", header, e))?;
         if let Some(Stmt::Fn(d)) = stmts.into_iter().next() {
             defs.push(d);
@@ -800,7 +800,7 @@ pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 /// The service, the function and the arguments to send, from `__service`'s.
 fn call_args(args: &[Value], who: &str, line: u32) -> Result<(String, String, Vec<Value>), Ctrl> {
-    let (Some(Value::Str(name)), Some(Value::Str(f)), Some(Value::List(given))) = (args.first(), args.get(1), args.get(2)) else {
+    let (Some(Value::Str(name) | Value::Css(name)), Some(Value::Str(f) | Value::Css(f)), Some(Value::List(given))) = (args.first(), args.get(1), args.get(2)) else {
         return fail(line, format!("`{}` is Quillo's own: call a service as `billing.invoice(...)`", who));
     };
     let required = match args.get(3) {
@@ -1697,13 +1697,15 @@ fn remote_tries(
     }
     let bearer = match &a.bearer {
         Some(f @ (Value::Func(_) | Value::Builtin(..))) => match it.call(f, Vec::new(), 0) {
-            Ok(Value::Str(t)) if !t.is_empty() => Some(t.to_string()),
+            // Trusted CSS too, which is the `str` it is (FEEDBACK79.md, Q-1250; branch
+            // feedback72-81).
+            Ok(Value::Str(t) | Value::Css(t)) if !t.is_empty() => Some(t.to_string()),
             Ok(Value::Err(e, ..)) => return Outcome::Missed(format!("service {}: its `bearer` gave no token: {}", name, e.display())),
             Ok(other) => return Outcome::Missed(format!("service {}: its `bearer` gives a token as text, not {}", name, short(&other))),
             Err(Ctrl::Error(e)) => return Outcome::Missed(format!("service {}: its `bearer` failed: {}", name, e.msg)),
             Err(_) => return Outcome::Missed(format!("service {}: its `bearer` gave no token", name)),
         },
-        Some(Value::Str(t)) => Some(t.to_string()),
+        Some(Value::Str(t) | Value::Css(t)) => Some(t.to_string()),
         _ => None,
     };
     let agent = match crate::svcauth::agent_for(a.mtls.as_ref()) {
@@ -2262,7 +2264,7 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: V
                 return refused(403, &format!("`{}` takes calls from {} only; this caller is `{}`: write that in `for`", f, allowed.join(", "), uri));
             }
             // The shared secret named no one (FEEDBACK71.md, Q-970; branch security).
-            let by_secret = matches!(&caller, Value::Map(m) if matches!(m.get("by"), Some(Value::Str(b)) if &**b == "quillo"));
+            let by_secret = matches!(&caller, Value::Map(m) if matches!(m.get("by"), Some(Value::Str(b) | Value::Css(b)) if &**b == "quillo"));
             if who.is_empty() && by_secret && it.accept.as_ref().is_some_and(|a| a.names_callers()) {
                 return refused(403, &format!("a call signed with the shared secret names no caller here, as `accept_calls` takes keys, certificates or tokens: `{}` is for {}", f, allowed.join(", ")));
             }
@@ -3194,7 +3196,7 @@ fn make_later(it: &mut Interp, c: &Later) -> Tried {
 /// `later.status(id)`: what became of a call made later (FEEDBACK23.md, Q-188;
 /// branch feedback23-fixes), or null if nothing is known of it.
 fn later_status(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let Some(Value::Str(id)) = args.first() else {
+    let Some(Value::Str(id) | Value::Css(id)) = args.first() else {
         return fail(line, "`later.status` expects the id a `.later` call gave");
     };
     let state = |state: &str, fields: Vec<(&str, Value)>| {

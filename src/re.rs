@@ -382,7 +382,7 @@ struct Key<'a> {
 impl Key<'_> {
     fn strings(&self) -> (String, String) {
         let text = |v: Option<&Value>| match v {
-            Some(Value::Str(s)) => s.to_string(),
+            Some(Value::Str(s) | Value::Css(s)) => s.to_string(),
             _ => String::new(),
         };
         (text(self.args.get(1)), text(self.args.get(self.flags_at)))
@@ -393,12 +393,12 @@ impl Key<'_> {
 /// which a pattern not yet kept is compiled for (`nfa_first`).
 fn pattern(args: &[Value], flags_at: usize, f: &str, line: u32, len: usize, caps: bool) -> Result<Pat, Ctrl> {
     let p = match args.get(1) {
-        Some(Value::Str(s)) => s.to_string(),
+        Some(Value::Str(s) | Value::Css(s)) => s.to_string(),
         other => return fail(line, format!("`{}` expects a str as argument 2, got {}", f, other.map_or("nothing", |v| v.type_name()))),
     };
     let flags = match args.get(flags_at) {
         None | Some(Value::Nil) => String::new(),
-        Some(Value::Str(s)) => s.to_string(),
+        Some(Value::Str(s) | Value::Css(s)) => s.to_string(),
         Some(other) => return fail(line, format!("`{}` expects a str as argument {}, got {}", f, flags_at + 1, other.type_name())),
     };
     let key = (p, flags);
@@ -2456,7 +2456,7 @@ fn match_value(names: Names, s: &str, m: &Found, chars: &mut (usize, usize)) -> 
 
 fn text_arg(args: &[Value], f: &str, line: u32) -> Result<std::sync::Arc<str>, Ctrl> {
     match args.first() {
-        Some(Value::Str(s)) => Ok(s.clone()),
+        Some(Value::Str(s) | Value::Css(s)) => Ok(s.clone()),
         other => fail(line, format!("`{}` expects a str as argument 1, got {}", f, other.map_or("nothing", |v| v.type_name()))),
     }
 }
@@ -2466,7 +2466,7 @@ fn text_arg(args: &[Value], f: &str, line: u32) -> Result<std::sync::Arc<str>, C
 /// (FEEDBACK25.md, Q-318; branch feedback26-fixes).
 fn valid(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     script_room(it, line)?;
-    let Some(p @ Value::Str(_)) = args.first() else { return Ok(Value::Bool(false)) };
+    let Some(p @ (Value::Str(_) | Value::Css(_))) = args.first() else { return Ok(Value::Bool(false)) };
     let asked = [Value::Nil, p.clone(), args.get(1).cloned().unwrap_or(Value::Nil)];
     Ok(Value::Bool(regex_of(&asked, 2, "re.valid", line).is_ok()))
 }
@@ -2581,7 +2581,7 @@ fn replace(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Ok(guard) = guard_for(&mut pat, Key { args: &args, flags_at: 3 }, s.len(), true) else { return Ok(gave_up("re.replace", s.len())) };
     let r = &pat.r;
     let with = args.get(2).cloned().unwrap_or(Value::Nil);
-    if !matches!(with, Value::Str(_) | Value::Func(_) | Value::Builtin(..)) {
+    if !matches!(with, Value::Str(_) | Value::Css(_) | Value::Func(_) | Value::Builtin(..)) {
         return fail(line, format!("`re.replace` expects what to put in (a str or a function) as argument 3, got {}", with.type_name()));
     }
     let names: Vec<Option<&str>> = Names::of(r, guard.as_ref()).list();
@@ -2603,7 +2603,7 @@ fn replace(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     for m in found {
         out.push_str(&s[last..m.start]);
         match &with {
-            Value::Str(t) => {
+            Value::Str(t) | Value::Css(t) => {
                 // Stopped as it writes, in a script: one match's text put in 8,192 times by `$0`
                 // was 1.9 GB before the check after the match (FEEDBACK72.md, Q-1013, found in
                 // review; branch feedback72-81).

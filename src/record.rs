@@ -385,7 +385,7 @@ fn fits_name(types: &Types, n: &str, ty: &Ty, v: &Value, deep: bool, depth: usiz
     if n.starts_with('"') {
         let want: String = serde_json::from_str(n).unwrap_or_default();
         return match v {
-            Value::Str(s) if **s == *want => Ok(()),
+            Value::Str(s) | Value::Css(s) if **s == *want => Ok(()),
             _ => Err(Why::default()),
         };
     }
@@ -518,7 +518,7 @@ fn make_name(it: &mut Interp, n: &str, ty: &Ty, v: &Value, lenient: bool, depth:
         // that is text the form or the query gives as it is, which `fits` reads below. The set
         // refused every value from a form or a query, and took it from JSON (FEEDBACK58.md,
         // Q-874; branch cache-and-migrate).
-        (t, Value::Str(s)) if lenient && !type_name_matches(t, v) && !t.starts_with('"') => match crate::interp::coerce(t, s) {
+        (t, Value::Str(s) | Value::Css(s)) if lenient && !type_name_matches(t, v) && !t.starts_with('"') => match crate::interp::coerce(t, s) {
             Some(x) => Ok(Ok(x)),
             None => Ok(Err(Why::default())),
         },
@@ -615,7 +615,7 @@ fn req_fits_name<C: Chain, M: Mode>(types: &Types, n: &str, ty: &Ty, v: &Value, 
     if n.starts_with('"') {
         let want: String = serde_json::from_str(n).unwrap_or_default();
         return match v {
-            Value::Str(s) if **s == *want => Ok(()),
+            Value::Str(s) | Value::Css(s) if **s == *want => Ok(()),
             _ => Err(Why::default()),
         };
     }
@@ -785,7 +785,7 @@ fn req_make_name<C: Chain, M: Mode>(it: &mut Interp, n: &str, ty: &Ty, v: &Value
         // that is text the form or the query gives as it is, which `fits` reads below. The set
         // refused every value from a form or a query, and took it from JSON (FEEDBACK58.md,
         // Q-874; branch cache-and-migrate).
-        (t, Value::Str(s)) if lenient && !type_name_matches(t, v) && !t.starts_with('"') => match crate::interp::coerce(t, s) {
+        (t, Value::Str(s) | Value::Css(s)) if lenient && !type_name_matches(t, v) && !t.starts_with('"') => match crate::interp::coerce(t, s) {
             Some(x) => Ok(Ok(x)),
             None => Ok(Err(Why::default())),
         },
@@ -951,7 +951,7 @@ fn same(x: &Value, y: &Value) -> bool {
         (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
         (Value::Dec(a), Value::Dec(b)) => a == b && a.scale() == b.scale(),
         (Value::Int(a), Value::Int(b)) => a == b,
-        (Value::Str(a), Value::Str(b)) => Arc::ptr_eq(a, b),
+        (Value::Str(a) | Value::Css(a), Value::Str(b) | Value::Css(b)) => Arc::ptr_eq(a, b),
         (Value::List(a), Value::List(b)) => Arc::ptr_eq(a, b),
         (Value::Map(a), Value::Map(b)) => Arc::ptr_eq(a, b),
         _ => false,
@@ -994,7 +994,7 @@ fn req_make_record<M: Mode>(it: &mut Interp, td: &TypeDef, m: &Map, lenient: boo
 /// `__record(name, fields)`: what `User(fields)` calls.
 pub fn construct(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
     let name = match args.first() {
-        Some(Value::Str(s)) => s.to_string(),
+        Some(Value::Str(s) | Value::Css(s)) => s.to_string(),
         _ => return crate::interp::fail(line, "`__record` is called by a record's name, as in User({ ... })"),
     };
     let Some(td) = it.types.get(&name).cloned() else {

@@ -38,10 +38,10 @@ pub fn is_site(v: &Value) -> bool {
 
 /// `__site(name, url)`: the value `site` declares.
 pub fn declare(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let (Some(Value::Str(name)), Some(url)) = (args.first(), args.get(1)) else {
+    let (Some(Value::Str(name) | Value::Css(name)), Some(url)) = (args.first(), args.get(1)) else {
         return fail(line, "`site` takes a name and an address: site shop = \"https://shop.example.com\"");
     };
-    let Value::Str(url) = url else {
+    let (Value::Str(url) | Value::Css(url)) = url else {
         return fail(line, format!("`site {}` needs an address, as text, got {}", name, url.type_name()));
     };
     let u = url.trim().trim_end_matches('/');
@@ -59,7 +59,7 @@ pub fn declare(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // The same declaration run again (a reload, a script) is the one made before: the list
     // holds each site once.
     let mut all = DECLARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let same = |d: &Map, k: &str| matches!((d.get(k), m.get(k)), (Some(Value::Str(a)), Some(Value::Str(b))) if a == b);
+    let same = |d: &Map, k: &str| matches!((d.get(k), m.get(k)), (Some(Value::Str(a) | Value::Css(a)), Some(Value::Str(b) | Value::Css(b))) if a == b);
     let m = match all.iter().find(|d| same(d, "$site") && same(d, "$url")) {
         Some(d) => d.clone(),
         None => {
@@ -131,15 +131,18 @@ fn island_marks(v: Value) -> Value {
         }
         Value::Map(mut m) => {
             let mark = m.len() == 1 && m.get_index(0).is_some_and(|(k, x)| match (&**k, x) {
-                ("$dec" | "$int", Value::Str(_)) | ("$quillo_err", _) => true,
-                ("$", Value::List(a)) => a.len() == 2 && matches!(a[0], Value::Str(_)),
+                ("$dec" | "$int" | "$css", Value::Str(_) | Value::Css(_)) | ("$quillo_err", _) => true,
+                ("$", Value::List(a)) => a.len() == 2 && matches!(a[0], Value::Str(_) | Value::Css(_)),
                 _ => false,
             });
             if mark {
                 let (k, x) = Arc::make_mut(&mut m).pop().expect("one entry");
                 return match (&*k, x) {
-                    ("$dec", Value::Str(s)) => crate::decimal::Dec::parse(&s).map_or(Value::Str(s), Value::Dec),
-                    ("$int", Value::Str(s)) => s.parse::<i64>().map_or(Value::Str(s), Value::Int),
+                    ("$dec", Value::Str(s) | Value::Css(s)) => crate::decimal::Dec::parse(&s).map_or(Value::Str(s), Value::Dec),
+                    ("$int", Value::Str(s) | Value::Css(s)) => s.parse::<i64>().map_or(Value::Str(s), Value::Int),
+                    // Another site's trusted CSS is text here, as all it sends (FEEDBACK79.md,
+                    // Q-1250; branch feedback72-81).
+                    ("$css", Value::Str(s) | Value::Css(s)) => Value::Str(s),
                     ("$", Value::List(a)) => {
                         let mut a = Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone());
                         let (x, k) = (a.pop().unwrap_or(Value::Nil), a.pop().unwrap_or(Value::Nil));
@@ -164,7 +167,7 @@ static SAID_SERVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// `shop.notes(a, b)`, called as `__site_call(site, "notes", a, b)`.
 pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let mut args = args.into_iter();
-    let (Some(site), Some(Value::Str(f))) = (args.next().as_ref().and_then(declared), args.next()) else {
+    let (Some(site), Some(Value::Str(f) | Value::Css(f))) = (args.next().as_ref().and_then(declared), args.next()) else {
         return fail(line, "a site's function is called on a value a `site` declaration made");
     };
     let name = site.get("$site").map(|v| v.display()).unwrap_or_default();
@@ -226,7 +229,7 @@ pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return Ok(Value::err(island_marks(e)));
     }
     let why = match j.get("error") {
-        Some(Value::Str(e)) => e.to_string(),
+        Some(Value::Str(e) | Value::Css(e)) => e.to_string(),
         _ => text.chars().take(200).collect(),
     };
     Ok(Value::err(Value::str(format!("site {}: `{}` answered {}: {}", name, f, status, why))))

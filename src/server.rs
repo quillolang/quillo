@@ -2648,6 +2648,8 @@ impl Interp {
             None => (if answer.err { "err" } else { "ok" }, &*answer.text),
         };
         let mut resp = json_response(200, serde_json::Value::Null);
+        // The server's own answer, marked (`MARKED`).
+        resp.headers.push((MARKED.into(), "1".into()));
         resp.body = format!(
             "{{\"{}\":{},\"h\":\"{}\",\"topics\":{},\"seq\":{},\"server\":{}}}",
             field,
@@ -2756,7 +2758,9 @@ fn fits_a_key(v: &Value) -> bool {
         Value::Float(f) => f.is_finite(),
         Value::List(l) => l.iter().all(fits_a_key),
         Value::Map(m) => m.values().all(fits_a_key),
-        Value::Func(_) | Value::Builtin(..) | Value::Html(_) | Value::Response(_) | Value::Err(..) => false,
+        // Trusted CSS comes back from the page as plain text (FEEDBACK79.md, Q-1250; branch
+        // feedback72-81).
+        Value::Func(_) | Value::Builtin(..) | Value::Html(_) | Value::Css(_) | Value::Response(_) | Value::Err(..) => false,
     }
 }
 
@@ -3451,15 +3455,22 @@ fn json_response(status: u16, j: serde_json::Value) -> HttpResponse {
 /// long texts took 408 MB first; branch security).
 fn answer_held(key: &str, v: &Value) -> HttpResponse {
     if !crate::httpd::MEMORY_LIMITED.load(std::sync::atomic::Ordering::Relaxed) {
-        return json_response(200, serde_json::json!({ key: crate::interp::island_json(v) }));
+        let mut r = json_response(200, serde_json::json!({ key: crate::interp::island_json(v) }));
+        r.headers.push((MARKED.into(), "1".into()));
+        return r;
     }
     let mut body = format!("{{\"{}\":", key).into_bytes();
     if v.island_into_held(&mut body) && crate::value::bytes_room(&mut body, 1) {
         body.push(b'}');
-        return HttpResponse { status: 200, headers: vec![("content-type".into(), "application/json".into())], body };
+        return HttpResponse { status: 200, headers: vec![("content-type".into(), "application/json".into()), (MARKED.into(), "1".into())], body };
     }
     over_memory_answer()
 }
+
+/// The header of a server fn's answer the server wrote itself, its value marked as an island's is
+/// (`interp::island_json`): the page takes trusted CSS's mark (`{"$css": t}`) in such an answer
+/// alone, never in one `respond` or `reply` wrote, whose JSON a program made of what it likes (FEEDBACK79.md, Q-1250, found in the review of the trusted CSS; branch feedback72-81).
+pub const MARKED: &str = "x-quillo-marked";
 
 /// The answer to a server fn call past `--max-memory`, and its line in the log.
 fn over_memory_answer() -> HttpResponse {
@@ -4028,7 +4039,9 @@ pub(crate) fn render_response(r: &Response) -> HttpResponse {
         Body::Value(v) => match v {
             Value::Nil => (None, Vec::new()),
             Value::Html(h) => (Some(markup_type(h)), h.as_bytes().to_vec()),
-            Value::Str(s) => (Some("text/plain; charset=utf-8"), s.as_bytes().to_vec()),
+            // A route's trusted CSS is the text it is (FEEDBACK79.md, Q-1250; branch
+            // feedback72-81).
+            Value::Str(s) | Value::Css(s) => (Some("text/plain; charset=utf-8"), s.as_bytes().to_vec()),
             other => {
                 // An answer too large or too deep to write is the program's error, not the
                 // server's end, said as it is written (Q-606, Q-592).
@@ -4419,7 +4432,7 @@ impl App {
 fn carry_data(old: &Interp, new: &Interp) -> String {
     fn plain(v: &Value) -> bool {
         match v {
-            Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) | Value::Html(_) => true,
+            Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) | Value::Html(_) | Value::Css(_) => true,
             Value::List(xs) => xs.iter().all(plain),
             Value::Map(m) => m.values().all(plain),
             Value::Err(v, ..) => plain(v),

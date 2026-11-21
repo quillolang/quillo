@@ -34,7 +34,7 @@ pub fn install(m: &mut Map) {
 
 fn text(args: &[Value], i: usize, f: &str, line: u32) -> Result<std::sync::Arc<str>, Ctrl> {
     match args.get(i) {
-        Some(Value::Str(s)) => Ok(s.clone()),
+        Some(Value::Str(s) | Value::Css(s)) => Ok(s.clone()),
         other => fail(line, format!("`crypto.{}` expects a str as argument {}, got {}", f, i + 1, other.map_or("nothing", |v| v.type_name()))),
     }
 }
@@ -339,7 +339,7 @@ const STAND_IN: &str = "$argon2id$v=19$m=19456,t=2,p=1$c3RhbmQtaW4tc2FsdA$DhLSbt
 fn verify_password(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let pw = text(&args, 0, "verify_password", line)?;
     let hash = match args.get(1) {
-        Some(Value::Str(h)) => Some(h.clone()),
+        Some(Value::Str(h) | Value::Css(h)) => Some(h.clone()),
         _ => None,
     };
     match hashing(it, move || argon_check(pw.as_bytes(), hash.as_deref())) {

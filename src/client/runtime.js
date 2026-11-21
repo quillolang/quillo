@@ -137,7 +137,14 @@ function plainOf(v) {
 const fail = (msg) => { throw new QuilloError(msg); };
 const isNil = (v) => v === null || v === undefined;
 const isEvent = (v) => typeof Event !== "undefined" && v instanceof Event;
-const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec) && !(v instanceof Fl) && !isEvent(v)));
+const isMap = (v) => v !== null && typeof v === "object" && (v.constructor === Object || (!Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec) && !(v instanceof Fl) && !(v instanceof Css) && !isEvent(v)));
+// Trusted CSS: what a css`...` written in the program makes (`W.csst`), or what the server sent
+// so (`{"$css": text}`, see `untag`). A style's `__css_value` writes it as it is; anywhere else it
+// is the `str` it is, and what anything makes of it is plain text; to the server it goes as text
+// (FEEDBACK79.md, Q-1250, the user's decision; branch feedback72-81).
+class Css extends String {}
+// A value as a builtin reads text: trusted CSS as the text it is, at any depth (FEEDBACK79.md, Q-1250; branch feedback72-81).
+const un = (v) => (v instanceof Css ? v.valueOf() : v);
 const isInt = (v) => typeof v === "number" && Number.isInteger(v);
 
 // A float whose value is whole (2.0, -0.0, 1e300): a JS number cannot say it is no int, so it is
@@ -378,7 +385,7 @@ const foreign = (v) => {
   if (v === null || typeof v !== "object") return false;
   if (v === globalThis) return true;
   const p = Object.getPrototypeOf(v);
-  return p !== Object.prototype && p !== null && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec) && !(v instanceof Fl);
+  return p !== Object.prototype && p !== null && !Array.isArray(v) && !(v instanceof Err) && !(v instanceof Html) && !(v instanceof Dec) && !(v instanceof Fl) && !(v instanceof Css);
 };
 // Functions of the page that run text as code or HTML, or that step around
 // the checks here (setting any property, calling a method with any `this`,
@@ -447,6 +454,8 @@ function pageCall(f, args) {
 // review; branch feedback55); past 16 levels too (`noOrd`).
 function forPage(v, depth) {
   if (v instanceof Fl) return v.f;
+  // Text to the page's code (FEEDBACK79.md, Q-1250; branch feedback72-81).
+  if (v instanceof Css) return v.valueOf();
   if (v === null || typeof v !== "object" || foreign(v)) return v;
   if (depth >= 16) return noOrd(v, new Map());
   if (Array.isArray(v)) {
@@ -546,6 +555,8 @@ function lenient(v, depth) {
   }
   // A number to the page, and a map that keeps its order a plain copy (see `forPage`).
   if (v instanceof Fl) return v.f;
+  // Text, as `forPage` gives it (FEEDBACK79.md, Q-1250; branch feedback72-81).
+  if (v instanceof Css) return v.valueOf();
   if (v === null || typeof v !== "object" || foreign(v)) return v;
   if (depth >= 16) return noOrd(v, new Map());
   if (Array.isArray(v)) {
@@ -613,6 +624,7 @@ function typeName(v) {
     case "function": return "fn";
     case "bigint": return "int";
   }
+  if (v instanceof Css) return "str";
   if (v instanceof Fl) return "float";
   if (v instanceof Dec) return "dec";
   if (Array.isArray(v)) return "list";
@@ -627,6 +639,7 @@ function typeName(v) {
 // takes: apart from the date module, which a page that only checks a type
 // does not carry (FEEDBACK13.md, Q-093; branch open-fixes).
 function isDay(s) {
+  s = un(s);
   const m = typeof s === "string" && /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
   if (!m) return false;
   const y = +m[1], mo = +m[2], d = +m[3];
@@ -642,7 +655,7 @@ function typeIs(t, v) {
     case "float": return isFloat(v);
     case "num": return isNumber(v);
     case "dec": return v instanceof Dec;
-    case "str": return typeof v === "string";
+    case "str": return typeof v === "string" || v instanceof Css;
     // Text that is a date (FEEDBACK13.md, Q-093; branch open-fixes).
     case "date": return isDay(v);
     // Money every money function takes (FEEDBACK50.md, Q-621; branch feedback50-fixes).
@@ -812,13 +825,14 @@ function repr(v) {
   if (v instanceof Err) return "err(" + (v.own || ERRORS_SHOWN ? repr(v.error) : "\"internal error\"") + ")";
   // Its markup, as on the server (FEEDBACK55.md, Q-779; branch feedback55).
   if (v instanceof Html) return htmlText(v);
+  if (v instanceof Css) return JSON.stringify(v.valueOf());
   if (isEvent(v)) return "<event " + v.type + ">";
   // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
   const ks = mkeys(v);
   return ks.length ? "{ " + ks.map((k) => fmtKey(k) + ": " + repr(v[k])).join(", ") + " }" : "{}";
 }
 
-const display = (v) => typeof v === "string" ? v : typeof v === "number" ? numText(v) : v instanceof Fl ? numText(v.f) : v instanceof Dec ? decText(v) : repr(v);
+const display = (v) => typeof v === "string" ? v : typeof v === "number" ? numText(v) : v instanceof Fl ? numText(v.f) : v instanceof Dec ? decText(v) : v instanceof Css ? v.valueOf() : repr(v);
 // A value as a map key (`set`, `get`, `group_by`): 12.5 and 12.50 are one.
 const keyText = (v) => (v instanceof Dec ? decKey(v) : display(v));
 const short = (v) => { const r = repr(v); return r.length > 40 ? r.slice(0, 40) + "…" : r; };
@@ -831,7 +845,7 @@ function eq(a, b) {
     // Two numbers (the usual case) test only their types here; an int past 2^53 (a BigInt) or a
     // whole float (an Fl) and a number, by their values, exactly (FEEDBACK55.md, Q-776; branch
     // feedback55).
-    if (typeof a === "object" || typeof b === "object") return a instanceof Dec || b instanceof Dec ? decEq(a, b) : a instanceof Fl || b instanceof Fl ? numEq(a, b) : isNil(a) && isNil(b);
+    if (typeof a === "object" || typeof b === "object") return a instanceof Dec || b instanceof Dec ? decEq(a, b) : a instanceof Fl || b instanceof Fl ? numEq(a, b) : a instanceof Css || b instanceof Css ? cssEq(a, b) : isNil(a) && isNil(b);
     return typeof a === "bigint" || typeof b === "bigint" ? numEq(a, b) : isNil(a) && isNil(b);
   }
   if (a instanceof Dec || b instanceof Dec) return decEq(a, b);
@@ -840,6 +854,7 @@ function eq(a, b) {
   if (a instanceof Err && b instanceof Err) return eq(a.error, b.error);
   // Markup by its text, as on the server (FEEDBACK55.md, Q-779; branch feedback55).
   if (a instanceof Html && b instanceof Html) return htmlText(a) === htmlText(b);
+  if (a instanceof Css || b instanceof Css) return cssEq(a, b);
   // The page's objects are themselves, not their fields: any two elements have none
   // (FEEDBACK28.md, Q-334; branch feedback29-fixes).
   if (foreign(a) || foreign(b)) return false;
@@ -850,6 +865,9 @@ function eq(a, b) {
   return false;
 }
 
+// Trusted CSS is the text it is, to `==`, as on the server (FEEDBACK79.md, Q-1250; branch
+// feedback72-81).
+const cssEq = (a, b) => { const x = a instanceof Css ? a.valueOf() : a, y = b instanceof Css ? b.valueOf() : b; return typeof x === "string" && x === y; };
 // Two numbers (an int, a BigInt, a float or an Fl) by their values, exactly: JavaScript compares
 // a BigInt with a number as numbers, not through a float (FEEDBACK55.md, Q-776; branch
 // feedback55).
@@ -887,6 +905,7 @@ function cmp(a, b) {
   // NaN is not ordered, as on the server (FEEDBACK55.md, Q-780; branch feedback55).
   if (typeof a === "number" && typeof b === "number") return a < b ? -1 : a > b ? 1 : a === b ? 0 : null;
   if (typeof a === "string" && typeof b === "string") return a === b ? 0 : strCmp(a, b);
+  if (a instanceof Css || b instanceof Css) return cmp(a instanceof Css ? a.valueOf() : a, b instanceof Css ? b.valueOf() : b);
   // A decimal with a decimal or an int; not with a float.
   if (a instanceof Dec || b instanceof Dec) {
     const x = a instanceof Dec ? a : isInt(a) || typeof a === "bigint" ? new Dec(BigInt(a), 0) : null;
@@ -929,6 +948,8 @@ function add(a, b) {
   }
   if (typeof a === "string") return a + display(b);
   if (typeof b === "string") return display(a) + b;
+  // Plain text, as on the server (FEEDBACK79.md, Q-1250; branch feedback72-81).
+  if (a instanceof Css || b instanceof Css) return display(a) + display(b);
   if (a instanceof Dec || b instanceof Dec) return decArith(a, b, "+", "add");
   if (a instanceof Fl || b instanceof Fl) return flArith(a, b, "+", "add");
   if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, "+", "add");
@@ -1125,6 +1146,9 @@ function index(o, i) {
   // The page's objects: by name, or by number for lists of theirs (files, elements).
   if (foreign(o) && (typeof i === "string" || isInt(i))) return field(o, String(i), null);
   if (isMap(o) && (typeof i === "string" || isInt(i))) return hasOwn(o, String(i)) ? o[String(i)] : null;
+  // Trusted CSS indexes and is indexed as the text it is (FEEDBACK79.md, Q-1250; branch
+  // feedback72-81).
+  if (o instanceof Css || i instanceof Css) return index(o instanceof Css ? o.valueOf() : o, i instanceof Css ? i.valueOf() : i);
   if (typeof o === "string" && isInt(i)) {
     // A text read by index in a loop is split once, and not at all when no
     // character takes two units (FEEDBACK25.md, Q-313; branch feedback26-fixes).
@@ -1232,7 +1256,7 @@ function iter(v) {
   if (Array.isArray(v)) return v;
   // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
   if (isMap(v)) return mkeys(v).map((k) => [k, v[k]]);
-  if (typeof v === "string") return Array.from(v);
+  if (typeof v === "string" || v instanceof Css) return Array.from(v.valueOf());
   if (isNil(v)) return [];
   fail(`cannot loop over ${typeName(v)}`);
 }
@@ -1359,7 +1383,7 @@ function match(p, v) {
 // ---- the standard library (the parts that make sense in a browser) -----
 
 const want = (ok, f, what, i, v) => { if (!ok) fail(`\`${f}\` expects ${what} as argument ${i}, got ${isNil(v) && v === undefined ? "nothing" : typeName(v)}${v instanceof Dec && what === "a number" ? FLOAT_ONLY : ""}`); };
-const S = (v, f, i = 1) => { want(typeof v === "string", f, "a str", i, v); return v; };
+const S = (v, f, i = 1) => { if (v instanceof Css) return v.valueOf(); want(typeof v === "string", f, "a str", i, v); return v; };
 const L = (v, f, i = 1) => { if (isNil(v)) return []; want(Array.isArray(v), f, "a list", i, v); return v; };
 const I = (v, f, i = 1) => { want(isInt(v), f, "an int", i, v); return v; };
 // An int, past 2^53 too (a BigInt), where the server takes any (FEEDBACK55.md, Q-776; branch
@@ -1457,6 +1481,9 @@ function toJSON(v, wire) {
   if (Array.isArray(v)) return v.map((x) => toJSON(x, wire));
   // Its markup, as the server writes it (FEEDBACK55.md, Q-779; branch feedback55).
   if (v instanceof Html) return htmlText(v);
+  // Its text, to the server too, which takes nothing a page sends for trusted (FEEDBACK79.md,
+  // Q-1250; branch feedback72-81).
+  if (v instanceof Css) return v.valueOf();
   if (typeof v === "function") return repr(v);
   if (v instanceof Dec) return wire ? { $dec: decText(v) } : decText(v);
   if (typeof v === "bigint") return wire ? { $int: String(v) } : rawNum(String(v));
@@ -2006,6 +2033,7 @@ B.print = meta((...a) => { console.log(a.map(display).join(" ")); return null; }
 B.error = meta((v) => (v instanceof Err ? v.error : null), "error", null);
 B.str = meta((v) => display(v), "str", null);
 B.int = meta((v) => {
+  v = un(v);
   if (isInt(v) || typeof v === "bigint") return v;
   const f = v instanceof Fl ? v.f : v;
   // Past an int's range, as on the server (FEEDBACK16.md, Q-111; branch feedback20-fixes): -2^63
@@ -2025,6 +2053,7 @@ B.int = meta((v) => {
   return new Err(`cannot convert ${typeName(v)} to int`);
 }, "int", null);
 B.float = meta((v) => {
+  v = un(v);
   // A float, whole too (FEEDBACK55.md, Q-775; branch feedback55).
   if (typeof v === "number") return fl(v);
   if (v instanceof Fl) return v;
@@ -2034,7 +2063,7 @@ B.float = meta((v) => {
   return new Err(`cannot convert ${typeName(v)} to float`);
 }, "float", null);
 B.len = meta((v) => {
-  if (typeof v === "string") return Array.from(v).length;
+  if (typeof v === "string" || v instanceof Css) return Array.from(v.valueOf()).length;
   if (Array.isArray(v)) return v.length;
   if (isMap(v)) return Object.keys(v).length;
   if (isNil(v)) return 0;
@@ -2046,6 +2075,7 @@ B.type_of = meta((v) => typeName(v), "type_of", null);
 // `dec(x)`: a decimal from text (exactly), an int, or a float (through its
 // shortest text, so dec(0.1) is 0.1m).
 B.dec = meta((v) => {
+  v = un(v);
   if (v instanceof Dec) return v;
   if (Number.isSafeInteger(v) || typeof v === "bigint") return new Dec(BigInt(v), 0);
   if (typeof v === "number" || v instanceof Fl) return decFromFloat(numOf(v)) ?? new Err("cannot convert float to dec: it is too large, or not a number");
@@ -2085,6 +2115,7 @@ B.local_path = meta((s) => {
 // One Unicode form, as on the server (FEEDBACK31.md, Q-394; branch feedback27-35-fixes).
 B.normalize = meta((s, form) => {
   S(s, "normalize");
+  form = un(form);
   const f = isNil(form) ? "NFC" : typeof form === "string" ? form.toUpperCase() : fail(`\`normalize\` expects a form ("NFC", "NFD", "NFKC" or "NFKD") as argument 2, got ${typeName(form)}`);
   if (!["NFC", "NFD", "NFKC", "NFKD"].includes(f)) fail(`\`normalize\`: the form is "NFC", "NFD", "NFKC" or "NFKD", got ${JSON.stringify(f)}`);
   return s.normalize(f);
@@ -2093,10 +2124,11 @@ B.normalize = meta((s, form) => {
 // (FEEDBACK55.md, Q-778; branch feedback55).
 B.trim = meta((s) => rsTrim(S(s, "trim")), "trim", null);
 // What `||` does in JavaScript, for text (FEEDBACK19.md, Q-151; branch feedback19-fixes).
-B.filled = (x) => (x === "" ? null : x);
-B.split = meta((s, sep = " ") => { S(s, "split"); S(sep, "split", 2); return sep === "" ? Array.from(s) : s.split(sep); }, "split", null);
+B.filled = (x) => (x = un(x), x === "" ? null : x);
+B.split = meta((s, sep = " ") => { s = S(s, "split"); sep = S(sep, "split", 2); return sep === "" ? Array.from(s) : s.split(sep); }, "split", null);
 B.join = meta((l, sep = "") => L(l, "join").map(display).join(S(sep, "join", 2)), "join", null);
 B.contains = meta((c, x) => {
+  c = un(c);
   if (typeof c === "string") return c.includes(display(x));
   if (Array.isArray(c)) return c.some((y) => eq(y, x));
   if (isMap(c)) return hasOwn(c, display(x));
@@ -2108,12 +2140,13 @@ B.ends_with = meta((s, p) => S(s, "ends_with").endsWith(S(p, "ends_with", 2)), "
 // An empty pattern is found before each character and at the end, as Rust's replace finds it, a
 // character past U+FFFF whole (FEEDBACK55.md, Q-778; branch feedback55).
 B.replace = meta((s, a, b) => {
-  S(s, "replace"); S(a, "replace", 2); S(b, "replace", 3);
+  s = S(s, "replace"); a = S(a, "replace", 2); b = S(b, "replace", 3);
   if (a !== "") return s.split(a).join(b);
   const cs = Array.from(s);
   return b + cs.join(b) + (cs.length ? b : "");
 }, "replace", null);
 B.slice = meta((v, start, end) => {
+  v = un(v);
   start = IN(start, "slice", 2);
   if (end !== undefined) end = IN(end, "slice", 3);
   if (Array.isArray(v)) { const [s, e] = clampRange(v.length, start, end); return v.slice(s, e); }
@@ -2141,12 +2174,13 @@ B.any = meta((l, f) => { F(f, "any"); for (const x of L(l, "any")) { const r = c
 B.all = meta((l, f) => { F(f, "all"); for (const x of L(l, "all")) { const r = cb(f, "all", x); if (r instanceof Err) return r; if (!truthy(r)) return false; } return true; }, "all", null);
 B.reduce = meta((l, acc, f) => { F(f, "reduce", 3); for (const x of L(l, "reduce")) acc = cb(f, "reduce", acc, x); return acc; }, "reduce", null);
 // Text is no number: `+` joined it, "012.505.00" (FEEDBACK55.md, Q-783; branch feedback55).
-B.sum = meta((l) => { let a = 0, i = 0; for (const x of L(l, "sum")) { if (typeof x === "string") fail(`\`sum\` adds numbers; got the str ${repr(x)} at item ${i}: use \`float(...)\` or \`dec(...)\` first`); a = add(a, x); i++; } return a; }, "sum", null);
+B.sum = meta((l) => { let a = 0, i = 0; for (const x of L(l, "sum")) { if (typeof x === "string" || x instanceof Css) fail(`\`sum\` adds numbers; got the str ${repr(x)} at item ${i}: use \`float(...)\` or \`dec(...)\` first`); a = add(a, x); i++; } return a; }, "sum", null);
 B.min = meta((l) => extreme(l, "min", -1), "min", null);
 B.max = meta((l) => extreme(l, "max", 1), "max", null);
 B.sort = meta((l) => sortValues(L(l, "sort").map((v) => [v, v]), "sort"), "sort", null);
 B.sort_by = meta((l, f) => { F(f, "sort_by"); return sortValues(L(l, "sort_by").map((v) => [cb(f, "sort_by", v), v]), "sort_by"); }, "sort_by", null);
 B.reverse = meta((v) => {
+  v = un(v);
   if (Array.isArray(v)) return v.slice().reverse();
   if (typeof v === "string") return Array.from(v).reverse().join("");
   fail(`\`reverse\` expects a list or str, got ${typeName(v)}`);
@@ -2596,6 +2630,7 @@ const isWhole = (x) => isInt(x) || typeof x === "bigint";
 // exactly `digits` decimals.
 function roundDec(x, d, mode) {
   if (!isNil(d)) d = IN(d, "round", 2);
+  mode = un(mode);
   if (isNil(mode)) mode = "half_even";
   else if (typeof mode !== "string") fail(`\`round\` expects a str as argument 3, got ${typeName(mode)}`);
   else if (!["half_even", "half_up", "half_down", "up", "down", "ceiling", "floor"].includes(mode)) fail(`\`round\`: unknown rounding ${JSON.stringify(mode)} (one of ${ROUNDINGS})`);
@@ -2750,7 +2785,7 @@ function uniqueKeys(v, decs) {
     const x = todo.pop();
     if (x === MARK_END) { put("]"); continue; }
     if (x instanceof MapKey) { put("k" + JSON.stringify(x.k)); continue; }
-    if (typeof x === "string") { put("s" + JSON.stringify(x)); continue; }
+    if (typeof x === "string" || x instanceof Css) { put("s" + JSON.stringify(x.valueOf())); continue; }
     if (isNil(x)) { put("z"); continue; }
     if (typeof x === "boolean") { put(x ? "b1" : "b0"); continue; }
     if (typeof x === "number" || x instanceof Fl || typeof x === "bigint") {
@@ -2802,12 +2837,13 @@ const MARK_END = Symbol("end");
 class MapKey { constructor(k) { this.k = k; } }
 B.flatten = meta((l) => [].concat(...L(l, "flatten").map((x) => Array.isArray(x) ? x : [x])), "flatten", null);
 B.zip = meta((a, b) => { a = L(a, "zip"); b = L(b, "zip", 2); return a.slice(0, Math.min(a.length, b.length)).map((x, i) => [x, b[i]]); }, "zip", null);
-B.take = meta((v, n) => { n = Math.max(IN(n, "take", 2), 0); return typeof v === "string" ? Array.from(v).slice(0, n).join("") : L(v, "take").slice(0, n); }, "take", null);
-B.drop = meta((v, n) => { n = Math.max(IN(n, "drop", 2), 0); return typeof v === "string" ? Array.from(v).slice(n).join("") : L(v, "drop").slice(n); }, "drop", null);
+B.take = meta((v, n) => { v = un(v); n = Math.max(IN(n, "take", 2), 0); return typeof v === "string" ? Array.from(v).slice(0, n).join("") : L(v, "take").slice(0, n); }, "take", null);
+B.drop = meta((v, n) => { v = un(v); n = Math.max(IN(n, "drop", 2), 0); return typeof v === "string" ? Array.from(v).slice(n).join("") : L(v, "drop").slice(n); }, "drop", null);
 B.count = meta((l, f) => { l = L(l, "count"); if (f === undefined) return l.length; F(f, "count"); let n = 0; for (const x of l) { const r = cb(f, "count", x); if (r instanceof Err) return r; if (truthy(r)) n++; } return n; }, "count", null);
 // Its groups in the order met (FEEDBACK55.md, Q-875; branch feedback55).
 B.group_by = meta((l, f) => { F(f, "group_by"); const out = {}; for (const x of L(l, "group_by")) { const r = cb(f, "group_by", x); if (r instanceof Err) return r; const k = keyText(r); if (!hasOwn(out, k)) mput(out, k, []); out[k].push(x); } return out; }, "group_by", null);
 B.index_of = meta((c, x) => {
+  c = un(c);
   if (Array.isArray(c)) { const i = c.findIndex((y) => eq(y, x)); return i < 0 ? null : i; }
   if (typeof c === "string") { const i = c.indexOf(display(x)); return i < 0 ? null : Array.from(c.slice(0, i)).length; }
   fail(`\`index_of\` expects a list or str, got ${typeName(c)}`);
@@ -3192,7 +3228,8 @@ B.css = meta((s) => S(s, "css"), "css", null);
 // error as an error of its contents escaped so, as on the server (`css_value_of`), so `??`, `&&`
 // and `||` choose as before (FEEDBACK79.md, Q-1250; branch feedback72-81).
 const cssOne = (v) => cssValue(display(v)).replace(/&/g, "\\26 ");
-B.__css_value = meta((v) => (v instanceof Err ? new Err(cssOne(v.error), v.own) : typeof v === "string" || Array.isArray(v) || isMap(v) || v instanceof Html ? cssOne(v) : v), "__css_value", null);
+// Trusted CSS as it is (FEEDBACK79.md, Q-1250, the user's decision; branch feedback72-81).
+B.__css_value = meta((v) => (v instanceof Css ? v : v instanceof Err ? new Err(cssOne(v.error), v.own) : typeof v === "string" || Array.isArray(v) || isMap(v) || v instanceof Html ? cssOne(v) : v), "__css_value", null);
 B.sql = meta((s) => S(s, "sql"), "sql", null);
 // A run the page moved under does not move it again: once the person went to another page (a link,
 // Back or Forward, a link or a form the browser follows itself) or a run that began after it moved
@@ -3631,7 +3668,7 @@ function reLines(p) {
 }
 const reCache = new Map();
 function reOf(p, flags, f, at) {
-  S(p, f, 2);
+  p = S(p, f, 2);
   flags = isNil(flags) ? "" : S(flags, f, at);
   const key = flags + "/" + p;
   let r = reCache.get(key);
@@ -3701,13 +3738,14 @@ function reExpand(t, x) {
 }
 
 B.re = {
-  valid: (p, flags) => { if (typeof p !== "string") return false; try { reOf(p, flags, "re.valid", 2); return true; } catch (e) { return false; } },
+  valid: (p, flags) => { p = un(p); if (typeof p !== "string") return false; try { reOf(p, flags, "re.valid", 2); return true; } catch (e) { return false; } },
   test: (s, p, flags) => { S(s, "re.test"); return reAll(s, reOf(p, flags, "re.test", 3), 1).length > 0; },
   find: (s, p, flags) => { S(s, "re.find"); const [x] = reAll(s, reOf(p, flags, "re.find", 3), 1); return x ? reValue(x) : null; },
   find_all: (s, p, flags) => { S(s, "re.find_all"); return reAll(s, reOf(p, flags, "re.find_all", 3), Infinity).map(reValue); },
   replace: (s, p, w, flags) => {
     S(s, "re.replace");
     const r = reOf(p, flags, "re.replace", 4);
+    w = un(w);
     const fn = typeof w === "function";
     want(fn || typeof w === "string", "re.replace", "what to put in (a str or a function)", 3, w);
     if (fn) denied(w);
@@ -3965,6 +4003,7 @@ const moneyShort = (v) => (v === undefined ? "nothing" : `${typeName(v)} ${short
 const rsTrim = (s) => s.replace(/^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g, "");
 const moneyCode = (c) => rsTrim(c).replace(/[a-z]/g, (x) => x.toUpperCase());
 function moneyCurrency(c, f, i) {
+  c = un(c);
   if (typeof c !== "string") fail(`\`${f}\` expects a currency code (a str) as argument ${i}, got ${moneyShort(c)}`);
   const code = moneyCode(c), u = unitsOf(code);
   return u === null ? new Err(`unknown currency ${repr(c)}`) : { code, units: u };
@@ -3975,11 +4014,11 @@ function moneyCurrency(c, f, i) {
 function moneyArg(v, f, i, exact = true) {
   const bad = (why) => fail(`\`${f}\` expects money ({ amount, currency }) as argument ${i}, got ${moneyShort(v)}${why}`);
   if (!isMap(v)) bad("");
-  const c = hasOwn(v, "currency") ? v.currency : null;
+  const c = hasOwn(v, "currency") ? un(v.currency) : null;
   if (typeof c !== "string") bad(": no currency");
   const code = moneyCode(c), units = unitsOf(code);
   if (units === null) bad(": unknown currency");
-  const a = hasOwn(v, "amount") ? v.amount : null;
+  const a = hasOwn(v, "amount") ? un(v.amount) : null;
   let amount;
   if (a instanceof Dec) amount = a;
   else if (isInt(a) || typeof a === "bigint") amount = new Dec(BigInt(a), 0);
@@ -4000,11 +4039,12 @@ const moneyIs = (v) => { try { moneyArg(v, "", 0); return true; } catch (e) { if
 function moneyFromData(v) {
   if (!isMap(v)) return { why: "must be money, { amount, currency }" };
   if (!hasOwn(v, "currency") || v.currency === undefined) return { why: "has no currency" };
-  if (typeof v.currency !== "string") return { why: "has a currency that is not text" };
-  const code = moneyCode(v.currency), units = unitsOf(code);
+  const cur = un(v.currency);
+  if (typeof cur !== "string") return { why: "has a currency that is not text" };
+  const code = moneyCode(cur), units = unitsOf(code);
   if (units === null) return { why: "has a currency that is not an ISO 4217 code" };
   if (!hasOwn(v, "amount") || v.amount === undefined) return { why: "has no amount" };
-  const a = v.amount;
+  const a = un(v.amount);
   const amount = a instanceof Dec ? a : isInt(a) || typeof a === "bigint" ? new Dec(BigInt(a), 0) : typeof a === "number" || a instanceof Fl ? decFromFloat(numOf(a))
     : typeof a === "string" && !/[eE]/.test(a) ? decParse(rsTrim(a), false) : null;
   if (amount === null) return { why: "has an amount that is not a number" };
@@ -4026,6 +4066,7 @@ function moneyOp(x, y, sub) {
   return moneyIn(decAdd(a.amount, sub ? new Dec(-b.amount.m, b.amount.s) : b.amount), a.code);
 }
 function moneyMode(m, f, i = f === "money.round" ? 2 : 3) {
+  m = un(m);
   if (isNil(m)) return "half_even";
   if (typeof m !== "string") fail(`\`${f}\` expects a rounding mode (a str) as argument ${i}, got ${moneyShort(m)}`);
   if (!["half_even", "half_up", "half_down", "up", "down", "ceiling", "floor"].includes(m)) fail(`\`${f}\`: unknown rounding ${JSON.stringify(m)} (one of ${ROUNDINGS})`);
@@ -4082,6 +4123,7 @@ function moneySame(a, b, verb) {
 }
 // The locale to write in: the one given, else the page's, else en-US.
 function moneyLocale(l, f, i) {
+  l = un(l);
   if (isNil(l)) { const d = i18n(); return d ? d.locale : "en-US"; }
   if (typeof l !== "string") fail(`\`${f}\` expects a locale (a str) as argument ${i}, got ${moneyShort(l)}`);
   return l;
@@ -4091,6 +4133,7 @@ B.money = {
     const c = moneyCurrency(currency, "money.of", 2);
     if (c instanceof Err) return c;
     let d;
+    amount = un(amount);
     if (amount instanceof Dec) d = amount;
     else if (isInt(amount) || typeof amount === "bigint") d = new Dec(BigInt(amount), 0);
     // Text as people write an amount, and money whose cents fit an int, as
@@ -4103,6 +4146,7 @@ B.money = {
   // An amount as the locale writes one, as src/money.rs's parse (FEEDBACK50.md, Q-624; branch
   // feedback50-fixes).
   parse: (text, currency, locale, mode) => {
+    text = un(text);
     if (typeof text !== "string") fail(`\`money.parse\` expects text as argument 1, got ${moneyShort(text)}`);
     const c = moneyCurrency(currency, "money.parse", 2);
     if (c instanceof Err) return c;
@@ -4553,7 +4597,7 @@ const momentsOf = (x, y) => {
 const pairedOf = (x, y, f) => { [x, y] = pairOf(x, y, f); if (x.length < 2) fail(`\`${f}\` requires at least two data points`); return [x, y]; };
 const varianceOf = (l, mu, f, sample) => { const x = dataOf(l, f, sample ? 2 : 1); return div2(ssOf(x, given(mu) ? N(mu, f, 2) : meanOf(x)), x.length - (sample ? 1 : 0)); };
 // A number by its float, 1 and 1.0 one value, as on the server.
-const tallyKey = (v) => isNumber(v) ? "n" + (numOf(v) + 0) : typeof v === "string" ? "s" + v : "v" + repr(v);
+const tallyKey = (v) => isNumber(v) ? "n" + (numOf(v) + 0) : typeof v === "string" || v instanceof Css ? "s" + v.valueOf() : "v" + repr(v);
 const tallyOf = (l) => { const at = new Map(), out = []; l.forEach((v, i) => { const k = tallyKey(v); if (at.has(k)) out[at.get(k)][1]++; else { at.set(k, out.length); out.push([i, 1]); } }); return out; };
 const normalArgs = (x, mu, sigma, f) => { x = N(x, f); mu = given(mu) ? N(mu, f, 2) : 0; sigma = given(sigma) ? N(sigma, f, 3) : 1; if (!(sigma > 0)) fail(`\`${f}\`: sigma must be positive, got ${display(sigma)}`); return [x, mu, sigma]; };
 const poly = (c, r) => c.reduce((acc, k) => acc * r + k, 0);
@@ -4831,6 +4875,7 @@ B.vec = {
   },
   column: (l, key) => {
     const rows = L(l, "vec.column");
+    key = un(key);
     if (typeof key === "string") return rows.map((r) => isMap(r) && hasOwn(r, key) ? r[key] : null);
     if (isInt(key)) return rows.map((r) => Array.isArray(r) && key >= 0 && key < r.length ? r[key] : null);
     fail(`\`vec.column\` expects a str or int key as argument 2, got ${typeName(key)}`);
@@ -4879,6 +4924,7 @@ function dtAddMonths(z, n) {
 const dtNum = (s) => /^[0-9]+$/.test(s) ? Number(s) : null;
 const dtYmd = (y, m, d) => y !== null && m !== null && d !== null && dtInRange(y) && m >= 1 && m <= 12 && d >= 1 && d <= dtMonthLen(y, m) ? dtDays(y, m, d) : null;
 function dtDate(s) {
+  s = un(s);
   if (typeof s !== "string" || s.length !== 10 || s[4] !== "-" || s[7] !== "-") return null;
   return dtYmd(dtNum(s.slice(0, 4)), dtNum(s.slice(5, 7)), dtNum(s.slice(8)));
 }
@@ -4898,6 +4944,7 @@ const dtAscii = (s) => /^[\x00-\x7f]*$/.test(s);
 // { day, sec, frac, off }: the local date and time as written, the fraction
 // of a second as written, and the offset in seconds east of UTC.
 function dtStamp(s) {
+  s = un(s);
   if (typeof s !== "string" || s.length < 20 || !dtAscii(s) || s[10] !== "T") return null;
   const day = dtDate(s.slice(0, 10)), sec = dtHms(s.slice(11, 19));
   if (day === null || sec === null) return null;
@@ -4943,7 +4990,7 @@ function dtEitherArg(v, f, i) {
   fail(`\`${f}\` expects a date or a date-time as argument ${i}, got ${dtGot(v)}`);
 }
 const dtInt = (v, f, i) => { if (!isInt(v)) fail(`\`${f}\` expects an int as argument ${i}, got ${dtGot(v)}`); return v; };
-const dtStr = (v, f, i) => { if (typeof v !== "string") fail(`\`${f}\` expects a str as argument ${i}, got ${dtGot(v)}`); return v; };
+const dtStr = (v, f, i) => { v = un(v); if (typeof v !== "string") fail(`\`${f}\` expects a str as argument ${i}, got ${dtGot(v)}`); return v; };
 const dtOutOfRange = (f) => fail(`\`${f}\`: the date is out of range (years 1 to 9999)`);
 const dtDay = (z, f) => z !== null && dtInRange(dtCivil(z)[0]) ? dtText(z) : dtOutOfRange(f);
 
@@ -4954,6 +5001,7 @@ const dtZones = new Map();
 // `not_a_zone` is the other half.
 const NOT_ZONES = /^(SystemV\/.*|US\/Pacific-New|Canada\/East-Saskatchewan|ACT|AET|AGT|ART|AST|BET|BST|CAT|CNT|CTT|EAT|ECT|IET|IST|JST|MIT|NET|NST|PLT|PNT|PRT|PST|SST|VST)$/i;
 function dtZone(v, f, i) {
+  v = un(v);
   if (isNil(v)) return 0;
   if (typeof v !== "string") fail(`\`${f}\` expects a time zone (like "Europe/Paris") as argument ${i}, got ${dtGot(v)}`);
   if (v.toUpperCase() === "UTC" || v === "Z") return 0;
@@ -5270,14 +5318,16 @@ B.date = {
       if (dtLocalDateTime(s.trim()) !== null) return new Err(`${dtGot(s)} has no offset, so it is a wall-clock time and names no instant: read it in its zone with date.at(v, zone)`);
       const r = dtReadIso(s.trim()) ?? dtReadHttp(s.trim()); return r === null ? new Err(`not a date or a date-time: ${dtGot(s)}`) : r;
     }
+    pattern = un(pattern);
     if (typeof pattern !== "string") fail(`\`date.parse\` expects a pattern (like "DD/MM/YYYY") as argument 2, got ${dtGot(pattern)}`);
     const r = dtRead(Array.from(s.trim()), Array.from(pattern));
     return r === null ? new Err(`${dtGot(s)} is not a date in the form ${dtGot(pattern)}`) : r;
   },
   // "date" or "date-time" as the second argument takes only that (FEEDBACK13.md,
   // Q-093; branch feedback13-fixes).
-  valid_zone: (z) => { if (typeof z !== "string") return false; try { dtZone(z, "date.valid_zone", 1); return true; } catch (e) { return false; } },
+  valid_zone: (z) => { z = un(z); if (typeof z !== "string") return false; try { dtZone(z, "date.valid_zone", 1); return true; } catch (e) { return false; } },
   valid: (s, kind) => {
+    s = un(s); kind = un(kind);
     if (!isNil(kind) && kind !== "date" && kind !== "date-time") fail(`\`date.valid\` takes "date" or "date-time" as argument 2, got ${dtGot(kind)}`);
     return (kind !== "date-time" && dtDate(s) !== null) || (kind !== "date" && dtStamp(s) !== null);
   },
@@ -5294,8 +5344,9 @@ B.date = {
     return out;
   },
   weekday: (v) => dtWeekday(dtEitherArg(v, "date.weekday", 1)[0]),
-  is_leap_year: (v) => dtLeap(typeof v === "string" ? dtCivil(dtEitherArg(v, "date.is_leap_year", 1)[0])[0] : dtInt(v, "date.is_leap_year", 1)),
+  is_leap_year: (v) => (v = un(v), dtLeap(typeof v === "string" ? dtCivil(dtEitherArg(v, "date.is_leap_year", 1)[0])[0] : dtInt(v, "date.is_leap_year", 1))),
   days_in_month: (a, b) => {
+    a = un(a);
     const f = "date.days_in_month";
     let y, m;
     if (typeof a === "string") [y, m] = dtCivil(dtEitherArg(a, f, 1)[0]);
@@ -5332,6 +5383,7 @@ B.date = {
     return dtDay(Math.floor((i + dtOffsetAt(z, i)) / 86400), "date.date_in");
   },
   at: (v, time, tz, opts) => {
+    v = un(v); time = un(time);
     const f = "date.at", both = dtLocalDateTime(v);
     if (both !== null) return dtAtLocal(dtZone(time, f, 2), both[0] * 86400 + both[1], tz, f, 3);
     const day = dtDateArg(v, f, 1);
@@ -5356,14 +5408,15 @@ B.date = {
   format: (v, how) => {
     const f = "date.format", [z, t] = dtEitherArg(v, f, 1);
     let pattern, n = dtEn;
+    how = un(how);
     if (typeof how === "string") pattern = how;
     else if (isMap(how)) {
-      const has = (k) => hasOwn(how, k), loc = has("locale") ? how.locale : null;
+      const has = (k) => hasOwn(how, k), loc = has("locale") ? un(how.locale) : null;
       if (!isNil(loc)) { if (typeof loc !== "string") fail(`\`${f}\`: locale is a str, like "de-DE", got ${dtGot(loc)}`); n = dtNames(loc); }
       // The first one set, as on the server (FEEDBACK55.md, Q-875; branch feedback55).
       const k = mkeys(how).find((k) => k !== "locale" && k !== "style" && k !== "pattern");
       if (k !== undefined) fail(`\`${f}\`: the options are locale, style and pattern, not \`${k}\``);
-      const P = has("pattern") ? how.pattern : undefined, St = has("style") ? how.style : undefined;
+      const P = has("pattern") ? un(how.pattern) : undefined, St = has("style") ? un(how.style) : undefined;
       if (typeof P === "string") pattern = P;
       else if (isNil(P) && isNil(St)) pattern = n.styles[1];
       else if (isNil(P) && typeof St === "string") {
@@ -6118,7 +6171,13 @@ async function rpcSend(name, args, live, idem) {
   if (r.headers && r.headers.get("x-quillo-session") !== null) swSession();
   let body = null, text = "", cut = false;
   try { text = await r.text(); } catch (_) { cut = true; }
-  try { body = readJSON(text); if (!body || !hasOwn(body, "patch")) body = untagDeep(body); } catch (_) {}
+  // Trusted CSS's mark only in what the server wrote of its own answer (`x-quillo-marked`), never
+  // in a body `respond` or `reply` wrote, whose JSON a program made of what it likes (FEEDBACK79.md,
+  // Q-1250, found in the review of the trusted CSS; branch feedback72-81).
+  // From the page's own server, not a place a redirect led to, whose answer may say what it likes
+  // (FEEDBACK79.md, Q-1250, found in the second review of the trusted CSS; branch feedback72-81).
+  const marked = !!r.headers && r.headers.get("x-quillo-marked") === "1" && !r.redirected && (!r.url || new URL(r.url, location.href).origin === location.origin);
+  try { body = readJSON(text); if (!marked) body = noCss(body); if (!body || !hasOwn(body, "patch")) body = untagDeep(body); } catch (_) {}
   // In development the server says why, and the console says it too, with its place, as an
   // error in the page does (FEEDBACK64.md, Q-933; branch feedback64).
   if (DEV && r.status === 500 && body && body.error) report(`server fn \`${name}\` failed: ${body.error}`); // dev
@@ -8085,7 +8144,7 @@ const styleKey = (k) => (k.startsWith("--") ? /^--[\p{L}\p{N}_-]+$/u : /^[A-Za-z
 // in review).
 const errLeft = (v) => v instanceof Err && (errShown(v), true);
 const styleText = (m) => mkeys(m).filter((k) => !isNil(m[k]) && m[k] !== false && styleKey(k) && !errLeft(m[k]))
-  .map((k) => { const n = styleName(k); return n + ": " + cssValue(display(m[k])) + stylePx(n, m[k]); }).join("; ");
+  .map((k) => { const n = styleName(k); return n + ": " + (m[k] instanceof Css ? m[k].valueOf() : cssValue(display(m[k]))) + stylePx(n, m[k]); }).join("; ");
 
 // The text a bool is for an attribute whose values are words, as on the server (see its
 // `bool_attr_text`): "true"/"false" for aria-*, data-*, draggable, spellcheck and
@@ -8102,6 +8161,9 @@ function setProp(el, k, v, old) {
   // server's, and the markup's own neither change them nor add one (FEEDBACK55.md, Q-700; branch
   // feedback55).
   if (el.__q && ISLAND_ATTRS.has(attrKey(k))) return;
+  // Trusted CSS given whole is the text it is (FEEDBACK79.md, Q-1250; branch feedback72-81).
+  if (v instanceof Css) v = v.valueOf();
+  if (old instanceof Css) old = old.valueOf();
   // A function is no value of an attribute's, as on the server (found in review).
   if (typeof v === "function") v = null;
   // Nor an error, which shows nothing, as on the server (FEEDBACK81.md, Q-1272; branch
@@ -9233,7 +9295,31 @@ function untag(v) {
   if (ks[0] === "$quillo_err") return new Err(v.$quillo_err, true);
   if (ks[0] === "$dec" && typeof v.$dec === "string") return decParse(v.$dec, false) ?? v.$dec;
   if (ks[0] === "$int" && typeof v.$int === "string" && /^-?\d{1,19}$/.test(v.$int)) return intOf(BigInt(v.$int));
+  // The server's trusted CSS: an island's props and state, a server fn's or a `live` answer
+  // (FEEDBACK79.md, Q-1250; branch feedback72-81).
+  if (ks[0] === "$css" && typeof v.$css === "string") return new Css(v.$css);
   return v;
+}
+// A body a program wrote (`respond`, `reply`) as a server fn's answer: its trusted CSS marks are
+// its data, each kept the map it is, as the server writes a map of one `$` key (`{"$": [k, v]}`,
+// see `untag`), its patches' values too (FEEDBACK79.md, Q-1250, found in the review of the trusted
+// CSS; branch feedback72-81).
+// What a mark held is looked into too, its own marks kept so: one inside another came out trusted
+// (FEEDBACK79.md, Q-1250, found in the second review of the trusted CSS; branch feedback72-81).
+function noCss(v) {
+  const box = [v], todo = [box];
+  while (todo.length) {
+    const x = todo.pop();
+    if (x === null || typeof x !== "object") continue;
+    for (const k of Object.keys(x)) {
+      const y = x[k];
+      if (y !== null && typeof y === "object" && !Array.isArray(y) && Object.keys(y).length === 1 && hasOwn(y, "$css")) {
+        x[k] = { $: ["$css", y.$css] };
+        todo.push(x[k].$);
+      } else todo.push(y);
+    }
+  }
+  return box[0];
 }
 // A state the server wrote as a prop's own value.
 class PropOf { constructor(name) { this.name = name; } }
@@ -10024,6 +10110,9 @@ W.repr = repr;
 W.short = short;
 W.cls = (xs) => { const out = []; clsWords(xs, out); return out.join(" "); };
 W.cls1 = (x) => (typeof x === "string" ? x : W.cls([x]));
+// css`...` as the parser writes it: trusted CSS (`Css`; FEEDBACK79.md, Q-1250; branch
+// feedback72-81).
+W.csst = (s) => new Css(s);
 W.nofn = (v) => (typeof v === "function" ? null : v);
 // What a text field or a select bound to state `s` gives it: a number when the state is one and
 // the text is that number written as Quillo writes it (null when empty, as a number input gives),

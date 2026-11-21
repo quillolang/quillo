@@ -215,7 +215,7 @@ fn decode_upright(path: &Path) -> Result<DynamicImage, String> {
 
 fn path_arg(it: &Interp, args: &[Value], i: usize, f: &str, line: u32) -> Result<PathBuf, Ctrl> {
     match args.get(i) {
-        Some(Value::Str(p)) => match crate::builtins::local_path(it, p) {
+        Some(Value::Str(p) | Value::Css(p)) => match crate::builtins::local_path(it, p) {
             Some(full) => Ok(full),
             None => fail(line, format!("`{}`: {:?} is not a path inside the program's folder", f, &**p)),
         },
@@ -308,7 +308,7 @@ fn job_of(opts: Option<&Value>, dest: &std::path::Path, line: u32) -> Result<Job
     let format = match o.get("format") {
         // `convert` gave an error value for a name that says none.
         None | Some(Value::Nil) => format_of_name(dest).unwrap_or(ImageFormat::Jpeg),
-        Some(Value::Str(f)) => match &**f {
+        Some(Value::Str(f) | Value::Css(f)) => match &**f {
             "jpeg" | "jpg" => ImageFormat::Jpeg,
             "png" => ImageFormat::Png,
             "webp" => ImageFormat::WebP,

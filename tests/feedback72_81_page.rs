@@ -553,8 +553,10 @@ route GET / = <html><body><P/></body></html>
         [one, "16px", "rgb(0, 0, 0)", none],
         [format!("{}; top: 0", one), "16px", "rgb(0, 0, 0)", none],
         [one, "16px", "rgb(0, 0, 0)", none],
-        // Escaped at the call and again as the component's value: still one value.
-        [r"padding: 8px; color: red\5c 3b  background: blue", "16px", "rgb(0, 0, 0)", none],
+        // Escaped at the call, where the template written in the `style` prop is trusted CSS since
+        // the user's decision, which the component's style lets through: escaped once, where it was
+        // escaped twice (`\5c 3b`), still one value (FEEDBACK79.md, Q-1250; branch feedback72-81).
+        [r"padding: 8px; color: red\3b  background: blue", "16px", "rgb(0, 0, 0)", none],
     ]);
     assert_eq!(v["server"], want, "{}", v);
     assert_eq!(v["browser"], want, "{}", v);
@@ -611,7 +613,10 @@ print(<style>{css`.a { color: ${err("x} body { display: none } .y {")} }`}</styl
         // A function's text, given whole: the program's own value, as decided.
         r#"<p style="color: red; background: blue">helper</p>"#,
         r#"<p style="color: red\3b  background: blue">css</p>"#,
-        r#"<p style="a: 1; color: red\5c 3b  background: blue">innercss</p>"#,
+        // Its values escaped by the walk, the inner call is css`...`'s form, trusted CSS since the
+        // user's decision, which the outer value lets through: escaped once, where it was escaped
+        // twice (`\5c 3b`), still one value (FEEDBACK79.md, Q-1250; branch feedback72-81).
+        r#"<p style="a: 1; color: red\3b  background: blue">innercss</p>"#,
         r#"<p style="color: red\3b  background: blue; top: 0">tagged</p>"#,
         r#"<p style="color: err(&quot;&lt;b&gt;x)\\3b  background: blue\\3b  y: (&lt;/b&gt;&quot;)">errhtml</p>"#,
         r#"<p style="color: err(&quot;\\7b  \&quot;x)\\3b  background: blue\\3b  y: (\&quot;: 1 \\7d &quot;)">errkey</p>"#,

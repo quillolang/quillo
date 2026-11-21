@@ -131,15 +131,15 @@ pub fn set_auth(name: &str, auth: Option<&Value>, forward: Option<&Value>, base:
     let text = |m: &Map, k: &str| -> Result<Option<String>, String> {
         match m.get(k) {
             None | Some(Value::Nil) => Ok(None),
-            Some(Value::Str(s)) if !s.is_empty() => Ok(Some(s.to_string())),
-            Some(Value::Str(_)) => Err(format!("service {}: `{}` is empty (is its environment variable set?)", name, k)),
+            Some(Value::Str(s) | Value::Css(s)) if !s.is_empty() => Ok(Some(s.to_string())),
+            Some(Value::Str(_) | Value::Css(_)) => Err(format!("service {}: `{}` is empty (is its environment variable set?)", name, k)),
             Some(other) => Err(format!("service {}: `{}` is text, not {}", name, k, crate::interp::short(other))),
         }
     };
     let path = |p: Option<String>| p.map(|p| if p == "system" { p } else { base.join(p).to_string_lossy().into_owned() });
     match auth {
         None | Some(Value::Nil) => {}
-        Some(Value::Str(s)) if &**s == "quillo" => {}
+        Some(Value::Str(s) | Value::Css(s)) if &**s == "quillo" => {}
         Some(Value::Map(m)) => {
             let given: Vec<&str> = ["key", "bearer", "oauth", "mtls"].into_iter().filter(|k| m.get(*k).is_some_and(|v| !matches!(v, Value::Nil))).collect();
             if let Some(k) = m.keys().find(|k| !["key", "as", "bearer", "oauth", "mtls"].contains(&&***k)) {
@@ -157,7 +157,7 @@ pub fn set_auth(name: &str, auth: Option<&Value>, forward: Option<&Value>, base:
             match m.get("bearer") {
                 None | Some(Value::Nil) => {}
                 Some(f @ (Value::Func(_) | Value::Builtin(..))) => a.bearer = Some(f.clone()),
-                Some(Value::Str(t)) => a.bearer = Some(Value::Str(t.clone())),
+                Some(Value::Str(t) | Value::Css(t)) => a.bearer = Some(Value::Str(t.clone())),
                 Some(other) => return Err(format!("service {}: `bearer` is a function giving a token, not {}", name, crate::interp::short(other))),
             }
             match m.get("oauth") {
@@ -204,7 +204,7 @@ pub fn set_auth(name: &str, auth: Option<&Value>, forward: Option<&Value>, base:
         Some(Value::List(l)) => {
             for v in l.iter() {
                 match v {
-                    Value::Str(h) if !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') => a.forward.push(h.to_ascii_lowercase()),
+                    Value::Str(h) | Value::Css(h) if !h.is_empty() && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') => a.forward.push(h.to_ascii_lowercase()),
                     other => return Err(format!("service {}: `forward` is a list of header names, not {}", name, crate::interp::short(other))),
                 }
             }
@@ -339,8 +339,8 @@ pub fn accept_of(v: &Value) -> Result<Accept, String> {
         Some(Value::Map(keys)) => {
             for (who, k) in keys.iter() {
                 let list: Vec<String> = match k {
-                    Value::Str(s) => s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
-                    Value::List(l) => l.iter().filter_map(|v| if let Value::Str(s) = v { Some(s.to_string()) } else { None }).filter(|s| !s.is_empty()).collect(),
+                    Value::Str(s) | Value::Css(s) => s.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                    Value::List(l) => l.iter().filter_map(|v| if let Value::Str(s) | Value::Css(s) = v { Some(s.to_string()) } else { None }).filter(|s| !s.is_empty()).collect(),
                     Value::Nil => Vec::new(),
                     other => return Err(format!("`accept_calls`: the key of `{}` is text or a list of text, not {}", who, crate::interp::short(other))),
                 };
@@ -364,7 +364,7 @@ pub fn accept_of(v: &Value) -> Result<Accept, String> {
                 return Err(format!("`accept_calls`: `jwt` has no `{}` (issuer, audience, jwks, secret)", k));
             }
             let text = |k: &str| match j.get(k) {
-                Some(Value::Str(s)) if !s.is_empty() => Some(s.to_string()),
+                Some(Value::Str(s) | Value::Css(s)) if !s.is_empty() => Some(s.to_string()),
                 _ => None,
             };
             let rules = JwtRules { issuer: text("issuer"), audience: text("audience"), jwks: text("jwks"), secret: text("secret") };
@@ -385,7 +385,7 @@ pub fn accept_of(v: &Value) -> Result<Accept, String> {
                 return Err(format!("`accept_calls`: `client_cert` has no `{}` (header, chain, subject)", k));
             }
             match c.get("header") {
-                Some(Value::Str(h)) if !h.is_empty() => a.client_cert = Some(h.to_ascii_lowercase()),
+                Some(Value::Str(h) | Value::Css(h)) if !h.is_empty() => a.client_cert = Some(h.to_ascii_lowercase()),
                 _ => return Err("`accept_calls`: `client_cert` needs `header`, the one the proxy that ended mTLS sets (x-forwarded-client-cert)".into()),
             }
             a.client_cert_chain = match c.get("chain") {

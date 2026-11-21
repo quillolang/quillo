@@ -241,6 +241,7 @@ fn want<T>(args: &[Value], i: usize, f: &str, what: &str, line: u32, get: impl F
 }
 
 fn s_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Arc<str>, Ctrl> {
+    // A builtin's own argument is never trusted CSS here: `Interp::call` made it text.
     want(args, i, f, "a str", line, |v| if let Value::Str(s) = v { Some(s.clone()) } else { None })
 }
 
@@ -290,7 +291,7 @@ fn no_page(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
 
 /// `cursor_index(s, n)`: the character a field's cursor at `n` is before.
 fn cursor_index(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let Value::Str(s) = arg(&args, 0) else { return fail(line, "`cursor_index` expects a str as argument 1") };
+    let (Value::Str(s) | Value::Css(s)) = arg(&args, 0) else { return fail(line, "`cursor_index` expects a str as argument 1") };
     let n = i_arg(&args, 1, "cursor_index", line)?.max(0) as usize;
     let (mut units, mut chars) = (0, 0);
     for c in s.chars() {
@@ -436,7 +437,7 @@ fn to_int(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
         Value::Bool(b) => Value::Int(b as i64),
         // The whole part (toward zero).
         Value::Dec(d) => d.trunc_i64().map_or_else(|| Value::err(Value::str(format!("{} is too large for an int", d))), Value::Int),
-        Value::Str(s) => crate::interp::coerce_loose("int", &s).unwrap_or_else(|| Value::err(Value::str(format!("not an int: {:?}", &*s)))),
+        Value::Str(s) | Value::Css(s) => crate::interp::coerce_loose("int", &s).unwrap_or_else(|| Value::err(Value::str(format!("not an int: {:?}", &*s)))),
         other => Value::err(Value::str(format!("cannot convert {} to int", other.type_name()))),
     })
 }
@@ -446,7 +447,7 @@ fn to_float(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
         Value::Int(n) => Value::Float(n as f64),
         Value::Float(f) => Value::Float(f),
         Value::Dec(d) => Value::Float(d.to_f64()),
-        Value::Str(s) => {
+        Value::Str(s) | Value::Css(s) => {
             crate::interp::coerce_loose("float", &s).unwrap_or_else(|| Value::err(Value::str(format!("not a number: {:?}", &*s))))
         }
         other => Value::err(Value::str(format!("cannot convert {} to float", other.type_name()))),
@@ -464,7 +465,7 @@ fn to_dec(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
             Some(d) => Value::Dec(d),
             None => Value::err(Value::str("cannot convert float to dec: it is too large, or not a number")),
         },
-        Value::Str(s) => match Dec::parse(s.trim()) {
+        Value::Str(s) | Value::Css(s) => match Dec::parse(s.trim()) {
             Some(d) => Value::Dec(d),
             None => Value::err(Value::str(format!("not a decimal: {:?}", &*s))),
         },
@@ -521,7 +522,7 @@ fn normalize(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let s = s_arg(&args, 0, "normalize", line)?;
     let form = match args.get(1) {
         None | Some(Value::Nil) => "NFC".into(),
-        Some(Value::Str(f)) => f.to_ascii_uppercase(),
+        Some(Value::Str(f) | Value::Css(f)) => f.to_ascii_uppercase(),
         Some(other) => return fail(line, format!("`normalize` expects a form (\"NFC\", \"NFD\", \"NFKC\" or \"NFKD\") as argument 2, got {}", other.type_name())),
     };
     // Written through a `Held` text where the limit is set: a character can take 18 of its kind
@@ -554,7 +555,7 @@ fn normalize(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// The value, or null for `""`: what `||` does in JavaScript, for text, as
 /// `filled(name) ?? "anonymous"` (FEEDBACK19.md, Q-151; branch feedback19-fixes).
 fn filled(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
-    Ok(args.into_iter().next().filter(|v| !matches!(v, Value::Str(s) if s.is_empty())).unwrap_or(Value::Nil))
+    Ok(args.into_iter().next().filter(|v| !matches!(v, Value::Str(s) | Value::Css(s) if s.is_empty())).unwrap_or(Value::Nil))
 }
 
 fn trim(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -590,7 +591,7 @@ fn join(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // then the whole.
     let mut total = sep.len().saturating_mul(l.len().saturating_sub(1));
     let texts = l.iter().all(|v| match v {
-        Value::Str(s) => {
+        Value::Str(s) | Value::Css(s) => {
             total = total.saturating_add(s.len());
             true
         }
@@ -605,7 +606,7 @@ fn join(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
             if i > 0 {
                 out.push_str(&sep);
             }
-            if let Value::Str(s) = v {
+            if let Value::Str(s) | Value::Css(s) = v {
                 out.push_str(s);
             }
         }
@@ -641,7 +642,7 @@ fn contains(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let needle = arg(&args, 1);
     Ok(Value::Bool(match arg(&args, 0) {
         // A list's text held, as `str` holds it (FEEDBACK71.md, Q-977; branch security).
-        Value::Str(s) => s.contains(&*needle.display_held().map_err(|o| o.at(line))?),
+        Value::Str(s) | Value::Css(s) => s.contains(&*needle.display_held().map_err(|o| o.at(line))?),
         Value::List(l) => l.iter().any(|v| equal(v, &needle)),
         Value::Map(m) => m.contains_key(&*needle.display_held().map_err(|o| o.at(line))?),
         Value::Nil => false,
@@ -691,7 +692,7 @@ fn slice(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
             let (s, e) = clamp_range(l.len(), start, end);
             Ok(Value::list(l[s..e].to_vec()))
         }
-        Value::Str(st) => {
+        Value::Str(st) | Value::Css(st) => {
             let chars: Vec<char> = st.chars().collect();
             let (s, e) = clamp_range(chars.len(), start, end);
             Ok(Value::str(chars[s..e].iter().collect::<String>()))
@@ -794,7 +795,7 @@ fn sum(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
             Some(v) => v,
             // Text is no number: `+` joined it, and amounts read from a form or a CSV summed to
             // "012.505.00" (FEEDBACK55.md, Q-783; branch feedback55).
-            None if matches!(x, Value::Str(_)) => return fail(line, sum_of_text(x, i)),
+            None if matches!(x, Value::Str(_) | Value::Css(_)) => return fail(line, sum_of_text(x, i)),
             None => crate::interp::binop(crate::ast::BinOp::Add, acc, x.clone(), line)?,
         };
     }
@@ -875,7 +876,7 @@ fn sort_by(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn reverse(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match arg(&args, 0) {
         Value::List(l) => Ok(Value::list(l.iter().rev().cloned().collect())),
-        Value::Str(s) => Ok(Value::str(s.chars().rev().collect::<String>())),
+        Value::Str(s) | Value::Css(s) => Ok(Value::str(s.chars().rev().collect::<String>())),
         other => fail(line, format!("`reverse` expects a list or str, got {}", other.type_name())),
     }
 }
@@ -958,7 +959,7 @@ fn values(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 fn get(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    if let (Some(Value::Map(m)), Some(Value::Str(k))) = (args.first(), args.get(1)) {
+    if let (Some(Value::Map(m)), Some(Value::Str(k) | Value::Css(k))) = (args.first(), args.get(1)) {
         return Ok(m.get(&**k).cloned().unwrap_or_else(|| arg(&args, 2)));
     }
     let m = m_arg(&args, 0, "get", line)?;
@@ -1530,10 +1531,10 @@ fn file_once(it: &mut Interp, args: &[Value], line: u32, hosted: Option<&Path>, 
         for (k, v) in m.iter() {
             match (&**k, v) {
                 ("cache", _) => {}
-                ("download", Value::Str(n)) if !n.is_empty() => download = Some(n.clone()),
+                ("download", Value::Str(n) | Value::Css(n)) if !n.is_empty() => download = Some(n.clone()),
                 // What is wrong with a str, said (FEEDBACK55.md, Q-726; branch feedback55).
-                ("download", Value::Str(_)) => return fail(line, "`file`'s download is empty: give the name a browser saves the file as, or leave it out"),
-                ("type", Value::Str(t)) => given_type = Some(content_type(t, "file", line)?),
+                ("download", Value::Str(_) | Value::Css(_)) => return fail(line, "`file`'s download is empty: give the name a browser saves the file as, or leave it out"),
+                ("type", Value::Str(t) | Value::Css(t)) => given_type = Some(content_type(t, "file", line)?),
                 ("download" | "type", Value::Nil) => {}
                 ("download" | "type", other) => return fail(line, format!("`file`'s {} is a str, got {}", k, other.repr())),
                 (k, _) => return fail(line, format!("`file` has no option `{}`: it takes `cache`, `download` and `type`", k)),
@@ -1596,7 +1597,7 @@ fn file_once(it: &mut Interp, args: &[Value], line: u32, hosted: Option<&Path>, 
     };
     let (reads, head) = match it.request_value() {
         Some(Value::Map(req)) => match req.get("method") {
-            Some(Value::Str(m)) => (&**m == "GET" || &**m == "HEAD", &**m == "HEAD"),
+            Some(Value::Str(m) | Value::Css(m)) => (&**m == "GET" || &**m == "HEAD", &**m == "HEAD"),
             _ => (true, false),
         },
         _ => (true, false),
@@ -1919,7 +1920,7 @@ fn accept_calls(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 /// `server fn refund(...) for ["shop"]`: the callers it takes, as the parser writes it.
 fn callers(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let (Some(Value::Str(f)), Some(Value::List(l))) = (args.first(), args.get(1)) else {
+    let (Some(Value::Str(f) | Value::Css(f)), Some(Value::List(l))) = (args.first(), args.get(1)) else {
         return fail(line, "`__callers` is written by `server fn ... for [...]`");
     };
     let names = l.iter().map(|v| v.display()).collect();
@@ -1950,7 +1951,7 @@ static BUILT: std::sync::Condvar = std::sync::Condvar::new();
 /// the first start stops the program, as `style_with`'s does; after a reload, the last good one
 /// is served (FEEDBACK37.md, Q-454; branch feedback36-39).
 fn built(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let (Some(Value::Str(path)), Some(f @ Value::Func(c))) = (args.first(), args.get(1)) else {
+    let (Some(Value::Str(path) | Value::Css(path)), Some(f @ Value::Func(c))) = (args.first(), args.get(1)) else {
         return fail(line, "`__built` is the route of a `build` declaration");
     };
     let key = (path.to_string(), Arc::as_ptr(&c.def) as usize);
@@ -2027,7 +2028,7 @@ fn built(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn built_answer(path: &str, v: &Value) -> Value {
     let (body, ctype) = match v {
         Value::Response(_) => return v.clone(),
-        Value::Str(s) => (s.as_bytes().to_vec(), mime(Path::new(path)).to_string()),
+        Value::Str(s) | Value::Css(s) => (s.as_bytes().to_vec(), mime(Path::new(path)).to_string()),
         Value::Html(h) => (h.as_bytes().to_vec(), "text/html; charset=utf-8".to_string()),
         other => {
             let mut out = Vec::new();
@@ -2054,7 +2055,7 @@ pub static SERVES_FOLDER: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let dir = s_arg(&args, 0, "files", line)?;
     let path = match args.get(1) {
-        Some(Value::Str(p)) => p.clone(),
+        Some(Value::Str(p) | Value::Css(p)) => p.clone(),
         None | Some(Value::Nil) => "".into(),
         Some(v) => return fail(line, format!("`files` takes the path asked for as argument 2, a str, got {}", v.repr())),
     };
@@ -2065,11 +2066,11 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Some(Value::Map(m)) => {
             for (k, v) in m.iter() {
                 match (&**k, v) {
-                    ("index", Value::Str(s)) if !s.is_empty() && !s.contains('/') => index = s.to_string(),
+                    ("index", Value::Str(s) | Value::Css(s)) if !s.is_empty() && !s.contains('/') => index = s.to_string(),
                     ("extensions", Value::List(l)) => {
                         extensions = l.iter().map(|e| e.display().trim_start_matches('.').to_string()).filter(|e| !e.is_empty()).collect();
                     }
-                    ("not_found", Value::Str(s)) => not_found_page = Some(s.to_string()).filter(|s| !s.is_empty()),
+                    ("not_found", Value::Str(s) | Value::Css(s)) => not_found_page = Some(s.to_string()).filter(|s| !s.is_empty()),
                     ("not_found", Value::Nil) => not_found_page = None,
                     ("cache", v) => {
                         file_opts.insert("cache".into(), v.clone());
@@ -2143,7 +2144,7 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let as_folder = |it: &mut Interp| {
         SERVES_FOLDER.load(std::sync::atomic::Ordering::Relaxed)
             && match it.request_value() {
-                Some(Value::Map(r)) => matches!(r.get("path"), Some(Value::Str(p)) if p.ends_with('/')
+                Some(Value::Map(r)) => matches!(r.get("path"), Some(Value::Str(p) | Value::Css(p)) if p.ends_with('/')
                     && crate::server::percent_decode(p.trim_end_matches('/'), false).ends_with(&format!("/{}", rel))),
                 _ => false,
             }
@@ -2287,7 +2288,7 @@ fn hidden_target(program: &Path, served: &Path, real: &Path) -> bool {
 pub(crate) fn duration_seconds(v: &Value) -> Option<u64> {
     match v {
         Value::Int(n) if *n >= 0 => Some(*n as u64),
-        Value::Str(s) => {
+        Value::Str(s) | Value::Css(s) => {
             let s = s.trim();
             let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
             let n: u64 = n.parse().ok()?;
@@ -2372,8 +2373,8 @@ fn allow_cross_site(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn site_headers(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (prefix, m) = match args.as_slice() {
         [Value::Map(m)] => ("/".to_string(), m.clone()),
-        [Value::Str(p), Value::Map(m)] if p.starts_with('/') => (p.trim_end_matches('/').to_string(), m.clone()),
-        [Value::Str(p), _] if !p.starts_with('/') => return fail(line, format!("`site_headers` needs a path that starts with /, got {:?}", &**p)),
+        [Value::Str(p) | Value::Css(p), Value::Map(m)] if p.starts_with('/') => (p.trim_end_matches('/').to_string(), m.clone()),
+        [Value::Str(p) | Value::Css(p), _] if !p.starts_with('/') => return fail(line, format!("`site_headers` needs a path that starts with /, got {:?}", &**p)),
         _ => return fail(line, "`site_headers` takes a map of headers, or a path and a map: site_headers(\"/admin\", { \"cache-control\": \"no-store\" })"),
     };
     let prefix = if prefix.is_empty() { "/".to_string() } else { prefix };
@@ -2386,18 +2387,19 @@ fn site_headers(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         if matches!(name.as_str(), "content-length" | "transfer-encoding" | "connection" | "set-cookie" | "content-type") {
             return fail(line, format!("`site_headers`: `{}` is the answer's own; a route sets it", name));
         }
-        // FEEDBACK69.md, Q-964, found in review; branch q964-miss-page.
-        if name == crate::server::AS_WRITTEN {
+        // FEEDBACK69.md, Q-964, found in review; branch q964-miss-page. And a server fn's own
+        // answer's mark (FEEDBACK79.md, Q-1250, found in the review of the trusted CSS; branch feedback72-81).
+        if name == crate::server::AS_WRITTEN || name == crate::server::MARKED {
             return fail(line, format!("`site_headers`: `{}` is Quillo's own", name));
         }
         let value = match v {
             Value::Nil => None,
             // A `location` that runs code or carries a page, as `respond`'s (FEEDBACK55.md, Q-719;
             // branch feedback55; found in review).
-            Value::Str(s) if name == "location" && runs_or_carries(s) => {
+            Value::Str(s) | Value::Css(s) if name == "location" && runs_or_carries(s) => {
                 return fail(line, format!("`site_headers`: `location` is not given a {} URL, got {}", carried_scheme(s).unwrap_or("data:"), v.repr()))
             }
-            Value::Str(s) if !s.contains(['\r', '\n']) => Some(s.to_string()),
+            Value::Str(s) | Value::Css(s) if !s.contains(['\r', '\n']) => Some(s.to_string()),
             Value::Int(_) | Value::Bool(_) => Some(v.display().to_string()),
             other => return fail(line, format!("`site_headers`: the value of `{}` is text on one line, or null, got {}", name, other.repr())),
         };
@@ -2419,7 +2421,7 @@ fn tenant(it: &mut Interp, _: Vec<Value>, _: u32) -> R {
 /// `_`; anything else is no tenant.
 fn tenant_from(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let rule = match args.first() {
-        Some(Value::Str(d)) => {
+        Some(Value::Str(d) | Value::Css(d)) => {
             let d = d.trim_start_matches('.').to_ascii_lowercase();
             if d.is_empty() || d.contains('/') || d.contains(':') {
                 return fail(line, format!("`tenant_from` needs a domain such as \"example.com\", got {:?}", d));
@@ -2699,6 +2701,12 @@ pub(crate) fn answer_headers(h: &Map, f: &str, line: u32) -> Result<Vec<(String,
         // found in review; branch q964-miss-page).
         if k == crate::server::AS_WRITTEN {
             return fail(line, format!("`{}` header `{}` is Quillo's own", f, k));
+        }
+        // The mark of a server fn's own answer, which tells the page to take trusted CSS from it:
+        // never on a program's answer, left out, so that one passing on another server fn's
+        // answer and its headers works as before (FEEDBACK79.md, Q-1250, found in the second review of the trusted CSS; branch feedback72-81).
+        if k == crate::server::MARKED {
+            continue;
         }
         match v {
             Value::Nil => out.push((k, crate::server::DROPPED.to_string())),
@@ -3121,7 +3129,7 @@ pub fn local_target(s: &str) -> Option<String> {
 
 fn local_path_fn(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     Ok(match args.first() {
-        Some(Value::Str(s)) => local_target(s).map_or(Value::Nil, Value::str),
+        Some(Value::Str(s) | Value::Css(s)) => local_target(s).map_or(Value::Nil, Value::str),
         _ => Value::Nil,
     })
 }
@@ -3338,7 +3346,7 @@ fn round_dec(d: crate::decimal::Dec, args: &[Value], line: u32) -> R {
     };
     let mode = match args.get(2) {
         None | Some(Value::Nil) => Rounding::HalfEven,
-        Some(Value::Str(s)) => match Rounding::parse(s) {
+        Some(Value::Str(s) | Value::Css(s)) => match Rounding::parse(s) {
             Some(m) => m,
             None => return fail(line, format!("`round`: unknown rounding {:?} (one of {})", &**s, Rounding::NAMES)),
         },
@@ -3644,7 +3652,7 @@ fn zip(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn take(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let n = i_arg(&args, 1, "take", line)?.max(0) as usize;
     match arg(&args, 0) {
-        Value::Str(s) => Ok(Value::str(s.chars().take(n).collect::<String>())),
+        Value::Str(s) | Value::Css(s) => Ok(Value::str(s.chars().take(n).collect::<String>())),
         _ => Ok(Value::list(l_arg(&args, 0, "take", line)?.iter().take(n).cloned().collect())),
     }
 }
@@ -3652,7 +3660,7 @@ fn take(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn drop_fn(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let n = i_arg(&args, 1, "drop", line)?.max(0) as usize;
     match arg(&args, 0) {
-        Value::Str(s) => Ok(Value::str(s.chars().skip(n).collect::<String>())),
+        Value::Str(s) | Value::Css(s) => Ok(Value::str(s.chars().skip(n).collect::<String>())),
         _ => Ok(Value::list(l_arg(&args, 0, "drop", line)?.iter().skip(n).cloned().collect())),
     }
 }
@@ -3714,12 +3722,12 @@ fn join_on(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let key = s_arg(&args, 2, "join_on", line)?;
     let other_key: Arc<str> = match arg(&args, 3) {
         Value::Nil => key.clone(),
-        Value::Str(s) => s,
+        Value::Str(s) | Value::Css(s) => s,
         other => return fail(line, format!("`join_on`'s fourth argument is the others' key (a str), got {}", other.type_name())),
     };
     let name: String = match arg(&args, 4) {
         Value::Nil => key.strip_suffix("_id").filter(|s| !s.is_empty()).unwrap_or("joined").to_string(),
-        Value::Str(s) => s.to_string(),
+        Value::Str(s) | Value::Css(s) => s.to_string(),
         other => return fail(line, format!("`join_on`'s fifth argument is the field to put the match in (a str), got {}", other.type_name())),
     };
     let mut index: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
@@ -3748,7 +3756,7 @@ fn index_of(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let x = arg(&args, 1);
     Ok(match arg(&args, 0) {
         Value::List(l) => l.iter().position(|v| equal(v, &x)).map_or(Value::Nil, |i| Value::Int(i as i64)),
-        Value::Str(s) => {
+        Value::Str(s) | Value::Css(s) => {
             let needle = x.display_held().map_err(|o| o.at(line))?;
             s.find(&*needle).map_or(Value::Nil, |b| Value::Int(s[..b].chars().count() as i64))
         }
@@ -3784,12 +3792,12 @@ fn markdown_page(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     let heading = || markdown_title(&text, opts.get("html").is_some_and(|v| v.truthy()));
     let title = match opts.get("title") {
-        Some(Value::Str(t)) => t.to_string(),
+        Some(Value::Str(t) | Value::Css(t)) => t.to_string(),
         None | Some(Value::Nil) => heading().unwrap_or_default(),
         Some(v) => return fail(line, format!("`markdown_page`'s title is a str, got {}", v.repr())),
     };
     let lang = match opts.get("lang") {
-        Some(Value::Str(l)) if !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => format!(" lang=\"{}\"", l),
+        Some(Value::Str(l) | Value::Css(l)) if !l.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') => format!(" lang=\"{}\"", l),
         None | Some(Value::Nil) => String::new(),
         Some(v) => return fail(line, format!("`markdown_page`'s lang is a language tag such as \"en\", got {}", v.repr())),
     };
@@ -4059,7 +4067,9 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             if let Some(o) = &mut it.reads {
                 o.extend(topics.iter().cloned());
             }
-            (Ok(crate::interp::from_island_json(&a.value)), topics, Some(a), false)
+            // The server's own answer, kept: its trusted CSS stays trusted (FEEDBACK79.md,
+            // Q-1250; branch feedback72-81).
+            (Ok(crate::interp::from_own_island_json(&a.value)), topics, Some(a), false)
         }
         None => {
             crate::metrics::live_run(false);
@@ -4161,7 +4171,7 @@ fn style_noop(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
     // A style whose body has no element to carry its mark is noted as it runs, and the
     // view around it is not kept, as a kept one would not run this (see
     // `name_unmarked_styles` in src/parser.rs).
-    if let Some(Value::Str(id)) = args.get(2) {
+    if let Some(Value::Str(id) | Value::Css(id)) = args.get(2) {
         if !it.styles_used.iter().any(|u| **u == **id) {
             it.styles_used.push(id.to_string());
         }
@@ -4191,7 +4201,7 @@ fn every(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// scripts, in the browser; rendering on the server, they give null.
 fn js(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match args.first() {
-        Some(Value::Str(_)) => Ok(Value::Nil),
+        Some(Value::Str(_) | Value::Css(_)) => Ok(Value::Nil),
         _ => fail(line, "`js` takes the name of what it calls first: js(\"Chart\", ...)"),
     }
 }
@@ -4347,7 +4357,7 @@ fn waiting(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
 /// one, so that two names are two on every database (FEEDBACK55.md, Q-756; branch feedback55;
 /// 63 and the marks found in review).
 fn sql_ident(v: &Value, f: &str, line: u32) -> Result<String, Ctrl> {
-    let Value::Str(s) = v else { return fail(line, format!("`{}` takes a name (a str) or a list of them, got {}", f, v.type_name())) };
+    let (Value::Str(s) | Value::Css(s)) = v else { return fail(line, format!("`{}` takes a name (a str) or a list of them, got {}", f, v.type_name())) };
     let mark = unicode_normalization::char::is_combining_mark;
     let mut after_letter = false;
     let mut chars_ok = true;
@@ -4436,11 +4446,14 @@ fn css_value_fn(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// declarations, and Q-668's `}` was back in css`...` in a `<style>` (third review).
 pub fn css_value_of(v: Value, line: u32) -> R {
     match &v {
-        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) => return Ok(v),
+        // Trusted CSS passes as it is: a css`...` the program wrote, given through a name, a
+        // prop, a list or a fn's answer (FEEDBACK79.md, Q-1250, the user's decision; branch
+        // feedback72-81).
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Css(_) => return Ok(v),
         Value::Str(s) if !crate::interp::css_special(s) => return Ok(v),
         Value::Err(e, own, at) => {
             let t = match &**e {
-                Value::Str(s) => s.to_string(),
+                Value::Str(s) | Value::Css(s) => s.to_string(),
                 other => other.display_held().map_err(|o| o.at(line))?,
             };
             let mut out = String::with_capacity(t.len() + 16);

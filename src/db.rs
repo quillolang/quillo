@@ -479,6 +479,9 @@ fn commits_by_itself(f: &str, stmt: &str) -> String {
 /// the SQL has no placeholder is no value (Q-747); and placeholders with no values are refused
 /// where SQLite stored nulls (Q-729; branch feedback55).
 fn given_values(scan: &crate::sql::Scan, params: Vec<Value>) -> Result<Vec<Value>, String> {
+    // Trusted CSS, however deep in a value, is stored as the text it is, and read back as text
+    // (FEEDBACK79.md, Q-1250; branch feedback72-81).
+    let params: Vec<Value> = params.into_iter().map(|v| Value::plain_deep(&v).unwrap_or(v)).collect();
     // `@name` with a map that has `name`, on MySQL: a variable of the session, null unless set,
     // where SQLite takes the map's value; the map was silently left out (FEEDBACK55.md, Q-752;
     // branch feedback55).
@@ -524,7 +527,7 @@ fn storable(v: &Value, given: bool, inside: bool) -> Result<(), String> {
             if inside { " holds" } else { " is" },
             v.repr()
         )),
-        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) | Value::Html(_) => Ok(()),
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) | Value::Html(_) | Value::Css(_) => Ok(()),
         Value::List(l) => l.iter().try_for_each(|x| storable(x, false, true)),
         Value::Map(m) => m.values().try_for_each(|x| storable(x, false, true)),
         Value::Err(..) if given => Err(" cannot be stored: got error".to_string()),
@@ -593,7 +596,7 @@ fn db_err(e: impl std::fmt::Display) -> Value {
 fn error_kind(_it: &mut Interp, args: Vec<Value>, _line: u32) -> R {
     let kind = match args.first() {
         Some(Value::Err(e, _, _)) => match &**e {
-            Value::Str(s) => s.strip_prefix("db: ").and_then(kind_of),
+            Value::Str(s) | Value::Css(s) => s.strip_prefix("db: ").and_then(kind_of),
             _ => None,
         },
         _ => None,
@@ -1444,7 +1447,8 @@ fn tenant_target_or_none(it: &mut Interp, dbs: &Arc<TenantDbs>, name: &str) -> R
         return Err(why);
     }
     match r {
-        Ok(Value::Str(s)) | Err(Ctrl::Return(Value::Str(s))) => Ok(Some(s.to_string())),
+        // Trusted CSS too, which is the `str` it is (FEEDBACK79.md, Q-1250; branch feedback72-81).
+        Ok(Value::Str(s) | Value::Css(s)) | Err(Ctrl::Return(Value::Str(s) | Value::Css(s))) => Ok(Some(s.to_string())),
         Ok(Value::Nil) | Err(Ctrl::Return(Value::Nil)) => Ok(None),
         Ok(Value::Err(e, _, _)) => Err(format!("tenant {}: {}", name, e.display())),
         Ok(other) => Err(format!("tenant {}: the function for tenants' databases gave {}, not a path or a URL", name, other.type_name())),
@@ -1653,7 +1657,7 @@ fn to_sql(v: &Value) -> Sql {
         Value::Float(f) => Sql::Real(*f + 0.0),
         // SQLite has no decimals: the text, exactly (see `Col::Dec`).
         Value::Dec(d) => Sql::Text(d.to_string()),
-        Value::Str(s) => Sql::Text(s.to_string()),
+        Value::Str(s) | Value::Css(s) => Sql::Text(s.to_string()),
         Value::Html(h) => Sql::Text(h.to_string()),
         other => Sql::Text(json_text(other)),
     }
@@ -1902,7 +1906,7 @@ fn no_tx_control(scan: &crate::sql::Scan, f: &str, line: u32) -> Result<(), Ctrl
 
 fn sql_arg(args: &[Value], name: &str, line: u32) -> Result<String, Ctrl> {
     match args.first() {
-        Some(Value::Str(s)) => Ok(s.to_string()),
+        Some(Value::Str(s) | Value::Css(s)) => Ok(s.to_string()),
         other => fail(line, format!("`{}` expects SQL text as its first argument, got {}", name, other.map_or("nothing", |v| v.type_name()))),
     }
 }
@@ -1923,7 +1927,7 @@ fn tenant_exists(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let on = it.db_on.take();
     let dbs = per_tenant(it, on, "db.tenant_exists", line)?;
     let name = match args.first() {
-        Some(Value::Str(s)) => s.clone(),
+        Some(Value::Str(s) | Value::Css(s)) => s.clone(),
         other => return fail(line, format!("`db.tenant_exists` expects a name, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
     if !crate::site::tenant_name_ok(&name) {
@@ -2050,12 +2054,12 @@ fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Resul
             return fail(line, format!("`{}` has no option `{}` (replicas)", f, k.as_str()));
         }
         let urls: Vec<String> = match o.get("replicas") {
-            Some(Value::List(l)) if l.iter().all(|u| matches!(u, Value::Str(_))) => l.iter().map(|u| u.display()).collect(),
+            Some(Value::List(l)) if l.iter().all(|u| matches!(u, Value::Str(_) | Value::Css(_))) => l.iter().map(|u| u.display()).collect(),
             Some(Value::Nil) | None => Vec::new(),
             Some(other) => return fail(line, format!("`replicas` is a list of database URLs, got {}", other.type_name())),
         };
         let primary = match args.first() {
-            Some(Value::Str(t)) if !t.contains("{tenant}") => t.to_string(),
+            Some(Value::Str(t) | Value::Css(t)) if !t.contains("{tenant}") => t.to_string(),
             _ => return fail(line, format!("`{}`: replicas are of one database, given by its URL", f)),
         };
         if !urls.is_empty() && !is_server_url(&primary) {
@@ -2082,11 +2086,11 @@ fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Resul
         return Ok(Ok(DbSlot::One(b)));
     }
     match args.first() {
-        Some(Value::Str(t)) if t.contains("{tenant}") => {
+        Some(Value::Str(t) | Value::Css(t)) if t.contains("{tenant}") => {
             tenant_template(&it.base_dir, t);
             Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs::new(Target::Text(t.to_string()))))))
         }
-        Some(Value::Str(t)) => Ok(open_backend(it, t).map(DbSlot::One)),
+        Some(Value::Str(t) | Value::Css(t)) => Ok(open_backend(it, t).map(DbSlot::One)),
         // Where each tenant's database is, opened when its tenant first uses it.
         Some(fv @ (Value::Func(_) | Value::Builtin(..))) => Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs::new(Target::Fn(fv.clone())))))),
         other => fail(
@@ -2113,7 +2117,7 @@ fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
                 // At once: a transaction rolled back does not undo the switch.
                 it.shared.publish(&topics);
             }
-            if let Some(Value::Str(t)) = args.first() {
+            if let Some(Value::Str(t) | Value::Css(t)) = args.first() {
                 if !is_server_url(t) && &**t != ":memory:" && !t.contains("{tenant}") {
                     let full = if Path::new(&**t).is_absolute() { Path::new(&**t).to_path_buf() } else { it.base_dir.join(&**t) };
                     let full = std::fs::canonicalize(&full).unwrap_or(full);
@@ -2154,7 +2158,7 @@ pub fn open_failed(inner: &Arc<Value>) -> bool {
 fn db_connect(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let label = match args.first() {
         // A label for its live updates' topics, the same on every server (and no secret in it).
-        Some(Value::Str(t)) => {
+        Some(Value::Str(t) | Value::Css(t)) => {
             let hash = |x: &str| crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(x.as_bytes()))[..12].to_string();
             let topics = hash(&target_label(&it.base_dir, t));
             // A server's connection is the same one only for the same URL: another user or other
@@ -2164,7 +2168,7 @@ fn db_connect(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         _ => format!("fn{}", it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()),
     };
-    if matches!(args.first(), Some(Value::Str(_))) {
+    if matches!(args.first(), Some(Value::Str(_) | Value::Css(_))) {
         if let Some(i) = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().position(|(l, _)| *l == label) {
             return Ok(connection(i));
         }
@@ -2240,7 +2244,7 @@ fn connection(i: usize) -> Value {
 fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let dir = match args.first() {
         None => "migrations".to_string(),
-        Some(Value::Str(s)) => s.to_string(),
+        Some(Value::Str(s) | Value::Css(s)) => s.to_string(),
         Some(other) => return fail(line, format!("`db.migrate` expects a folder name, got {}", other.type_name())),
     };
     let on = it.db_on.take();
@@ -2579,7 +2583,7 @@ pub fn uses_atomic(it: &Interp) -> bool {
 /// `db.system(target)`: where Quillo keeps its own tables, when the
 /// program's databases are one per tenant (or to keep them apart).
 fn system(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    let Some(Value::Str(t)) = args.first() else {
+    let Some(Value::Str(t) | Value::Css(t)) = args.first() else {
         return fail(line, "`db.system` expects a path or a database URL");
     };
     if t.contains("{tenant}") {
@@ -2907,7 +2911,7 @@ pub(crate) fn later_due(it: &mut Interp, on: Option<usize>, now: i64, limit: usi
     let sql = format!("select id, service, fn, args, tenant, rid, at, tries from _quillo_later where at <= ? order by at limit {}", limit);
     let Ok(Value::List(rows)) = query_on(it, on, vec![Value::str(sql), Value::Int(now)]) else { return Vec::new() };
     let text = |r: &Map, k: &str| match r.get(k) {
-        Some(Value::Str(s)) => s.to_string(),
+        Some(Value::Str(s) | Value::Css(s)) => s.to_string(),
         _ => String::new(),
     };
     let int = |r: &Map, k: &str| match r.get(k) {
@@ -2982,7 +2986,7 @@ pub(crate) fn later_tenants(it: &mut Interp, now: i64, limit: usize) -> Vec<(Str
     rows.iter()
         .filter_map(|r| match r {
             Value::Map(r) => match (r.get("tenant"), r.get("made")) {
-                (Some(Value::Str(t)), Some(Value::Int(m))) => Some((t.to_string(), *m)),
+                (Some(Value::Str(t) | Value::Css(t)), Some(Value::Int(m))) => Some((t.to_string(), *m)),
                 _ => None,
             },
             _ => None,
@@ -3042,14 +3046,14 @@ pub(crate) fn later_status(it: &mut Interp, id: &str) -> Option<(i64, Option<Str
         if let Ok(Some(Value::Map(r))) = waiting.map(|mut rows| rows.pop()) {
             let tries = if let Some(Value::Int(n)) = r.get("tries") { *n } else { 0 };
             let error = match r.get("error") {
-                Some(Value::Str(e)) => Some(e.to_string()),
+                Some(Value::Str(e) | Value::Css(e)) => Some(e.to_string()),
                 _ => None,
             };
             return Some((tries, error, None));
         }
         let done = apart(it, &b, "select answer from _quillo_later_done where id = ?".into(), vec![Value::str(id)]);
         if let Ok(Some(Value::Map(r))) = done.map(|mut rows| rows.pop()) {
-            if let Some(Value::Str(a)) = r.get("answer") {
+            if let Some(Value::Str(a) | Value::Css(a)) = r.get("answer") {
                 return Some((0, None, Some(a.to_string())));
             }
         }
@@ -3099,7 +3103,7 @@ pub(crate) fn call_claim(it: &mut Interp, id: &str, now_ms: i64, forget_before: 
     match rows {
         Ok(Value::List(rows)) => match rows.first() {
             Some(Value::Map(r)) => match (r.get("status"), r.get("answer"), r.get("at")) {
-                (Some(Value::Int(s)), Some(Value::Str(a)), _) if *s > 0 => Some(Claim::Done(*s as u16, a.to_string())),
+                (Some(Value::Int(s)), Some(Value::Str(a) | Value::Css(a)), _) if *s > 0 => Some(Claim::Done(*s as u16, a.to_string())),
                 // A copy that died running it left this, and it would be
                 // refused for ever. Older than a signature can be, it is free
                 // (FEEDBACK23.md, Q-186; branch feedback23-fixes).
@@ -3699,7 +3703,7 @@ fn shards(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     let mut list = Vec::new();
     for t in targets.iter() {
-        if let Value::Str(s) = t {
+        if let Value::Str(s) | Value::Css(s) = t {
             if s.contains("{tenant}") {
                 return fail(line, "a shard is one database: no {tenant} in it");
             }

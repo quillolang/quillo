@@ -236,8 +236,8 @@ fn opts_of(v: Option<&Value>, fname: &str, line: u32, base: &std::path::Path) ->
     let file = |name: &str| -> Result<Option<String>, Ctrl> {
         match m.get(name) {
             None | Some(Value::Nil) => Ok(None),
-            Some(Value::Str(s)) if name == "ca" && &**s == "system" => Ok(Some("system".into())),
-            Some(Value::Str(s)) if !s.is_empty() => Ok(Some(base.join(&**s).to_string_lossy().into_owned())),
+            Some(Value::Str(s) | Value::Css(s)) if name == "ca" && &**s == "system" => Ok(Some("system".into())),
+            Some(Value::Str(s) | Value::Css(s)) if !s.is_empty() => Ok(Some(base.join(&**s).to_string_lossy().into_owned())),
             Some(other) => fail(line, format!("`{}`: `{}` is the path of a PEM file{}, got {}", fname, name, if name == "ca" { " or \"system\"" } else { "" }, other.repr())),
         }
     };
@@ -989,7 +989,7 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
     if o.cache > 0 && method != "GET" {
         return fail(line, format!("`{}`: `cache` keeps the answers of GET requests, not {}", fname, method));
     }
-    let Value::Str(url) = url else {
+    let (Value::Str(url) | Value::Css(url)) = url else {
         return fail(line, format!("`{}` expects a URL string, got {}", fname, url.type_name()));
     };
     if !(url.starts_with("http://") || url.starts_with("https://")) {
@@ -1002,7 +1002,8 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
     };
     let payload: Option<(String, Vec<u8>)> = match body {
         Value::Nil => None,
-        Value::Str(s) => Some(("text/plain; charset=utf-8".into(), s.as_bytes().to_vec())),
+        // Trusted CSS is the text it is (FEEDBACK79.md, Q-1250; branch feedback72-81).
+        Value::Str(s) | Value::Css(s) => Some(("text/plain; charset=utf-8".into(), s.as_bytes().to_vec())),
         Value::Html(h) => Some(("text/html; charset=utf-8".into(), h.as_bytes().to_vec())),
         other => match json_body(other, line)? {
             Ok(j) => Some(("application/json".into(), j)),
@@ -1089,7 +1090,7 @@ fn patch(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn request(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // Judged as written, and said so: upper case changes no character's kind.
     let method = match a(&args, 0) {
-        Value::Str(m) => match not_a_method(&m) {
+        Value::Str(m) | Value::Css(m) => match not_a_method(&m) {
             Some(e) => return Ok(e),
             None => m.to_ascii_uppercase(),
         },
@@ -1254,7 +1255,7 @@ fn pieces(p: &mut Pending, kind: Kind, end: bool) -> Result<Vec<Vec<Value>>, Str
 /// is not a success), or an error value when it could not be had.
 fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     not_in_component(it, "http.stream", line)?;
-    let Value::Str(url) = a(&args, 0) else {
+    let (Value::Str(url) | Value::Css(url)) = a(&args, 0) else {
         return fail(line, format!("`http.stream` expects a URL string, got {}", a(&args, 0).type_name()));
     };
     let f = match a(&args, 1) {
@@ -1275,7 +1276,7 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     let body = opts.get("body").cloned().unwrap_or(Value::Nil);
     let method = match opts.get("method") {
-        Some(Value::Str(m)) => match not_a_method(m) {
+        Some(Value::Str(m) | Value::Css(m)) => match not_a_method(m) {
             Some(e) => return Ok(e),
             None => m.to_ascii_uppercase(),
         },
@@ -1288,7 +1289,7 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     };
     let payload: Option<(String, Vec<u8>)> = match &body {
         Value::Nil => None,
-        Value::Str(s) => Some(("text/plain; charset=utf-8".into(), s.as_bytes().to_vec())),
+        Value::Str(s) | Value::Css(s) => Some(("text/plain; charset=utf-8".into(), s.as_bytes().to_vec())),
         other => match json_body(other, line)? {
             Ok(j) => Some(("application/json".into(), j)),
             Err(e) => return Ok(e),

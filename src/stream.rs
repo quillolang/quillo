@@ -132,10 +132,10 @@ fn response(args: &[Value], name: &str, events: bool, line: u32) -> R {
     // the first was let go and the second dropped as the head was written (FEEDBACK55.md, Q-726;
     // branch feedback55).
     let ctype = match opts.get("type") {
-        Some(Value::Str(t)) if !events => crate::builtins::content_type(t, name, line)?,
+        Some(Value::Str(t) | Value::Css(t)) if !events => crate::builtins::content_type(t, name, line)?,
         None | Some(Value::Nil) => if events { "text/event-stream" } else { "text/plain; charset=utf-8" }.into(),
         // `events`' type is its own, but a type that is no str is refused there too.
-        Some(Value::Str(_)) => "text/event-stream".into(),
+        Some(Value::Str(_) | Value::Css(_)) => "text/event-stream".into(),
         Some(other) => return fail(line, format!("`{}`'s type is a str, like \"text/csv\", got {}", name, other.type_name())),
     };
     let mut headers = vec![("content-type".to_string(), ctype)];
@@ -186,14 +186,14 @@ fn events(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// browser (src/client/runtime.js); rendering on the server, they do nothing.
 fn listen(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match (args.first(), args.get(1)) {
-        (Some(Value::Str(_)), Some(Value::Func(_) | Value::Builtin(..))) => Ok(Value::Nil),
+        (Some(Value::Str(_) | Value::Css(_)), Some(Value::Func(_) | Value::Builtin(..))) => Ok(Value::Nil),
         _ => fail(line, "`listen` takes a URL and a function: listen(\"/progress\", (p) => { done = p.done })"),
     }
 }
 
 fn receive(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match (args.first(), args.get(1)) {
-        (Some(Value::Str(_)), Some(Value::Func(_) | Value::Builtin(..))) => Ok(Value::Nil),
+        (Some(Value::Str(_) | Value::Css(_)), Some(Value::Func(_) | Value::Builtin(..))) => Ok(Value::Nil),
         _ => fail(line, "`receive` takes a URL and a function: receive(\"/reply\", (t) => { text = text + t })"),
     }
 }
@@ -207,7 +207,8 @@ fn receive(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn encode(v: &Value, event: Option<&Value>, events: bool) -> Option<Vec<u8>> {
     if !events {
         return Some(match v {
-            Value::Str(s) => s.as_bytes().to_vec(),
+            // Trusted CSS is the text it is (FEEDBACK79.md, Q-1250; branch feedback72-81).
+            Value::Str(s) | Value::Css(s) => s.as_bytes().to_vec(),
             Value::Html(h) => h.as_bytes().to_vec(),
             Value::Nil => Vec::new(),
             other => {
