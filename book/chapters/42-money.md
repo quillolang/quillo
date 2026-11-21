@@ -229,7 +229,7 @@ route POST /hooks/stripe with db, env, time {
                     money.to_minor(amt), to, amt.currency)?
                 record("deposit", { to, amount: amt, stripe_event: event.id })?
             }
-        })
+        })?                                  // a rollback answers 500, and Stripe sends it again
     }
     { received: true }
 }

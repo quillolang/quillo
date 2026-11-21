@@ -9,8 +9,8 @@ functions and the same checks.
 
 > **Try it on your machine.** These programs need ports, a camera or a sender of their
 > own, so each part below has a command to run. Open the pages at
-> `http://127.0.0.1:8080` rather than `localhost`: see
-> [Which way a page connects](#which-way-a-page-connects).
+> `http://localhost:8080` or `http://127.0.0.1:8080`: both connect the same way (see
+> [Which way a page connects](#which-way-a-page-connects)).
 
 ## Packets in
 
@@ -385,10 +385,10 @@ In the Network panel, the connection is the request to `/_quillo/wt`; if its typ
 `channel`, `media` or `js` in it, nothing mounted, no service and no plugin) answers
 `/_quillo/wt-ticket` with 404 *(since 0.8.9)*.
 
-On your own machine, open `http://127.0.0.1:8080` rather than `localhost`. `quillo run`
-listens on 127.0.0.1, and browsers try `localhost` over IPv6 first for UDP. They find
-nothing there and use a WebSocket instead. `quillo run main.qwe --host ::1` serves `localhost` over IPv6, if
-you would rather keep the name.
+On your own machine, `http://localhost:8080` and `http://127.0.0.1:8080` both use
+WebTransport. `quillo run` listens on 127.0.0.1, and for WebTransport on `[::1]` too,
+where a browser may dial `localhost` over IPv6 *(since 0.8.10: it was refused there, so a
+page at `localhost` took the WebSocket for good)*.
 
 ## In production
 

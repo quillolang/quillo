@@ -289,3 +289,27 @@ fn a_plain_check_says_the_comment_warnings_an_editors_does() {
     let (ok, out) = quillo_in(&d.0, "check");
     assert!(ok && out.contains("b.qwe:2: warning: `//` starts a comment here, so `// 4` is left out"), "{}", out);
 }
+
+// A page's runtime holds what its code needs: Q-1272's message for an error shown as nothing
+// (`errShown`) named a local `comp` and the word `match`, which the runtime's shake reads as
+// references, and every page took `match`, `matchInto`, `typeIs` and the money and date checks, 5.3
+// KB of a counter's runtime (the 0.8.10 release benchmark). The message reads as before.
+#[test]
+fn a_counters_runtime_takes_no_match() {
+    let d = Dir::new("counter", &[(
+        "main.qwe",
+        "component Counter() {\n    state n = 0\n    return <button onclick={() => { n += 1 }}>Clicked {n} times</button>\n}\nroute GET / {\n    return <main><Counter/></main>\n}\n",
+    )]);
+    let server = support::serve(&d.main(), &[]);
+    let page = support::send(server.port, "GET", "/", &[], "").body;
+    let at = page.find("/_quillo/r/").expect("the page takes a runtime file");
+    let path: String = page[at..].chars().take_while(|c| *c != '"' && *c != '\'' && *c != ')').collect();
+    let rt = support::send(server.port, "GET", &path, &[], "").body;
+    assert!(rt.contains("function errShown("), "{}", &rt[..rt.len().min(300)]);
+    for unneeded in ["function matchInto(", "function typeIs(", "function moneyFromData(", "function comp("] {
+        assert!(!rt.contains(unneeded), "{} in a counter's runtime", unneeded);
+    }
+    // As written for the console: `match`, not its escape.
+    assert!(rt.contains("or \\`ma\\u0074ch\\`)"), "the escape is kept as written");
+    drop(server);
+}

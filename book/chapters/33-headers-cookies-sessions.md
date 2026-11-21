@@ -130,9 +130,10 @@ route GET /log = stream((out) => { for line in tail_log() { out(line) } },
   A list is one header per item for `set-cookie` alone (`{ "set-cookie": ["a=1", "b=2"]
   }` sends two), and an error for any other header, as a map is.
 - `content-length`, `transfer-encoding`, `connection` and `date` are the server's,
-  whatever is given. `server: Quillo` is sent unless the route sets `server` (`null`
-  for none); `x-request-id` and `x-content-type-options: nosniff` are added unless the
-  route names them.
+  whatever is given. `server: Quillo` is sent unless the route or `site_headers` sets
+  `server` (`null` for none, a text in its place; the route's own wins) *(since 0.8.10:
+  `site_headers` could not take it away)*; `x-request-id` and
+  `x-content-type-options: nosniff` are added unless the route names them.
 - A `location` that is a `javascript:`, `vbscript:` or `data:` URL is refused, in
   `respond`, `stream`, `events` and `site_headers` as in `redirect`.
 - `stream` and `events` refuse a status that has no body (204, 205, 304), so no
@@ -296,10 +297,10 @@ HMAC-SHA256. The browser holds it and sends it back; it can read it, so keep sec
 out, but it cannot change it, since the signature would no longer match.
 
 ```quillo
-route POST /login { form: { email: str, password: str } } with db, random {
+route POST /login { form: { email: str, password: str } } with db {
     let user = db.one("select * from users where email = ?", email)
-    let hash = user.password_hash ?? crypto.hash_password("not anyone's")   // same work, user or not
-    if user == null || !crypto.verify_password(password, hash) { reply 401 "Wrong email or password" }
+    let ok = crypto.verify_password(password, user.password_hash)   // as long for a stranger's null
+    if user == null || !ok { reply 401 "Wrong email or password" }
     set_session({ user: user.id })
     redirect("/")
 }
@@ -356,8 +357,8 @@ is set on the answer to the call, and the pages the visitor opens next carry it.
 ```quillo
 server fn sign_in(email: str, password: str) -> map {
     let user = db.one("select * from users where email = ?", email)
-    let hash = user.password_hash ?? crypto.hash_password("not anyone's")
-    if user == null || !crypto.verify_password(password, hash) { return err("Wrong email or password") }
+    let ok = crypto.verify_password(password, user.password_hash)
+    if user == null || !ok { return err("Wrong email or password") }
     set_session({ user: user.id })
     { name: user.name }
 }
@@ -535,10 +536,10 @@ route GET /login ? { next: str = "/" } =
         </form>
     </Page>
 
-route POST /login { form: { email: str, password: str, next: str = "/" } } with db, random, time {
+route POST /login { form: { email: str, password: str, next: str = "/" } } with db, time {
     let user = db.one("select * from users where email = ?", email)
-    let hash = user.password_hash ?? crypto.hash_password("not anyone's")
-    if user == null || !crypto.verify_password(password, hash) { reply 401 "Wrong email or password" }
+    let ok = crypto.verify_password(password, user.password_hash)
+    if user == null || !ok { reply 401 "Wrong email or password" }
     set_session({ user: user.id, at: now() })
     redirect(local(next))
 }

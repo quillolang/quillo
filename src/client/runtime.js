@@ -7132,9 +7132,14 @@ function errShown(v) {
   // scopes of their own; found in review).
   let c = Writer !== null ? Writer : Owner ? Owner.comp : null;
   for (let s = Owner; s && !(c instanceof Inst); s = s.up) if (s instanceof Inst) c = s;
-  const comp = c instanceof Inst ? c.def.$name : null;
+  const named = c instanceof Inst ? c.def.$name : null;
   const text = v.own || ERRORS_SHOWN ? display(v.error) : "internal error";
-  report(new Error(`an error no statement took, shown${comp ? ` in <${comp}>` : ""} as nothing: ${text} (give a value for it with \`??\`, or show something else with \`is_err\` or \`match\`)`));
+  // Neither a name nor a word here is one of the runtime's: a bundle takes every function whose
+  // name its code holds, strings too (client.rs, `shake`), and `comp` and `match` written here
+  // brought `match`, `matchInto`, `typeIs` and the money and date checks into every page's
+  // runtime, 5.3 KB (1.4 KB gzipped) of a counter's (the 0.8.10 release benchmark; branch
+  // feedback72-81). `\u0074` is the `t` of match.
+  report(new Error(`an error no statement took, shown${named ? ` in <${named}>` : ""} as nothing: ${text} (give a value for it with \`??\`, or show something else with \`is_err\` or \`ma\u0074ch\`)`));
 }
 // A value as the page shows it: a NUL is U+FFFD, as the server writes it and the HTML parser makes
 // it, or the server's page read otherwise than what the browser makes (FEEDBACK55.md, Q-772;

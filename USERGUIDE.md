@@ -2347,7 +2347,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   keeps them for good. Their comment lines, blank lines and indentation are taken out, but
   they are not minified: names and the spaces inside a line stay.
   - `/_quillo/r/<hash>.js`, the runtime: the parts of it the program's components
-    reach (about 139 KB, 39 KB gzipped, for a page with one counter). Every page of the program
+    reach (about 142 KB, 39 KB gzipped, for a page with one counter). Every page of the program
     loads the same one, so the browser downloads it once.
   - `/_quillo/b/<hash>.js`, the page's own code: the components it was rendered with,
     every component they can show, and what they use. Pages with the same components

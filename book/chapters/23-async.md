@@ -92,7 +92,7 @@ Calling one while the markup is being worked out is a mistake, and `quillo check
 where it belongs:
 
 ```
-error: `load` waits on the server, so <Bad> can only call it from an event handler (@click={() => { ... }}) or to set state: state x = load(...)
+error: `load` waits on the server, so <Bad> can only call it from an event handler (onclick={() => { ... }}) or to set state: state x = load(...)
 ```
 
 Functions that call the server need nothing either. A helper that calls `add_note` twice

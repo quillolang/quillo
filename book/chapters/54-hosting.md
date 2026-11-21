@@ -333,6 +333,10 @@ about 170 MB, most of it Debian; `quillo` needs only the C library from it.
   its services, checks of its own), 200 or 503: give it to an orchestrator's readiness
   probe. Each part, as JSON, is said only with the health token (`Authorization: Bearer`
   and `QUILLO_HEALTH_TOKEN`); anyone else gets `{"ready": ...}` alone *(since 0.7)*.
+  With a database per tenant, the database is `"ready (per tenant)"` when a tenant can be
+  opened: the tenants' folder can be written, or their server answers, and no database is
+  opened or made to ask *(since 0.8.10: it was `"down"`, so the app was never ready)*.
+  Neither probe is logged or counted.
 - `--log json` writes a JSON line per request (time, method, path with its query, status,
   ms, ip, tenant, and `rid`, the request's id) on stderr, where systemd's journal or the
   container's log collects it. A malformed request is an object of its own,

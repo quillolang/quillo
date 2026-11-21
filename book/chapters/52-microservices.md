@@ -370,7 +370,8 @@ described that way only.
   was started. Under `--base /shop` it says where it is served:
   `"servers": [{ "url": "/shop" }]`.
 - **Several routes on one method and path shape are one operation.** Their bodies are a
-  `oneOf`, each literal field an `enum`; their query parameters are merged, required
+  `oneOf`, each literal field an `enum`, or an `anyOf` when one body could fit two of
+  them (a catch-all route after the others); their query parameters are merged, required
   only where every route requires them; the path template is named as the first route
   names it (`/users/{id}`), its parameter a `oneOf` of the routes' types; and
   `x-quillo-at` is a list of the places in the source.

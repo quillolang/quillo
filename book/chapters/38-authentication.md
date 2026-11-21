@@ -48,7 +48,8 @@ route POST /logout { end_session(); redirect("/login") }
   yours, and so is what `user` holds (an id, a DN, an email).
 - An email nobody has finds no row, so `user.password_hash` is null, and
   `crypto.verify_password` says false after the same work as for a real hash: the answer
-  takes as long, and tells no one which emails have accounts.
+  takes as long, and tells no one which emails have accounts. A `user == null ||` before
+  the call skips that work and answers a stranger at once: call it first, then check `user`.
 - Signing out is a form that posts. A link would be a `GET`, which another site, a
   prefetch or a mail scanner could follow. The cookie and its rules are in [Headers,
   cookies and sessions](#sessions).
