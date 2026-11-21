@@ -72,7 +72,7 @@ FILES = {
 NOTE_LIST = """
 component NoteList() {
     state notes = load_notes()
-    <ul>{for n in notes ?? [] => <li key={n.id} @click={() => { let _ = add_note("x") }}>{n.text}</li>}</ul>
+    <ul>{for n in notes ?? [] => <li key={n.id}><button @click={() => { let _ = add_note("x") }}>{n.text}</button></li>}</ul>
 }
 """
 

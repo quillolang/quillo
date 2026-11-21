@@ -31,7 +31,7 @@ Operators are as in JavaScript, with these meanings:
 |---|---|
 | `+` | numbers add; a string with anything is text (`"n=" + 1` is `"n=1"`, `"a" + null` is `"anull"`); two lists join; two maps merge, the right one's values winning; `true + 1` and `null + 1` are errors |
 | `- * %` | as in JavaScript on numbers; nothing else is converted (`"5" * 2` is an error) |
-| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division, done in ints past 2^53 too: `floor`, `ceil`, `round`, `math.floor`, `math.ceil` and `math.trunc` of an int divided by an int, written in the call (`floor(a / b)`, `a / b \| floor`, `(a / b).floor()`, `math.floor(a / b)`, a builtin held in a variable), give the exact int, as Python's `a // b` does; a quotient kept in a variable first (`let q = a / b`) is a float, and its digits past 2^53 are gone; `math` has no `round` (write `round(a / b)`), on both sides |
+| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division, done in ints past 2^53 too: `floor`, `ceil`, `round`, `math.floor`, `math.ceil` and `math.trunc` of an int divided by an int, written in the call (`floor(a / b)`, `a / b \| floor`, `(a / b).floor()`, `math.floor(a / b)`, a builtin held in a variable), give the exact int, as Python's `a // b` does (here `//` starts a comment, so `pages // 2` is `pages`, and `quillo check` says so); a quotient kept in a variable first (`let q = a / b`) is a float, and its digits past 2^53 are gone; `math` has no `round` (write `round(a / b)`), on both sides |
 | `== !=` | deep equality, like comparing JSON: `1 == 1.0` and `0.1m == 0.1`, but `1 == "1"` is false (nothing is converted); an int and a float compare exactly, as in Python (`9007199254740993 == 9007199254740992.0` is false), in compiled code and in the browser too; functions are equal only to themselves |
 | `< <= > >=` | comparison of two numbers (ints, floats and decimals mix, exactly; not a decimal and a float), or two strings by code point; a string and a number, booleans, or NaN is an error |
 | `!`, `&&`, `\|\|` | not, and, or; `a && b` and `a \|\| b` give back one of their operands, so `{loading && <Spinner/>}` works |
@@ -529,11 +529,33 @@ wherever they were made.
 In a page under `--watch`, the browser's console says the same, from the error's stack:
 the `.qwe` file and line, and the calls. In production it says the message alone.
 The browser hides a builtin's error in production as the server does (see [What a route
-returns](#what-a-route-returns)): shown as text, in a template, in markup or an attribute,
-or written by `json.stringify`, it is `internal error`, so a component made again in the
-browser shows no more than the server's page did; so are a builtin's errors in attribute
-JSON and in channel messages. Errors the program wrote, a `server fn`'s errors (which the
-server has judged already) and the page's own JavaScript's are shown as they are.
+returns](#what-a-route-returns)): made into text, in a template or by `str`, or written by
+`json.stringify`, it is `internal error`, so a component made again in the browser shows
+no more than the server's page did; so are a builtin's errors in attribute JSON and in
+channel messages. Errors the program wrote, a `server fn`'s errors (which the server has
+judged already) and the page's own JavaScript's are made into text as they are.
+
+An error value shown in markup, any error, shows nothing: as a child, an attribute, a
+class, a style map's value or a `<style>`'s text, on the server and in the browser alike.
+The log says so once a request (``main.qwe:6: an error no statement took, made at
+main.qwe:1, shown in <News> as nothing: 503 Service Unavailable``), and `quillo check`
+warns where a value that can fail is shown with no `??`, `?`, `match` or `is_err` test: one
+from a function that declares `! E`, uses `?` or `err(...)`, or a `let` or `state` set from
+one. Give it a fallback, or show its words with `error(r)`:
+
+```quillo
+server fn load_news() -> str ! str = err("503 Service Unavailable")
+
+component News() {
+    state news = load_news()
+    <div>
+        <p>{news ?? "No news today"}</p>
+        <p>{is_err(news) ? `No news: ${error(news)}` : news}</p>
+    </div>
+}
+```
+
+The page shows `No news today` and `No news: 503 Service Unavailable`.
 
 ## Effects
 
@@ -687,10 +709,12 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   the `{name}` shorthand takes a bare name, and an attribute written twice is an error.
 - An event attribute given an expression, `onclick={() => ...}` or `onClick={save}`, is a
   handler *(since 0.7)*, the same as `@click={...}` (both on one element is an error).
-  Where React's name means another DOM event, it is that one: `onChange` on an `<input>`
-  or a `<textarea>` is `@input`, each keystroke (the DOM's `change` waits until the field
-  loses focus; `@change` is still that); `onDoubleClick` is `@dblclick`; `onFocus` and
-  `onBlur` are `@focusin` and `@focusout`, which a wrapper around fields hears.
+  Where React's camel-case name means another DOM event, it is that one: `onChange` on an
+  `<input>` or a `<textarea>` is `@input`, each keystroke; `onDoubleClick` is `@dblclick`;
+  `onFocus` and `onBlur` are `@focusin` and `@focusout`, which a wrapper around fields hears.
+  A lower-case name is the DOM's own event: `onchange` is `change`, which waits until the
+  field is left (as `@change`), `oninput` comes at each keystroke, and `onfocus` and
+  `onblur` are `focus` and `blur`.
   `onClickCapture` and React's other `…Capture` names are an error, as there is no capture
   phase here. The DOM's names are lower case and compared as written, so `quillo check`
   warns of `@mouseEnter`, which never fires. Given text,
@@ -823,7 +847,10 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 - `quillo check` warns of a class a sheet styles (`` css`...` ``, a `style`, or a `.css`
   file under `public/`) that nothing in the program writes: "`.never-used` is styled here,
   but nothing in the program writes it". Text anywhere in the program counts, and so do
-  its services' and the scripts under `public/`. A template's start counts for every class
+  its services', the scripts and `.html` files under `public/`, and the `.html` files and
+  scripts of the folders it serves with `files()`, links followed as the server follows
+  them. A `public/` sheet's unused classes are warned of only in a program that serves
+  pages, so a script beside a site's sheets gets no such warning. A template's start counts for every class
   that begins with it (`` `card-${size}` `` writes any `card-...`), and so do the classes
   Quillo sets (below). For classes a library's script sets, name their starts in a comment
   in the sheet: `/* set elsewhere: leaflet- */`. A file that does not parse counts as

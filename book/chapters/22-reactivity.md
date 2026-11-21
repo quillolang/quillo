@@ -318,6 +318,11 @@ The rules of hooks have no counterpart: state is found by its name, not by the o
 calls, and a statement that starts something may sit inside an `if` (that is how it is
 stopped).
 
+Vue's and Svelte's spellings are told by `quillo check`, with what to write: `@click.prevent`
+never fires, as there are no modifiers (`onclick={(e) => { e.preventDefault(); ... }}`);
+`v-model={x}` is `value={x}`, two-way by itself; `v-on:click` is `onclick={...}`; and
+Svelte's `on:click={...}` is an error that says to write `onclick={...}`.
+
 On [quillolang.org's Reactivity page](https://quillolang.org/docs/reactivity/), live
 demos show each of these running beside its code.
 

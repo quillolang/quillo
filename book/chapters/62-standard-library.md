@@ -244,10 +244,23 @@ Safety built in:
   attribute would say is checked, so `href={markdown(u, { inline: true })}` too. So do
   the values an SVG `<set>` or `<animate>` gives another attribute (`to`, `from`, `by`,
   each of `values`), which may be an `href`.
-- CSS takes data as it is written, but for what would end it: `style={...}` is escaped
-  like any attribute, a style map's values and css`...`'s `${...}` have `{ } ; \` written
-  as CSS's escapes, and css`...`'s `&` as `\26 ` (so a value adds no rule or declaration,
-  in `<svg>` and `<math>` too), and `<style>{x}</style>` has
+- CSS takes data as it is written, but for what would end it. Each value interpolated
+  into a `style` template is one CSS value, wherever it stands in the expression (in a `? :`,
+  `if`, `match`, `??`, `&&` or `||`, through `+`, `trim` or `join`, a list or a block), while
+  the text the program writes stays as written: with `c` from a visitor as `red; background:
+  blue`, `` style={`color: ${c}; padding: 4px`} `` is written `color: red\3b  background:
+  blue; padding: 4px`, a colour the browser drops, and no declaration is added. A value can
+  only take away the declarations after it, never add one. Its `{ } ; \` are written as
+  CSS's escapes and its `&` as `\26 `, as are css`...`'s `${...}`, and a style map's values
+  have `{ } ; \` escaped (so a value adds no rule or declaration, in `<svg>` and `<math>`
+  too). Compose declarations with a style map, `style={{ color: c }}`, or css`...`. A
+  template made in a `let` or a helper and given whole, `style={s}`, is the program's own
+  text and written as it is (escaped as any attribute): keep a visitor's value in a template
+  written in the `style={...}` itself, or in a style map. A component's or view's `style`
+  prop is escaped where its tag gives it (`` <Box style={`color: ${c}`}/> ``), while a view
+  or `fn` called as a function, `Box(...)`, gets its arguments as given. A component that
+  takes its caller's styles merges them with a style map: `style={{ padding: "8px", ...style
+  }}`. `<style>{x}</style>` has
   its `<` rewritten (`\3c `), so none can end the element; within a value, what it says is
   CSS. CSS runs no script in today's browsers; data put
   there can still restyle the page (cover it with an overlay,
@@ -971,7 +984,9 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
   `en-ZA`, `de-AT` (`Jänner`, `Jän.`), `fr-CA`, `fr-CH`, `es-MX`, `it-CH`, `nl-BE` and
   `pt-PT`, the same on the server and in the browser (CLDR's forms, names in a pattern
   too); another region takes its language's (`de-CH` is German's), and any other
-  language gives English. `date.parse(s)` reads a date or a date-time, with `T` or
+  language gives English, with a warning in the log (in the browser's console) once for
+  each locale, as `format_number` gives one (`quillo: warning: no date data for locale
+  "ja-JP": written in English`). `date.parse(s)` reads a date or a date-time, with `T` or
   a space and an offset (`+01`, `+0100`, `+01:00` or `Z`), and gives it back as above;
   a date-time with no offset is an error value that says to read it with `date.at(v,
   zone)`, as it names no instant until a zone is given; an HTTP date (`Tue, 27 Oct 2026
@@ -1308,6 +1323,9 @@ There is no SQLCipher (no encryption at rest), and a file is opened by path, not
 file, whatever its name or folder (see [Static files](#static-files)); `file("app.db")`
 sends one on purpose. Back it up with `db.exec("vacuum into
 'backup.db'")` or `sqlite3 app.db ".backup ..."`, not by copying the file while it runs.
+A clean stop closes each SQLite database, so its `-wal` and `-shm` files go, and a copy
+restored over the file before the next start is what that start opens; they stay while
+another process (another instance, Litestream, a `sqlite3` shell) has the file open.
 A path inside SQL is SQLite's own: it counts from the folder the process was started in,
 not from the program's folder as `db.open`'s does, so `vacuum into 'backups/b.db'` in a
 program started from elsewhere (`quillo run app/main.qwe`, or a service manager) fails

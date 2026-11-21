@@ -72,6 +72,39 @@ state *(since 0.8.9)* that a component reads and that comes from `env`, `read_fi
 `db.transaction` or `db.atomic`, which on SQLite holds every other request while the client
 reads (see [Concurrency](#concurrency-and-reloading)). Warnings never make it fail.
 
+It also warns of what a page does:
+
+- A written `href`, `redirect` or `navigate` (or a template's written start) to a path no
+  route, mount, service, file route or file under `public/` or `files()` answers, with
+  the nearest one: ``no route answers `/abuot`, so this link is a 404 (did you mean
+  `/about`?)``; and a redirect to a path only another method answers, as a redirect is
+  followed with `GET` (a 307 or 308 keeps the method, and is not warned of).
+- Markup a keyboard can't reach: a click on an element with no role, `tabindex` or key
+  handler around it (`` a `<div>` with onclick can't be reached with the keyboard: use a
+  `<button>` ``), an `<img>` with no `alt` (`alt=""` for decoration), and `:focus {
+  outline: none }` with no `:focus-visible` and no other ring for that selector.
+- CSS built from a value in a `<style>` or in a `style=` made with `+`: write css`...`,
+  or a style map, whose values are written as CSS values.
+- A group that guards its routes but not the server fns their pages call, followed through
+  helpers, views and components; and an effect that what a page runs while it is made (a
+  component's `state` values, its markup, the helpers they call) needs and the route's
+  `with` lacks: an error where it always runs, a warning where it runs under a condition,
+  on the left of `??`, or in `state x = defer(...)`.
+- A new value or an error dropped at the end of an `if`, `else`, `match`, `for` or `while`
+  branch, or by a handler named by reference (`onclick={go}`, judged by what `go` gives).
+  A `server fn`'s error dropped in a handler is not warned of: the run logs it.
+- A component's plain `let` that a handler changes and its markup shows (`` `shown` is
+  changed in a handler but isn't a state, so the page won't show it: write `state shown =
+  0` ``).
+- A value that can fail shown in markup (see [Errors](#errors)), an event attribute that
+  never runs (see [Composition](#composition)), `random`, `random_int` or `uuid` drawn in
+  a component's body and shown (see [Components](#components)), `pages // 2` (see
+  [Values](#values)), and Vue's and Svelte's spellings (see [Coming from other
+  frameworks](#coming-from-other-frameworks)).
+- A sheet under `public/` has its unused classes warned of only in a program that serves
+  pages, and classes written in `public/**/*.html` and in the `.html` files and scripts of
+  `files()` folders count as written.
+
 A type grows as the code is read (a list of maps of lists, made again on each line), so
 the check keeps each to 1,000,000 parts and 64 levels, and takes what grows past them as
 unknown, which says less but never wrongly: a program whose types double on each line is

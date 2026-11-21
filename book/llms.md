@@ -160,7 +160,8 @@ let age = int("x") ?? 18                     // ?? replaces null or an error
 `is_err(r)` tests, `r.error` reads the message. An error a statement drops is logged; an
 error from `db.exec` should be passed on with `?`, or a transaction may keep half its
 work. Inside a lambda, `?` leaves the lambda only: use a `for` loop to stop at the first
-failure.
+failure. An error value shown in markup shows nothing (and is logged): give it a fallback,
+`{news ?? "No news"}`, or show its words, `{is_err(news) ? news.error : news}`.
 
 ## Program structure
 
@@ -251,10 +252,16 @@ route GET / = <html><body><Card title="Hi"><Counter start={5}/></Card></body></h
 - A `view` is made on the server only. A `component` is made on the server and resumes in
   the browser; nothing else on the page needs JavaScript.
 - Events are `onclick`, `onsubmit`, `oninput`, `onchange` (or `@click` and the rest),
-  given a lambda. What a person changes is two-way by itself when it shows a state *(since 0.7)*:
+  given a lambda, on elements a keyboard reaches (a `<button>`, a link, a field). Lower-case
+  names are the DOM's: `oninput` comes at each keystroke, `onchange` when the field is left.
+  What a person changes is two-way by itself when it shows a state *(since 0.7)*:
   `<input value={draft}/>`, `checked={done}`, `<details open={more}>`, a player's
   `volume={v}`. A handler of the input's own, or `readonly`, keeps it one way.
-- `style css`...`` at the start of a component's body is CSS for its elements only.
+- `style css`...`` at the start of a component's body is CSS for its elements only. A
+  value in a `style` template is one CSS value and adds no declaration; build styles from
+  data with a style map, `style={{ color: c }}`.
+- `state` goes at the top of a component's body. `random()` or `uuid()` that a component
+  shows goes in a `state` (`state ref = uuid()`), which keeps the server's value.
 - A `server fn` is a function the browser calls over HTTP. In a component it is awaited
   for you and returns an error value if it fails:
 
@@ -332,5 +339,7 @@ db.transaction(() => {
 
 - `quillo check` passes with no errors, and its warnings are read.
 - Every error a statement can give is passed on (`?`), replaced (`??`) or taken (`let _ =`).
+- No value that can be an error is shown in markup without `??` or an `is_err` test.
+- Each link and redirect goes to a route the program has; each `<img>` has an `alt`.
 - `0` and `""` were not used as false.
 - No builtin was guessed: each is in the list below.

@@ -902,7 +902,7 @@ Operators are as in JavaScript, with these meanings:
 |---|---|
 | `+` | numbers add; a string with anything is text (`"n=" + 1` is `"n=1"`, `"a" + null` is `"anull"`); two lists join; two maps merge, the right one's values winning; `true + 1` and `null + 1` are errors |
 | `- * %` | as in JavaScript on numbers; nothing else is converted (`"5" * 2` is an error) |
-| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division, done in ints past 2^53 too: `floor`, `ceil`, `round`, `math.floor`, `math.ceil` and `math.trunc` of an int divided by an int, written in the call (`floor(a / b)`, `a / b \| floor`, `(a / b).floor()`, `math.floor(a / b)`, a builtin held in a variable), give the exact int, as Python's `a // b` does; a quotient kept in a variable first (`let q = a / b`) is a float, and its digits past 2^53 are gone; `math` has no `round` (write `round(a / b)`), on both sides |
+| `/` | exact division: `7 / 2` is `3.5`, and a whole result stays an integer (`6 / 2` is `3`); `floor(7 / 2)` is integer division, done in ints past 2^53 too: `floor`, `ceil`, `round`, `math.floor`, `math.ceil` and `math.trunc` of an int divided by an int, written in the call (`floor(a / b)`, `a / b \| floor`, `(a / b).floor()`, `math.floor(a / b)`, a builtin held in a variable), give the exact int, as Python's `a // b` does (here `//` starts a comment, so `pages // 2` is `pages`, and `quillo check` says so); a quotient kept in a variable first (`let q = a / b`) is a float, and its digits past 2^53 are gone; `math` has no `round` (write `round(a / b)`), on both sides |
 | `== !=` | deep equality, like comparing JSON: `1 == 1.0` and `0.1m == 0.1`, but `1 == "1"` is false (nothing is converted); an int and a float compare exactly, as in Python (`9007199254740993 == 9007199254740992.0` is false), in compiled code and in the browser too; functions are equal only to themselves |
 | `< <= > >=` | comparison of two numbers (ints, floats and decimals mix, exactly; not a decimal and a float), or two strings by code point; a string and a number, booleans, or NaN is an error |
 | `!`, `&&`, `\|\|` | not, and, or; `a && b` and `a \|\| b` give back one of their operands, so `{loading && <Spinner/>}` works |
@@ -1400,11 +1400,33 @@ wherever they were made.
 In a page under `--watch`, the browser's console says the same, from the error's stack:
 the `.qwe` file and line, and the calls. In production it says the message alone.
 The browser hides a builtin's error in production as the server does (see [What a route
-returns](#what-a-route-returns)): shown as text, in a template, in markup or an attribute,
-or written by `json.stringify`, it is `internal error`, so a component made again in the
-browser shows no more than the server's page did; so are a builtin's errors in attribute
-JSON and in channel messages. Errors the program wrote, a `server fn`'s errors (which the
-server has judged already) and the page's own JavaScript's are shown as they are.
+returns](#what-a-route-returns)): made into text, in a template or by `str`, or written by
+`json.stringify`, it is `internal error`, so a component made again in the browser shows
+no more than the server's page did; so are a builtin's errors in attribute JSON and in
+channel messages. Errors the program wrote, a `server fn`'s errors (which the server has
+judged already) and the page's own JavaScript's are made into text as they are.
+
+An error value shown in markup, any error, shows nothing: as a child, an attribute, a
+class, a style map's value or a `<style>`'s text, on the server and in the browser alike.
+The log says so once a request (``main.qwe:6: an error no statement took, made at
+main.qwe:1, shown in <News> as nothing: 503 Service Unavailable``), and `quillo check`
+warns where a value that can fail is shown with no `??`, `?`, `match` or `is_err` test: one
+from a function that declares `! E`, uses `?` or `err(...)`, or a `let` or `state` set from
+one. Give it a fallback, or show its words with `error(r)`:
+
+```quillo
+server fn load_news() -> str ! str = err("503 Service Unavailable")
+
+component News() {
+    state news = load_news()
+    <div>
+        <p>{news ?? "No news today"}</p>
+        <p>{is_err(news) ? `No news: ${error(news)}` : news}</p>
+    </div>
+}
+```
+
+The page shows `No news today` and `No news: 503 Service Unavailable`.
 
 ### Effects
 
@@ -1558,10 +1580,12 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   the `{name}` shorthand takes a bare name, and an attribute written twice is an error.
 - An event attribute given an expression, `onclick={() => ...}` or `onClick={save}`, is a
   handler *(since 0.7)*, the same as `@click={...}` (both on one element is an error).
-  Where React's name means another DOM event, it is that one: `onChange` on an `<input>`
-  or a `<textarea>` is `@input`, each keystroke (the DOM's `change` waits until the field
-  loses focus; `@change` is still that); `onDoubleClick` is `@dblclick`; `onFocus` and
-  `onBlur` are `@focusin` and `@focusout`, which a wrapper around fields hears.
+  Where React's camel-case name means another DOM event, it is that one: `onChange` on an
+  `<input>` or a `<textarea>` is `@input`, each keystroke; `onDoubleClick` is `@dblclick`;
+  `onFocus` and `onBlur` are `@focusin` and `@focusout`, which a wrapper around fields hears.
+  A lower-case name is the DOM's own event: `onchange` is `change`, which waits until the
+  field is left (as `@change`), `oninput` comes at each keystroke, and `onfocus` and
+  `onblur` are `focus` and `blur`.
   `onClickCapture` and React's other `…Capture` names are an error, as there is no capture
   phase here. The DOM's names are lower case and compared as written, so `quillo check`
   warns of `@mouseEnter`, which never fires. Given text,
@@ -1694,7 +1718,10 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
 - `quillo check` warns of a class a sheet styles (`` css`...` ``, a `style`, or a `.css`
   file under `public/`) that nothing in the program writes: "`.never-used` is styled here,
   but nothing in the program writes it". Text anywhere in the program counts, and so do
-  its services' and the scripts under `public/`. A template's start counts for every class
+  its services', the scripts and `.html` files under `public/`, and the `.html` files and
+  scripts of the folders it serves with `files()`, links followed as the server follows
+  them. A `public/` sheet's unused classes are warned of only in a program that serves
+  pages, so a script beside a site's sheets gets no such warning. A template's start counts for every class
   that begins with it (`` `card-${size}` `` writes any `card-...`), and so do the classes
   Quillo sets (below). For classes a library's script sets, name their starts in a comment
   in the sheet: `/* set elsewhere: leaflet- */`. A file that does not parse counts as
@@ -1912,7 +1939,11 @@ route GET / = <html><body><Counter start={5}/></body></html>
   follows it, write `let count = ...` in place of the state ``), so a value worked out
   from others is a `let`. Each place in the
   markup that shows a value follows only that value: changing one row's text changes that
-  text. Assigning the value a state already has does nothing.
+  text. Assigning the value a state already has does nothing. A `state` is declared at the
+  top of the component's body, not inside an `if`, `for`, `while`, `fn` or block: the error
+  says to declare it there, with a first value, and set it where it was
+  (`` `state` goes at the top of a component's body, not inside an `if`: declare `state n =
+  0` there and set it in the `if` ``).
 
   ```quillo
   component Total(price: int) {
@@ -1964,7 +1995,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   (`onsubmit`, `oninput`, `onmount`, ...); on a view or component, `on_change={...}` or
   `onChange={...}` is a parameter like any other. There are no
   modifiers: `@click.prevent` is taken as an event named `click.prevent`, which never
-  fires; call `e.preventDefault()`. Event names are not checked, so a misspelt one
+  fires, and `quillo check` says so; call `e.preventDefault()`. Event names are not checked, so a misspelt one
   (`@clik`) is silent. Clicks are handled once, at the document, innermost first, so
   `e.stopPropagation()` stops outer handlers, and a library that stops a click before
   it reaches the document hides it from Quillo; other events listen on their element.
@@ -2034,6 +2065,10 @@ route GET / = <html><body><Counter start={5}/></body></html>
       </form>
   }
   ```
+
+  A form's reset (a `<button type="reset">`, or `form.reset()`) sets each bound field's
+  state from the field again, so `name` above empties with its input; a reset the page
+  prevents changes nothing.
 
   A number or range input gives a number back (`null` when empty, or only spaces), so
   `qty + 1` after typing 3 is 4, and text being typed that already reads as the state's
@@ -2169,7 +2204,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   component Pair() {
       state a = 0
       state b = 0
-      <p onclick={() => { a += 1; b = a * 10 }}>{a} and {b}</p>
+      <button onclick={() => { a += 1; b = a * 10 }}>{a} and {b}</button>
   }
   ```
 
@@ -2270,13 +2305,17 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
   ```quillo
   component Receipt(total: float, at: str) {
-      <p>{format_number(total)} on {at}, ref {uuid()}</p>
+      state ref = uuid()                    // drawn once, on the server
+      <p>{format_number(total)} on {at}, ref {ref}</p>
   }
   ```
 
   `<Receipt total={1234.5} at="2026-11-03"/>` shows `1,234.5 on 2026-11-03, ref` and a
-  uuid, on the server and in the browser alike. `env("PUBLIC_SHOP")` may join them;
-  `env("DB_URL")` may not.
+  uuid, the same on the server and in the browser. `random()`, `random_int` and `uuid()`
+  written in the body or the markup would be drawn again when the component wakes in the
+  browser, and the page would change under the visitor (`quillo check` warns): a `state`
+  keeps the server's, and a prop (`ref={order.ref}`) works too. `env("PUBLIC_SHOP")` may
+  join them; `env("DB_URL")` may not.
 - There is nothing built in for `document`, `window`, `localStorage`, the clipboard,
   focus or scrolling: reach them through the page, `js("localStorage.getItem", k)`,
   `js("navigator.clipboard.writeText", s)`, `js("window.innerWidth")` (no arguments
@@ -2317,8 +2356,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   # /_quillo/b/0767fa4dd4c7b224.js
   ```
 - And only when it is needed: the server's HTML shows at once, and the bundle comes
-  when someone reaches for a component (points at, touches or focuses it, or presses a
-  key in it). What they typed before it came is kept, and each click, double click,
+  when someone reaches for a component (points at, touches or focuses it, presses a key
+  in it, or scrolls it, for one that handles `scroll`: that scroll is done again once the
+  code is in). What they typed before it came is kept, and each click, double click,
   right or middle click, press and release is done again then as it was made: on the
   same element, at the same point, with the same buttons, keys and click count (a
   `@pointerdown` may still capture a pointer whose finger was lifted meanwhile). A
@@ -2538,7 +2578,7 @@ component Counter(label: str, start: int = 0, on_change = null) {
 component Panel(header, children) {          // `header` is a named slot: any HTML
     state open = true
     <div>
-        <div onclick={() => { open = !open }}>{header}</div>
+        <button onclick={() => { open = !open }}>{header}</button>
         {open && children}
     </div>
 }
@@ -2596,7 +2636,11 @@ component Dashboard() {
 - A plain function used as a tag (`<Row item={x}/>` where `Row` is neither a view nor a
   component) is called again as a whole when what it is given changes.
 - Views are plain functions: they have no state and add nothing to the browser bundle
-  unless a component uses them.
+  unless a component uses them. So an event attribute (`onclick={...}`) in a view, in a
+  route's own markup or in a plain `fn`'s markup that a page places outside any component
+  never runs, as no code of the page's holds it: `quillo check` says so (`` `onclick` in
+  view Tip never runs: Tip is placed in a page (main.qwe:18), not in a component ``). Make
+  it a component, or place it inside one.
 - A component placed directly in a page gets its props from the server, so they must
   be data (no functions, no HTML values), and they stay as the page was made: nothing
   above it changes them. Inside another component, props can be anything (callbacks,
@@ -2621,7 +2665,7 @@ component Card(title: str) {
       .title:hover { text-decoration: underline }
     `
     state open = false
-    <div.card @click={() => { open = !open }}><h2.title>{title}</h2>{open && <p>More about {title}</p>}</div>
+    <div.card><h2.title>{title}</h2><button onclick={() => { open = !open }}>More</button>{open && <p>More about {title}</p>}</div>
 }
 
 route GET / = <html><head><title>Cards</title></head><body><Card title="Hello"/></body></html>
@@ -3342,8 +3386,9 @@ redirect led to, a proxy's page, an empty body. Quillo's server marks what it se
 into this error; ordinary answers go through). A `redirect` from the function itself is followed
 by the browser, and gives this error too. A function that returns `err(v)` gives an error value with `v`. A `reply 401
 "Log in first"` inside it gives only the status (``failed (401)``), since its body is
-not JSON: return `err("Log in first")`, or `reply 401 { error: "Log in first" }`, for the
-page to show the words. Nothing happens by itself on a 401 or a 500 (no redirect, no
+not JSON: return `err("Log in first")`, or `reply 401 { error: "Log in first" }`, and
+show the words with `r.error`, as `problem` above does (an error value itself shows
+nothing in markup, see [Errors](#errors)). Nothing happens by itself on a 401 or a 500 (no redirect, no
 retry, except for [idempotent](#idempotent-requests) calls); there is no loading flag
 either: set a state of your own around the call.
 
@@ -4168,6 +4213,11 @@ The rules of hooks have no counterpart: state is found by its name, not by the o
 calls, and a statement that starts something may sit inside an `if` (that is how it is
 stopped).
 
+Vue's and Svelte's spellings are told by `quillo check`, with what to write: `@click.prevent`
+never fires, as there are no modifiers (`onclick={(e) => { e.preventDefault(); ... }}`);
+`v-model={x}` is `value={x}`, two-way by itself; `v-on:click` is `onclick={...}`; and
+Svelte's `on:click={...}` is an error that says to write `onclick={...}`.
+
 On [quillolang.org's Reactivity page](https://quillolang.org/docs/reactivity/), live
 demos show each of these running beside its code.
 
@@ -4432,7 +4482,11 @@ If no route matches, the response is 404 for an unknown path, 405 for a known
 path with the wrong method (with `Allow`, the methods it takes), and 400 when a route
 matched the path and method but none of its patterns matched. The 400 is logged with the
 route that came closest and its first miss (`` POST /form (main.qwe:6): `form.agree` is
-missing, and must be a bool ``), and under `--watch` the answer says it too *(since 0.7)*. Before any route is tried, a `POST`, `PUT`, `PATCH` or
+missing, and must be a bool ``), and under `--watch` the answer says it too *(since 0.7)*.
+Of several routes on the path, the closest is one whose body is of the kind the request's
+content-type says (`json`, `form`), then the one that missed later (its body, after its
+query and its group's pattern), then the one with the most fields sent that fit (a field
+left to its default counts as none), and on a tie the first written. Before any route is tried, a `POST`, `PUT`, `PATCH` or
 `DELETE` with a form, multipart or plain-text body (or none) that the browser marks as
 coming from another site is refused with 403 (see `allow_cross_site` under
 [Standard library](#standard-library)). A last `route ANY /*rest` is a 404 page of
@@ -4623,6 +4677,11 @@ route POST /docs { files: { docs: [map] } } {
 }
 ```
 
+A file sent in a field the pattern takes as text (`{ form: { photo: str } }`) is named as
+a file in the 400 and the log: `` `form.photo` is a file (cat.png), not a str; it is in
+request.files.photo ``. When the field has a default, the route runs with it, and the log
+says the same, with `(the route ran with its default)`.
+
 The whole round trip for one file: the page with its form, then the route the form posts
 to. The bytes stay with the request until saved:
 
@@ -4745,7 +4804,13 @@ run_script("total > 100", { total: 120 }, { timeout: "1s" })               // tr
 ```
 
 - The script sees the values in `vars` and the builtins that only compute (`len`,
-  `upper`, `map`, `filter`, ...). Method calls are the same: `"x".upper` works,
+  `upper`, `map`, `filter`, ...), with the modules `math`, `stats`, `re`, `bit` and `date`
+  (without its clock), `dec` and `format_number` (`en-US` unless the script names a
+  locale), and spreads (`[...xs, 4]`, `{ ...m }`):
+  `run_script("format_number(stats.mean(xs), \"de-DE\", 2)", { xs: [1, 2, 4] })` gives
+  `"2,33"`. `db`, `now`, `random`, `range` and `vec` are not there, and saying so is the
+  error (`` `range` is not available in a script: it can make a huge value from a small
+  one ``). Method calls are the same: `"x".upper` works,
   `"HOME".env` and `"f".read_file` do not, nor the program's functions.
 - It cannot define functions (it can write `(x) => ...`), routes, state or markup,
   `use` files or reply.
@@ -4756,7 +4821,8 @@ run_script("total > 100", { total: 120 }, { timeout: "1s" })               // tr
 - It stops after 20,000 steps (calls and loop rounds). A value it makes may be up to
   1 MB (strings, and lists and maps counted with what they hold), and each KB it makes
   costs a step: doubling a string in a loop stops there, not when the memory runs out.
-  Each KB a builtin or a comparison reads costs a step too, so `unique`, `min` or `==` on a
+  The same 1 MB holds for a spread, for the text `re.replace` builds as it goes, and for
+  the matches `re.find_all` and `re.split` give, their groups counted. Each KB a builtin or a comparison reads costs a step too, so `unique`, `min` or `==` on a
   list near 1 MB is many steps, not one; what a builtin only looks into (`len` of a list,
   `get`, `has`, `first`, `last`) or copies into what it gives back (`push`, `set`, `merge`,
   `sort`) is paid for as made, so `out = push(out, x)` pays for `out` once *(since 0.8.9: a
@@ -4829,7 +4895,7 @@ route POST /photos {
 }
 
 route GET /photos/:id = <figure>
-    <img src={`/thumbs/${id}.jpg`} width="800"/>
+    <img src={`/thumbs/${id}.jpg`} width="800" alt="The uploaded photo"/>
     <figcaption>{image.info(`uploads/${id}`).width} pixels wide, shown at 800</figcaption>
 </figure>
 
@@ -5102,13 +5168,30 @@ route GET /intranet {
 | `events(f, { status, headers })` | Server-Sent Events, as `f` sends them |
 | a runtime error | 500 `text/plain`, `internal error` |
 
+- Inside `rss`, `feed`, `urlset`, `sitemapindex`, `entry`, `item`, `url` and `sitemap`, and
+  inside a literal whose outermost element names a namespace other than XHTML's, HTML's
+  empty elements are XML's: `<link>` holds text, as an RSS channel's link does, and an
+  empty one is written `<link .../>`, as Atom's is (an HTML page's own elements of those
+  names write `<br/>` the same, which browsers read alike). A helper whose root is
+  `<link/>` cannot see the feed it goes in: write it in the entry's own literal.
+
+  ```quillo
+  route GET /rss.xml =
+      <rss version="2.0">
+          <channel>
+              <title>Notes</title>
+              <link>https://example.com/</link>
+          </channel>
+      </rss>
+  ```
 - `redirect(...)` and `respond(...)` make an answer; they do not leave. A route answers with
   its last value, or what `return` or `reply` gives, so `if no_user { redirect("/login") }`
   with more after it goes on and shows the page. To leave, write
   `reply 303 redirect("/login")`; `quillo check` warns of one nothing takes.
-- An error the program wrote, `err("That name is taken")`, is sent as it is. One a builtin
+- An error the program wrote, `err("That name is taken")`, is sent as it is: as a route's
+  value, inside a map or list, or from a `server fn`. One a builtin
   made says `internal error` instead, wherever it would reach a visitor: as a route's
-  value, inside a map or list, in markup, or from a `server fn`, in what a `stream` or
+  value, inside a map or list, or from a `server fn`, in what a `stream` or
   `events` answer sends *(since 0.8.9: a stream sent it as it was)*, and when it is turned
   into text: a template string, `str`, `join`, `json.stringify`. A database's has the SQL
   and the tables, an `http` call's the address with its key, a file's its path, so that
@@ -5118,7 +5201,8 @@ route GET /intranet {
   What is read that way is plain text, no longer protected: `{ line: error(r) }` sends
   it. To show a visitor something, say it:
   `err("Billing is down, try again soon")`. A service's own `err` reaches its caller's
-  visitors in the same way.
+  visitors in the same way. In markup, any error value, the program's too, shows nothing
+  and is logged (see [Errors](#errors)): show its words with `error(r)`.
 - A failed request's line in the log names it, with the id in its `x-request-id`:
   `quillo: error: GET /checkout (rid 1cf61931): main.qwe:8: division by zero`. Under
   [`--log json`](#options-of-quillo-run) it is an object, with `level`, `request` and `error`.
@@ -5129,7 +5213,8 @@ route GET /intranet {
   one ``); `reply` takes 200 to 599 too. A 205 goes with no body, whatever is given, and
   each status has its reason phrase (`418 I'm a teapot`). A route's answer that carries
   an `etag` is a 304 to a `GET` or `HEAD` whose `If-None-Match` holds it, as files are:
-  `` respond(200, v, { etag: `"${version}"` }) ``. Header names are written in lower case, and a name or value with a control character (a line break) is
+  `` respond(200, v, { etag: `"${version}"` }) ``, and the log and the metrics count it as
+  a 304. Header names are written in lower case, and a name or value with a control character (a line break) is
   a runtime error. `content-length`, `transfer-encoding`, `connection` and `date` are
   the server's, whatever is given.
 - A page whose route, group middleware or server fn reads `request.headers`,
@@ -5162,7 +5247,7 @@ route GET /intranet {
 - `stream` and `events` refuse a status that has no body (204, 205, 304) and a 1xx, as
   their function would write one (`` `stream` cannot answer 204: that status has no body
   ``), and `events` refuses a `type` that is not text, as `stream` does.
-- Every answer carries `server: Quillo` (unless the route sets `server`), `date`,
+- Every answer carries `server: Quillo` (unless the route or `site_headers` sets `server`), `date`,
   `x-request-id` and `x-content-type-options: nosniff`. Every HTML page carries
   `x-frame-options: SAMEORIGIN`, unless the route sets one or a
   `content-security-policy` with `frame-ancestors`. None carries `Strict-Transport-Security`
@@ -5208,7 +5293,9 @@ route GET /intranet {
   set it with `site_headers` instead.
 - `site_headers(map)` *(since 0.7)* at the top level adds headers to every answer that does not set
   them itself, and `site_headers("/admin", map)` to those under a path; a longer path's
-  rule wins over a shorter one's. A `null` value takes away one Quillo sends. Names are
+  rule wins over a shorter one's. A `null` value takes away one Quillo sends:
+  `"server": null` takes away `server: Quillo`, and a text replaces it (a route's own
+  `server` still wins). Names are
   checked, and values are one line; `content-length`, `transfer-encoding`, `connection`,
   `set-cookie` and `content-type` are refused, as a route sets them:
 
@@ -5882,11 +5969,15 @@ How messages travel:
   have no socket, both go through the app's bridge instead.
 - The server listens for WebTransport on the UDP port with the HTTP port's number
   (start the program with [`--wt-port`](#options-of-quillo-run) for another, `quillo run main.qwe --wt-port 4433`), from when the first page asks to connect, on every address
-  of the machine unless [`--host`](#options-of-quillo-run) is a loopback address. It makes a certificate of its
+  of the machine unless [`--host`](#options-of-quillo-run) is a loopback address. On
+  127.0.0.1 it listens on `[::1]` too, so a page at `http://localhost`, which the browser
+  may dial over IPv6, uses WebTransport in development. It makes a certificate of its
   own, good for 13 days and replaced after 11, which browsers take by its hash (they
   take such certificates for two weeks at most); [`--tls-cert`](#options-of-quillo-run) and [`--tls-key`](#options-of-quillo-run), given
   together, give it a real one. A WebTransport connection is kept alive every 5 s and
-  dropped after 20 s of silence. A session counts among the connections a server keeps
+  dropped after 20 s of silence. A clean stop closes each session (`server stopping`), so
+  its pages notice at once and connect to the next server; a crash or a `SIGKILL` is
+  noticed by the keep-alive, within about 20 s. A session counts among the connections a server keeps
   open, as a WebSocket does (see [Live data](#live-data)), opens at most 8 streams of
   media frames and 2 both ways, and may have 1 MiB a stream, and 4 MiB in all, on its way
   before the server reads it *(since 0.8.9: it was not counted, and one session could hold
@@ -7532,10 +7623,23 @@ Safety built in:
   attribute would say is checked, so `href={markdown(u, { inline: true })}` too. So do
   the values an SVG `<set>` or `<animate>` gives another attribute (`to`, `from`, `by`,
   each of `values`), which may be an `href`.
-- CSS takes data as it is written, but for what would end it: `style={...}` is escaped
-  like any attribute, a style map's values and css`...`'s `${...}` have `{ } ; \` written
-  as CSS's escapes, and css`...`'s `&` as `\26 ` (so a value adds no rule or declaration,
-  in `<svg>` and `<math>` too), and `<style>{x}</style>` has
+- CSS takes data as it is written, but for what would end it. Each value interpolated
+  into a `style` template is one CSS value, wherever it stands in the expression (in a `? :`,
+  `if`, `match`, `??`, `&&` or `||`, through `+`, `trim` or `join`, a list or a block), while
+  the text the program writes stays as written: with `c` from a visitor as `red; background:
+  blue`, `` style={`color: ${c}; padding: 4px`} `` is written `color: red\3b  background:
+  blue; padding: 4px`, a colour the browser drops, and no declaration is added. A value can
+  only take away the declarations after it, never add one. Its `{ } ; \` are written as
+  CSS's escapes and its `&` as `\26 `, as are css`...`'s `${...}`, and a style map's values
+  have `{ } ; \` escaped (so a value adds no rule or declaration, in `<svg>` and `<math>`
+  too). Compose declarations with a style map, `style={{ color: c }}`, or css`...`. A
+  template made in a `let` or a helper and given whole, `style={s}`, is the program's own
+  text and written as it is (escaped as any attribute): keep a visitor's value in a template
+  written in the `style={...}` itself, or in a style map. A component's or view's `style`
+  prop is escaped where its tag gives it (`` <Box style={`color: ${c}`}/> ``), while a view
+  or `fn` called as a function, `Box(...)`, gets its arguments as given. A component that
+  takes its caller's styles merges them with a style map: `style={{ padding: "8px", ...style
+  }}`. `<style>{x}</style>` has
   its `<` rewritten (`\3c `), so none can end the element; within a value, what it says is
   CSS. CSS runs no script in today's browsers; data put
   there can still restyle the page (cover it with an overlay,
@@ -8259,7 +8363,9 @@ date.parse("27/10/2026", "DD/MM/YYYY")                     // "2026-10-27", or a
   `en-ZA`, `de-AT` (`Jänner`, `Jän.`), `fr-CA`, `fr-CH`, `es-MX`, `it-CH`, `nl-BE` and
   `pt-PT`, the same on the server and in the browser (CLDR's forms, names in a pattern
   too); another region takes its language's (`de-CH` is German's), and any other
-  language gives English. `date.parse(s)` reads a date or a date-time, with `T` or
+  language gives English, with a warning in the log (in the browser's console) once for
+  each locale, as `format_number` gives one (`quillo: warning: no date data for locale
+  "ja-JP": written in English`). `date.parse(s)` reads a date or a date-time, with `T` or
   a space and an offset (`+01`, `+0100`, `+01:00` or `Z`), and gives it back as above;
   a date-time with no offset is an error value that says to read it with `date.at(v,
   zone)`, as it names no instant until a zone is given; an HTTP date (`Tue, 27 Oct 2026
@@ -8596,6 +8702,9 @@ There is no SQLCipher (no encryption at rest), and a file is opened by path, not
 file, whatever its name or folder (see [Static files](#static-files)); `file("app.db")`
 sends one on purpose. Back it up with `db.exec("vacuum into
 'backup.db'")` or `sqlite3 app.db ".backup ..."`, not by copying the file while it runs.
+A clean stop closes each SQLite database, so its `-wal` and `-shm` files go, and a copy
+restored over the file before the next start is what that start opens; they stay while
+another process (another instance, Litestream, a `sqlite3` shell) has the file open.
 A path inside SQL is SQLite's own: it counts from the folder the process was started in,
 not from the program's folder as `db.open`'s does, so `vacuum into 'backups/b.db'` in a
 program started from elsewhere (`quillo run app/main.qwe`, or a service manager) fails
@@ -9255,6 +9364,39 @@ state *(since 0.8.9)* that a component reads and that comes from `env`, `read_fi
 `db.transaction` or `db.atomic`, which on SQLite holds every other request while the client
 reads (see [Concurrency](#concurrency-and-reloading)). Warnings never make it fail.
 
+It also warns of what a page does:
+
+- A written `href`, `redirect` or `navigate` (or a template's written start) to a path no
+  route, mount, service, file route or file under `public/` or `files()` answers, with
+  the nearest one: ``no route answers `/abuot`, so this link is a 404 (did you mean
+  `/about`?)``; and a redirect to a path only another method answers, as a redirect is
+  followed with `GET` (a 307 or 308 keeps the method, and is not warned of).
+- Markup a keyboard can't reach: a click on an element with no role, `tabindex` or key
+  handler around it (`` a `<div>` with onclick can't be reached with the keyboard: use a
+  `<button>` ``), an `<img>` with no `alt` (`alt=""` for decoration), and `:focus {
+  outline: none }` with no `:focus-visible` and no other ring for that selector.
+- CSS built from a value in a `<style>` or in a `style=` made with `+`: write css`...`,
+  or a style map, whose values are written as CSS values.
+- A group that guards its routes but not the server fns their pages call, followed through
+  helpers, views and components; and an effect that what a page runs while it is made (a
+  component's `state` values, its markup, the helpers they call) needs and the route's
+  `with` lacks: an error where it always runs, a warning where it runs under a condition,
+  on the left of `??`, or in `state x = defer(...)`.
+- A new value or an error dropped at the end of an `if`, `else`, `match`, `for` or `while`
+  branch, or by a handler named by reference (`onclick={go}`, judged by what `go` gives).
+  A `server fn`'s error dropped in a handler is not warned of: the run logs it.
+- A component's plain `let` that a handler changes and its markup shows (`` `shown` is
+  changed in a handler but isn't a state, so the page won't show it: write `state shown =
+  0` ``).
+- A value that can fail shown in markup (see [Errors](#errors)), an event attribute that
+  never runs (see [Composition](#composition)), `random`, `random_int` or `uuid` drawn in
+  a component's body and shown (see [Components](#components)), `pages // 2` (see
+  [Values](#values)), and Vue's and Svelte's spellings (see [Coming from other
+  frameworks](#coming-from-other-frameworks)).
+- A sheet under `public/` has its unused classes warned of only in a program that serves
+  pages, and classes written in `public/**/*.html` and in the `.html` files and scripts of
+  `files()` folders count as written.
+
 A type grows as the code is read (a list of maps of lists, made again on each line), so
 the check keeps each to 1,000,000 parts and 64 levels, and takes what grows past them as
 unknown, which says less but never wrongly: a program whose types double on each line is
@@ -9534,7 +9676,20 @@ whether what the program needs is there: `{ "ready": true, "checks": { "database
 "ready", "service billing": "ready", "ledger": "not ready" } }`, 200 or 503, its
 database (`select 1`), each service it declares (see [Services](#services)) and the
 program's own checks, `ready("ledger", () => ...)` at the top level, a function that
-gives true. For an orchestrator's readiness probe. Neither request is logged or counted.
+gives true. For an orchestrator's readiness probe. With a database per tenant (see [Many
+tenants](#many-tenants)) the database is `"ready (per tenant)"` when a tenant can be
+opened: the tenants' folder can be written, or their server answers (MySQL by a real
+login), and no database is opened or made to ask. Neither request is logged or counted
+(a route of the program's own at a path ending in `/_quillo/ready` is).
+
+A program with nothing to serve over HTTP (only `every`, `udp.listen` or jobs) listens on
+the default port, or `$PORT`, when it is free, for its health and metrics (`quillo: nothing
+to serve over HTTP; health and metrics listening on ...`). When that port is taken and
+nothing asked for one, it runs without a port, and says so (`quillo: 8080 is taken; this
+program serves nothing over HTTP, so it runs without a port (give --port for
+/_quillo/health)`): give it `--port` to reach `/_quillo/health` and the metrics. A port
+asked for (`--port`, `$PORT`, `--host`, `--listen`, `--metrics`) that is taken stops it, as
+for any program.
 
 `GET /_quillo/health/queries` says how long database queries take: the minimum,
 maximum and average of the last 100, with how many ran and failed in all:

@@ -48,7 +48,7 @@ fn post_savings_interest(period: str) -> int with db, time, random {
         db.exec("insert into settings (key, value) values (?, ?)", key, str(now()))
         let posted = for a in db.query("select id, balance from accounts where kind = 'savings' and status = 'open' and balance > 0") => {
             let interest = int(round(dec(a.balance) * dec(rate) / 120000, 0, "half_up"))
-            if interest > 0 { post(a.id, interest, "interest", `Interest for ${period} at ${pct(rate)} a year`, new_journal(), null) }
+            if interest > 0 { post(a.id, interest, "interest", `Interest for ${period} at ${pct(rate)} a year`, new_journal(), null)? }
             interest
         }
         len(posted | filter((x) => x > 0))
@@ -121,7 +121,7 @@ server fn break_deposit(id: int) ! str with db, time, random {
 fn mature_deposits() -> int with db, time, random {
     let due = db.query("select id from accounts where kind = 'deposit' and status = 'open' and matures <= ?", today())
     for d in due {
-        db.transaction({ isolation: "serializable" }, () => close_deposit(d.id, true, null))
+        db.transaction({ isolation: "serializable" }, () => close_deposit(d.id, true, null))?
     }
     len(due)
 }
@@ -131,8 +131,8 @@ fn mature_deposits() -> int with db, time, random {
 // yet posted.
 server fn run_daily() ! str with db, time, random {
     let u = acting_as(["manager"])?
-    let matured = mature_deposits()
-    let interest = post_savings_interest(slice(date.add_months(today(), -1), 0, 7))
+    let matured = mature_deposits()?
+    let interest = post_savings_interest(slice(date.add_months(today(), -1), 0, 7))?
     audit(u.id, "run daily", `${matured} deposits, interest on ${interest}`)
     { matured, interest }
 }
@@ -141,7 +141,7 @@ server fn run_daily() ! str with db, time, random {
 // month's savings interest.
 fn daily() with db, time, random {
     let t = today()
-    let matured = mature_deposits()
-    let interest = slice(t, 8) == "01" ? post_savings_interest(slice(date.add_months(t, -1), 0, 7)) : 0
+    let matured = mature_deposits()?
+    let interest = slice(t, 8) == "01" ? post_savings_interest(slice(date.add_months(t, -1), 0, 7))? : 0
     if matured > 0 || interest > 0 { print(`coop: ${matured} deposits matured, interest on ${interest} savings accounts`) }
 }

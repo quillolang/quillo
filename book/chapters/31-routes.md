@@ -219,7 +219,11 @@ If no route matches, the response is 404 for an unknown path, 405 for a known
 path with the wrong method (with `Allow`, the methods it takes), and 400 when a route
 matched the path and method but none of its patterns matched. The 400 is logged with the
 route that came closest and its first miss (`` POST /form (main.qwe:6): `form.agree` is
-missing, and must be a bool ``), and under `--watch` the answer says it too *(since 0.7)*. Before any route is tried, a `POST`, `PUT`, `PATCH` or
+missing, and must be a bool ``), and under `--watch` the answer says it too *(since 0.7)*.
+Of several routes on the path, the closest is one whose body is of the kind the request's
+content-type says (`json`, `form`), then the one that missed later (its body, after its
+query and its group's pattern), then the one with the most fields sent that fit (a field
+left to its default counts as none), and on a tie the first written. Before any route is tried, a `POST`, `PUT`, `PATCH` or
 `DELETE` with a form, multipart or plain-text body (or none) that the browser marks as
 coming from another site is refused with 403 (see `allow_cross_site` under
 [Standard library](#standard-library)). A last `route ANY /*rest` is a 404 page of
@@ -410,6 +414,11 @@ route POST /docs { files: { docs: [map] } } {
 }
 ```
 
+A file sent in a field the pattern takes as text (`{ form: { photo: str } }`) is named as
+a file in the 400 and the log: `` `form.photo` is a file (cat.png), not a str; it is in
+request.files.photo ``. When the field has a default, the route runs with it, and the log
+says the same, with `(the route ran with its default)`.
+
 The whole round trip for one file: the page with its form, then the route the form posts
 to. The bytes stay with the request until saved:
 
@@ -532,7 +541,13 @@ run_script("total > 100", { total: 120 }, { timeout: "1s" })               // tr
 ```
 
 - The script sees the values in `vars` and the builtins that only compute (`len`,
-  `upper`, `map`, `filter`, ...). Method calls are the same: `"x".upper` works,
+  `upper`, `map`, `filter`, ...), with the modules `math`, `stats`, `re`, `bit` and `date`
+  (without its clock), `dec` and `format_number` (`en-US` unless the script names a
+  locale), and spreads (`[...xs, 4]`, `{ ...m }`):
+  `run_script("format_number(stats.mean(xs), \"de-DE\", 2)", { xs: [1, 2, 4] })` gives
+  `"2,33"`. `db`, `now`, `random`, `range` and `vec` are not there, and saying so is the
+  error (`` `range` is not available in a script: it can make a huge value from a small
+  one ``). Method calls are the same: `"x".upper` works,
   `"HOME".env` and `"f".read_file` do not, nor the program's functions.
 - It cannot define functions (it can write `(x) => ...`), routes, state or markup,
   `use` files or reply.
@@ -543,7 +558,8 @@ run_script("total > 100", { total: 120 }, { timeout: "1s" })               // tr
 - It stops after 20,000 steps (calls and loop rounds). A value it makes may be up to
   1 MB (strings, and lists and maps counted with what they hold), and each KB it makes
   costs a step: doubling a string in a loop stops there, not when the memory runs out.
-  Each KB a builtin or a comparison reads costs a step too, so `unique`, `min` or `==` on a
+  The same 1 MB holds for a spread, for the text `re.replace` builds as it goes, and for
+  the matches `re.find_all` and `re.split` give, their groups counted. Each KB a builtin or a comparison reads costs a step too, so `unique`, `min` or `==` on a
   list near 1 MB is many steps, not one; what a builtin only looks into (`len` of a list,
   `get`, `has`, `first`, `last`) or copies into what it gives back (`push`, `set`, `merge`,
   `sort`) is paid for as made, so `out = push(out, x)` pays for `out` once *(since 0.8.9: a
@@ -616,7 +632,7 @@ route POST /photos {
 }
 
 route GET /photos/:id = <figure>
-    <img src={`/thumbs/${id}.jpg`} width="800"/>
+    <img src={`/thumbs/${id}.jpg`} width="800" alt="The uploaded photo"/>
     <figcaption>{image.info(`uploads/${id}`).width} pixels wide, shown at 800</figcaption>
 </figure>
 
@@ -889,13 +905,30 @@ route GET /intranet {
 | `events(f, { status, headers })` | Server-Sent Events, as `f` sends them |
 | a runtime error | 500 `text/plain`, `internal error` |
 
+- Inside `rss`, `feed`, `urlset`, `sitemapindex`, `entry`, `item`, `url` and `sitemap`, and
+  inside a literal whose outermost element names a namespace other than XHTML's, HTML's
+  empty elements are XML's: `<link>` holds text, as an RSS channel's link does, and an
+  empty one is written `<link .../>`, as Atom's is (an HTML page's own elements of those
+  names write `<br/>` the same, which browsers read alike). A helper whose root is
+  `<link/>` cannot see the feed it goes in: write it in the entry's own literal.
+
+  ```quillo
+  route GET /rss.xml =
+      <rss version="2.0">
+          <channel>
+              <title>Notes</title>
+              <link>https://example.com/</link>
+          </channel>
+      </rss>
+  ```
 - `redirect(...)` and `respond(...)` make an answer; they do not leave. A route answers with
   its last value, or what `return` or `reply` gives, so `if no_user { redirect("/login") }`
   with more after it goes on and shows the page. To leave, write
   `reply 303 redirect("/login")`; `quillo check` warns of one nothing takes.
-- An error the program wrote, `err("That name is taken")`, is sent as it is. One a builtin
+- An error the program wrote, `err("That name is taken")`, is sent as it is: as a route's
+  value, inside a map or list, or from a `server fn`. One a builtin
   made says `internal error` instead, wherever it would reach a visitor: as a route's
-  value, inside a map or list, in markup, or from a `server fn`, in what a `stream` or
+  value, inside a map or list, or from a `server fn`, in what a `stream` or
   `events` answer sends *(since 0.8.9: a stream sent it as it was)*, and when it is turned
   into text: a template string, `str`, `join`, `json.stringify`. A database's has the SQL
   and the tables, an `http` call's the address with its key, a file's its path, so that
@@ -905,7 +938,8 @@ route GET /intranet {
   What is read that way is plain text, no longer protected: `{ line: error(r) }` sends
   it. To show a visitor something, say it:
   `err("Billing is down, try again soon")`. A service's own `err` reaches its caller's
-  visitors in the same way.
+  visitors in the same way. In markup, any error value, the program's too, shows nothing
+  and is logged (see [Errors](#errors)): show its words with `error(r)`.
 - A failed request's line in the log names it, with the id in its `x-request-id`:
   `quillo: error: GET /checkout (rid 1cf61931): main.qwe:8: division by zero`. Under
   [`--log json`](#options-of-quillo-run) it is an object, with `level`, `request` and `error`.
@@ -916,7 +950,8 @@ route GET /intranet {
   one ``); `reply` takes 200 to 599 too. A 205 goes with no body, whatever is given, and
   each status has its reason phrase (`418 I'm a teapot`). A route's answer that carries
   an `etag` is a 304 to a `GET` or `HEAD` whose `If-None-Match` holds it, as files are:
-  `` respond(200, v, { etag: `"${version}"` }) ``. Header names are written in lower case, and a name or value with a control character (a line break) is
+  `` respond(200, v, { etag: `"${version}"` }) ``, and the log and the metrics count it as
+  a 304. Header names are written in lower case, and a name or value with a control character (a line break) is
   a runtime error. `content-length`, `transfer-encoding`, `connection` and `date` are
   the server's, whatever is given.
 - A page whose route, group middleware or server fn reads `request.headers`,
@@ -949,7 +984,7 @@ route GET /intranet {
 - `stream` and `events` refuse a status that has no body (204, 205, 304) and a 1xx, as
   their function would write one (`` `stream` cannot answer 204: that status has no body
   ``), and `events` refuses a `type` that is not text, as `stream` does.
-- Every answer carries `server: Quillo` (unless the route sets `server`), `date`,
+- Every answer carries `server: Quillo` (unless the route or `site_headers` sets `server`), `date`,
   `x-request-id` and `x-content-type-options: nosniff`. Every HTML page carries
   `x-frame-options: SAMEORIGIN`, unless the route sets one or a
   `content-security-policy` with `frame-ancestors`. None carries `Strict-Transport-Security`
@@ -995,7 +1030,9 @@ route GET /intranet {
   set it with `site_headers` instead.
 - `site_headers(map)` *(since 0.7)* at the top level adds headers to every answer that does not set
   them itself, and `site_headers("/admin", map)` to those under a path; a longer path's
-  rule wins over a shorter one's. A `null` value takes away one Quillo sends. Names are
+  rule wins over a shorter one's. A `null` value takes away one Quillo sends:
+  `"server": null` takes away `server: Quillo`, and a text replaces it (a route's own
+  `server` still wins). Names are
   checked, and values are one line; `content-length`, `transfer-encoding`, `connection`,
   `set-cookie` and `content-type` are refused, as a route sets them:
 
@@ -1669,11 +1706,15 @@ How messages travel:
   have no socket, both go through the app's bridge instead.
 - The server listens for WebTransport on the UDP port with the HTTP port's number
   (start the program with [`--wt-port`](#options-of-quillo-run) for another, `quillo run main.qwe --wt-port 4433`), from when the first page asks to connect, on every address
-  of the machine unless [`--host`](#options-of-quillo-run) is a loopback address. It makes a certificate of its
+  of the machine unless [`--host`](#options-of-quillo-run) is a loopback address. On
+  127.0.0.1 it listens on `[::1]` too, so a page at `http://localhost`, which the browser
+  may dial over IPv6, uses WebTransport in development. It makes a certificate of its
   own, good for 13 days and replaced after 11, which browsers take by its hash (they
   take such certificates for two weeks at most); [`--tls-cert`](#options-of-quillo-run) and [`--tls-key`](#options-of-quillo-run), given
   together, give it a real one. A WebTransport connection is kept alive every 5 s and
-  dropped after 20 s of silence. A session counts among the connections a server keeps
+  dropped after 20 s of silence. A clean stop closes each session (`server stopping`), so
+  its pages notice at once and connect to the next server; a crash or a `SIGKILL` is
+  noticed by the keep-alive, within about 20 s. A session counts among the connections a server keeps
   open, as a WebSocket does (see [Live data](#live-data)), opens at most 8 streams of
   media frames and 2 both ways, and may have 1 MiB a stream, and 4 MiB in all, on its way
   before the server reads it *(since 0.8.9: it was not counted, and one session could hold

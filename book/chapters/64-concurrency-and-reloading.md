@@ -221,7 +221,20 @@ whether what the program needs is there: `{ "ready": true, "checks": { "database
 "ready", "service billing": "ready", "ledger": "not ready" } }`, 200 or 503, its
 database (`select 1`), each service it declares (see [Services](#services)) and the
 program's own checks, `ready("ledger", () => ...)` at the top level, a function that
-gives true. For an orchestrator's readiness probe. Neither request is logged or counted.
+gives true. For an orchestrator's readiness probe. With a database per tenant (see [Many
+tenants](#many-tenants)) the database is `"ready (per tenant)"` when a tenant can be
+opened: the tenants' folder can be written, or their server answers (MySQL by a real
+login), and no database is opened or made to ask. Neither request is logged or counted
+(a route of the program's own at a path ending in `/_quillo/ready` is).
+
+A program with nothing to serve over HTTP (only `every`, `udp.listen` or jobs) listens on
+the default port, or `$PORT`, when it is free, for its health and metrics (`quillo: nothing
+to serve over HTTP; health and metrics listening on ...`). When that port is taken and
+nothing asked for one, it runs without a port, and says so (`quillo: 8080 is taken; this
+program serves nothing over HTTP, so it runs without a port (give --port for
+/_quillo/health)`): give it `--port` to reach `/_quillo/health` and the metrics. A port
+asked for (`--port`, `$PORT`, `--host`, `--listen`, `--metrics`) that is taken stops it, as
+for any program.
 
 `GET /_quillo/health/queries` says how long database queries take: the minimum,
 maximum and average of the last 100, with how many ran and failed in all:

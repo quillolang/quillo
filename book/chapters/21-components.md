@@ -77,7 +77,11 @@ route GET / = <html><body><Counter start={5}/></body></html>
   follows it, write `let count = ...` in place of the state ``), so a value worked out
   from others is a `let`. Each place in the
   markup that shows a value follows only that value: changing one row's text changes that
-  text. Assigning the value a state already has does nothing.
+  text. Assigning the value a state already has does nothing. A `state` is declared at the
+  top of the component's body, not inside an `if`, `for`, `while`, `fn` or block: the error
+  says to declare it there, with a first value, and set it where it was
+  (`` `state` goes at the top of a component's body, not inside an `if`: declare `state n =
+  0` there and set it in the `if` ``).
 
   ```quillo
   component Total(price: int) {
@@ -129,7 +133,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   (`onsubmit`, `oninput`, `onmount`, ...); on a view or component, `on_change={...}` or
   `onChange={...}` is a parameter like any other. There are no
   modifiers: `@click.prevent` is taken as an event named `click.prevent`, which never
-  fires; call `e.preventDefault()`. Event names are not checked, so a misspelt one
+  fires, and `quillo check` says so; call `e.preventDefault()`. Event names are not checked, so a misspelt one
   (`@clik`) is silent. Clicks are handled once, at the document, innermost first, so
   `e.stopPropagation()` stops outer handlers, and a library that stops a click before
   it reaches the document hides it from Quillo; other events listen on their element.
@@ -199,6 +203,10 @@ route GET / = <html><body><Counter start={5}/></body></html>
       </form>
   }
   ```
+
+  A form's reset (a `<button type="reset">`, or `form.reset()`) sets each bound field's
+  state from the field again, so `name` above empties with its input; a reset the page
+  prevents changes nothing.
 
   A number or range input gives a number back (`null` when empty, or only spaces), so
   `qty + 1` after typing 3 is 4, and text being typed that already reads as the state's
@@ -334,7 +342,7 @@ route GET / = <html><body><Counter start={5}/></body></html>
   component Pair() {
       state a = 0
       state b = 0
-      <p onclick={() => { a += 1; b = a * 10 }}>{a} and {b}</p>
+      <button onclick={() => { a += 1; b = a * 10 }}>{a} and {b}</button>
   }
   ```
 
@@ -435,13 +443,17 @@ route GET / = <html><body><Counter start={5}/></body></html>
 
   ```quillo
   component Receipt(total: float, at: str) {
-      <p>{format_number(total)} on {at}, ref {uuid()}</p>
+      state ref = uuid()                    // drawn once, on the server
+      <p>{format_number(total)} on {at}, ref {ref}</p>
   }
   ```
 
   `<Receipt total={1234.5} at="2026-11-03"/>` shows `1,234.5 on 2026-11-03, ref` and a
-  uuid, on the server and in the browser alike. `env("PUBLIC_SHOP")` may join them;
-  `env("DB_URL")` may not.
+  uuid, the same on the server and in the browser. `random()`, `random_int` and `uuid()`
+  written in the body or the markup would be drawn again when the component wakes in the
+  browser, and the page would change under the visitor (`quillo check` warns): a `state`
+  keeps the server's, and a prop (`ref={order.ref}`) works too. `env("PUBLIC_SHOP")` may
+  join them; `env("DB_URL")` may not.
 - There is nothing built in for `document`, `window`, `localStorage`, the clipboard,
   focus or scrolling: reach them through the page, `js("localStorage.getItem", k)`,
   `js("navigator.clipboard.writeText", s)`, `js("window.innerWidth")` (no arguments
@@ -482,8 +494,9 @@ route GET / = <html><body><Counter start={5}/></body></html>
   # /_quillo/b/0767fa4dd4c7b224.js
   ```
 - And only when it is needed: the server's HTML shows at once, and the bundle comes
-  when someone reaches for a component (points at, touches or focuses it, or presses a
-  key in it). What they typed before it came is kept, and each click, double click,
+  when someone reaches for a component (points at, touches or focuses it, presses a key
+  in it, or scrolls it, for one that handles `scroll`: that scroll is done again once the
+  code is in). What they typed before it came is kept, and each click, double click,
   right or middle click, press and release is done again then as it was made: on the
   same element, at the same point, with the same buttons, keys and click count (a
   `@pointerdown` may still capture a pointer whose finger was lifted meanwhile). A
@@ -703,7 +716,7 @@ component Counter(label: str, start: int = 0, on_change = null) {
 component Panel(header, children) {          // `header` is a named slot: any HTML
     state open = true
     <div>
-        <div onclick={() => { open = !open }}>{header}</div>
+        <button onclick={() => { open = !open }}>{header}</button>
         {open && children}
     </div>
 }
@@ -761,7 +774,11 @@ component Dashboard() {
 - A plain function used as a tag (`<Row item={x}/>` where `Row` is neither a view nor a
   component) is called again as a whole when what it is given changes.
 - Views are plain functions: they have no state and add nothing to the browser bundle
-  unless a component uses them.
+  unless a component uses them. So an event attribute (`onclick={...}`) in a view, in a
+  route's own markup or in a plain `fn`'s markup that a page places outside any component
+  never runs, as no code of the page's holds it: `quillo check` says so (`` `onclick` in
+  view Tip never runs: Tip is placed in a page (main.qwe:18), not in a component ``). Make
+  it a component, or place it inside one.
 - A component placed directly in a page gets its props from the server, so they must
   be data (no functions, no HTML values), and they stay as the page was made: nothing
   above it changes them. Inside another component, props can be anything (callbacks,
@@ -786,7 +803,7 @@ component Card(title: str) {
       .title:hover { text-decoration: underline }
     `
     state open = false
-    <div.card @click={() => { open = !open }}><h2.title>{title}</h2>{open && <p>More about {title}</p>}</div>
+    <div.card><h2.title>{title}</h2><button onclick={() => { open = !open }}>More</button>{open && <p>More about {title}</p>}</div>
 }
 
 route GET / = <html><head><title>Cards</title></head><body><Card title="Hello"/></body></html>
@@ -1507,8 +1524,9 @@ redirect led to, a proxy's page, an empty body. Quillo's server marks what it se
 into this error; ordinary answers go through). A `redirect` from the function itself is followed
 by the browser, and gives this error too. A function that returns `err(v)` gives an error value with `v`. A `reply 401
 "Log in first"` inside it gives only the status (``failed (401)``), since its body is
-not JSON: return `err("Log in first")`, or `reply 401 { error: "Log in first" }`, for the
-page to show the words. Nothing happens by itself on a 401 or a 500 (no redirect, no
+not JSON: return `err("Log in first")`, or `reply 401 { error: "Log in first" }`, and
+show the words with `r.error`, as `problem` above does (an error value itself shows
+nothing in markup, see [Errors](#errors)). Nothing happens by itself on a 401 or a 500 (no redirect, no
 retry, except for [idempotent](#idempotent-requests) calls); there is no loading flag
 either: set a state of your own around the call.
 
