@@ -294,7 +294,7 @@ quillo: 2 files reach something not confirmed yet
 | `quillo run` on a terminal, `--watch` too | asks about the new item only, then goes on |
 | `quillo check` | lists them, and exits 1 once the project has a `quillo.confirmed` |
 | A start with no terminal (CI, systemd, FastCGI, a container) | never asks. What is not confirmed is refused as it is reached, and a plugin stops the start (decided, question 3) |
-| Under a provider's policy | a program with no `quillo.confirmed`, or with anything not confirmed, does not start (decided, question 5; question 6 asks about one release of warning first) |
+| Under a provider's policy | a program with no `quillo.confirmed`, or with anything not confirmed, does not start (decided, question 5: asked by the provider's own layers only, as revised on 2026-11-23; one release warns first, question 6) |
 | A project with no `quillo.confirmed`, and no policy in force | runs as today, with one line: `quillo: 6 addresses and 1 path in 2 files are not confirmed: quillo confirm lists them` |
 | The editor | a note at the line, with the action "confirm" |
 | `quillo install airtable` | shows the catalog's list for the plugin and asks. A yes writes its block and hash |
@@ -518,7 +518,9 @@ The effects are `db`, `http`, `fs`, `env`, `time`, `random` and `net`. `cli_run`
 | The kit's `fetch` calls | 3 files: the page's own address, or a `src` the program gives |
 | Building a small plugin with no crates of its own | 1.4 s with the cache warm |
 
-## Questions for the user (1 to 5 decided, 2026-11-21; 6 open)
+## Questions for the user (all decided: 1 to 5 on 2026-11-21, 6 on 2026-11-22; 5 revised on 2026-11-23)
+
+Built since, on branch `feedback82-85` for 0.8.11 (`CHANGELOG.md`, "Unreleased (0.8.11)"). The questions are kept as they were asked, each with its decision.
 
 ### 1. Decided: the scan covers every file of the program
 
@@ -591,6 +593,8 @@ How I read "includes catalog" (to correct if wrong):
 
 **The user, 2026-11-21: "policy must require complete".** Asked as: may a provider's policy require a complete `quillo.confirmed` before anything starts? It happens on every host that runs others' programs under a policy (FEEDBACK82).
 
+**Revised by the user, 2026-11-23: only a provider's layers ask for it.** Those are the host's file, what it includes, `policy.d` and `QUILLO_POLICY_PATH`. A file given with `--policy` is the developer's, as `quillo.policy` is, and does not ask. This replaces "any layer may ask for it" and my first reading, both below.
+
 | Impact | |
 |---|---|
 | **Functionality** | Under a provider's policy, a program starts only when its `quillo.confirmed` is there and nothing the scan lists is outside it: every written address, path and script, and each Rust file's hash. Otherwise the start stops, naming what is missing and the policy file that asks for it. `quillo check --policy` says the same before a deploy |
@@ -603,16 +607,18 @@ What "complete" can and cannot mean:
 - **It covers what the scan lists as the program starts.** An address worked out while the program runs is not in that list. It is refused when it is used, as question 3 decided.
 - **It only narrows, as every policy setting does.** Any layer may ask for it, and no later layer can take it back.
 
-How I read "policy must require complete" (to correct if wrong):
+How I read "policy must require complete" (the first reading was corrected by the revision of 2026-11-23, above):
 
-- "A provider's policy" is the host's file and any `--policy` file. The program's own `quillo.policy` may ask for it too.
+- "A provider's policy" is the host's file and any `--policy` file. The program's own `quillo.policy` may ask for it too. **Corrected:** neither a `--policy` file nor `quillo.policy` asks.
 - "Must" is read as: this is how a provider's policy works. It is not a key (`[confirm] require = true`) that each provider has to remember to write. Where no policy is in force, question 3's softer rule stays: the one thing is refused and the program runs.
 
-This adds a twelfth thing to what a policy says. FEEDBACK82's question 1 (`[run]`, `[fs] paths`, `[env] set`) is still open there.
+This adds a twelfth thing to what a policy says. FEEDBACK82's question 1 (`[run]`, `[fs] paths`, `[env] set`) was decided on 2026-11-22, as that report's Part D has them.
 
-### 6. Should the first release that has this only warn under a policy, before it stops programs?
+### 6. Decided: the first release only warns under a provider's policy, and the next one stops
 
-**Yes: one release of warning first. Otherwise the upgrade itself stops every program on a host with a policy.** It happens the day a host installs the release: no program there has a `quillo.confirmed` yet, since the file does not exist before that release. Read from the decision in question 5, not measured: nothing is built.
+**The user, 2026-11-22, on the decisions page of the batch FEEDBACK82 to 85: warn for one release, then stop.** Asked as: should the first release that has this only warn under a policy, before it stops programs? Otherwise the upgrade itself stops every program on a host with a policy. It happens the day a host installs the release: no program there has a `quillo.confirmed` yet, since the file does not exist before that release.
+
+As built: 0.8.11 warns at start and in `quillo check`, naming 0.8.12, from which such a program does not start.
 
 | Impact | |
 |---|---|
@@ -623,6 +629,4 @@ This adds a twelfth thing to what a policy says. FEEDBACK82's question 1 (`[run]
 
 What stopping at once has: the rule holds from the first day.
 
-**My recommendation:** warn for one release, then stop. A provider that wants it at once can say so in its policy.
-
-**The question:** shall the first release only warn? If not, it stops from the first release, and the release notes tell hosts to have every program confirmed before they upgrade.
+What was recommended, and taken: warn for one release, then stop. The recommendation also said a provider that wants the stop at once could say so in its policy. The guide for 0.8.11 names no such setting.

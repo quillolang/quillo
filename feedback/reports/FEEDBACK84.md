@@ -186,6 +186,8 @@ What they agree on:
 
 A sketch. The names are open. Nothing here is built.
 
+Decided since, on 2026-11-22 (see the questions at the end): the head is set by a builtin, `page_head`, not by C.1's block, and C.2 is built as `moves_in_place()`.
+
 ### C.1 A `<head>` block in any view or component
 
 ```quillo
@@ -495,9 +497,15 @@ Measured in A.1. An SPA's link asks for its page's whole HTML when pointed at or
 | A statement setting `document.title` from `url().path` | follows every move, and Back |
 | The published `spa.qwe` at the root | 404 for `/nope` and `/products/99`, 200 for the rest |
 
-## Questions for the user
+## Questions for the user (all decided, 2026-11-22)
+
+Decided by the user on the decisions page of the batch FEEDBACK82 to 85, and built since on branch `feedback82-85` for 0.8.11 (`CHANGELOG.md`, "Unreleased (0.8.11)"). The questions are kept as they were asked, each with its decision under the heading. The first was decided against this report's recommendation.
 
 ### 1. How should a page say what goes in the head?
+
+**Decided: by a builtin, `page_head({ title, description, image })`, not by the `<head>` block recommended below.** `page_url()` is wanted with it. As built: `page_head({ title, description, image, canonical })` from any view or component, the innermost call winning, on the server and, following state, in the browser. A component inside `<head>` is now an error that names `page_head` (Q-1322).
+
+As it was asked:
 
 **With a `<head>` block that any view or component may write.** It is HTML's own word, and it puts the title where the data is. It is needed in both ways of making a site: measured, a view's `<title>` stays in the body (Q-1321), and an SPA's head never changes (Q-1320).
 
@@ -519,6 +527,10 @@ The other two ways:
 
 ### 2. Should the routes be the SPA's routing system, with moves made in place?
 
+**Decided: yes, as an opt-in, a switch at the top of the program.** `url()` and `navigate()` stay as they are. As built: `moves_in_place()`.
+
+As it was asked:
+
 **Yes. The routes already are a routing system, with everything a hand-written `match` lacks, and today's SPA already fetches the next route's page.** It happens in every program that wants pages to keep state across moves: today that means leaving routes for one component and writing the table again (Q-1323).
 
 | Impact | |
@@ -535,6 +547,10 @@ What today's one-component way has that this gives up: a move that sends only da
 **The question:** shall I plan routes changed in place as the SPA routing system? If not, the routing work is C.3 alone: path patterns in a `match`, with the head from question 1 and the manners of C.4.
 
 ### 3. With moves in place, should page state and a kept component's state survive a move?
+
+**Decided: yes.** Page state and a kept component's state survive a move in place, and a real page load starts over. As built: page states keep their values, and so does a component that is on both pages with the same props.
+
+As it was asked:
 
 **Yes: it is what an SPA is taken for.** It happens at every move once question 2 is built. Page state (`state cart = []` at the top) was decided on 2026-11-15 as "per page load", when every move was a page load.
 
