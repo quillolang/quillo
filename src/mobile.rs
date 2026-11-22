@@ -155,6 +155,16 @@ pub fn start(bundle: &Path, data: &Path, main: &str, device: &str) -> Result<Sta
     if !path.exists() {
         return Err(format!("no {} in the app's program", main));
     }
+    // The program's own policy follows it into its phone app: its hosts, effects, variables and
+    // limits, which it ran without (FEEDBACK82.md, Q-1284; branch feedback82-85). A phone has no
+    // host's file nor a provider's environment, so only `quillo.policy` is read; one there but
+    // broken stops the start, as under `quillo run` (Q-1283).
+    let policy = crate::policy::load_program(&path)?;
+    let workers = policy.workers.map_or(8, |w| w.min(8));
+    let max_body = policy.max_body;
+    policy.put_env();
+    policy.hold_limits();
+    crate::policy::set(policy);
     let token = crate::server::launch_token()?;
     let (tx, rx) = std::sync::mpsc::channel::<Result<u16, String>>();
     let thread_token = token.clone();
@@ -185,11 +195,14 @@ pub fn start(bundle: &Path, data: &Path, main: &str, device: &str) -> Result<Sta
             }
             let mut app = App::new(Loaded::Ready(interp), shared, &path, &base, false);
             app.launch_token = Some(thread_token);
+            if let Some(b) = max_body {
+                app.max_body = app.max_body.min(b);
+            }
             let ready = tx.clone();
             // The same port at each launch: a page's origin holds it, and `localStorage`
             // and IndexedDB go by origin (FEEDBACK28.md, Q-339; branch feedback29-fixes).
             let kept = kept_port(&port_file);
-            if let Err(e) = crate::server::serve_with(app, &kept, 8, move |a| {
+            if let Err(e) = crate::server::serve_with(app, &kept, workers, move |a| {
                 let _ = std::fs::write(&port_file, a.port().to_string());
                 let _ = ready.send(Ok(a.port()));
             }) {

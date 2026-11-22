@@ -50,7 +50,7 @@ fn window(file: &str, flags: &[String]) -> i32 {
         }
     }
     let flags = &rest[..];
-    let o = match crate::run_options(flags) {
+    let mut o = match crate::run_options(flags) {
         Ok(o) => o,
         Err(code) => return code,
     };
@@ -69,6 +69,15 @@ fn window(file: &str, flags: &[String]) -> i32 {
     if o.port.is_some() || o.listen.is_some() {
         eprintln!("quillo: `app` has no port: its window asks the program directly, with no socket; --port and --listen are for `run`");
         return 2;
+    }
+    // The policy, as `quillo run` reads it: the host's layers, `--policy`, `quillo.policy`. The
+    // window's program ran under none, `--policy` taken and ignored without a word (FEEDBACK82.md,
+    // Q-1284; branch feedback82-85).
+    if let Err(code) = crate::with_policy(Path::new(file), &o.policies, true) {
+        return code;
+    }
+    if let Err(code) = crate::policy_in_force(&mut o, flags) {
+        return code;
     }
     if let Err(code) = crate::before_the_program(file, &o) {
         return code;

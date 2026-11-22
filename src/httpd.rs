@@ -2577,20 +2577,12 @@ pub(crate) fn named_address(peer: &str) -> String {
 
 /// Takes `10.0.0.0/8,127.0.0.1`; false if a part of it is neither.
 pub fn trust_proxies(list: &str) -> bool {
-    let mut nets = Vec::new();
-    for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let (ip, bits) = part.split_once('/').map_or((part, None), |(i, b)| (i, Some(b)));
-        let Ok(ip) = ip.parse::<std::net::IpAddr>() else { return false };
-        let most = if ip.is_ipv4() { 32 } else { 128 };
-        let bits = match bits {
-            None => most,
-            Some(b) => match b.parse::<u32>() {
-                Ok(b) if b <= most => b,
-                _ => return false,
-            },
-        };
-        nets.push((ip, bits));
-    }
+    crate::policy::nets(list).is_some_and(trust_nets)
+}
+
+/// The networks `--trust-proxy` named, held to a policy's `[run] trust_proxy` first, or that
+/// policy's own (FEEDBACK82.md, Q-1280; branch feedback82-85); false when none, or set already.
+pub fn trust_nets(nets: Vec<(std::net::IpAddr, u32)>) -> bool {
     !nets.is_empty() && TRUSTED.set(nets).is_ok()
 }
 

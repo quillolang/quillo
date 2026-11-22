@@ -3501,8 +3501,10 @@ pub fn split(path: &Path, watch: bool, reload: bool, static_check: bool, checked
         if let Some(ms) = crate::httpd::compute_limit_of_option() {
             args.extend(["--max-compute".to_string(), format!("{}ms", ms)]);
         }
-        // The app's policy is its services' too (the host's they read themselves).
-        for f in crate::policy::get().files.iter().filter(|f| f.as_path() != Path::new(crate::policy::HOST_FILE)) {
+        // The app's policy is its services' too (the host's they read themselves, and the layers
+        // the host's names, policy.d's and QUILLO_POLICY_PATH's: FEEDBACK82.md, Q-1281; branch
+        // feedback82-85).
+        for f in crate::policy::get().passed_on() {
             args.extend(["--policy".to_string(), f.display().to_string()]);
         }
         if !static_check {

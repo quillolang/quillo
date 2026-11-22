@@ -38,6 +38,12 @@ pub fn set_root(dir: &std::path::Path) {
     let _ = ROOT.get_or_init(|| dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
 }
 
+/// The program's folder, once set (FEEDBACK82.md, Q-1285: a pinned plugin is built outside it;
+/// branch feedback82-85).
+pub fn root() -> Option<std::path::PathBuf> {
+    ROOT.get().cloned()
+}
+
 /// The eight hex digits of a file: from its path as seen from the program's folder, so they
 /// are the same on every server, after every deploy, and from whatever folder the program was
 /// started: it was the folder it ran in, so copies started from two folders each ran a

@@ -2878,6 +2878,19 @@ pub fn allow_path(dir: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A folder for `--allow-path` already resolved, as a policy's `[fs] paths` judged it: not looked
+/// up again by its name, which could lead elsewhere by then (FEEDBACK82.md, Q-1280, found in
+/// review; branch feedback82-85).
+pub fn allow_real_path(real: std::path::PathBuf) {
+    ALLOWED_PATHS.write().unwrap_or_else(std::sync::PoisonError::into_inner).push(real);
+}
+
+/// The folders `--allow-path` named, for what must stay out of the program's reach (FEEDBACK82.md,
+/// Q-1285; branch feedback82-85).
+pub(crate) fn allowed_paths() -> Vec<std::path::PathBuf> {
+    ALLOWED_PATHS.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
 /// A path under the program's folder; `..` and absolute paths are refused, unless they
 /// lead into a folder `--allow-path` named.
 pub(crate) fn local_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {

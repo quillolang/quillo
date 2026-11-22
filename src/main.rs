@@ -69,6 +69,11 @@ usage:
                                     client that starts it, over stdio (MCP
                                     2026-07-28): checked, its top level run, then
                                     messages on stdin and stdout; no routes
+  quillo policy [<file.qwe>]        the policy the program would run under: its
+               [--policy FILE]      layers, the places that had none, and each
+                                    setting with the file it came from (exit 1:
+                                    a layer asked for is not there; 2: one is
+                                    there but broken)
   quillo <file.qwe>                 same as `quillo run`
 
 The program is the first argument that is not an option, wherever the options
@@ -80,7 +85,9 @@ options for `run`:
   --port N       port to listen on (default $PORT, then 8080)
   --host H       address to listen on (default 127.0.0.1)
   --listen unix:PATH  listen on a Unix socket, for a web server in front (mode 0600; --socket-mode 660)
-  --policy FILE  narrow what it may do, after /etc/quillo/policy.toml and before quillo.policy
+  --policy FILE  narrow what it may do, after the host's layers (/etc/quillo/policy.toml, the
+                 files it includes, /etc/quillo/policy.d/, $QUILLO_POLICY_PATH) and before
+                 quillo.policy; `quillo policy` shows what is in force
   --env-file F   the settings from F, not the .env beside the program (F must be there)
   --no-build     load the .qwer libraries .quillo holds, as plugins.lock names them; never run cargo
   --instances N  run the program N times over, each on a core of its own
@@ -452,6 +459,9 @@ fn real_main(args: Vec<String>) -> i32 {
         Some("dap") => quillo::debug::serve(|l| run(&l.program, &l.args)),
         // The program's tools for an AI client, over stdio (FEEDBACK56.md, C.1; branch feedback56).
         Some("mcp") => with_program(&args[2..], mcp),
+        // What the policy in force says, and where each value came from (FEEDBACK82.md, Q-1286;
+        // branch feedback82-85).
+        Some("policy") => policy_command(&args[2..]),
         Some("check") => {
             // `--policy FILE`: what the program would be refused under it, said before a deploy
             // (FEEDBACK41.md, Q-478; branch feedback40-43).
@@ -487,7 +497,17 @@ fn real_main(args: Vec<String>) -> i32 {
         // `--mcp`: what an AI client is told of the program's tools, as its doors answer
         // (FEEDBACK56.md, Part D; branch feedback56).
         Some("docs") => docs(&args),
-        Some("build") => with_one_program(&args, &[], |f, _| match quillo::native::build_all(Path::new(f)) {
+        // Not where the policy says `build = false`, which it did not read (FEEDBACK82.md, Q-1285,
+        // found in review; branch feedback82-85).
+        Some("build") => with_one_program(&args, &[], |f, _| match with_policy(Path::new(f), &[], false).and_then(|()| match quillo::policy::get().build_from.as_ref() {
+            Some(from) if !quillo::policy::get().build => {
+                eprintln!("quillo: no build here: the policy {} says build = false", from.display());
+                Err(2)
+            }
+            _ => Ok(()),
+        }) {
+            Err(code) => code,
+            Ok(()) => match quillo::native::build_all(Path::new(f)) {
                 Ok(libs) => {
                     for l in &libs {
                         println!("built {}", l.display());
@@ -501,6 +521,7 @@ fn real_main(args: Vec<String>) -> i32 {
                     eprintln!("quillo: {}", e);
                     1
                 }
+            },
         }),
         // The `use`s a program's files need (src/modules.rs; branch feedback19-fixes).
         Some("fix") => with_one_program(&args, &[], |f, _| match quillo::modules::fix(Path::new(f)) {
@@ -686,7 +707,66 @@ fn docs(args: &[String]) -> i32 {
 /// The commands, for the nearest to a misspelt one (FEEDBACK31.md, Q-389; `serve`, `classes` and
 /// `fcgi` too: FEEDBACK55.md, Q-852; branch feedback55; `mcp`: FEEDBACK56.md, C.1; branch
 /// feedback56).
-const COMMANDS: &[&str] = &["run", "check", "docs", "build", "fix", "install", "repl", "lsp", "dap", "app", "new", "serve", "classes", "fcgi", "mcp", "version", "help"];
+const COMMANDS: &[&str] = &["run", "check", "docs", "build", "fix", "install", "repl", "lsp", "dap", "app", "new", "serve", "classes", "fcgi", "mcp", "policy", "version", "help"];
+
+/// The options of `quillo policy`.
+const POLICY_OPTIONS: &[&str] = &["--policy"];
+
+/// `quillo policy [main.qwe] [--policy FILE]...`: the layers a program would run under, the places
+/// that had none, and each setting in force with the file it came from, read as `quillo run` reads
+/// them; a host can run it from inside an account to see that its file is seen (FEEDBACK82.md,
+/// Q-1286; branch feedback82-85). Exit 1 when a layer that was asked for is not there (a file
+/// `include` or `QUILLO_POLICY_PATH` names, the variable `require_path` asks for), 2 when one is
+/// there but cannot be read or says what a policy does not, so that it can be a health check.
+fn policy_command(args: &[String]) -> i32 {
+    let mut policies = Vec::new();
+    let mut program = None;
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(v) = a.strip_prefix("--policy=") {
+            policies.push(PathBuf::from(v));
+        } else if a == "--policy" {
+            match args.get(i + 1) {
+                Some(v) if !v.starts_with('-') => {
+                    policies.push(PathBuf::from(v));
+                    i += 1;
+                }
+                _ => {
+                    eprintln!("quillo: `--policy` needs the policy's file: `quillo policy main.qwe --policy policy.toml`");
+                    return 2;
+                }
+            }
+        } else if a.starts_with('-') {
+            eprintln!("quillo: unknown option `{}` for `policy`{}", a, nearest(a, POLICY_OPTIONS.iter()));
+            return 2;
+        } else if program.is_none() {
+            program = Some(a.clone());
+        } else {
+            eprintln!("quillo: unknown argument `{}`: `policy` takes one program", a);
+            return 2;
+        }
+        i += 1;
+    }
+    // No program needed: a folder, or none, is its main.qwe's, whose folder may hold quillo.policy.
+    let named = program.unwrap_or_else(|| ".".into());
+    let main = if Path::new(&named).is_dir() { Path::new(&named).join("main.qwe") } else { PathBuf::from(&named) };
+    match quillo::policy::load_layers(&main, &policies) {
+        Ok(p) => {
+            println!("the policy for {}", main.display());
+            println!("{}", p.report());
+            0
+        }
+        Err(e) => {
+            eprintln!("quillo: {}", e.message);
+            if e.missing {
+                1
+            } else {
+                2
+            }
+        }
+    }
+}
 
 /// The options of `run` that `quillo mcp` takes: those about the program, not about serving it.
 const MCP_OPTIONS: &[&str] = &["--env-file", "--policy", "--allow-path", "--no-build", "--drain"];
@@ -722,19 +802,16 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
     if let Err(code) = with_policy(Path::new(file), &o.policies, true) {
         return code;
     }
+    // Its `--allow-path` held to `[fs] paths`, and `[env] set` (FEEDBACK82.md, Q-1280; branch
+    // feedback82-85).
+    let mut o = o;
+    if let Err(code) = policy_run(&mut o, flags) {
+        return code;
+    }
     // The policy's limits, held as `run_program` holds them: how long a call may compute, and
     // how long a message may be (found in review: they were not read here).
     let policy = quillo::policy::get();
-    if let Some(c) = policy.max_compute {
-        let (now, c) = (quillo::httpd::compute_limit_ms(), c.as_millis().max(1) as u64);
-        if now == 0 || now > c {
-            quillo::httpd::limit_compute(c);
-            if let Some(f) = &policy.max_compute_from {
-                quillo::httpd::compute_limit_from(f);
-            }
-        }
-    }
-    policy_memory(&policy);
+    policy.hold_limits();
     if let Err(code) = before_the_program(file, &o) {
         return code;
     }
@@ -861,6 +938,13 @@ struct RunOptions {
     /// A flag that answers over HTTP was given (`--metrics`, `--describe`, `--query-stats`): the
     /// program listens, whatever else it serves (FEEDBACK72.md, Q-1011; branch feedback72-81).
     asks_port: bool,
+    /// `--trust-proxy`'s networks and `--allow-path`'s folders (links followed), put in force once
+    /// the policy has held them to its own (`policy_run`), and whether `--client-cert-header` or
+    /// `--user-header` was given, which need a proxy trusted (FEEDBACK82.md, Q-1280; branch
+    /// feedback82-85).
+    trust_proxy: Option<Vec<quillo::policy::Net>>,
+    allow_paths: Vec<PathBuf>,
+    identity_named: bool,
 }
 
 fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
@@ -890,6 +974,9 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         with: Vec::new(),
         tools: None,
         asks_port: false,
+        trust_proxy: None,
+        allow_paths: Vec::new(),
+        identity_named: false,
     };
     let mut tls: (Option<PathBuf>, Option<PathBuf>) = (None, None);
     // `--client-cert-header`, `--client-cert-subject`, and whether either identity header is named.
@@ -1085,12 +1172,19 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                     return Err(2);
                 }
             },
-            ("--allow-path", Some(v)) => {
-                if let Err(e) = quillo::builtins::allow_path(v) {
-                    eprintln!("quillo: --allow-path needs a folder that is there: {}", e);
+            // Put in force after the policy is read, which may hold it to its `[fs] paths`
+            // (FEEDBACK82.md, Q-1280; branch feedback82-85).
+            ("--allow-path", Some(v)) => match Path::new(v).canonicalize() {
+                Ok(real) if real.is_dir() => o.allow_paths.push(real),
+                Ok(_) => {
+                    eprintln!("quillo: --allow-path needs a folder that is there: {} is not a folder", v);
                     return Err(2);
                 }
-            }
+                Err(e) => {
+                    eprintln!("quillo: --allow-path needs a folder that is there: {}: {}", v, e);
+                    return Err(2);
+                }
+            },
             ("--max-compute", Some(v)) => match compute_limit(v) {
                 Some(ms) => quillo::httpd::limit_compute(ms),
                 None => {
@@ -1137,12 +1231,15 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 eprintln!("quillo: --join-as is the address this copy is called at: --join-as https://billing-3.internal:8443");
                 return Err(2);
             }
-            ("--trust-proxy", Some(v)) => {
-                if !quillo::httpd::trust_proxies(v) {
+            // Once, as before; held to the policy's `[run] trust_proxy` before it is believed
+            // (FEEDBACK82.md, Q-1280; branch feedback82-85).
+            ("--trust-proxy", Some(v)) => match quillo::policy::nets(v) {
+                Some(nets) if o.trust_proxy.is_none() => o.trust_proxy = Some(nets),
+                _ => {
                     eprintln!("quillo: --trust-proxy needs addresses or networks, as 127.0.0.1 or 10.0.0.0/8,192.168.0.0/16");
                     return Err(2);
                 }
-            }
+            },
             // Who the visitor is to a proxy that ended mTLS or signed them in, from the header the
             // operator names (FEEDBACK78.md, A.13 and A.14, the user's decision; branch feedback75).
             // Once, as `--user-header` is: given twice, the last was taken and a first that named
@@ -1279,11 +1376,8 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         None => {}
     }
     // Believed from a proxy only, never from a visitor, who can send any header (FEEDBACK78.md,
-    // A.13 and A.14).
-    if identity_named && !quillo::httpd::trusts_proxies() {
-        eprintln!("quillo: --client-cert-header and --user-header read a proxy's header, believed only from the addresses --trust-proxy names: give --trust-proxy too (any visitor can send that header)");
-        return Err(2);
-    }
+    // A.13 and A.14): asked once the proxies are known, a policy's among them (`policy_run`).
+    o.identity_named = identity_named;
     // The files are there, said with the other options (FEEDBACK31.md, Q-381; branch
     // feedback27-35-fixes).
     for (flag, f) in [("--tls-cert", quillo::wt::TLS_CERT.get()), ("--tls-key", quillo::wt::TLS_KEY.get())] {
@@ -1322,7 +1416,9 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     // The files read or tried, watched under --watch while the program does not load
     // (FEEDBACK55.md, Q-836; branch feedback55).
     let (checked, mut tried) = quillo::error::noting_reads(|| if o.static_check && !o.checked { static_errors(path).map(Some) } else { Ok(o.tools.clone()) });
-    if let (Err(_), false) = (&checked, o.watch) {
+    // Under a policy's `check = true`, errors stop the start under --watch too (FEEDBACK82.md,
+    // Q-1280, found in review; branch feedback82-85).
+    if checked.is_err() && (!o.watch || quillo::policy::get().run.check) {
         return Err(1);
     }
     // A service the app started apart: the app's folder (Q-807).
@@ -1466,18 +1562,149 @@ mod with {
     }
 }
 
-/// The policy's `max_memory`, where it is less than `--max-memory` or that is not given: it
-/// narrows, as the other limits do (FEEDBACK71.md, Q-977; branch security).
-fn policy_memory(p: &quillo::policy::Policy) {
-    if let Some(m) = p.max_memory {
-        let now = quillo::httpd::memory_limit();
-        if now == 0 || now > m as u64 {
-            quillo::httpd::limit_memory(m as u64);
-            if let Some(f) = &p.max_memory_from {
-                quillo::httpd::memory_limit_from(f);
+/// The options of `run` among `flags` (each value skipped): the first of `names` given, with its
+/// value when it takes one.
+fn given<'a>(flags: &'a [String], names: &[&str]) -> Option<(&'a str, Option<&'a str>)> {
+    let mut i = 0;
+    while i < flags.len() {
+        let f = flags[i].as_str();
+        let takes = VALUE_OPTIONS.contains(&f);
+        if names.contains(&f) {
+            return Some((f, if takes { flags.get(i + 1).map(String::as_str) } else { None }));
+        }
+        i += if takes { 2 } else { 1 };
+    }
+    None
+}
+
+/// What the policy says of `run`'s options, put in force (FEEDBACK82.md, Q-1280, Part D, as the
+/// user decided it 2026-11-22; branch feedback82-85): an option a switch turned off, or one that
+/// changes a forced value, stops the start (exit 2) naming the file; a ceiling holds the option to
+/// the least; `--trust-proxy` may name only networks inside the policy's, and without it the
+/// policy's are believed; `--allow-path` only folders inside `[fs] paths`; `[env] set`'s values
+/// are put in the environment before `.env` is read. Before, a provider could not write any of
+/// these down, and `--trust-proxy 0.0.0.0/0` made `request.ip` what a visitor wrote.
+fn policy_run(o: &mut RunOptions, flags: &[String]) -> Result<(), i32> {
+    use std::sync::atomic::Ordering::SeqCst;
+    let p = quillo::policy::get();
+    let refuse = |why: String| {
+        eprintln!("quillo: {}", why);
+        Err(2)
+    };
+    let from = |key: &str| p.origin_of(key).map_or_else(|| "the policy".to_string(), |f| f.display().to_string());
+    for k in quillo::policy::SWITCHES {
+        if let (Some(f), Some((option, _))) = (p.switched_off(k), given(flags, quillo::policy::switch_options(k))) {
+            return refuse(format!("{} is turned off by the policy {} (run.{} = false)", option, f.display(), k));
+        }
+    }
+    if p.run.check && given(flags, &["--no-check"]).is_some() {
+        return refuse(format!("--no-check is refused by the policy {} (run.check = true)", from("run.check")));
+    }
+    // `--checked` skips the check too: it is what `--split` gives the services it starts, which
+    // it checked itself. Given by hand under `check = true` it is refused; given by the app, it is
+    // not taken, and the service checks again (FEEDBACK82.md, Q-1280, found in review; branch
+    // feedback82-85).
+    if p.run.check && given(flags, &["--checked"]).is_some() {
+        if !WITH_APP.load(SeqCst) {
+            return refuse(format!("--checked is refused by the policy {} (run.check = true)", from("run.check")));
+        }
+        o.checked = false;
+    }
+    // A service `--split` starts is served under its path below the app's (`--base /billing`),
+    // which a forced base would refuse in it: refused here, before any starts.
+    if let (Some(b), Some(_)) = (p.run_forced("base"), given(flags, &["--split"])) {
+        return refuse(format!("--split does not go with the base the policy {} forces (run.base = \"{}\"): each service is served under a path of its own", from("run.base"), b));
+    }
+    if let Some(want) = p.run_forced("log") {
+        match given(flags, &["--log"]) {
+            Some((_, Some(v))) if v != want => return refuse(format!("--log {} is not the request log the policy {} sets (run.log = \"{}\")", v, from("run.log"), want)),
+            _ => quillo::metrics::LOG.store(
+                match want {
+                    "json" => quillo::metrics::JSON,
+                    "off" => quillo::metrics::OFF,
+                    _ => quillo::metrics::TEXT,
+                },
+                std::sync::atomic::Ordering::Relaxed,
+            ),
+        }
+    }
+    if let Some(want) = p.run_forced("base") {
+        match &o.base {
+            Some(b) if b != want => return refuse(format!("--base {} is not the path the policy {} serves the program under (run.base = \"{}\")", b, from("run.base"), want)),
+            Some(_) => {}
+            None => {
+                o.base = Some(want.to_string());
+                quillo::session::serving_under(want);
             }
         }
     }
+    if let Some(n) = p.run_ceiling("instances") {
+        o.instances = o.instances.min(n as usize);
+    }
+    if let Some(n) = p.run_ceiling("max_connections") {
+        let now = quillo::httpd::MAX_CONNECTIONS.load(SeqCst);
+        quillo::httpd::MAX_CONNECTIONS.store(if now == 0 { n as usize } else { now.min(n as usize) }, SeqCst);
+    }
+    if let Some(n) = p.run_ceiling("connections_per_client") {
+        quillo::httpd::CONNECTIONS_PER_CLIENT.fetch_min(n as usize, SeqCst);
+    }
+    if let Some(n) = p.run_ceiling("live_per_client") {
+        quillo::server::LIVE_PER_CLIENT.fetch_min(n as usize, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(ms) = p.run_ceiling("drain") {
+        if quillo::httpd::drain().map_or(true, |d| d.as_millis() as u64 > ms) {
+            quillo::httpd::limit_drain(ms);
+        }
+    }
+    if let Some(m) = p.run.socket_mode {
+        o.socket_mode &= m;
+    }
+    let nets = match (o.trust_proxy.take(), &p.run.trust_proxy) {
+        (Some(given), Some(allowed)) => {
+            if let Some(wide) = p.wider_proxy(&given) {
+                let theirs: Vec<String> = allowed.iter().map(quillo::policy::net_shown).collect();
+                let what = if theirs.is_empty() { "trusts no proxy (run.trust_proxy = [])".to_string() } else { format!("trusts: {}", theirs.join(", ")) };
+                return refuse(format!("--trust-proxy {} is not among the proxies the policy {} {}", quillo::policy::net_shown(wide), from("run.trust_proxy"), what));
+            }
+            Some(given)
+        }
+        (given, None) => given,
+        (None, Some(allowed)) => Some(allowed.clone()),
+    };
+    if let Some(n) = nets.filter(|n| !n.is_empty()) {
+        quillo::httpd::trust_nets(n);
+    }
+    // Believed from a proxy only, never from a visitor, who can send any header (FEEDBACK78.md,
+    // A.13 and A.14).
+    if o.identity_named && !quillo::httpd::trusts_proxies() {
+        return refuse("--client-cert-header and --user-header read a proxy's header, believed only from the addresses --trust-proxy names: give --trust-proxy too (any visitor can send that header)".into());
+    }
+    // The folder as judged, not read again by its name, which may lead elsewhere by then (found
+    // in review).
+    for dir in std::mem::take(&mut o.allow_paths) {
+        if let Err(why) = p.allows_path(&dir) {
+            return refuse(why);
+        }
+        quillo::builtins::allow_real_path(dir);
+    }
+    p.put_env();
+    Ok(())
+}
+
+/// The policy in force for `run` and `app`: its options (`policy_run`), then its limits, each the
+/// least of the option's and the policy's.
+fn policy_in_force(o: &mut RunOptions, flags: &[String]) -> Result<(), i32> {
+    policy_run(o, flags)?;
+    let p = quillo::policy::get();
+    if let Some(w) = p.workers {
+        o.workers = o.workers.min(w);
+    }
+    if let Some(b) = p.max_body {
+        o.max_body = o.max_body.min(b);
+    }
+    // The policy narrows the option, as for the others (FEEDBACK56.md, C.4; branch feedback56).
+    p.hold_limits();
+    Ok(())
 }
 
 /// A length of time for `--max-compute` and `--drain`, in ms.
@@ -1750,29 +1977,8 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
     if let Err(code) = with_policy(Path::new(file), &o.policies, true) {
         return code;
     }
-    {
-        let p = quillo::policy::get();
-        if let Some(w) = p.workers {
-            o.workers = o.workers.min(w);
-        }
-        if let Some(b) = p.max_body {
-            o.max_body = o.max_body.min(b);
-        }
-        // The policy narrows the option, as for the others (FEEDBACK56.md, C.4; branch feedback56).
-        if let Some(n) = p.max_tool_calls {
-            quillo::mcp::MAX_TOOL_CALLS.fetch_min(n, std::sync::atomic::Ordering::Relaxed);
-        }
-        if let Some(c) = p.max_compute {
-            let (now, c) = (quillo::httpd::compute_limit_ms(), c.as_millis().max(1) as u64);
-            if now == 0 || now > c {
-                quillo::httpd::limit_compute(c);
-                // Its message names the file (FEEDBACK55.md, Q-849; branch feedback55).
-                if let Some(f) = &p.max_compute_from {
-                    quillo::httpd::compute_limit_from(f);
-                }
-            }
-        }
-        policy_memory(&p);
+    if let Err(code) = policy_in_force(&mut o, flags) {
+        return code;
     }
     if let Err(code) = before_the_program(file, &o) {
         return code;
@@ -1790,6 +1996,19 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
         (o.port.is_none() && (p.is_some() || port.starts_with('/'))).then(|| PathBuf::from(p.unwrap_or(&port)))
     });
     let fcgi = FCGI.load(std::sync::atomic::Ordering::Relaxed);
+    // A Unix socket only, where the policy says so: `--listen unix:PATH`, a socket's path in
+    // `$PORT`, or `quillo fcgi` on the socket its web server gives (FEEDBACK82.md, Q-1280; branch
+    // feedback82-85).
+    if quillo::policy::get().run_forced("listen").is_some() && listen.is_none() && !(fcgi && o.port.is_none()) {
+        let f = quillo::policy::get().origin_of("run.listen").map_or_else(|| "the policy".to_string(), |f| f.display().to_string());
+        eprintln!("quillo: the policy {} has the program listen on a Unix socket only (run.listen = \"unix\"): give --listen unix:PATH", f);
+        return 2;
+    }
+    // Nor a UDP port for WebTransport: none is opened on a Unix socket already (`start_jobs`);
+    // said here, so that it stays so.
+    if quillo::policy::get().run_forced("listen").is_some() {
+        quillo::wt::DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     // Nor one that tells others its port, which it does not listen on (`--join`).
     if (listen.is_some() || fcgi) && (o.split || o.instances > 1 || o.register.is_some() || o.join.is_some() || cfg!(not(unix))) {
         eprintln!("quillo: {} is for one process (not with --split, --instances, --register or --join), on Unix", if fcgi { "quillo fcgi" } else { "--listen unix:" });
@@ -1850,7 +2069,7 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
                 }
                 Err(_) => o.checked = false,
             }
-            if !o.checked && !o.watch {
+            if !o.checked && (!o.watch || quillo::policy::get().run.check) {
                 return 1;
             }
         }

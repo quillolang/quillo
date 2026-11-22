@@ -28,7 +28,7 @@ fn from_file() -> &'static Mutex<HashSet<String>> {
 }
 
 /// Whether `name` came from a `.env` file rather than the environment.
-fn set_by_file(name: &str) -> bool {
+pub(crate) fn set_by_file(name: &str) -> bool {
     from_file().lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(name)
 }
 
@@ -42,9 +42,30 @@ pub fn load_into_process(path: &Path, required: bool) -> Result<(), String> {
     for (n, why) in skipped {
         eprintln!("quillo: {}:{}: {}, skipped", path.display(), n, why);
     }
+    let host = crate::policy::get().has_host_layer();
     for (k, v) in pairs {
         if std::env::var_os(&k).is_some() && !keys.contains(&k) {
             continue;
+        }
+        // A name that steers Quillo or the processes it starts (`--split`'s services, cargo,
+        // `--with`'s commands) is not the program's file's to set: `QUILLO_POLICY_PATH` in `.env`
+        // made a service read the developer's file as a host's layer, and `LD_PRELOAD` or `CARGO`
+        // reached every process started from this one. Under a host's policy the start stops,
+        // naming it; without one, only the policy's names are left out, said (FEEDBACK82.md,
+        // Q-1281, found in review; branch feedback82-85).
+        if steers(&k) {
+            if host {
+                return Err(format!(
+                    "{} sets {}, which steers Quillo or the processes it starts and is not a program's setting under the host's policy: set it where the program is started, or take it out of {}",
+                    path.display(),
+                    k,
+                    path.display()
+                ));
+            }
+            if k.to_ascii_uppercase().starts_with("QUILLO_POLICY") {
+                eprintln!("quillo: {} sets {}, which only whoever starts Quillo may set: not read", path.display(), k);
+                continue;
+            }
         }
         std::env::set_var(&k, v);
         keys.insert(k);
@@ -78,6 +99,16 @@ fn read_file(path: &Path, required: bool, program: bool) -> Result<Option<String
         return Err(format!("cannot read {}: it is a link to {}, {}{}", path.display(), to.display(), why, way_out(e.kind())));
     }
     crate::error::read_source_whole(path).map(Some).map_err(|e| format!("cannot read {}: {}{}", path.display(), e, way_out(e.kind())))
+}
+
+/// Whether `.env` may not set `name` under a host's policy: what chooses the policy, the internal
+/// markers one Quillo gives the processes it starts, what the system's loader reads, and what
+/// steers cargo, rustc and where plugins are built (FEEDBACK82.md, Q-1281, found in review; branch
+/// feedback82-85).
+pub fn steers(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    ["QUILLO_POLICY", "QUILLO_HOST", "LD_", "DYLD_", "CARGO", "RUSTC", "RUSTUP_"].iter().any(|p| n.starts_with(p))
+        || ["RUSTFLAGS", "RUSTDOCFLAGS", "QUILLO_NATIVE_CACHE", "XDG_CACHE_HOME", "QUILLO_STOP_WITH_APP", "QUILLO_PROGRAM_ROOT", FROM_FILE_VAR, "QUILLO_APP_URL", "HOME", "TMPDIR", "TMP", "TEMP", "PATH", "USER"].contains(&n.as_str())
 }
 
 /// A file that is always there and empty, for `--env-file`: no settings.

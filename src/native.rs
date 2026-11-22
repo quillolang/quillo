@@ -1413,6 +1413,12 @@ pub struct Note {
 }
 
 pub fn check(qwer: &Path) -> Result<Vec<Note>, String> {
+    // Cargo runs a crate's build scripts even for a check: not where the policy says `build =
+    // false` (FEEDBACK82.md, Q-1285, found in review; branch feedback82-85).
+    let policy = crate::policy::load(qwer, &[])?;
+    if !policy.build {
+        return Err(format!("no cargo check here: the policy {} says build = false", policy.build_from.as_ref().map_or_else(|| "in force".to_string(), |f| f.display().to_string())));
+    }
     // Read as the program's files are, for the editor (FEEDBACK71.md, Q-982; branch security).
     let src = crate::error::read_text(qwer).map_err(|e| format!("cannot read {}: {}", qwer.display(), e))?;
     let parsed = parse(&src);
@@ -1573,8 +1579,10 @@ pub fn prebuild(files: &[PathBuf]) {
     }
     let mut todo = Vec::new();
     for f in files {
-        // What the policy refuses is not built: cargo would run its build scripts first.
-        if plugin_allowed(f).is_err() {
+        // What the policy refuses is not built: cargo would run its build scripts first. Nor what
+        // it holds to its source's hash, which `build_private` builds apart (FEEDBACK82.md,
+        // Q-1285; branch feedback82-85).
+        if plugin_check(f) != Ok(false) {
             continue;
         }
         let Ok(src) = crate::error::read_text(f) else { continue };
@@ -1659,6 +1667,16 @@ fn keep_lib(qwer: &Path, lib: &Path, crate_name: &str, target: &Path) -> Result<
 }
 
 pub fn build(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
+    build_with(qwer, false)
+}
+
+/// `build`; `here`: only a library this process builds from the source may load (`plugin_check`),
+/// whatever `.quillo/native` and its lock hold (FEEDBACK82.md, Q-1285, found in review; branch
+/// feedback82-85).
+fn build_with(qwer: &Path, here: bool) -> Result<(PathBuf, Parsed), String> {
+    if here {
+        return build_private(qwer);
+    }
     let src = crate::error::read_source(qwer).map_err(|e| format!("cannot read {}: {}", qwer.display(), e))?;
     let parsed = parse(&src);
     let abs = qwer.canonicalize().unwrap_or_else(|_| qwer.to_path_buf());
@@ -1702,7 +1720,13 @@ pub fn build(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         }
         return Err(format!("{} is not built, and --no-build says not to build it here: build it with `quillo build` and bring .quillo along", qwer.display()));
     }
-    let (crate_name, dir) = prepare(&abs, &parsed)?;
+    build_now(qwer, &abs, &parsed, &lib)?;
+    Ok((lib, parsed))
+}
+
+/// Runs cargo for `qwer` and puts the library at `lib`.
+fn build_now(qwer: &Path, abs: &Path, parsed: &Parsed, lib: &Path) -> Result<(), String> {
+    let (crate_name, dir) = prepare(abs, parsed)?;
     let target = cache_sub(&cache_dir()?, &["target"])?;
     eprintln!("quillo: building {}", qwer.display());
     let out = std::process::Command::new(cargo_program())
@@ -1727,8 +1751,7 @@ pub fn build(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
             .collect();
         return Err(format!("cannot build {}:\n{}", qwer.display(), errors.join("\n")));
     }
-    keep_lib(qwer, &lib, &crate_name, &target)?;
-    Ok((lib, parsed))
+    keep_lib(qwer, lib, &crate_name, &target)
 }
 
 // ---- loading and calling ---------------------------------------------------------------
@@ -1794,13 +1817,254 @@ fn open(path: &Path, count: usize) -> Result<Arc<Lib>, String> {
 
 /// Why the policy refuses plugin `qwer`, named by its file and its `//! version:`, if it does.
 pub fn plugin_allowed(qwer: &Path) -> Result<(), String> {
+    plugin_check(qwer).map(|_| ())
+}
+
+/// `plugin_allowed`, and whether only a library this process builds from the source may load:
+/// when the layers that pin it by a SHA-256 hold it to its source's, a library found in
+/// `.quillo/native` under the name that source's would have, with a lock line to match, was
+/// loaded although nothing tied it to that source (FEEDBACK82.md, Q-1285, found in review; branch
+/// feedback82-85). A prebuilt library loads only where every layer is met by that library's own
+/// hash; else where every layer is met by the source's, it is built here; else it is refused.
+fn plugin_check(qwer: &Path) -> Result<bool, String> {
     let p = crate::policy::get();
     if p.plugins.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     // `quillo check` asks this of a cloned repository's file (FEEDBACK71.md, Q-982; branch security).
     let version = crate::error::read_text(qwer).ok().and_then(|t| crate::install::header_version(&t));
-    p.plugin(&stem(qwer), version.as_deref())
+    let name = stem(qwer);
+    if !p.pins_by_hash() {
+        return p.plugin(&name, version.as_deref(), &[]).map(|_| false);
+    }
+    // Held to its hash where a layer pins one: the source's SHA-256 as the catalog gives it (its
+    // bytes as they are), and the library built from it, by the name `build` would load
+    // (FEEDBACK82.md, Q-1285; branch feedback82-85).
+    let source = crate::error::read_file(qwer).map(|b| crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&b))).unwrap_or_default();
+    let library = crate::error::read_source(qwer).ok().map(|src| lib_path(qwer, &src)).filter(|l| l.is_file()).and_then(|l| file_hash(&l).ok());
+    if let Some(l) = &library {
+        if p.plugin(&name, version.as_deref(), std::slice::from_ref(l)).is_ok() {
+            return Ok(false);
+        }
+    }
+    match p.plugin(&name, version.as_deref(), std::slice::from_ref(&source)) {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            let both: Vec<String> = [Some(source), library].into_iter().flatten().collect();
+            match p.plugin(&name, version.as_deref(), &both) {
+                Err(e) => Err(e),
+                Ok(()) => Err(format!("{}: one layer of the policy pins the plugin by its source's SHA-256 and another by its library's; the library in .quillo/native was not built here from that source", e.split(": ").next().unwrap_or(&e))),
+            }
+        }
+    }
+}
+
+/// Where `build` looks for the library of `qwer`, as its source is now.
+pub fn library_path(qwer: &Path) -> Option<PathBuf> {
+    crate::error::read_source(qwer).ok().map(|src| lib_path(qwer, &src))
+}
+
+/// The libraries this process built from a source a policy pins, by the source's SHA-256: where
+/// each is and its own SHA-256 as built, loaded again only while it is still that file.
+static BUILT_HERE: Mutex<Option<HashMap<String, (PathBuf, String)>>> = Mutex::new(None);
+
+/// The variables cargo is given for a pinned plugin's build, and no others: not `CARGO`, `RUSTC`,
+/// `RUSTC_WRAPPER`, `RUSTFLAGS` nor any `CARGO_*` that changes what is built or where.
+const BUILD_ENV: &[&str] = &["PATH", "HOME", "USER", "CARGO_HOME", "RUSTUP_HOME", "TMPDIR", "SYSTEMROOT", "USERPROFILE", "TEMP", "TMP", "APPDATA", "LOCALAPPDATA"];
+
+/// The private folders of pinned builds, by the library opened from each: removed once it is
+/// loaded, which keeps it mapped (FEEDBACK82.md, Q-1285, found in review; branch feedback82-85).
+static PRIVATE_DIRS: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+
+/// The library at `lib` just loaded: its private folder goes. On Windows a loaded library cannot
+/// be removed, and its folder stays.
+fn loaded(lib: &Path) {
+    let mut dirs = PRIVATE_DIRS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(i) = dirs.iter().position(|(l, _)| l == lib) {
+        let (_, dir) = dirs.remove(i);
+        if cfg!(unix) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// A folder for a pinned build that only this process writes: under the temporary folder of
+/// whoever started Quillo (`TMPDIR` from `.env` is not taken), never inside the program's folder,
+/// the one it ran in, or a folder `--allow-path` or `[fs] paths` lets its file builtins reach;
+/// made new under a name no one can guess, and checked after it is made to be a folder, no link,
+/// this user's, that no one else may enter (FEEDBACK82.md, Q-1285, found in review; branch
+/// feedback82-85).
+fn private_dir() -> Result<PathBuf, String> {
+    let from_file = ["TMPDIR", "TMP", "TEMP"].iter().any(|k| crate::dotenv::set_by_file(k));
+    #[cfg(unix)]
+    let base = if from_file { PathBuf::from("/tmp") } else { std::env::temp_dir() };
+    #[cfg(not(unix))]
+    let base = if from_file { return Err("a pinned plugin is built in the temporary folder of whoever starts Quillo, and .env set TMP or TEMP".into()) } else { std::env::temp_dir() };
+    let base = base.canonicalize().map_err(|e| format!("cannot use the temporary folder {}: {}", base.display(), e))?;
+    let mut reach: Vec<PathBuf> = crate::builtins::allowed_paths();
+    reach.extend(crate::privacy::root());
+    reach.extend(std::env::current_dir().ok().and_then(|d| d.canonicalize().ok()));
+    for (_, paths) in &crate::policy::get().fs_paths {
+        reach.extend(paths.iter().cloned());
+    }
+    // A folder that is the whole disk's root (a unit's working folder) holds every place.
+    if let Some(r) = reach.iter().filter(|r| r.parent().is_some()).find(|r| base.starts_with(r)) {
+        return Err(format!("a pinned plugin is built apart, and the temporary folder {} is inside {}, which the program can reach", base.display(), r.display()));
+    }
+    let dir = base.join(format!("quillo-pinned-{}", crate::service::new_id(16)));
+    let mut made = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut made, 0o700);
+    made.create(&dir).map_err(|e| format!("cannot make the private folder {}: {}", dir.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(&dir).map_err(|e| e.to_string())?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if !m.file_type().is_dir() || m.uid() != me || m.mode() & 0o077 != 0 {
+            let _ = std::fs::remove_dir(&dir);
+            return Err(format!("the private folder {} is not this user's alone", dir.display()));
+        }
+    }
+    Ok(dir)
+}
+
+/// The library to open, as checked: on Linux, by a descriptor opened on the file whose bytes were
+/// hashed (`/proc/self/fd/N`, kept open), so no file put in its place is opened; elsewhere, by its
+/// path in the private folder, hashed again just before.
+fn checked_lib(lib: &Path, want: &str) -> Result<PathBuf, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let mut f = std::fs::File::open(lib).map_err(|e| format!("cannot open {}: {}", lib.display(), e))?;
+        let mut bytes = Vec::new();
+        f.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes)) != want {
+            return Err(format!("{} changed after it was built", lib.display()));
+        }
+        let at = PathBuf::from(format!("/proc/self/fd/{}", f.as_raw_fd()));
+        static KEPT: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
+        KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(f);
+        Ok(at)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if file_hash(lib)? != want {
+            return Err(format!("{} changed after it was built", lib.display()));
+        }
+        Ok(lib.to_path_buf())
+    }
+}
+
+/// `cargo` on the PATH, never `$CARGO`, and that PATH not one `.env` gave.
+fn path_cargo() -> PathBuf {
+    let name = if cfg!(windows) { "cargo.exe" } else { "cargo" };
+    std::env::split_paths(&std::env::var_os("PATH").filter(|_| !crate::dotenv::set_by_file("PATH")).unwrap_or_default())
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(name))
+        .find(|p| runnable(p))
+        .unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// A plugin a policy holds to its source's SHA-256, built from exactly the bytes judged: read
+/// once, hashed, judged, and written into a folder this process makes for it alone (0700, a name
+/// no one can guess), where its crate, a target of its own (no cache another may have filled) and
+/// the library loaded are; cargo runs with the variables of `BUILD_ENV` alone. Before, `$CARGO`
+/// from `.env` ran the developer's cargo, the target was a reused cache under the developer's
+/// home, and the library was opened again by its name in `.quillo/native` (FEEDBACK82.md, Q-1285,
+/// found in review; branch feedback82-85). What is left is the account's own toolchain: its
+/// `CARGO_HOME` (config, registry sources) and rustup's toolchains, which only a pin by the
+/// library's own SHA-256, built by the host, holds.
+fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
+    let bytes = crate::error::read_file(qwer).map_err(|e| format!("cannot read {}: {}", qwer.display(), e))?;
+    let hash = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
+    let src = String::from_utf8(bytes.clone()).map_err(|_| format!("{} is not UTF-8 text", qwer.display()))?;
+    let version = crate::install::header_version(&src);
+    crate::policy::get().plugin(&stem(qwer), version.as_deref(), std::slice::from_ref(&hash))?;
+    let parsed = parse(src.strip_prefix('\u{FEFF}').unwrap_or(&src));
+    // Loaded already (an instance, a reload): the library in memory, whose file is gone.
+    let kept = BUILT_HERE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|m| m.get(&hash).cloned());
+    if let Some((lib, _)) = kept {
+        if libraries().lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&lib) {
+            return Ok((lib, parsed));
+        }
+    }
+    if no_build() {
+        return Err(format!(
+            "the policy holds {} to its source's SHA-256, so only a library built here from that source may load, and building is off (build = false or --no-build); a pin by the library's own SHA-256 (as .quillo/plugins.lock has it) lets the one in .quillo/native load",
+            qwer.display()
+        ));
+    }
+    let _one = BUILDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The environment of whoever started Quillo, never what `.env` gave: a `HOME` of the program's
+    // own led rustup to a toolchain the developer wrote, whose cargo ran (FEEDBACK82.md, Q-1285,
+    // found in review; branch feedback82-85).
+    let real = |k: &str| std::env::var_os(k).filter(|_| !crate::dotenv::set_by_file(k));
+    if real("HOME").is_none() && real("CARGO_HOME").is_none() {
+        return Err(format!("{} is held to its source's SHA-256 and is built here, which needs HOME (or CARGO_HOME) from whoever starts Quillo, not from .env", qwer.display()));
+    }
+    let dir = private_dir()?;
+    let mut made = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut made, 0o700);
+    let write = |f: &Path, b: &[u8]| -> Result<(), String> {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        o.open(f).and_then(|mut file| std::io::Write::write_all(&mut file, b)).map_err(|e| format!("cannot write {}: {}", f.display(), e))
+    };
+    let result = (|| {
+        let src_file = dir.join(format!("{}.qwer", stem(qwer)));
+        write(&src_file, &bytes)?;
+        let crate_name = format!("quillo_{}_pinned", stem(qwer));
+        let crate_dir = dir.join("crate");
+        made.create(&crate_dir).map_err(|e| e.to_string())?;
+        write(&crate_dir.join("Cargo.toml"), manifest(&crate_name, &parsed.deps).as_bytes())?;
+        write(&crate_dir.join("lib.rs"), glue(&src_file, &parsed.exports).as_bytes())?;
+        let target = dir.join("target");
+        eprintln!("quillo: building {} (held to its SHA-256: from its source, apart)", qwer.display());
+        let mut cmd = std::process::Command::new(path_cargo());
+        cmd.current_dir(cargo_dir()).env_clear();
+        for k in BUILD_ENV {
+            if let Some(v) = real(k) {
+                cmd.env(k, v);
+            }
+        }
+        let out = cmd
+            .args(["build", "--release", "--message-format=short", "--manifest-path"])
+            .arg(crate_dir.join("Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&target)
+            .output()
+            .map_err(|e| format!("cannot build {}: cargo did not run ({})", qwer.display(), e))?;
+        if !out.status.success() {
+            let log = String::from_utf8_lossy(&out.stderr);
+            let errors: Vec<&str> = log.lines().filter(|l| !l.trim_start().starts_with("Compiling") && !l.trim_start().starts_with("Updating") && !l.trim_start().starts_with("Locking")).collect();
+            return Err(format!("cannot build {}:\n{}", qwer.display(), errors.join("\n")));
+        }
+        let built = target.join("release").join(format!("{}{}.{}", std::env::consts::DLL_PREFIX, crate_name, std::env::consts::DLL_EXTENSION));
+        let lib = dir.join(format!("{}{}-{}.{}", std::env::consts::DLL_PREFIX, lib_stem(qwer), &hash[..16], std::env::consts::DLL_EXTENSION));
+        let built_bytes = std::fs::read(&built).map_err(|e| format!("cannot read {}: {}", built.display(), e))?;
+        write(&lib, &built_bytes)?;
+        let want = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&built_bytes));
+        // Its crate and target go; the library is opened by what was checked.
+        let _ = std::fs::remove_dir_all(&target);
+        let _ = std::fs::remove_dir_all(&crate_dir);
+        let lib = checked_lib(&lib, &want)?;
+        BUILT_HERE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new).insert(hash.clone(), (lib.clone(), want));
+        PRIVATE_DIRS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((lib.clone(), dir.clone()));
+        Ok(lib)
+    })();
+    match result {
+        Ok(lib) => Ok((lib, parsed)),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            Err(e)
+        }
+    }
 }
 
 /// `use "x.qwer"`: builds and loads it, and defines its functions.
@@ -1810,12 +2074,13 @@ pub fn plugin_allowed(qwer: &Path) -> Result<(), String> {
 pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>, renames: Option<&HashMap<String, Option<String>>>, line: u32) -> Result<(), Ctrl> {
     let path = qwer.to_path_buf();
     // A plugin the policy names, at a version it names (FEEDBACK41.md, Q-478; branch feedback40-43).
-    plugin_allowed(qwer).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
+    let here = plugin_check(qwer).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
     // A build takes seconds: other requests go on meanwhile (on a reload,
     // with the version that runs now).
-    let built = it.unlocked(move || build(&path));
+    let built = it.unlocked(move || build_with(&path, here));
     let (lib_path, parsed) = built.map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
     let lib = open(&lib_path, parsed.exports.len()).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
+    loaded(&lib_path);
     let file = qwer.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     // `import "x.qwer" use a, b as c`: each must be one of its functions (branch imports).
     if let Some(only) = only {

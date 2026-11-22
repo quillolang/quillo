@@ -27,21 +27,134 @@
 //! The host's file comes first, then any `--policy FILE`, then `quillo.policy` beside the
 //! program. Each is a layer: a later one can only narrow, never widen, as each list is a
 //! condition every layer must meet. What one refuses says which file refused it.
+//!
+//! The layers, in the order read (FEEDBACK82.md, Q-1281 and Q-1282, as the user decided them
+//! 2026-11-22; branch feedback82-85): the anchor (`/etc/quillo/policy.toml`; on Windows
+//! `%ProgramData%\quillo\policy.toml`, found through the system's known folder, never the current
+//! drive; or the path a provider's own build compiles in as `QUILLO_HOST_POLICY`), the files the
+//! anchor `include`s, `policy.d/*.toml` beside the anchor in name order, each file
+//! `QUILLO_POLICY_PATH` names (a list, as `PATH` is), each `--policy FILE`, then `quillo.policy`.
+//! Only the anchor may say `include = [...]` and `require_path = true` (then a start without the
+//! variable stops). A file any of these names must be there, and a layer that is there but is no
+//! readable file (a broken link, a folder) stops the program, naming it (Q-1283).
+//!
+//! What `quillo run`'s options may be (Q-1280), each a forced value, a ceiling or an off switch:
+//!
+//! ```toml
+//! [run]
+//! trust_proxy = ["10.0.0.0/8"]   # forced: `--trust-proxy` may only name networks inside it
+//! with = false                   # off: no `--with`
+//! watch = false                  # off: no `--watch` or `--reload`
+//! describe = false               # off: no `--describe`
+//! plain_http = false             # off: no `--plain-http`
+//! split = false                  # off: no `--split` or `--scale`
+//! join = false                   # off: no `--join` or `--register`
+//! check = true                   # forced: no `--no-check`
+//! instances = 2                  # ceilings: the least of the layers' and the option's
+//! max_connections = 200
+//! connections_per_client = 32
+//! live_per_client = 16
+//! drain = "30s"
+//! socket_mode = "660"            # a ceiling of permission bits
+//! listen = "unix"                # forced: a Unix socket only (`--listen unix:PATH`, `quillo fcgi`)
+//! base = "/shop"                 # forced: the path it is served under
+//! log = "json"                   # forced: the request log's format
+//!
+//! [fs]
+//! paths = ["/srv/shared"]        # a ceiling for `--allow-path`; [] allows none
+//!
+//! [env]
+//! set = { APP_ENV = "production" }   # what env() gives, whatever .env or the shell says
+//! ```
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// The host's policy, always read when it is there.
+/// The host's policy, always read when it is there (the anchor on Unix: see `anchor`).
 pub const HOST_FILE: &str = "/etc/quillo/policy.toml";
 /// The program's own, beside its main file.
 pub const PROGRAM_FILE: &str = "quillo.policy";
+/// The variable that names further layers, a list as `PATH` is (FEEDBACK82.md, Q-1281; branch
+/// feedback82-85).
+pub const PATH_VAR: &str = "QUILLO_POLICY_PATH";
+
+/// What a layer is, by where it was found (FEEDBACK82.md, Q-1286; branch feedback82-85).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The anchor: the host's file.
+    Host,
+    /// A file the anchor names with `include`.
+    Included,
+    /// A file of `policy.d/` beside the anchor.
+    Dropin,
+    /// A file `QUILLO_POLICY_PATH` names.
+    PathVar,
+    /// A `--policy FILE`.
+    Named,
+    /// `quillo.policy` beside the program.
+    Program,
+}
+
+impl Kind {
+    pub fn said(self) -> &'static str {
+        match self {
+            Kind::Host => "the host's file",
+            Kind::Included => "included by the host's file",
+            Kind::Dropin => "policy.d",
+            Kind::PathVar => PATH_VAR,
+            Kind::Named => "--policy",
+            Kind::Program => "the program's",
+        }
+    }
+}
+
+/// A network as `--trust-proxy` takes one: an address and how many of its bits.
+pub type Net = (IpAddr, u32);
+
+/// What a policy says of `quillo run`'s options (FEEDBACK82.md, Q-1280, Part D; branch
+/// feedback82-85): each a forced value, a ceiling or an off switch, which a later layer only
+/// narrows.
+#[derive(Debug, Clone, Default)]
+pub struct Run {
+    /// The proxies whose `X-Forwarded-For` is believed: every layer's networks at once.
+    pub trust_proxy: Option<Vec<Net>>,
+    /// The switches turned off (`with`, `watch`, ...), with the first file that did.
+    pub off: Vec<(&'static str, PathBuf)>,
+    /// `check = true`: `--no-check` is refused.
+    pub check: bool,
+    /// `instances`, `max_connections`, `connections_per_client`, `live_per_client`, and `drain`
+    /// in ms: the least of the layers'.
+    pub ceilings: Vec<(&'static str, u64)>,
+    /// `socket_mode`: the permission bits a socket may have, every layer's at once.
+    pub socket_mode: Option<u32>,
+    /// `log`, `base` and `listen`: a value no later layer may change.
+    pub forced: Vec<(&'static str, String)>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Policy {
     /// The files read, in order.
     pub files: Vec<PathBuf>,
+    /// What each of `files` is (FEEDBACK82.md, Q-1286; branch feedback82-85).
+    pub kinds: Vec<Kind>,
+    /// The places looked at that had no layer, for `quillo policy`.
+    pub absent: Vec<String>,
+    /// The anchor's `include` and `require_path` (FEEDBACK82.md, Q-1281; branch feedback82-85).
+    pub include: Vec<PathBuf>,
+    pub require_path: bool,
+    /// `[run]` (FEEDBACK82.md, Q-1280; branch feedback82-85).
+    pub run: Run,
+    /// Each layer's `[fs] paths`: where `--allow-path` may lead.
+    pub fs_paths: Vec<(PathBuf, Vec<PathBuf>)>,
+    /// `[env] set`: what env() gives for each name, whatever `.env` or the environment says.
+    pub env_set: Vec<(String, String)>,
+    /// Each value that took effect and the file it came from, by its `section.key`, for
+    /// `quillo policy` (FEEDBACK82.md, Q-1286; branch feedback82-85).
+    pub origin: Vec<(String, PathBuf)>,
+    /// Every `section.key` each layer said, as written, and its file.
+    pub said: Vec<(String, String, PathBuf)>,
     /// May cargo run when a plugin is used (false in any layer: never).
     pub build: bool,
     /// Where a build was forbidden.
@@ -78,6 +191,15 @@ impl Default for Policy {
     fn default() -> Self {
         Policy {
             files: Vec::new(),
+            kinds: Vec::new(),
+            absent: Vec::new(),
+            include: Vec::new(),
+            require_path: false,
+            run: Run::default(),
+            fs_paths: Vec::new(),
+            env_set: Vec::new(),
+            origin: Vec::new(),
+            said: Vec::new(),
             build: true,
             build_from: None,
             plugins: Vec::new(),
@@ -116,35 +238,213 @@ pub fn ceiling() -> u8 {
     get().effects
 }
 
+/// Why the policy could not be read: `missing` when a layer that was asked for is not there (a
+/// file `include` or `QUILLO_POLICY_PATH` names, or the variable `require_path` asks for), which
+/// `quillo policy` tells from a broken one by its exit code (FEEDBACK82.md, Q-1286; branch
+/// feedback82-85).
+#[derive(Debug)]
+pub struct LoadError {
+    pub message: String,
+    pub missing: bool,
+}
+
+impl From<String> for LoadError {
+    fn from(message: String) -> Self {
+        LoadError { message, missing: false }
+    }
+}
+
+/// The anchor: the host's file, which every `quillo` reads and a developer cannot switch off. A
+/// provider's own build may compile in another (`QUILLO_HOST_POLICY=/opt/host/policy.toml cargo
+/// build`); on Windows it is `%ProgramData%\quillo\policy.toml`, which only administrators may
+/// write, where `/etc/quillo/policy.toml` was `\etc` on whichever drive the program ran from and
+/// any user could make it (FEEDBACK82.md, Q-1281 and Q-1282; branch feedback82-85).
+pub fn anchor() -> Result<PathBuf, String> {
+    if let Some(built) = option_env!("QUILLO_HOST_POLICY").filter(|p| !p.is_empty()) {
+        return Ok(PathBuf::from(built));
+    }
+    #[cfg(windows)]
+    {
+        program_data().map(|d| d.join("quillo").join("policy.toml")).ok_or_else(|| "cannot find the ProgramData folder, where the host's policy is".to_string())
+    }
+    #[cfg(not(windows))]
+    Ok(PathBuf::from(HOST_FILE))
+}
+
+/// `FOLDERID_ProgramData`, from the system (`SHGetKnownFolderPath`), never from the environment,
+/// which the process's starter sets.
+#[cfg(windows)]
+fn program_data() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    #[repr(C)]
+    struct Guid(u32, u16, u16, [u8; 8]);
+    // {62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}
+    const PROGRAM_DATA: Guid = Guid(0x62AB_5D82, 0xFDC1, 0x4DC3, [0xA9, 0xDD, 0x07, 0x0D, 0x1D, 0x49, 0x5D, 0x97]);
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(id: *const Guid, flags: u32, token: *mut core::ffi::c_void, path: *mut *mut u16) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(p: *mut core::ffi::c_void);
+    }
+    let mut p: *mut u16 = std::ptr::null_mut();
+    // SAFETY: the GUID and the out pointer are valid; the string it gives is freed below, as its
+    // documentation says, whether or not the call succeeded.
+    let hr = unsafe { SHGetKnownFolderPath(&PROGRAM_DATA, 0, std::ptr::null_mut(), &mut p) };
+    let out = (hr >= 0 && !p.is_null()).then(|| {
+        let mut n = 0;
+        // SAFETY: a NUL-ended string of UTF-16 the system wrote.
+        while unsafe { *p.add(n) } != 0 {
+            n += 1;
+        }
+        PathBuf::from(std::ffi::OsString::from_wide(unsafe { std::slice::from_raw_parts(p, n) }))
+    });
+    if !p.is_null() {
+        // SAFETY: allocated by the call above.
+        unsafe { CoTaskMemFree(p.cast()) };
+    }
+    out
+}
+
+/// Whether a layer is at `f`: not there at all is none, while anything else at that name must be
+/// a file, or the program stops naming it, as the host's file did already. A `quillo.policy` that
+/// was a broken link or a folder was skipped without a word, and the program ran with no policy
+/// (FEEDBACK82.md, Q-1283, as the user decided it 2026-11-22; branch feedback82-85).
+fn there(f: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(f) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("cannot read the policy {}: {}", f.display(), e)),
+        Ok(m) if m.file_type().is_symlink() && std::fs::metadata(f).is_err() => {
+            let to = std::fs::read_link(f).map_or_else(|_| "somewhere".to_string(), |t| t.display().to_string());
+            Err(format!("cannot read the policy {}: it is a link to {}, which is not there", f.display(), to))
+        }
+        Ok(_) if f.is_dir() => Err(format!("cannot read the policy {}: it is a folder, not a policy file", f.display())),
+        Ok(_) => Ok(true),
+    }
+}
+
 /// The host's file, then `extra` (`--policy`), then the program's: each read that is there.
 pub fn load(main: &Path, extra: &[PathBuf]) -> Result<Policy, String> {
+    load_layers(main, extra).map_err(|e| e.message)
+}
+
+/// `load`, saying whether what stopped it was a layer asked for and not there.
+pub fn load_layers(main: &Path, extra: &[PathBuf]) -> Result<Policy, LoadError> {
+    // A `QUILLO_POLICY_PATH` a `.env` gave (a `--split` service knows the names its app's file
+    // gave) is no layer: the host's is set where the process starts (FEEDBACK82.md, Q-1281, found
+    // in review; branch feedback82-85).
+    let var = std::env::var_os(PATH_VAR).filter(|_| {
+        let from_file = crate::dotenv::set_by_file(PATH_VAR);
+        if from_file {
+            eprintln!("quillo: {} came from a .env file, which may not name the policy: not read", PATH_VAR);
+        }
+        !from_file
+    });
+    load_from(&anchor()?, main, extra, var)
+}
+
+/// The layers from `anchor`, `path_var` (`QUILLO_POLICY_PATH`'s value), `extra` and the program's
+/// file, in that order (FEEDBACK82.md, Q-1281; branch feedback82-85).
+pub fn load_from(anchor: &Path, main: &Path, extra: &[PathBuf], path_var: Option<std::ffi::OsString>) -> Result<Policy, LoadError> {
     let mut p = Policy::default();
-    let host = PathBuf::from(HOST_FILE);
-    let program = main.parent().unwrap_or(Path::new(".")).join(PROGRAM_FILE);
-    let mut files = Vec::new();
+    let missing = |message: String| LoadError { message, missing: true };
     // Only a host's file that is not there is no policy: one that cannot be read is an error, not
     // a policy skipped without a word.
-    match std::fs::symlink_metadata(&host) {
-        Ok(_) => files.push(host),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(format!("cannot read the policy {}: {}", host.display(), e)),
+    if there(anchor)? {
+        p.read(anchor, Kind::Host)?;
+    } else {
+        p.absent.push(format!("{} ({})", anchor.display(), Kind::Host.said()));
+    }
+    for f in p.include.clone() {
+        if !there(&f)? {
+            return Err(missing(format!("the policy {} includes {}, which is not there", anchor.display(), f.display())));
+        }
+        p.read(&f, Kind::Included)?;
+    }
+    // Plans and drop-ins, in name order, without editing one file.
+    let dropins = anchor.parent().unwrap_or(Path::new("/")).join("policy.d");
+    match std::fs::symlink_metadata(&dropins) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => p.absent.push(format!("{}/ ({})", dropins.display(), Kind::Dropin.said())),
+        Err(e) => return Err(format!("cannot read the policies in {}: {}", dropins.display(), e).into()),
+        Ok(_) if !dropins.is_dir() => return Err(format!("cannot read the policies in {}: it is not a folder", dropins.display()).into()),
+        Ok(_) => {
+            let mut names: Vec<PathBuf> = std::fs::read_dir(&dropins)
+                .map_err(|e| format!("cannot read the policies in {}: {}", dropins.display(), e))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|f| f.extension().is_some_and(|x| x == "toml"))
+                .collect();
+            names.sort();
+            for f in names {
+                there(&f)?;
+                p.read(&f, Kind::Dropin)?;
+            }
+        }
+    }
+    // The variable adds layers where the provider starts the process; each file it names must be
+    // there, and the anchor's `require_path` makes a start without it stop rather than run without
+    // the provider's limits.
+    let named: Vec<PathBuf> = path_var.as_ref().map(|v| std::env::split_paths(v).filter(|f| !f.as_os_str().is_empty()).collect()).unwrap_or_default();
+    if named.is_empty() {
+        if p.require_path {
+            let why = if path_var.is_none() { "is not set" } else { "names no file" };
+            return Err(missing(format!("the policy {} says require_path = true, and {} {}", anchor.display(), PATH_VAR, why)));
+        }
+        p.absent.push(format!("{} ({})", PATH_VAR, if path_var.is_none() { "not set" } else { "names no file" }));
+    }
+    for f in named {
+        if !there(&f)? {
+            return Err(missing(format!("{} names the policy {}, which is not there", PATH_VAR, f.display())));
+        }
+        p.read(&f, Kind::PathVar)?;
     }
     // A `--policy` is the person's to name: `--policy <(cat p.toml)` is read (FEEDBACK71.md, Q-982,
     // found in review; branch security).
     for f in extra {
         crate::error::name_file(f);
+        p.read(f, Kind::Named)?;
     }
-    files.extend(extra.iter().cloned());
-    if program.is_file() {
-        files.push(program);
-    }
-    for f in files {
-        // A regular file of a bounded size: `quillo check` reads a cloned repository's (FEEDBACK71.md,
-        // Q-982; branch security).
-        let text = crate::error::read_text(&f).map_err(|e| format!("cannot read the policy {}: {}", f.display(), e))?;
-        p.add(&f, &text)?;
-    }
+    p.program(main)?;
     Ok(p)
+}
+
+/// The program's own layer alone, for a phone app, which has no host's file nor environment of
+/// the provider's (FEEDBACK82.md, Q-1284; branch feedback82-85).
+pub fn load_program(main: &Path) -> Result<Policy, String> {
+    let mut p = Policy::default();
+    p.program(main)?;
+    Ok(p)
+}
+
+impl Policy {
+    /// One layer, read from a regular file of a bounded size: `quillo check` reads a cloned
+    /// repository's (FEEDBACK71.md, Q-982; branch security).
+    fn read(&mut self, f: &Path, kind: Kind) -> Result<(), String> {
+        let text = crate::error::read_text(f).map_err(|e| format!("cannot read the policy {}: {}", f.display(), e))?;
+        self.add_layer(f, &text, kind)
+    }
+
+    /// `quillo.policy` beside `main`, when there is one.
+    fn program(&mut self, main: &Path) -> Result<(), String> {
+        let program = main.parent().unwrap_or(Path::new(".")).join(PROGRAM_FILE);
+        if there(&program)? {
+            self.read(&program, Kind::Program)
+        } else {
+            self.absent.push(format!("{} ({})", program.display(), Kind::Program.said()));
+            Ok(())
+        }
+    }
+
+    /// Whether a layer of the host's is in force: its file, what it includes, policy.d's, or
+    /// `QUILLO_POLICY_PATH`'s.
+    pub fn has_host_layer(&self) -> bool {
+        self.kinds.iter().any(|k| matches!(k, Kind::Host | Kind::Included | Kind::Dropin | Kind::PathVar))
+    }
+
+    /// The layers a `--split` service is given as `--policy`: the host's it reads itself.
+    pub fn passed_on(&self) -> impl Iterator<Item = &PathBuf> {
+        self.files.iter().zip(&self.kinds).filter(|(_, k)| matches!(k, Kind::Named | Kind::Program)).map(|(f, _)| f)
+    }
 }
 
 /// A value of the file's small TOML.
@@ -154,6 +454,43 @@ enum V {
     Int(i64),
     Str(String),
     List(Vec<String>),
+    /// `{ APP_ENV = "production", REGION = "eu" }`, for `[env] set` (FEEDBACK82.md, Q-1280; branch
+    /// feedback82-85).
+    Table(Vec<(String, String)>),
+}
+
+/// A value as a layer wrote it, for `quillo policy`.
+fn shown(v: &V) -> String {
+    match v {
+        V::Bool(b) => b.to_string(),
+        V::Int(n) => n.to_string(),
+        V::Str(s) => format!("\"{}\"", s),
+        V::List(l) => format!("[{}]", l.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", ")),
+        V::Table(t) => format!("{{ {} }}", t.iter().map(|(k, v)| format!("{} = \"{}\"", k, v)).collect::<Vec<_>>().join(", ")),
+    }
+}
+
+/// `{ A = "x", B = "y" }`: bare names, each a text; a `,` or `=` inside the text is the text's.
+fn table(inner: &str) -> Option<Vec<(String, String)>> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut rest = inner.trim();
+    while !rest.is_empty() {
+        let (k, after) = rest.split_once('=')?;
+        let k = k.trim();
+        if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') || out.iter().any(|(o, _)| o == k) {
+            return None;
+        }
+        let after = after.trim_start().strip_prefix('"')?;
+        let end = after.find('"')?;
+        out.push((k.to_string(), after[..end].to_string()));
+        rest = after[end + 1..].trim_start();
+        rest = match rest.strip_prefix(',') {
+            Some(r) => r.trim_start(),
+            None if rest.is_empty() => rest,
+            None => return None,
+        };
+    }
+    Some(out)
 }
 
 /// `[section]` and `key = value` lines: booleans, integers, strings, and lists of strings
@@ -223,6 +560,9 @@ fn value(v: &str) -> Option<V> {
         }
         return Some(V::List(out));
     }
+    if let Some(inner) = v.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        return table(inner).map(V::Table);
+    }
     v.replace('_', "").parse().ok().map(V::Int)
 }
 
@@ -267,24 +607,188 @@ pub fn size(s: &str) -> Option<usize> {
     n.trim().parse::<usize>().ok().and_then(|n| n.checked_mul(mul))
 }
 
+/// `[run]`'s off switches, and the options each refuses (FEEDBACK82.md, Q-1280; branch
+/// feedback82-85).
+pub const SWITCHES: [&str; 6] = ["with", "watch", "describe", "plain_http", "split", "join"];
+
+/// The options of `quillo run` a switch of `SWITCHES` turns off.
+pub fn switch_options(switch: &str) -> &'static [&'static str] {
+    match switch {
+        "with" => &["--with"],
+        "watch" => &["--watch", "-w", "--watch=reload", "--reload"],
+        "describe" => &["--describe"],
+        "plain_http" => &["--plain-http"],
+        // And what serves as a service or lets copies join (found in review): `--as-service` serves
+        // server fns to other processes; `--allow-join` takes copies, `--join-as` and `--service`
+        // go with `--join` and `--register` (FEEDBACK82.md, Q-1280; branch feedback82-85).
+        "split" => &["--split", "--scale", "--as-service"],
+        "join" => &["--join", "--register", "--allow-join", "--join-as", "--service"],
+        _ => &[],
+    }
+}
+
+/// `--base`'s path: `/shop`, without a `/` at its end.
+fn base_path(s: &str) -> Option<String> {
+    let b = s.trim_end_matches('/');
+    (b.starts_with('/') && !b.contains("//") && !b.contains('?')).then(|| b.to_string())
+}
+
+/// `10.0.0.0/8,127.0.0.1`, as `--trust-proxy` takes it; None if a part is neither an address nor
+/// a network, or there is none. An IPv4 address written as IPv6 is IPv4.
+pub fn nets(list: &str) -> Option<Vec<Net>> {
+    let mut out = Vec::new();
+    for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let (ip, bits) = part.split_once('/').map_or((part, None), |(i, b)| (i, Some(b)));
+        let ip: IpAddr = ip.parse().ok()?;
+        let most = if ip.is_ipv4() { 32 } else { 128 };
+        let bits = match bits {
+            None => most,
+            Some(b) => b.parse::<u32>().ok().filter(|b| *b <= most)?,
+        };
+        out.push(match ip {
+            IpAddr::V6(a) => match a.to_ipv4_mapped() {
+                Some(v4) if bits >= 96 => (IpAddr::V4(v4), bits - 96),
+                _ => (ip, bits),
+            },
+            v4 => (v4, bits),
+        });
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// The first `bits` of `ip`, the rest zero, as a number of its family's width.
+fn prefix(ip: IpAddr, bits: u32) -> u128 {
+    match ip {
+        IpAddr::V4(a) => (u32::from(a) as u128).checked_shr(32 - bits).unwrap_or(0),
+        IpAddr::V6(a) => u128::from(a).checked_shr(128 - bits).unwrap_or(0),
+    }
+}
+
+/// Whether network `inner` lies inside network `outer`.
+pub fn within(inner: &Net, outer: &Net) -> bool {
+    inner.0.is_ipv4() == outer.0.is_ipv4() && outer.1 <= inner.1 && prefix(inner.0, outer.1) == prefix(outer.0, outer.1)
+}
+
+/// The networks both lists hold: of each pair, the one inside the other.
+fn intersect(a: &[Net], b: &[Net]) -> Vec<Net> {
+    let mut out: Vec<Net> = Vec::new();
+    for x in a {
+        for y in b {
+            let both = if within(x, y) {
+                *x
+            } else if within(y, x) {
+                *y
+            } else {
+                continue;
+            };
+            if !out.contains(&both) {
+                out.push(both);
+            }
+        }
+    }
+    out
+}
+
+/// A network as `--trust-proxy` writes it.
+pub fn net_shown(n: &Net) -> String {
+    let most = if n.0.is_ipv4() { 32 } else { 128 };
+    if n.1 == most {
+        n.0.to_string()
+    } else {
+        format!("{}/{}", n.0, n.1)
+    }
+}
+
 impl Policy {
     /// One more layer, read from `file`: it narrows what is allowed.
     pub fn add(&mut self, file: &Path, text: &str) -> Result<(), String> {
+        self.add_layer(file, text, Kind::Named)
+    }
+
+    /// The value of `key` took effect from `file` (FEEDBACK82.md, Q-1286; branch feedback82-85).
+    fn took(&mut self, key: &str, file: &Path) {
+        match self.origin.iter_mut().find(|(k, _)| k == key) {
+            Some((_, f)) => *f = file.to_path_buf(),
+            None => self.origin.push((key.to_string(), file.to_path_buf())),
+        }
+    }
+
+    /// The file `key`'s value in force came from (`limits.workers`, `run.trust_proxy`, ...).
+    pub fn origin_of(&self, key: &str) -> Option<&Path> {
+        self.origin.iter().find(|(k, _)| k == key).map(|(_, f)| f.as_path())
+    }
+
+    /// `[run]`'s ceiling `key`, the least of the layers'.
+    pub fn run_ceiling(&self, key: &str) -> Option<u64> {
+        self.run.ceilings.iter().find(|(k, _)| *k == key).map(|(_, n)| *n)
+    }
+
+    /// The file that turned `[run]`'s switch `key` off, if one did.
+    pub fn switched_off(&self, key: &str) -> Option<&Path> {
+        self.run.off.iter().find(|(k, _)| *k == key).map(|(_, f)| f.as_path())
+    }
+
+    /// `[run]`'s forced `key` (`log`, `base`, `listen`).
+    pub fn run_forced(&self, key: &str) -> Option<&str> {
+        self.run.forced.iter().find(|(k, _)| *k == key).map(|(_, v)| v.as_str())
+    }
+
+    fn ceiling(&mut self, key: &'static str, n: u64, file: &Path) {
+        match self.run.ceilings.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, m)) if *m <= n => return,
+            Some((_, m)) => *m = n,
+            None => self.run.ceilings.push((key, n)),
+        }
+        self.took(&format!("run.{}", key), file);
+    }
+
+    /// One more layer, of `kind`: only the host's file may say `include` and `require_path`.
+    pub fn add_layer(&mut self, file: &Path, text: &str, kind: Kind) -> Result<(), String> {
         let at = |line: usize, why: String| format!("{}:{}: {}", file.display(), line, why);
         self.files.push(file.to_path_buf());
+        self.kinds.push(kind);
+        let names_before = self.env.len();
+        let mut set_here: Vec<String> = Vec::new();
         for (section, key, v, line) in parse(text).map_err(|e| format!("{}: {}", file.display(), e))? {
             let list = |v: &V| match v {
                 V::List(l) => Ok(l.clone()),
                 _ => Err(at(line, format!("`{}` is a list: [\"...\", ...]", key))),
             };
+            let name = if section.is_empty() { key.clone() } else { format!("{}.{}", section, key) };
+            self.said.push((name.clone(), shown(&v), file.to_path_buf()));
             match (section.as_str(), key.as_str(), &v) {
+                // The anchor ties the other layers to it (FEEDBACK82.md, Q-1281; branch
+                // feedback82-85).
+                ("", "include" | "require_path", _) if kind != Kind::Host => {
+                    return Err(at(line, format!("`{}` is said only by the host's file, {}", key, anchor().map_or_else(|e| e, |a| a.display().to_string()))));
+                }
+                ("", "include", _) => {
+                    for f in list(&v)? {
+                        if !Path::new(&f).is_absolute() {
+                            return Err(at(line, format!("`include` names files by their whole path, not \"{}\"", f)));
+                        }
+                        self.include.push(PathBuf::from(f));
+                    }
+                }
+                ("", "require_path", V::Bool(b)) => self.require_path |= *b,
                 ("plugins", "build", V::Bool(b)) => {
                     if !b && self.build {
                         self.build = false;
                         self.build_from = Some(file.to_path_buf());
                     }
                 }
-                ("plugins", "allow", _) => self.plugins.push((file.to_path_buf(), list(&v)?)),
+                ("plugins", "allow", _) => {
+                    let allow = list(&v)?;
+                    // A plugin held to its hash (FEEDBACK82.md, Q-1285; branch feedback82-85).
+                    for a in &allow {
+                        if let Some(h) = a.split_once('@').and_then(|(_, v)| v.strip_prefix("sha256:")) {
+                            if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+                                return Err(at(line, format!("`{}`: a plugin's SHA-256 is 64 hexadecimal digits, as `qr@sha256:9f86d0...`", a)));
+                            }
+                        }
+                    }
+                    self.plugins.push((file.to_path_buf(), allow));
+                }
                 ("effects", "allow", _) => {
                     let mut mask = 0;
                     for e in list(&v)? {
@@ -309,7 +813,12 @@ impl Policy {
                 // The command line's ranges: 0 is no limit to nginx and refused by `--max-body 0`,
                 // and was taken as one that refused every body, or ended every request at once
                 // (FEEDBACK55.md, Q-849; branch feedback55).
-                ("limits", "workers", V::Int(n)) if *n > 0 => self.workers = Some(self.workers.map_or(*n as usize, |w| w.min(*n as usize))),
+                ("limits", "workers", V::Int(n)) if *n > 0 => {
+                    if self.workers.map_or(true, |w| (*n as usize) < w) {
+                        self.workers = Some(*n as usize);
+                        self.took("limits.workers", file);
+                    }
+                }
                 ("limits", "workers", V::Int(_)) => return Err(at(line, "`workers` is a positive number, as `--workers` takes".into())),
                 ("limits", "max_compute", V::Str(s)) => {
                     let d = duration(s).ok_or_else(|| at(line, format!("`{}` is not a time such as \"10s\" or \"500ms\"", s)))?;
@@ -326,7 +835,10 @@ impl Policy {
                     if b == 0 {
                         return Err(at(line, "`max_body` is a size larger than 0, as `--max-body` takes, such as \"10MB\"".into()));
                     }
-                    self.max_body = Some(self.max_body.map_or(b, |m| m.min(b)));
+                    if self.max_body.map_or(true, |m| b < m) {
+                        self.max_body = Some(b);
+                        self.took("limits.max_body", file);
+                    }
                 }
                 // As `--max-memory` takes it, the least of the layers' (FEEDBACK71.md, Q-977; branch
                 // security).
@@ -340,16 +852,187 @@ impl Policy {
                         self.max_memory_from = Some(file.to_path_buf());
                     }
                 }
-                ("limits", "max_tool_calls", V::Int(n)) if *n > 0 => self.max_tool_calls = Some(self.max_tool_calls.map_or(*n as usize, |m| m.min(*n as usize))),
+                ("limits", "max_tool_calls", V::Int(n)) if *n > 0 => {
+                    if self.max_tool_calls.map_or(true, |m| (*n as usize) < m) {
+                        self.max_tool_calls = Some(*n as usize);
+                        self.took("limits.max_tool_calls", file);
+                    }
+                }
                 ("limits", "max_tool_calls", V::Int(_)) => return Err(at(line, "`max_tool_calls` is a positive number, the calls a minute, as `--max-tool-calls` takes".into())),
+                // `[run]`, `[fs] paths` and `[env] set` (FEEDBACK82.md, Q-1280, Part D, as the user
+                // decided it 2026-11-22; branch feedback82-85).
+                ("run", "trust_proxy", _) => {
+                    let mut given = Vec::new();
+                    for n in list(&v)? {
+                        match nets(&n) {
+                            Some(mut one) if one.len() == 1 => given.append(&mut one),
+                            _ => return Err(at(line, format!("`{}` is not an address or a network, as 127.0.0.1 or 10.0.0.0/8", n))),
+                        }
+                    }
+                    let now = match self.run.trust_proxy.take() {
+                        None => given,
+                        Some(before) => intersect(&before, &given),
+                    };
+                    self.run.trust_proxy = Some(now);
+                    self.took("run.trust_proxy", file);
+                }
+                ("run", k @ ("with" | "watch" | "describe" | "plain_http" | "split" | "join"), V::Bool(b)) => {
+                    let k: &'static str = SWITCHES.iter().find(|s| **s == k).copied().unwrap_or("with");
+                    if !b && self.switched_off(k).is_none() {
+                        self.run.off.push((k, file.to_path_buf()));
+                        self.took(&format!("run.{}", k), file);
+                    }
+                }
+                ("run", "check", V::Bool(b)) => {
+                    if *b && !self.run.check {
+                        self.run.check = true;
+                        self.took("run.check", file);
+                    }
+                }
+                ("run", k @ ("instances" | "max_connections" | "connections_per_client" | "live_per_client"), V::Int(n)) if *n > 0 => {
+                    let k: &'static str = ["instances", "max_connections", "connections_per_client", "live_per_client"].into_iter().find(|s| *s == k).unwrap_or("instances");
+                    self.ceiling(k, *n as u64, file);
+                }
+                ("run", k @ ("instances" | "max_connections" | "connections_per_client" | "live_per_client"), V::Int(_)) => {
+                    return Err(at(line, format!("`{}` is a positive number, as `--{}` takes", k, k.replace('_', "-"))));
+                }
+                ("run", "drain", V::Str(s)) => match duration(s) {
+                    Some(d) if !d.is_zero() => self.ceiling("drain", d.as_millis() as u64, file),
+                    _ => return Err(at(line, format!("`drain` is a time longer than 0, as `--drain` takes, such as \"30s\", not \"{}\"", s))),
+                },
+                ("run", "socket_mode", V::Str(s)) => match u32::from_str_radix(s, 8) {
+                    Ok(m) if m <= 0o777 && m & 0o600 == 0o600 => {
+                        let now = self.run.socket_mode.map_or(m, |before| before & m);
+                        if self.run.socket_mode != Some(now) {
+                            self.run.socket_mode = Some(now);
+                            self.took("run.socket_mode", file);
+                        }
+                    }
+                    _ => return Err(at(line, format!("`socket_mode` is octal permissions the owner can read and write, as `--socket-mode` takes, such as \"660\", not \"{}\"", s))),
+                },
+                ("run", k @ ("log" | "base" | "listen"), V::Str(s)) => {
+                    let ok = match k {
+                        "log" => matches!(s.as_str(), "text" | "json" | "off"),
+                        "listen" => s == "unix",
+                        _ => base_path(s).is_some(),
+                    };
+                    if !ok {
+                        let what = match k {
+                            "log" => "text, json or off, as `--log` takes",
+                            "listen" => "\"unix\": a Unix socket only",
+                            _ => "a path such as \"/shop\", as `--base` takes",
+                        };
+                        return Err(at(line, format!("`{}` is {}, not \"{}\"", k, what, s)));
+                    }
+                    let s = if k == "base" { base_path(s).unwrap_or_default() } else { s.clone() };
+                    let k: &'static str = ["log", "base", "listen"].into_iter().find(|f| *f == k).unwrap_or("log");
+                    match self.run_forced(k) {
+                        Some(before) if before == s => {}
+                        Some(before) => {
+                            let from = self.origin_of(&format!("run.{}", k)).map_or_else(String::new, |f| f.display().to_string());
+                            return Err(at(line, format!("`run.{}` is \"{}\" in {}, which a later layer cannot change", k, before, from)));
+                        }
+                        None => {
+                            self.run.forced.push((k, s));
+                            self.took(&format!("run.{}", k), file);
+                        }
+                    }
+                }
+                ("fs", "paths", _) => {
+                    let mut paths = Vec::new();
+                    for f in list(&v)? {
+                        if !Path::new(&f).is_absolute() {
+                            return Err(at(line, format!("`paths` names folders by their whole path, not \"{}\"", f)));
+                        }
+                        // As `--allow-path` takes a folder, its links followed.
+                        paths.push(Path::new(&f).canonicalize().unwrap_or_else(|_| PathBuf::from(&f)));
+                    }
+                    self.fs_paths.push((file.to_path_buf(), paths));
+                }
+                ("env", "set", V::Table(t)) => {
+                    for (k, val) in t {
+                        self.force_env(k, val, file, kind).map_err(|e| at(line, e))?;
+                        set_here.push(k.clone());
+                    }
+                }
+                ("env.set", k, V::Str(val)) if !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') => {
+                    self.force_env(k, val, file, kind).map_err(|e| at(line, e))?;
+                    set_here.push(k.to_string());
+                }
                 (s, k, _) => {
-                    let known = ["plugins.build", "plugins.allow", "effects.allow", "http.private", "http.hosts", "env.names", "limits.workers", "limits.max_compute", "limits.max_body", "limits.max_tool_calls", "limits.max_memory"];
+                    let known = [
+                        "plugins.build", "plugins.allow", "effects.allow", "http.private", "http.hosts", "env.names", "env.set", "limits.workers", "limits.max_compute", "limits.max_body", "limits.max_tool_calls", "limits.max_memory",
+                        "run.trust_proxy", "run.with", "run.watch", "run.describe", "run.plain_http", "run.split", "run.join", "run.check", "run.instances", "run.max_connections", "run.connections_per_client", "run.live_per_client",
+                        "run.drain", "run.socket_mode", "run.listen", "run.base", "run.log", "fs.paths",
+                    ];
                     let name = format!("{}.{}", s, k);
-                    return Err(at(line, if known.contains(&name.as_str()) { format!("`{}` has the wrong kind of value", name) } else { format!("`{}` is not something a policy says (it says {})", name, known.join(", ")) }));
+                    let known_here = known.contains(&name.as_str()) || s == "env.set" || (s.is_empty() && matches!(k, "include" | "require_path"));
+                    return Err(at(line, if known_here { format!("`{}` has the wrong kind of value", name) } else { format!("`{}` is not something a policy says (it says {}, and the host's file include and require_path)", name, known.join(", ")) }));
+                }
+            }
+        }
+        // What a layer sets, it lets env() read, beside the names it gives.
+        if self.env.len() > names_before {
+            if let Some((_, names)) = self.env.last_mut() {
+                for k in set_here {
+                    if !names.contains(&k) {
+                        names.push(k);
+                    }
                 }
             }
         }
         Ok(())
+    }
+
+    /// `[env] set`'s `name` = `value`: a name an earlier layer set keeps its value.
+    /// Only the host's layers may say it: a value the program's own layer or a `--policy` put in
+    /// the environment narrows nothing, and would reach every process started beside the program
+    /// (`--with`'s commands, cargo, a `--split` service, which reads `QUILLO_POLICY_PATH` again).
+    /// Nor may any layer set the names that choose the policy or what a process loads, so that a
+    /// host's own slip cannot drop its layers (FEEDBACK82.md, Q-1280, found in review; branch
+    /// feedback82-85).
+    fn force_env(&mut self, name: &str, value: &str, file: &Path, kind: Kind) -> Result<(), String> {
+        if !matches!(kind, Kind::Host | Kind::Included | Kind::Dropin | Kind::PathVar) {
+            return Err(format!("`env.set` is the host's to say (its file, what it includes, policy.d, {}), not {}'s", PATH_VAR, kind.said()));
+        }
+        let upper = name.to_ascii_uppercase();
+        if upper.starts_with("QUILLO_POLICY") || upper.starts_with("LD_") || upper.starts_with("DYLD_") {
+            return Err(format!("`env.set` may not set {}: it chooses the policy, or what a process loads", name));
+        }
+        match self.env_set.iter().find(|(k, _)| k == name) {
+            Some((_, before)) if before == value => Ok(()),
+            // Its name only: a value may be a secret (found in review).
+            Some(_) => {
+                let from = self.origin_of(&format!("env.set.{}", name)).map_or_else(String::new, |f| f.display().to_string());
+                Err(format!("`env.set.{}` is set in {}, which a later layer cannot change", name, from))
+            }
+            None => {
+                self.env_set.push((name.to_string(), value.to_string()));
+                self.took(&format!("env.set.{}", name), file);
+                Ok(())
+            }
+        }
+    }
+
+    /// Why `--allow-path` may not name `real` (a folder, its links followed), if it may not
+    /// (FEEDBACK82.md, Q-1280; branch feedback82-85).
+    pub fn allows_path(&self, real: &Path) -> Result<(), String> {
+        for (file, paths) in &self.fs_paths {
+            if paths.is_empty() {
+                return Err(format!("--allow-path {}: {} allows no folder outside the program's ([fs] paths = [])", real.display(), file.display()));
+            }
+            if !paths.iter().any(|p| real.starts_with(p)) {
+                let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                return Err(format!("--allow-path {} is not inside the folders {} allows: {}", real.display(), file.display(), list.join(", ")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `--trust-proxy`'s networks lie inside the policy's: the first that does not.
+    pub fn wider_proxy<'a>(&self, given: &'a [Net]) -> Option<&'a Net> {
+        let allowed = self.run.trust_proxy.as_ref()?;
+        given.iter().find(|n| !allowed.iter().any(|a| within(n, a)))
     }
 
     fn where_(&self, f: &Option<PathBuf>) -> String {
@@ -357,18 +1040,35 @@ impl Policy {
     }
 
     /// Why plugin `name` (at `version`, its `//! version:`) may not be used, if it may not.
-    pub fn plugin(&self, name: &str, version: Option<&str>) -> Result<(), String> {
+    /// `hashes` are what it is by SHA-256, in lower-case hex: its source's (what the catalog
+    /// gives for it) and its built library's, which `name@sha256:...` must match, so that a file
+    /// renamed to an allowed name does not pass (FEEDBACK82.md, Q-1285; branch feedback82-85).
+    pub fn plugin(&self, name: &str, version: Option<&str>, hashes: &[String]) -> Result<(), String> {
         for (file, allow) in &self.plugins {
             let ok = allow.iter().any(|a| match a.split_once('@') {
                 None => a == name,
-                Some((n, v)) => n == name && version.is_some_and(|have| have == v || have.starts_with(&format!("{}.", v))),
+                Some((n, v)) => match v.strip_prefix("sha256:") {
+                    Some(h) => n == name && hashes.iter().any(|have| have.eq_ignore_ascii_case(h)),
+                    None => n == name && version.is_some_and(|have| have == v || have.starts_with(&format!("{}.", v))),
+                },
             });
             if !ok {
                 let said = version.map_or(String::new(), |v| format!(" {}", v));
-                return Err(format!("the plugin `{}`{} is not in the plugins {} allows: {}", name, said, file.display(), allow.join(", ")));
+                // Its hash, when a layer pins one by it: what to put in the list, or why it differs.
+                let pinned = allow.iter().any(|a| a.split_once('@').is_some_and(|(n, v)| n == name && v.starts_with("sha256:")));
+                let its = match hashes.first() {
+                    Some(h) if pinned => format!(" (its SHA-256 is {})", h),
+                    _ => String::new(),
+                };
+                return Err(format!("the plugin `{}`{} is not in the plugins {} allows: {}{}", name, said, file.display(), allow.join(", "), its));
             }
         }
         Ok(())
+    }
+
+    /// Whether a layer holds a plugin to its SHA-256, so that its hashes are worth working out.
+    pub fn pins_by_hash(&self) -> bool {
+        self.plugins.iter().any(|(_, allow)| allow.iter().any(|a| a.contains("@sha256:")))
     }
 
     /// Why `env()` may not read `name`, if it may not.
@@ -442,12 +1142,167 @@ impl Policy {
         if let Some(m) = self.max_memory {
             out.push(format!("max_memory {} bytes", m));
         }
+        // And what it says of the options, so a start held to it is seen to be (FEEDBACK82.md,
+        // Q-1280; branch feedback82-85).
+        if let Some(t) = &self.run.trust_proxy {
+            out.push(if t.is_empty() { "no proxy trusted".to_string() } else { format!("trust_proxy {}", t.iter().map(net_shown).collect::<Vec<_>>().join(",")) });
+        }
+        for (k, _) in &self.run.off {
+            out.push(format!("no {}", switch_options(k)[0]));
+        }
+        if self.run.check {
+            out.push("checked".into());
+        }
+        for (k, n) in &self.run.ceilings {
+            out.push(if *k == "drain" { format!("drain {}ms", n) } else { format!("{} {}", k, n) });
+        }
+        if let Some(m) = self.run.socket_mode {
+            out.push(format!("socket_mode {:o}", m));
+        }
+        for (k, v) in &self.run.forced {
+            out.push(format!("{} {}", k, v));
+        }
+        if !self.fs_paths.is_empty() {
+            out.push("allow-path held".into());
+        }
+        if !self.env_set.is_empty() {
+            out.push(format!("env set: {}", self.env_set.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>().join(", ")));
+        }
         format!("policy {}{}", self.files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(" + "), if out.is_empty() { String::new() } else { format!(" ({})", out.join("; ")) })
     }
 
     /// Where effects were taken away, for a message.
     pub fn effects_source(&self) -> String {
         self.where_(&self.effects_from)
+    }
+
+    /// What `quillo policy` prints: the layers, the places that had none, and each setting in
+    /// force with the file it came from (FEEDBACK82.md, Q-1286; branch feedback82-85).
+    pub fn report(&self) -> String {
+        let mut out = Vec::new();
+        if self.files.is_empty() {
+            out.push("no policy: nothing narrows what the program may do".to_string());
+        } else {
+            out.push("layers, in the order read (each only narrows the ones before it):".to_string());
+            for (f, k) in self.files.iter().zip(&self.kinds) {
+                out.push(format!("  {} ({})", f.display(), k.said()));
+            }
+        }
+        if !self.absent.is_empty() {
+            out.push("not there:".to_string());
+            for a in &self.absent {
+                out.push(format!("  {}", a));
+            }
+        }
+        let from = |f: Option<&Path>| f.map_or_else(String::new, |f| format!(" ({})", f.display()));
+        let mut said = Vec::new();
+        if !self.build {
+            said.push(format!("plugins.build = false{}", from(self.build_from.as_deref())));
+        }
+        // A list is a condition each layer's meets: each is shown with its file.
+        let each = |key: &str, layers: &[(PathBuf, Vec<String>)]| -> Option<String> {
+            (!layers.is_empty()).then(|| {
+                let l: Vec<String> = layers.iter().map(|(f, v)| format!("[{}] ({})", v.join(", "), f.display())).collect();
+                format!("{}: in every one of {}", key, l.join(", "))
+            })
+        };
+        said.extend(each("plugins.allow", &self.plugins));
+        if self.effects != crate::ast::ALL_EFFECTS {
+            said.push(format!("effects.allow = {}{}", crate::ast::effect_names(self.effects).join(", "), from(self.effects_from.as_deref())));
+        }
+        if !self.private {
+            said.push(format!("http.private = false{}", from(self.private_from.as_deref())));
+        }
+        said.extend(each("http.hosts", &self.hosts));
+        said.extend(each("env.names", &self.env));
+        for (k, v) in &self.env_set {
+            // Its name only: a value may be a secret (found in review).
+            let _ = v;
+            said.push(format!("env.set.{} (set){}", k, from(self.origin_of(&format!("env.set.{}", k)))));
+        }
+        let paths: Vec<(PathBuf, Vec<String>)> = self.fs_paths.iter().map(|(f, p)| (f.clone(), p.iter().map(|p| p.display().to_string()).collect())).collect();
+        said.extend(each("fs.paths", &paths));
+        if let Some(w) = self.workers {
+            said.push(format!("limits.workers = {}{}", w, from(self.origin_of("limits.workers"))));
+        }
+        if let Some(c) = self.max_compute {
+            said.push(format!("limits.max_compute = {}ms{}", c.as_millis(), from(self.max_compute_from.as_deref())));
+        }
+        if let Some(b) = self.max_body {
+            said.push(format!("limits.max_body = {} bytes{}", b, from(self.origin_of("limits.max_body"))));
+        }
+        if let Some(m) = self.max_memory {
+            said.push(format!("limits.max_memory = {} bytes{}", m, from(self.max_memory_from.as_deref())));
+        }
+        if let Some(n) = self.max_tool_calls {
+            said.push(format!("limits.max_tool_calls = {} a minute{}", n, from(self.origin_of("limits.max_tool_calls"))));
+        }
+        if let Some(t) = &self.run.trust_proxy {
+            let nets: Vec<String> = t.iter().map(net_shown).collect();
+            said.push(format!("run.trust_proxy = [{}]{}", nets.join(", "), from(self.origin_of("run.trust_proxy"))));
+        }
+        for (k, f) in &self.run.off {
+            said.push(format!("run.{} = false ({}){}", k, switch_options(k).join(", "), from(Some(f))));
+        }
+        if self.run.check {
+            said.push(format!("run.check = true{}", from(self.origin_of("run.check"))));
+        }
+        for (k, n) in &self.run.ceilings {
+            let n = if *k == "drain" { format!("{}ms", n) } else { n.to_string() };
+            said.push(format!("run.{} = {}{}", k, n, from(self.origin_of(&format!("run.{}", k)))));
+        }
+        if let Some(m) = self.run.socket_mode {
+            said.push(format!("run.socket_mode = {:o}{}", m, from(self.origin_of("run.socket_mode"))));
+        }
+        for (k, v) in &self.run.forced {
+            said.push(format!("run.{} = \"{}\"{}", k, v, from(self.origin_of(&format!("run.{}", k)))));
+        }
+        if self.require_path {
+            said.push(format!("require_path = true{}", from(self.files.first().map(PathBuf::as_path))));
+        }
+        if !self.files.is_empty() {
+            out.push(if said.is_empty() { "in force: nothing (the layers say nothing that narrows)".to_string() } else { "in force:".to_string() });
+            out.extend(said.into_iter().map(|l| format!("  {}", l)));
+        }
+        out.join("\n")
+    }
+
+    /// `[env] set`'s values, put in the environment before the program's `.env` is read, which
+    /// does not change what is there already: what env() gives, whatever `.env` or the shell said
+    /// (FEEDBACK82.md, Q-1280; branch feedback82-85).
+    pub fn put_env(&self) {
+        for (k, v) in &self.env_set {
+            std::env::set_var(k, v);
+        }
+    }
+
+    /// The limits a request is held to, in force where they are less than the options' (or those
+    /// are not given): `max_compute`, `max_memory` and `max_tool_calls`, as `quillo run` holds
+    /// them, for a phone app too (FEEDBACK82.md, Q-1284; branch feedback82-85).
+    pub fn hold_limits(&self) {
+        if let Some(n) = self.max_tool_calls {
+            crate::mcp::MAX_TOOL_CALLS.fetch_min(n, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(c) = self.max_compute {
+            let (now, c) = (crate::httpd::compute_limit_ms(), c.as_millis().max(1) as u64);
+            if now == 0 || now > c {
+                crate::httpd::limit_compute(c);
+                // Its message names the file (FEEDBACK55.md, Q-849; branch feedback55).
+                if let Some(f) = &self.max_compute_from {
+                    crate::httpd::compute_limit_from(f);
+                }
+            }
+        }
+        // It narrows, as the other limits do (FEEDBACK71.md, Q-977; branch security).
+        if let Some(m) = self.max_memory {
+            let now = crate::httpd::memory_limit();
+            if now == 0 || now > m as u64 {
+                crate::httpd::limit_memory(m as u64);
+                if let Some(f) = &self.max_memory_from {
+                    crate::httpd::memory_limit_from(f);
+                }
+            }
+        }
     }
 }
 
@@ -507,11 +1362,11 @@ mod tests {
         assert_eq!(p.effects, crate::ast::effect_bit("db"));
         assert_eq!(p.effects_source(), "layer0");
         assert!(!p.build);
-        assert!(p.plugin("csv", Some("1.4.2")).is_ok());
-        assert!(p.plugin("csv", Some("1.5.0")).unwrap_err().contains("layer1"));
-        assert!(p.plugin("csv", Some("10.4")).is_err(), "1 is not 10");
-        assert!(p.plugin("pdf", None).unwrap_err().contains("not in the plugins layer0 allows: csv@1, qr"));
-        assert!(p.plugin("qr", None).unwrap_err().contains("layer1"));
+        assert!(p.plugin("csv", Some("1.4.2"), &[]).is_ok());
+        assert!(p.plugin("csv", Some("1.5.0"), &[]).unwrap_err().contains("layer1"));
+        assert!(p.plugin("csv", Some("10.4"), &[]).is_err(), "1 is not 10");
+        assert!(p.plugin("pdf", None, &[]).unwrap_err().contains("not in the plugins layer0 allows: csv@1, qr"));
+        assert!(p.plugin("qr", None, &[]).unwrap_err().contains("layer1"));
         assert!(p.http("https://api.stripe.com/v1").is_ok());
         assert!(p.http("https://tiles.mapbox.com/x").is_ok());
         assert!(p.http("https://mapbox.com/x").unwrap_err().contains("not among the hosts layer1 allows"));
