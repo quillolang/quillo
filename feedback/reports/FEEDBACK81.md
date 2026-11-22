@@ -5,7 +5,7 @@
 | App | No app of this report's own. Two findings from quillo-videos-36 while it made React Quirks #1 (`~/dev/quillo-videos/videos/178-react-state`, React 19.3 against Quillo), each reproduced for this report in a few lines of its own (the repros below). Three more from the same video went in FEEDBACK80 (Q-1267 to Q-1269), the last of its block. |
 | Quillo | `quillo 0.8.6 (238dac2, 2026-11-16)`, the version the videos are pinned to, and `quillo 0.8.8 (6e18cda, 2026-11-20)`, this repository's `target/release/quillo` at the time: both open on both. quillo-videos-36 saw them on 0.8.8 (f35bf2d). Q-1272 was also tried on `quillo 0.8.9 (7801fff, 2026-11-20)`: open. |
 | Model | Claude Opus 5.5 (`claude-opus-5-5`), as quillo-videos-37, with the findings from quillo-videos-36 (also Claude Opus 5.5) |
-| Found by | quillo-videos-36; reproduced and written up by quillo-videos-37 (Q-1270, Q-1271). Q-1272: quillo-videos-9d (was 37), making Solid 2.0 Quirks #3 |
+| Found by | quillo-videos-36; reproduced and written up by quillo-videos-37 (Q-1270, Q-1271). Q-1272: quillo-videos-9d (was 37), making Solid 2.0 Quirks #3. Q-1273: quillo-videos-09 (was 95), making video 196 (a Next.js advisory against Quillo); Q-1275: quillo-videos-09, making video 200 (Leptos and Dioxus against Quillo) |
 | Tested with | `quillo check`, Google Chrome (headless, through `tests/browser/run.js`), Playwright's Chromium, `feedback/run.mjs` for the repros. |
 
 What worked well: the video put React's first-day surprises next to Quillo's, and most of Quillo's answers held up
@@ -120,6 +120,82 @@ visitors, in Quillo's own notation, is not, and nothing points at it before it d
 state set from one) is interpolated in markup without `??`, `is_err` or `?`: "`news` can be an error value here, and it
 would show as `err(...)`: give a fallback with `??`, or test `is_err(news)`". Or render an error value in markup as
 nothing (or a fixed placeholder) and log it, as an error a statement drops is logged.
+
+### Q-1273. Quillo's security fixes have no published advisories, and nothing tells an app that its pinned version has one
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| docs | quillo-videos-09 (was 95), making video 196 ("Your framework had a critical bug. Would you know?", Next.js's middleware advisory against Quillo), 2026-11-21 | 1 |
+
+The video asks how a developer would hear of a security fix. For Next.js, `npm audit` names GHSA-f82v-jwr5-mffw in a
+project on 15.2.2, with its severity, from GitHub's advisory database. For Quillo, the fixes are real and serious:
+0.8.0's changelog says "One viewer's `live` answer could reach another, for up to two seconds, in 0.7.0 and before:
+upgrade", and 0.8.9's Security section lists the fixes of the 0.8.7 security audit. But:
+
+```sh
+gh api /repos/quillolang/quillo/security-advisories --jq length    # 0
+gh api /repos/quillolang/quillo/contents/CHANGELOG.md --jq .content | base64 -d | grep -c '^### Security'    # 4
+```
+
+SECURITY.md says "The fix is released, then the advisory is published", and "Quillo is before 1.0: fixes go into the
+latest release only". No advisory has been published for any of them, and the GitHub releases (v0.8.4 to v0.8.9) have
+no notes, so the changelog in the repository is the only place a fix is announced. An app pins its Quillo in
+`get-quillo.sh` (the videos' apps pin 0.8.6 or 0.8.8), and nothing (not `quillo check`, `quillo version`, nor
+get-quillo) says that the pinned version has a known security fix.
+
+| Impact | |
+|---|---|
+| **Functionality** | None directly. |
+| **User** | A visitor of an app on an old Quillo stays exposed to a fixed bug (one viewer's data shown to another, in 0.7.0) for as long as its developer doesn't read the changelog. |
+| **Requests** | No change. |
+| **Security** | Medium: fixes exist but don't reach the people who need them; the video says so, as Quillo's side of the comparison. |
+
+**Suggestion:** publish a GitHub security advisory for each Security entry from 0.8.0 on (GitHub then shows them to
+anyone watching the repository, and they get GHSA ids), as SECURITY.md promises. Put a release's Security lines in its
+GitHub release notes. And let `quillo version` or `quillo check` say when a newer release has a security fix, e.g.
+from a small signed list on quillolang.org: "quillo 0.7.0: 0.8.0 fixed a security issue (one viewer's live answer
+could reach another); upgrade". Opt-out for offline machines.
+
+### Q-1275. A single-page app has no way to set the tab's title: every page keeps the title the server sent, and `<title>` in a component does nothing
+
+| Kind | Detected by | Attempts |
+|---|---|---|
+| limitation | quillo-videos-09, making video 200 (Leptos 0.8.23 and Dioxus 0.7.10 against Quillo 0.8.8: server rendering, SPA navigation, components, routing), 2026-11-21; quillo-videos-1d saw the same planning its SPA course (spa/COURSE.md, lesson 10) | 1 |
+
+The video's Trail Guide is an SPA as the guide's "Single-page apps" section writes one: `component App()` reads
+`url().path`, and `route GET /*rest` renders it for every address. Clicking from `/` to `/trails/2` changes the page
+without a load, but the tab still says "Trail Guide" (Chromium, Playwright, 0.8.8 f35bf2d), on every page and in Back's
+history list. Leptos's `<Title text=.../>` (leptos_meta) and Dioxus's `document::Title { ... }` set it on the server
+and on each client-side navigation, so the video shows this as a gap. What works in Quillo today, about 15 lines
+(video 200's `compare/quillo-title/main.qwe`):
+
+```quillo
+// in the browser, the page's own <title> element; js() is null on the server, so this does nothing there
+fn show_title(text: str) {
+    let el = js("document.querySelector", "title")
+    if el != null { el.textContent = text }
+}
+component TrailPage(id: int, tab: str) {
+    state trail = load_trail(id)
+    if trail != null && !is_err(trail) { show_title(`${trail.name} · Trail Guide`) }
+    ...
+}
+// and the route computes the same title for each address, for the first answer
+```
+
+A `<title>` written in a component's markup renders inside the body and is ignored by the browser (quillo-videos-1d
+checked this on 0.8.8). Nothing in the guide says how a single-page app should title its pages.
+
+| Impact | |
+|---|---|
+| **Functionality** | Every page of an SPA has one title: tabs, bookmarks, history and screen readers' page announcements can't tell pages apart. |
+| **User** | Back's history list shows the same name five times; a bookmark of `/trails/2` is called "Trail Guide". |
+| **Requests** | No change. |
+| **Security** | None. |
+
+**Suggestion:** a `title(text)` builtin (or `<title>` honoured in a component) that sets the response's `<title>` while
+the page renders on the server and `document.title` in the browser, following state like any other read, the last
+one rendered winning, as Leptos's and Dioxus's do. Mention it in "Single-page apps".
 
 ## Where the AI struggled
 
