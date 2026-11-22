@@ -727,10 +727,29 @@ const RUST_CALLS: &[(&str, &str)] = &[
     ("::from_file(", "fs"),
     ("::load(", "fs"),
     (".save(", "fs"),
+    // A builder's own way to its file: `csv::ReaderBuilder::new().from_path(path)`, and `.open(path)`
+    // where the statement starts at a builder; and what asks about a path: `Path::new(p).exists()`,
+    // `dir.read_dir()` (FEEDBACK83.md, Q-1305; branch feedback82-85: the catalog's csv.qwer and
+    // cli_run.qwer said fs, the reading did not).
+    (".from_path(", "fs"),
+    (".open(", "fs"),
+    (".exists()", "fs"),
+    (".try_exists()", "fs"),
+    (".is_dir()", "fs"),
+    (".is_file()", "fs"),
+    (".is_symlink()", "fs"),
+    (".metadata()", "fs"),
+    (".symlink_metadata()", "fs"),
+    (".canonicalize()", "fs"),
+    ("read_dir(", "fs"),
     ("TcpStream::", "net"),
     ("TcpListener::", "net"),
     ("UdpSocket::", "net"),
     ("UnixStream::", "net"),
+    // A name looked up: DNS (FEEDBACK83.md, Q-1305; branch feedback82-85: ssrf_guard.qwer).
+    ("to_socket_addrs", "net"),
+    ("ToSocketAddrs", "net"),
+    ("lookup_host", "net"),
     ("ureq::", "http"),
     ("reqwest::", "http"),
     ("hyper::", "http"),
@@ -742,11 +761,18 @@ const RUST_CALLS: &[(&str, &str)] = &[
     ("Utc::now", "time"),
     ("Local::now", "time"),
     ("OffsetDateTime::now", "time"),
+    // A wait reads the clock: `std::thread::sleep(d)`, tokio's `time::sleep(d)` (FEEDBACK83.md,
+    // Q-1305; branch feedback82-85: 29 catalog plugins retry after a wait).
+    ("sleep(", "time"),
     ("rand::", "random"),
     ("thread_rng", "random"),
     ("OsRng", "random"),
     ("getrandom", "random"),
     ("fastrand::", "random"),
+    // std's own seed for a hash map, taken as a random number (FEEDBACK83.md, Q-1305; branch
+    // feedback82-85: spotify.qwer, square.qwer).
+    ("RandomState::new", "random"),
+    ("RandomState::default", "random"),
     ("process::Command", "run"),
     ("Command::new", "run"),
 ];
@@ -802,7 +828,48 @@ const RUST_CRATES: &[(&str, &str)] = &[
     ("ulid", "time"),
     ("svix-ksuid", "random"),
     ("svix-ksuid", "time"),
+    // What these do unseen (FEEDBACK83.md, Q-1305; branch feedback82-85): a CUID2 takes the time
+    // in; a PASETO token its time and nonce; a captcha, a Bloom filter's seeds (bloomfilter's
+    // default `random` feature) and feed-rs's ids for entries without one are random; an
+    // icalendar event gets a DTSTAMP and a UID where it has none.
+    ("cuid2", "time"),
+    ("pasetors", "time"),
+    ("pasetors", "random"),
+    ("captcha", "random"),
+    ("bloomfilter", "random"),
+    ("feed-rs", "random"),
+    ("icalendar", "time"),
+    ("icalendar", "random"),
 ];
+
+/// Crates that do what an effect names only where the file takes a feature of theirs
+/// (`feature:v4` in its dependency line) or calls one of theirs (any text of the code): `uuid`'s
+/// v4 and v7, `bcrypt::hash`'s salt (FEEDBACK83.md, Q-1305; branch feedback82-85).
+const RUST_CRATE_USES: &[(&str, &[&str], &str)] = &[
+    ("uuid", &["feature:v4", "feature:v7", "new_v4", "now_v7"], "random"),
+    ("uuid", &["feature:v7", "now_v7"], "time"),
+    ("totp-rs", &["generate_secret", "gen_secret("], "random"),
+    ("bcrypt", &["hash(", "hash_with_result("], "random"),
+    ("biscuit-auth", &["KeyPair::new"], "random"),
+    ("biscuit-auth", &[".time()"], "time"),
+    ("age", &["Identity::generate", "encrypt", "Encryptor"], "random"),
+    ("sharks", &["dealer("], "random"),
+    ("bson", &["ObjectId::new"], "time"),
+    ("bson", &["ObjectId::new"], "random"),
+    ("epub-builder", &["generate("], "time"),
+    ("epub-builder", &["generate("], "random"),
+    ("printpdf", &["PdfDocument::new"], "time"),
+    ("rusty-s3", &["sign("], "time"),
+    ("pgp", &["sign"], "time"),
+    ("lettre", &["Message::builder"], "time"),
+    ("lettre", &["Message::builder"], "random"),
+];
+
+/// Calls of a wide pattern (`::open(`, `::create(`, `::from_path(`) that take no file: redis's
+/// `Client::open(url)`, rust-stemmers' `Stemmer::create(language)`, tantivy's
+/// `SnippetGenerator::create(..)`, `mime_guess::from_path(name)` (a name's extension) (FEEDBACK83.md,
+/// Q-1305; branch feedback82-85).
+const RUST_NOT_FILES: &[&str] = &["Client::open", "Stemmer::create", "SnippetGenerator::create", "mime_guess::from_path"];
 
 /// A Rust file's code with its comments taken out and each string's text out of it (`""` in its
 /// place), lines kept; and the strings, each with its line and where it stood in the code.
@@ -949,10 +1016,27 @@ fn effects_in(code: &str, starts_programs: bool) -> (Effects, Vec<(&'static str,
             if *pat == "Command::new" && !starts_programs {
                 continue;
             }
+            // A function of the file's own by that name (`fn sleep(`) is not the call; `.open(x)`
+            // is a file only where the statement starts at a builder (`ReaderBuilder::new()`),
+            // not hpke's `ctx.open(ct, aad)` (FEEDBACK83.md, Q-1305; branch feedback82-85).
+            if word && code[..at].ends_with("fn ") {
+                continue;
+            }
+            if *pat == ".open(" {
+                let stmt = code[..at].rfind([';', '{', '}']).map_or(0, |i| i + 1);
+                if tb.get(from) == Some(&b')') || !code[stmt..at].contains("Builder") {
+                    continue;
+                }
+            }
             let ident = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_' || *c == b':';
             let s = at - code[..at].bytes().rev().take_while(ident).count();
-            let e = from + code[from..].bytes().take_while(ident).count();
+            // A pattern that ends at its `(` names the call without what it is given
+            // (`redis::Client::open`, not `redis::Client::open(url`).
+            let e = if pat.ends_with(['(', ')']) { from } else { from + code[from..].bytes().take_while(ident).count() };
             let call = code[s..e].trim_end_matches(['(', ':']).to_string();
+            if pat.starts_with("::") && RUST_NOT_FILES.iter().any(|n| call == *n || call.strip_suffix(n).is_some_and(|p| p.ends_with("::"))) {
+                continue;
+            }
             mask |= effect_bit(effect);
             if !found.iter().any(|(_, c, _): &(&str, String, u32)| *c == call) {
                 let line = code[..at].bytes().filter(|b| *b == b'\n').count() as u32 + 1;
@@ -1010,6 +1094,22 @@ fn scan_rust(bytes: &[u8]) -> Block {
         for (_, effect) in RUST_CRATES.iter().filter(|(k, _)| *k == name) {
             mask |= effect_bit(effect);
             calls.push((*effect, format!("the crate {}", name), 0));
+        }
+    }
+    // A crate's feature or call that does it (FEEDBACK83.md, Q-1305; branch feedback82-85).
+    for l in parsed.deps.lines() {
+        let Some((name, spec)) = l.split_once('=') else { continue };
+        let name = name.trim();
+        for (_, uses, effect) in RUST_CRATE_USES.iter().filter(|(k, _, _)| *k == name) {
+            let by = uses.iter().find(|u| match u.strip_prefix("feature:") {
+                Some(f) => spec.contains(&format!("\"{}\"", f)),
+                // `hash(`, not `legacy_django_hash(`.
+                None => code.match_indices(*u).any(|(at, _)| !u.as_bytes()[0].is_ascii_alphanumeric() || at == 0 || !(code.as_bytes()[at - 1].is_ascii_alphanumeric() || code.as_bytes()[at - 1] == b'_')),
+            });
+            if let Some(u) = by {
+                mask |= effect_bit(effect);
+                calls.push((*effect, format!("the crate {} ({})", name, u.trim_end_matches('(')), 0));
+            }
         }
     }
     b.found_effects = mask;
@@ -2241,5 +2341,98 @@ mod tests {
         assert_eq!(rust_effects("use std::process::Command;\nfn a() { Command::new(\"sh\"); }").0, effect_bit("run"));
         // A name that ends with another's is not it; raw strings and lifetimes pass.
         assert_eq!(rust_effects("fn a<'a>(x: &'a str) { my_fs::read(r#\"std::fs::\"#); }").0, 0);
+    }
+
+    // FEEDBACK83.md, Q-1305 (branch feedback82-85): what the review of the 632 catalog plugins
+    // found the reading missed or overstated, one test for each kind.
+
+    fn reads(code: &str) -> Vec<&'static str> {
+        effect_names(rust_effects(code).0)
+    }
+
+    /// A file with these dependency lines and this code, as `quillo confirm --effects` reads it.
+    fn reads_with(deps: &str, code: &str) -> Vec<&'static str> {
+        let header: String = deps.lines().map(|l| format!("//! {}\n", l)).collect();
+        let src = format!("//! version: 1.0.0\n//!\n//! [dependencies]\n{}\n{}", header, code);
+        effect_names(scan_rust(src.as_bytes()).found_effects)
+    }
+
+    #[test]
+    fn rust_read_a_wait_as_time() {
+        assert_eq!(reads("fn a() { std::thread::sleep(std::time::Duration::from_millis(5)); }"), vec!["time"]);
+        assert_eq!(reads("use std::thread::sleep;\nfn a() { sleep(D); }"), vec!["time"]);
+        assert_eq!(reads("async fn a() { tokio::time::sleep(D).await; }"), vec!["time"]);
+        // Its own function by that name, or one that ends with it, is not a wait.
+        assert!(reads("fn sleep(n: u8) -> u8 { n }\nfn a() { my_sleep(1); }").is_empty());
+    }
+
+    #[test]
+    fn rust_read_crates_that_do_it_unseen() {
+        assert_eq!(reads_with("uuid = { version = \"1\", features = [\"v4\"] }", "fn a() {}"), vec!["random"]);
+        assert_eq!(reads_with("uuid = { version = \"1\", features = [\"v7\"] }", "fn a() {}"), vec!["time", "random"]);
+        assert_eq!(reads_with("uuid = \"1\"", "fn a() -> String { uuid::Uuid::now_v7().to_string() }"), vec!["time", "random"]);
+        assert_eq!(reads_with("uuid = \"1\"", "fn a() -> String { Uuid::new_v4().to_string() }"), vec!["random"]);
+        // v5 is the same id for the same name: nothing.
+        assert!(reads_with("uuid = { version = \"1\", features = [\"v5\"] }", "fn a() { Uuid::new_v5(&N, b\"x\"); }").is_empty());
+        assert_eq!(reads_with("totp-rs = \"5\"", "fn a() { Secret::generate_secret(); }"), vec!["random"]);
+        assert_eq!(reads_with("bcrypt = \"0.15\"", "fn a() { bcrypt::hash(p, 12); }"), vec!["random"]);
+        assert!(reads_with("bcrypt = \"0.15\"", "fn legacy_django_hash() { bcrypt::verify(p, h); }").is_empty());
+        assert_eq!(reads_with("pasetors = \"0.7\"", "fn a() {}"), vec!["time", "random"]);
+        assert_eq!(reads_with("biscuit-auth = \"6\"", "fn a() { KeyPair::new(); }"), vec!["random"]);
+        assert_eq!(reads_with("biscuit-auth = \"6\"", "fn a() { AuthorizerBuilder::new().time().build(&t); }"), vec!["time"]);
+        assert_eq!(reads_with("age = \"0.11\"", "fn a() { age::x25519::Identity::generate(); }"), vec!["random"]);
+        assert_eq!(reads_with("captcha = \"0.0.9\"", "fn a() {}"), vec!["random"]);
+        assert_eq!(reads_with("sharks = \"0.5\"", "fn a() { Sharks(2).dealer(&d); }"), vec!["random"]);
+        assert_eq!(reads_with("bloomfilter = \"3\"", "fn a() {}"), vec!["random"]);
+        assert_eq!(reads_with("bson = \"2\"", "fn a() { ObjectId::new(); }"), vec!["time", "random"]);
+        assert_eq!(reads_with("icalendar = \"0.16\"", "fn a() {}"), vec!["time", "random"]);
+        assert_eq!(reads_with("epub-builder = \"0.8\"", "fn a() { b.generate(&mut out); }"), vec!["time", "random"]);
+        assert_eq!(reads_with("printpdf = \"0.7\"", "fn a() { PdfDocument::new(t, w, h, l); }"), vec!["time"]);
+        assert_eq!(reads_with("rusty-s3 = \"0.5\"", "fn a() { b.get_object(Some(&c), k).sign(d); }"), vec!["time"]);
+        assert_eq!(reads_with("pgp = \"0.21\"", "fn a() { m.sign(&k, p); }"), vec!["time"]);
+        assert_eq!(reads_with("feed-rs = \"2\"", "fn a() {}"), vec!["random"]);
+        assert_eq!(reads_with("lettre = \"0.11\"", "fn a() { Message::builder(); }"), vec!["time", "random", "net"]);
+        assert_eq!(reads_with("lettre = \"0.11\"", "fn a() {}"), vec!["net"]);
+        assert_eq!(reads_with("cuid2 = \"0.1\"", "fn a() {}"), vec!["time", "random"]);
+    }
+
+    #[test]
+    fn rust_read_a_hash_seed_as_random() {
+        assert_eq!(reads("fn a() { let s = std::collections::hash_map::RandomState::new(); }"), vec!["random"]);
+        assert_eq!(reads("fn a() { let s = RandomState::default(); }"), vec!["random"]);
+    }
+
+    #[test]
+    fn rust_read_a_builders_file() {
+        assert_eq!(reads("fn a(p: &str) { csv::ReaderBuilder::new().flexible(true).from_path(p); }"), vec!["fs"]);
+        assert_eq!(reads("fn a(p: &str) { let r = DbBuilder::new()\n    .cache(9)\n    .open(p); }"), vec!["fs"]);
+        // Not a builder's: hpke opens a message, a maze a cell.
+        assert!(reads("fn a() { let m = ctx.open(ct, aad); for n in g.open(c) {} }").is_empty());
+    }
+
+    #[test]
+    fn rust_read_a_name_looked_up_as_net() {
+        assert_eq!(reads("fn a(h: &str) { (h, 80).to_socket_addrs(); }"), vec!["net"]);
+        assert_eq!(reads("use std::net::ToSocketAddrs;\nfn a() {}"), vec!["net"]);
+    }
+
+    #[test]
+    fn rust_read_what_asks_about_a_path_as_fs() {
+        for code in ["Path::new(p).exists()", "Path::new(p).is_dir()", "p.is_file()", "p.metadata()", "p.read_dir()", "std::fs::metadata(p)", "fs::read_dir(p)", "p.canonicalize()", "p.try_exists()"] {
+            assert_eq!(reads(&format!("fn a() {{ {}; }}", code)), vec!["fs"], "{}", code);
+        }
+    }
+
+    #[test]
+    fn rust_read_constructors_that_take_no_file() {
+        assert!(reads("fn a(u: &str) { redis::Client::open(u); Client::open(u); }").is_empty());
+        assert!(reads("fn a() { Stemmer::create(Algorithm::English); SnippetGenerator::create(&s, &*q, f); mime_guess::from_path(n); }").is_empty());
+        // What does open or make a file still does.
+        for code in ["image::open(p)", "std::fs::File::open(p)", "hound::WavWriter::create(p, s)", "Database::create(p)", "shapefile::Writer::from_path(p, t)", "Tiff::open(p)"] {
+            assert_eq!(reads(&format!("fn a() {{ {}; }}", code)), vec!["fs"], "{}", code);
+        }
+        // A call is named without what it is given.
+        let b = scan_rust(b"//! effects: none\nfn a(p: &str) { image::open(p); }\n");
+        assert!(b.notes[0].1.contains("calls image::open (line 2)"), "{:?}", b.notes);
     }
 }
