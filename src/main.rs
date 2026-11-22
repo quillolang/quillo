@@ -68,7 +68,8 @@ usage:
   quillo mcp <file.qwe> [options]   serve the program's tools (`fn mcp`) to an AI
                                     client that starts it, over stdio (MCP
                                     2026-07-28): checked, its top level run, then
-                                    messages on stdin and stdout; no routes
+                                    messages on stdin and stdout; no routes,
+                                    unless --serve [--port N]
   quillo policy [<file.qwe>]        the policy the program would run under: its
                [--policy FILE]      layers, the places that had none, and each
                                     setting with the file it came from (exit 1:
@@ -187,7 +188,9 @@ is the page the window opens on (default /).
 `mcp` takes --env-file, --policy, --allow-path, --no-build, --drain and `-- a b`.
 Its stdout carries MCP's messages alone: `print` and the log go to stderr, and
 `stdin`, `read_line` and `exit` are refused. It ends when stdin closes, or on
-SIGTERM once the call in progress is answered (with --drain, at most that long).";
+SIGTERM once the call in progress is answered (with --drain, at most that long).
+With --serve [--port N] it serves the program's routes too, as `run` does, in the
+same process; it then stops as `run` does, stdin closing as SIGTERM.";
 
 // See quillo::alloc.
 #[global_allocator]
@@ -776,13 +779,27 @@ const MCP_OPTIONS: &[&str] = &["--env-file", "--policy", "--allow-path", "--no-b
 /// its top level run, as `quillo run` does it; then MCP's messages are read on stdin and answered
 /// on stdout, which carries nothing else. No routes are served, and there are no tokens: the user
 /// who starts it is the caller.
+/// `--serve [--port N]`: the routes too, as `quillo run` serves them, in the same process, the
+/// stdio door's caller still the user who started it: a tool that drives the program's own pages
+/// needed a `quillo run` beside it (FEEDBACK85.md, Q-1347; branch feedback82-85).
 fn mcp(file: &str, flags: &[String]) -> i32 {
+    let serve = flags.iter().any(|f| f == "--serve");
+    let flags: Vec<String> = flags.iter().filter(|f| *f != "--serve").cloned().collect();
+    let flags = &flags[..];
     let mut i = 0;
     while i < flags.len() {
         let f = flags[i].as_str();
+        if f == "--port" && serve {
+            i += 2;
+            continue;
+        }
+        if f == "--port" {
+            eprintln!("quillo: `--port` goes with `--serve`, which serves the program's routes beside its tools: quillo mcp {} --serve --port N", file);
+            return 2;
+        }
         if !MCP_OPTIONS.contains(&f) {
             if VALUE_OPTIONS.contains(&f) || FLAG_OPTIONS.contains(&f) || f == "-w" {
-                eprintln!("quillo: `{}` is not for `quillo mcp`, which serves no routes: it takes --env-file, --policy, --allow-path, --no-build and --drain", f);
+                eprintln!("quillo: `{}` is not for `quillo mcp`: it takes --env-file, --policy, --allow-path, --no-build and --drain, and --serve [--port N] to serve its routes too", f);
             } else if f.starts_with('-') {
                 eprintln!("quillo: unknown option `{}` for `mcp`{}", f, nearest(f, MCP_OPTIONS.iter()));
             } else {
@@ -794,7 +811,13 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
     }
     // First: from here on nothing but MCP's messages reaches the client's stdout.
     let mut out = quillo::mcp::take_stdout();
-    let _ = ctrlc::set_handler(quillo::mcp::stop_asked);
+    // Serving, a stop is `quillo run`'s: once the requests in progress and the call in progress are
+    // answered (see `serve_beside`).
+    if serve {
+        install_stop();
+    } else {
+        let _ = ctrlc::set_handler(quillo::mcp::stop_asked);
+    }
     let o = match run_options(flags) {
         Ok(o) => o,
         Err(code) => return code,
@@ -805,8 +828,14 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
     // Its `--allow-path` held to `[fs] paths`, and `[env] set` (FEEDBACK82.md, Q-1280; branch
     // feedback82-85).
     let mut o = o;
-    if let Err(code) = policy_run(&mut o, flags) {
+    // Serving, held as `quillo run` is: its workers and body too (FEEDBACK85.md, Q-1347).
+    if let Err(code) = if serve { policy_in_force(&mut o, flags) } else { policy_run(&mut o, flags) } {
         return code;
+    }
+    if serve && quillo::policy::get().run_forced("listen").is_some() {
+        let f = quillo::policy::get().origin_of("run.listen").map_or_else(|| "the policy".to_string(), |f| f.display().to_string());
+        eprintln!("quillo: the policy {} has the program listen on a Unix socket only (run.listen = \"unix\"), and `quillo mcp --serve` listens on a port: serve it with quillo run --listen unix:PATH", f);
+        return 2;
     }
     // The policy's limits, held as `run_program` holds them: how long a call may compute, and
     // how long a message may be (found in review: they were not read here).
@@ -837,6 +866,9 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
     }
     let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    if serve {
+        return serve_beside(path, stem, tools, o, out);
+    }
     quillo::service::serve_as(&stem);
     // stdin is the client's from the start: `stdin`, `read_line` and `exit` are refused as in any
     // program that serves, at the top level too, where one would take the client's first message.
@@ -858,6 +890,74 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
     let mut input = stdin.lock();
     quillo::mcp::serve_stdio(&door, &mut interp, &mut input, &mut *out)
 }
+
+/// `quillo mcp --serve`: the program loaded once, as `quillo run` loads it, its routes served on a
+/// thread of their own, and its tools answered on stdio by an interpreter of the same program, as
+/// a request's is: one program's data, one top level run. stdin closing stops it as SIGTERM stops
+/// `quillo run`: once the requests in progress are answered (`--drain` gives that a limit), and
+/// the call in progress (FEEDBACK85.md, Q-1347; branch feedback82-85).
+fn serve_beside(path: &Path, stem: String, tools: Vec<quillo::mcp::Tool>, mut o: RunOptions, mut out: Box<dyn std::io::Write + Send>) -> i32 {
+    // Checked once, above.
+    o.checked = true;
+    o.tools = Some(tools.clone());
+    let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
+    let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));
+    // stdin is the client's from the start, as on the door alone.
+    quillo::value::SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let app = match load(path, &o) {
+        Ok(Some(app)) => app,
+        Ok(None) => return 0,
+        Err(code) => return code,
+    };
+    let Some(mut interp) = app.fork_loaded() else { return 1 };
+    let listener = match std::net::TcpListener::bind(format!("{}:{}", host, port)) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("quillo: cannot listen on {}:{}: {}", host, port, e);
+            return 1;
+        }
+    };
+    stop_on_signal_with(None, None);
+    let workers = o.workers;
+    // The server ends once a stop has drained it; the process with it, once the door has answered
+    // the call in progress.
+    std::thread::Builder::new()
+        .name("quillo-serve".into())
+        .stack_size(quillo::server::WORKER_STACK)
+        .spawn(move || {
+            let code = match quillo::server::serve_bound(app, listener, workers) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("quillo: {}", e);
+                    1
+                }
+            };
+            quillo::mcp::stop_after_call();
+            while quillo::mcp::busy() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            with::stop_all();
+            std::process::exit(code.max(DOOR_CODE.load(std::sync::atomic::Ordering::SeqCst)));
+        })
+        .expect("a thread for the server");
+    quillo::value::HIDING.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut door = quillo::mcp::Door::of_program(path, stem, tools, false);
+    if let Some(b) = quillo::policy::get().max_body {
+        door.most = door.most.min(b);
+    }
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let code = quillo::mcp::serve_stdio(&door, &mut interp, &mut input, &mut *out);
+    DOOR_CODE.store(code, std::sync::atomic::Ordering::SeqCst);
+    // The client is gone: the routes stop as at SIGTERM, and the server's thread ends the process.
+    begin_stop(false);
+    loop {
+        std::thread::park();
+    }
+}
+
+/// How `quillo mcp --serve`'s stdio door ended, for the process's exit status.
+static DOOR_CODE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// `-h` or `--help` after a command (or a program's file), wherever it stands: the command's usage,
 /// on stdout, read before anything else, so that `run -h` needs no main.qwe and `lsp --help` starts

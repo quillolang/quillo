@@ -4405,6 +4405,15 @@ impl App {
         self.css.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
+    /// An interpreter of the program as it is loaded now, as a request's is: for `quillo mcp
+    /// --serve`'s stdio door, beside the routes (FEEDBACK85.md, Q-1347; branch feedback82-85).
+    pub fn fork_loaded(&self) -> Option<Interp> {
+        match &*self.current().1 {
+            Loaded::Ready(it) => Some(it.fork()),
+            Loaded::Failed(_) => None,
+        }
+    }
+
     /// What the program's interpreters share.
     pub fn shared(&self) -> Arc<Shared> {
         self.shared.clone()

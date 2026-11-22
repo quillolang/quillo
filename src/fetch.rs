@@ -21,6 +21,13 @@
 //! gives an error value; unless given, 10 s to connect and 60 s in all
 //! (`http.stream`: 300 s of silence). Any other option is an error, not
 //! ignored (FEEDBACK5.md, Q-049; branch stays-fixes).
+//! `save`: a path, held as `write_file`'s is, that a 2xx answer's body is
+//! written to as it arrives, through a file beside it that takes its place
+//! once the whole has come (so a failed call leaves what was there), at most
+//! `max_bytes` (64 MiB unless given); the call gives `{ status, ok, headers,
+//! file, bytes }`, and an answer that is not 2xx is not written, its text in
+//! `body`. It needs the fs effect as well (FEEDBACK85.md, Q-1342; branch
+//! feedback82-85).
 //!
 //! In a component, these run in the browser (src/client/runtime.js). While
 //! the server renders one, a call from its code is a mistake: it would be
@@ -81,8 +88,35 @@ struct Opts {
 
 const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0, timeout_ms: 0, tls: 0, same_origin: false };
 
-/// The options there are; `http.stream`'s map also has its request's.
-const OPTION_NAMES: &[&str] = &["redirects", "public_only", "cache", "timeout", "ca", "cert", "key"];
+/// The options there are; `http.stream`'s map also has its request's. `save`, a file to write the
+/// answer's body to, with `max_bytes`, the most it writes: the others' alone, as `http.stream`
+/// hands its answer over as it arrives (FEEDBACK85.md, Q-1342; branch feedback82-85).
+pub(crate) const OPTION_NAMES: &[&str] = &["redirects", "public_only", "cache", "timeout", "ca", "cert", "key", "save", "max_bytes"];
+
+/// Where a call's options are among its arguments, by its name.
+fn options_at(name: &str) -> Option<usize> {
+    match name {
+        "http.get" | "http.delete" => Some(2),
+        "http.post" | "http.put" | "http.patch" => Some(3),
+        "http.request" => Some(4),
+        _ => None,
+    }
+}
+
+/// Whether a call written as `args` (`piped` of its arguments given by a pipe, not written) says
+/// `save`, for `quillo check`: it writes a file, and needs the fs effect as well as http
+/// (FEEDBACK85.md, Q-1342; branch feedback82-85).
+pub(crate) fn save_written(name: &str, args: &[crate::ast::Expr], piped: usize) -> bool {
+    use crate::ast::{Expr, Lit};
+    let at = options_at(name).and_then(|i| i.checked_sub(piped)).and_then(|i| args.get(i));
+    matches!(at, Some(Expr::Map(fields)) if fields.iter().any(|(k, v)| k == "save" && !matches!(v, Expr::Lit(Lit::Nil))))
+}
+
+/// Whether a call says `save`, as it runs: the fs effect too (FEEDBACK85.md, Q-1342; branch
+/// feedback82-85).
+pub(crate) fn saves(name: &str, args: &[Value]) -> bool {
+    matches!(options_at(name).and_then(|i| args.get(i)), Some(Value::Map(m)) if m.get("save").is_some_and(|v| !matches!(v, Value::Nil)))
+}
 /// What `ca`, `cert` and `key` named, each set once, so that `Opts` stays a plain value: a CA
 /// file (or "system") to trust instead of the bundled ones, and a certificate and its key to
 /// present, as some banks' and governments' APIs ask (FEEDBACK36.md, Q-442; branch feedback36-39).
@@ -195,7 +229,10 @@ const MAX_TIMEOUT_SECS: f64 = 300.0;
 /// The longest `cache`: a day.
 const MAX_CACHE_SECS: i64 = 86_400;
 
-fn opts_of(v: Option<&Value>, fname: &str, line: u32, base: &std::path::Path) -> Result<Opts, Ctrl> {
+/// `saving`: set when the options say `save` or `max_bytes`, found by their names as the keys are
+/// looked over, so that a call without them looks nothing up for them (FEEDBACK85.md, Q-1342;
+/// branch feedback82-85).
+fn opts_of(v: Option<&Value>, fname: &str, line: u32, base: &std::path::Path, saving: &mut bool) -> Result<Opts, Ctrl> {
     let m = match v {
         None | Some(Value::Nil) => return Ok(DEFAULT_OPTS),
         Some(Value::Map(m)) => m,
@@ -228,8 +265,15 @@ fn opts_of(v: Option<&Value>, fname: &str, line: u32, base: &std::path::Path) ->
         Some(s) => return fail(line, format!("`{}`: `timeout` is seconds, more than 0 and up to {}, got {}", fname, MAX_TIMEOUT_SECS, s)),
     };
     let stream = fname == "http.stream";
+    *saving = m.keys().any(|k| matches!(k.as_ref(), "save" | "max_bytes"));
+    if stream && *saving {
+        if let Some(k) = ["save", "max_bytes"].into_iter().find(|k| m.get(*k).is_some()) {
+            return fail(line, format!("`http.stream`: `{}` is for the calls that read an answer whole (http.get and the others): http.stream hands it over as it arrives", k));
+        }
+    }
     if let Some(k) = m.keys().map(|k| k.as_ref()).find(|k| !OPTION_NAMES.contains(k) && !(stream && STREAM_NAMES.contains(k))) {
-        let known = if stream { [STREAM_NAMES, OPTION_NAMES].concat() } else { OPTION_NAMES.to_vec() };
+        // `save` and `max_bytes` are not `http.stream`'s (FEEDBACK85.md, Q-1342; branch feedback82-85).
+        let known = if stream { [STREAM_NAMES, OPTION_NAMES].concat().into_iter().filter(|k| !matches!(*k, "save" | "max_bytes")).collect() } else { OPTION_NAMES.to_vec() };
         return fail(line, format!("`{}`: unknown option `{}` (the options are {})", fname, k, known.join(", ")));
     }
     // Files are named from the program's folder, as `read_file` names them.
@@ -666,6 +710,14 @@ fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Op
     // Those set on the way first, so that the last answer's have the last word.
     passed.extend(last);
     let cookies = passed;
+    let body = read_text(o, &url, reader, most)?;
+    Ok(Reply { status, headers, cookies, body })
+}
+
+/// An answer's body read whole, as its text, held to `most` (`send`'s, and `save`'s for an answer
+/// it does not write: FEEDBACK85.md, Q-1342; branch feedback82-85).
+fn read_text(o: Opts, url: &str, reader: Body, most: u64) -> Result<String, Unsent> {
+    let url = url.to_string();
     // A site's call reads the same way, as it is made here (FEEDBACK75.md, Q-1072; branch
     // feedback75).
     let bytes = match read_whole(reader, most) {
@@ -686,12 +738,157 @@ fn send(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Op
     // security).
     // Text that is UTF-8 is the buffer itself, not a copy of it (FEEDBACK75.md, Q-1072; branch
     // feedback75).
-    let body = if most < MAX_BODY {
+    Ok(if most < MAX_BODY {
         crate::value::lossy_held(bytes).map_err(|_| Unsent::OverMemory)?
     } else {
         String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+    })
+}
+
+/// Where `save` writes a call's answer: the file, as the program named it, and the most it writes.
+struct SaveTo {
+    full: std::path::PathBuf,
+    shown: String,
+    most: u64,
+}
+
+/// `save` and `max_bytes` of a call's options: the file judged as `write_file` judges one (the
+/// program's folder, or one `--allow-path` named; none of the program's own files), or the error
+/// value that says why not (FEEDBACK85.md, Q-1342; branch feedback82-85).
+fn save_to(it: &Interp, fname: &str, opts: Option<&Value>, o: Opts, line: u32) -> Result<Result<Option<SaveTo>, Value>, Ctrl> {
+    let Some(Value::Map(m)) = opts else { return Ok(Ok(None)) };
+    let most = match m.get("max_bytes") {
+        None | Some(Value::Nil) => None,
+        Some(Value::Int(n)) if *n > 0 => Some(*n as u64),
+        Some(other) => return fail(line, format!("`{}`: `max_bytes` is the most bytes `save` writes, a whole number more than 0, got {}", fname, other.display())),
     };
-    Ok(Reply { status, headers, cookies, body })
+    let p = match m.get("save") {
+        None | Some(Value::Nil) if most.is_some() => {
+            return fail(line, format!("`{}`: `max_bytes` goes with `save`; an answer read whole is held to {} MiB", fname, MAX_BODY >> 20));
+        }
+        None | Some(Value::Nil) => return Ok(Ok(None)),
+        Some(Value::Str(s) | Value::Css(s)) if !s.is_empty() => s.to_string(),
+        Some(other) => return fail(line, format!("`{}`: `save` is the path of the file to write the answer to, got {}", fname, other.repr())),
+    };
+    if o.cache > 0 {
+        return fail(line, format!("`{}`: `cache` keeps answers in memory and `save` writes one to its file: one or the other", fname));
+    }
+    let said = |why: String| Ok(Err(Value::err(Value::str(format!("{}: save: {}", fname, why)))));
+    let Some(full) = crate::builtins::local_path(it, &p) else {
+        return said(format!("path must stay inside the program's folder: {}{}", p, crate::builtins::way_out(&p, "write")));
+    };
+    if let Some(why) = crate::builtins::own_file(it, &full, false) {
+        return said(format!("will not write {}: {}", p, why));
+    }
+    if full.is_dir() {
+        return said(format!("{} is a folder", p));
+    }
+    Ok(Ok(Some(SaveTo { full, shown: p, most: most.unwrap_or(MAX_BODY) })))
+}
+
+/// A call whose answer is saved: an answer of 2xx written to its file, through a file beside it
+/// that takes its place when the whole has arrived (the bytes it wrote), so the file is never half
+/// one answer; any other answer read as its text, as without `save`, and no file written
+/// (FEEDBACK85.md, Q-1342; branch feedback82-85).
+fn send_saved(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<(String, Vec<u8>)>, most: u64, to: &SaveTo) -> Result<(Reply, Option<u64>), Unsent> {
+    let mut passed = Vec::new();
+    let (url, resp) = follow(o, false, method, url, headers, body, &mut passed)?;
+    let (status, headers, last, reader) = head_of(o, &url, method, resp)?;
+    passed.extend(last);
+    if !(200..300).contains(&status) {
+        let body = read_text(o, &url, reader, most)?;
+        return Ok((Reply { status, headers, cookies: passed, body }, None));
+    }
+    let n = write_answer(o, &url, reader, to).map_err(Unsent::Said)?;
+    Ok((Reply { status, headers, cookies: passed, body: String::new() }, Some(n)))
+}
+
+/// The files a save of this name left beside it when its process ended as it wrote (a crash, a
+/// SIGKILL), each up to its `max_bytes`: `stem` and 16 hex digits and `.part`, older than the
+/// longest a call may take, removed (found in review of FEEDBACK85.md, Q-1342; branch
+/// feedback82-85).
+fn stale_parts(dir: &std::path::Path, stem: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let ceiling = Duration::from_secs(MAX_TIMEOUT_SECS as u64 * 2);
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(stem)).and_then(|r| r.strip_suffix(".part")) else { continue };
+        if rest.len() != 16 || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let old = e.metadata().ok().filter(|m| m.is_file()).and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|age| age > ceiling);
+        if old {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// The answer's bytes written to `to.full`, `to.most` at most, 64 KiB held at a time: into a new
+/// file beside it (its name begun with a dot, which `files` does not serve), made by this call
+/// alone, then moved into its place. One that fails, or goes past the most, is removed, and a
+/// file that was there stays as it was.
+fn write_answer(o: Opts, url: &str, mut reader: Body, to: &SaveTo) -> Result<u64, String> {
+    use std::io::Write;
+    let said = |e: std::io::Error| format!("save: {}: {}", to.shown, e);
+    let dir = to.full.parent().map(std::path::Path::to_path_buf).unwrap_or_default();
+    std::fs::create_dir_all(&dir).map_err(said)?;
+    let name = to.full.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    // Short enough for a name, whatever the file's is.
+    let mut cut = name.len().min(180);
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let stem = format!(".{}.", &name[..cut]);
+    stale_parts(&dir, &stem);
+    let (part, mut f) = loop {
+        let part = dir.join(format!("{}{:016x}.part", stem, fastrand::u64(..)));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&part) {
+            Ok(f) => break (part, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(said(e)),
+        }
+    };
+    // The file it replaces keeps its mode: a 0600 file was made 0644, and one run lost its `x`
+    // (found in review).
+    // Only its read, write and run bits: never setuid, setgid or sticky, which would make the
+    // downloaded bytes run as the file's owner where the process may keep them (as root in a
+    // container) (FEEDBACK85.md, Q-1342, found in the second review; branch feedback82-85).
+    if let Ok(m) = std::fs::metadata(&to.full) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(m.permissions().mode() & 0o777));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = f.set_permissions(m.permissions());
+        }
+    }
+    let written = (|| -> Result<u64, String> {
+        let mut buf = vec![0u8; 64 << 10];
+        let mut total = 0u64;
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(timed_out(o, url, e.to_string())),
+            };
+            if total + n as u64 > to.most {
+                return Err(format!("{}: the answer is longer than {} bytes, the most `save` writes (say more with max_bytes)", url, to.most));
+            }
+            f.write_all(&buf[..n]).map_err(said)?;
+            total += n as u64;
+        }
+        f.sync_all().map_err(said)?;
+        Ok(total)
+    })();
+    drop(f);
+    let done = written.and_then(|n| std::fs::rename(&part, &to.full).map(|()| n).map_err(said));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    done
 }
 
 /// A `site`'s call (src/sites.rs), `POST url` with `body` as JSON, made as every call here is:
@@ -985,7 +1182,8 @@ fn keep(key: String, secs: u32, reply: &Reply) {
 
 fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Value, headers: &Value, opts: Option<&Value>, line: u32) -> R {
     not_in_component(it, fname, line)?;
-    let o = opts_of(opts, fname, line, &it.base_dir.clone())?;
+    let mut saving = false;
+    let o = opts_of(opts, fname, line, &it.base_dir.clone(), &mut saving)?;
     if o.cache > 0 && method != "GET" {
         return fail(line, format!("`{}`: `cache` keeps the answers of GET requests, not {}", fname, method));
     }
@@ -1010,6 +1208,35 @@ fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Va
             Err(e) => return Ok(e),
         },
     };
+    // Written to a file (FEEDBACK85.md, Q-1342; branch feedback82-85): looked at only when the
+    // options name it.
+    if saving {
+        let to = match save_to(it, fname, opts, o, line)? {
+            Ok(to) => to,
+            Err(e) => return Ok(e),
+        };
+        if let Some(to) = to {
+            let (method, url) = (method.to_string(), url.to_string());
+            let most = body_room();
+            let res = it.unlocked(move || send_saved(o, &method, &url, &hdrs, payload, most, &to).map(|r| (r, to.shown)));
+            let ((reply, bytes), shown) = match res {
+                Ok(r) => r,
+                Err(Unsent::OverMemory) => return Err(crate::httpd::OverMemory.at(line)),
+                Err(Unsent::Said(e)) => return Ok(Value::err(Value::str(format!("http: {}", e)))),
+            };
+            let mut m = Map::new();
+            m.insert("status".into(), Value::Int(reply.status as i64));
+            m.insert("ok".into(), Value::Bool((200..300).contains(&reply.status)));
+            m.insert("headers".into(), Value::map(reply.headers.into_iter().map(|(k, v)| (k.into(), Value::str(v))).collect()));
+            m.insert("file".into(), if bytes.is_some() { Value::str(shown) } else { Value::Nil });
+            m.insert("bytes".into(), Value::Int(bytes.unwrap_or(0) as i64));
+            // An answer not saved says why in its own words.
+            if bytes.is_none() {
+                m.insert("body".into(), Value::str(reply.body));
+            }
+            return Ok(Value::map(m));
+        }
+    }
     let key = (o.cache > 0).then(|| cache_key(o, method, url, &hdrs, payload.as_ref()));
     let reply = match key.as_deref().and_then(cached) {
         Some(r) => r,
@@ -1270,7 +1497,7 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Ok(Value::err(Value::str(format!("http: not an http(s) URL: {}", url))));
     }
-    let o = opts_of(Some(&Value::Map(opts.clone())), "http.stream", line, &it.base_dir.clone())?;
+    let o = opts_of(Some(&Value::Map(opts.clone())), "http.stream", line, &it.base_dir.clone(), &mut false)?;
     if o.cache > 0 {
         return fail(line, "`http.stream`: `cache` keeps whole answers, of `http.get`");
     }

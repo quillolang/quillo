@@ -417,6 +417,13 @@ struct Fault {
     data: Option<J>,
 }
 
+/// What a request without `_meta`'s version and capabilities is told: both keys, with the version
+/// this door speaks and an empty map of capabilities, as they are written in a request
+/// (FEEDBACK85.md, Q-1346; branch feedback82-85).
+fn meta_wanted() -> String {
+    format!("Invalid params: `_meta` must carry `io.modelcontextprotocol/protocolVersion` (\"{}\") and `io.modelcontextprotocol/clientCapabilities` ({{}})", PROTOCOL)
+}
+
 fn fault(code: i64, message: impl Into<String>) -> Fault {
     Fault { code, message: message.into(), data: None }
 }
@@ -630,7 +637,9 @@ impl Door {
             return Err(unsupported(v));
         }
         if version.is_none() || !meta.and_then(|m| m.get("io.modelcontextprotocol/clientCapabilities")).is_some_and(J::is_object) {
-            return Err(fault(INVALID_PARAMS, "Invalid params: `_meta` carries io.modelcontextprotocol/protocolVersion and io.modelcontextprotocol/clientCapabilities"));
+            // Both keys and what they hold, to copy: "carries" read as a word of what was sent
+            // (FEEDBACK85.md, Q-1346; branch feedback82-85).
+            return Err(fault(INVALID_PARAMS, meta_wanted()));
         }
         // What the client can do for the user: show a form (client/elicitation, Capabilities: an
         // empty `elicitation` is form mode; one of `url` alone is not).
@@ -2380,6 +2389,18 @@ pub fn take_stdout() -> Box<dyn std::io::Write + Send> {
         }
     }
     Box::new(std::io::stdout())
+}
+
+/// Whether the door is answering a message, from its first byte read until its answer is out:
+/// `quillo mcp --serve` ends once it is not (FEEDBACK85.md, Q-1347; branch feedback82-85).
+pub fn busy() -> bool {
+    BUSY.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The door ends after the call in progress, rather than reading another (FEEDBACK85.md, Q-1347;
+/// branch feedback82-85).
+pub fn stop_after_call() {
+    STOP.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// SIGTERM or Ctrl-C (`ctrlc`'s handler): before the door reads, and the second time, the process

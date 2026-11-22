@@ -177,6 +177,10 @@ pub struct Lexer {
     /// function declared under them says it does (see `doc_above`; FEEDBACK56.md, Q-854; branch
     /// feedback56). Shared by the lexer's clones, as `plain_dollars` is.
     comments: Arc<std::sync::Mutex<std::collections::HashMap<u32, Option<String>>>>,
+    /// The line of a string begun right after an empty one, `"""` or `'''`, Python's text over
+    /// several lines, which is `""` and then another: for the parser to say what is meant
+    /// (FEEDBACK85.md, Q-1345; branch feedback82-85).
+    pub triple: Option<u32>,
 }
 
 impl Lexer {
@@ -205,7 +209,7 @@ impl Lexer {
             // Q-529; branch feedback40-43).
             chars.push(if c == '\r' { '\n' } else { c });
         }
-        Lexer { chars: Arc::new(chars), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None, unclosed: None, plain_dollars: Default::default(), comments: Default::default() }
+        Lexer { chars: Arc::new(chars), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None, unclosed: None, plain_dollars: Default::default(), comments: Default::default(), triple: None }
     }
 
     /// A `//` comment just read, from `start` to here on `line`: noted when it starts its line
@@ -475,6 +479,9 @@ impl Lexer {
             }
             Tok::Ident(w)
         } else if c == '"' || c == '\'' {
+            if self.pos >= 2 && self.chars[self.pos - 1] == c && self.chars[self.pos - 2] == c && matches!(&self.last, Some(Tok::Str(p)) if matches!(p.as_slice(), [StrPart::Lit(t)] if t.is_empty())) {
+                self.triple = Some(line);
+            }
             Tok::Str(self.lex_string()?)
         } else if c == '`' {
             Tok::Str(self.lex_template()?)

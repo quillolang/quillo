@@ -2781,7 +2781,8 @@ fn c1_protocol_errors_have_their_codes() {
         assert_eq!(door.refusal(&request(json!(8), "tools/list", json!({ "cursor": cursor }))), (Some(json!(8)), invalid_params, "Invalid cursor".into()));
     }
     // `_meta`'s version and capabilities, on every request.
-    let meta_said = "Invalid params: `_meta` carries io.modelcontextprotocol/protocolVersion and io.modelcontextprotocol/clientCapabilities";
+    // Both keys and their values, since FEEDBACK85.md, Q-1346 (branch feedback82-85).
+    let meta_said = "Invalid params: `_meta` must carry `io.modelcontextprotocol/protocolVersion` (\"2026-07-28\") and `io.modelcontextprotocol/clientCapabilities` ({})";
     for line in [
         r#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#.to_string(),
         r#"{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}"#.to_string(),
@@ -3035,8 +3036,10 @@ fn c1_a_program_that_does_not_check_does_not_start() {
     // `run`'s options about serving are not `mcp`'s (`--drain` is: the user's graceful stop,
     // 2026-11-09; branch feedback56).
     for (args, said) in [
-        (&["main.qwe", "--port", "1"][..], "quillo: `--port` is not for `quillo mcp`, which serves no routes: it takes --env-file, --policy, --allow-path, --no-build and --drain\n"),
-        (&["--watch", "main.qwe"], "quillo: `--watch` is not for `quillo mcp`, which serves no routes: it takes --env-file, --policy, --allow-path, --no-build and --drain\n"),
+        // `--port` goes with `--serve` since FEEDBACK85.md, Q-1347 (decided by the user, 2026-11-22;
+        // branch feedback82-85), which the words name.
+        (&["main.qwe", "--port", "1"][..], "quillo: `--port` goes with `--serve`, which serves the program's routes beside its tools: quillo mcp main.qwe --serve --port N\n"),
+        (&["--watch", "main.qwe"], "quillo: `--watch` is not for `quillo mcp`: it takes --env-file, --policy, --allow-path, --no-build and --drain, and --serve [--port N] to serve its routes too\n"),
         (&["main.qwe", "--bogus"], "quillo: unknown option `--bogus` for `mcp`\n"),
         (&["main.qwe", "--env-fil", "x"], "quillo: unknown option `--env-fil` for `mcp` (did you mean `--env-file`?)\n"),
         (&["main.qwe", "other.qwe"], "quillo: unknown argument `other.qwe`: `mcp` takes one program; its own arguments go after `--`\n"),

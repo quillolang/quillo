@@ -3029,6 +3029,10 @@ struct Checker {
     /// `url_fixed`), as `sql_vars` is kept, and the next one's.
     url_vars: Vec<(usize, String, bool)>,
     next_url: bool,
+    /// The top level's variables that hold only what `env()` and text written in the program make,
+    /// by name, with the variables of the environment they read: the operator's settings, which a
+    /// visitor does not choose (FEEDBACK85.md, Q-1348; branch feedback82-85).
+    url_env: HashMap<String, Vec<String>>,
     /// The ticks (`true`) and jobs the top level adds, by name, with where and on what path
     /// (FEEDBACK55.md, Q-803; branch feedback55).
     job_names: HashMap<(bool, String), Vec<JobSeen>>,
@@ -3225,6 +3229,7 @@ impl Checker {
             next_sql: SqlVar::Other,
             url_vars: Vec::new(),
             next_url: false,
+            url_env: HashMap::new(),
             job_names: HashMap::new(),
             path: Vec::new(),
             branches: 0,
@@ -3579,6 +3584,11 @@ impl Checker {
                                 // Q-1095; branch feedback75).
                                 let msg = if self.confined { unquoted_native(&msg) } else { msg };
                                 self.diag_at(fname.clone(), l, Severity::Warning, msg);
+                            }
+                            // A function's effects line wider than its file's (FEEDBACK85.md, Q-1344;
+                            // branch feedback82-85).
+                            for (l, msg) in &parsed.errors {
+                                self.diag_at(fname.clone(), *l, Severity::Error, msg.clone());
                             }
                             let short = full.file_name().map_or(String::new(), |f| f.to_string_lossy().to_string());
                             if let Some(names) = names {
@@ -3979,6 +3989,9 @@ impl Checker {
                             }
                             let u = self.url_fixed(e);
                             self.url_vars.push((0, n.to_string(), u));
+                            if let Some(names) = self.env_only(e).filter(|names| !names.is_empty()) {
+                                self.url_env.insert(n.to_string(), names);
+                            }
                         }
                     }
                     for (n, t, sig) in binds {
@@ -10071,12 +10084,18 @@ impl Checker {
         };
         if let (false, Some(Expr::Map(fields))) = (piped, opts_at.and_then(|i| args.get(i))) {
             for (k, _) in fields {
-                if !["redirects", "public_only", "cache", "timeout", "ca", "cert", "key"].contains(&k.as_str()) {
-                    self.error(format!("`http.{}`: unknown option `{}` (the options are redirects, public_only, cache, timeout, ca, cert, key)", f, k));
+                // And `save` with its `max_bytes` (FEEDBACK85.md, Q-1342; branch feedback82-85).
+                if !crate::fetch::OPTION_NAMES.contains(&k.as_str()) {
+                    self.error(format!("`http.{}`: unknown option `{}` (the options are {})", f, k, crate::fetch::OPTION_NAMES.join(", ")));
                 }
             }
         }
         if let Some(c) = self.in_component() {
+            // A file written is the server's (FEEDBACK85.md, Q-1342; branch feedback82-85).
+            if !piped && crate::fetch::save_written(&format!("http.{}", f), args, 0) {
+                self.error(format!("`http.{}` in <{}> runs in the browser, which writes no file of the server's: `save` is for a `server fn`", f, c));
+                return;
+            }
             let (nested, init) = self.fns.last().map_or((false, false), |x| (x.nested, x.state_init));
             if !nested || init {
                 self.error(format!(
@@ -10102,7 +10121,19 @@ impl Checker {
             None => false,
         };
         if let Some(url) = args.get(url_at) {
-            if !says && !self.url_fixed(url) {
+            // The operator's setting, not a visitor's: said as that (FEEDBACK85.md, Q-1348; branch
+            // feedback82-85).
+            let operator = if !says && !self.url_fixed(url) { self.env_only(url).filter(|names| !names.is_empty()) } else { None };
+            if let Some(names) = operator {
+                let named: Vec<String> = names.iter().map(|n| format!("`{}`", n)).collect();
+                self.warn(format!(
+                    "the host `http.{}` goes to comes from {}, the operator's setting{}: say {{ public_only: false }} as its options if it is \
+                     meant to reach this machine or its network (or public_only: true, if not)",
+                    f,
+                    named.join(" and "),
+                    if names.len() == 1 { "" } else { "s" }
+                ));
+            } else if !says && !self.url_fixed(url) {
                 self.warn(format!(
                     "the host `http.{}` goes to comes from a value: if a visitor can choose it, they can reach this \
                      server's own network (localhost, a cloud's metadata service). Pass {{ public_only: true }} as its options \
@@ -10133,6 +10164,61 @@ impl Checker {
             Expr::If(_, a, b) => self.url_fixed(a) && b.as_deref().map_or(true, |b| self.url_fixed(b)),
             Expr::Match(_, arms, _) => arms.iter().all(|a| self.url_fixed(&a.body)),
             Expr::Block(stmts) => matches!(stmts.last(), Some(Stmt::Expr(e)) if self.url_fixed(e)),
+            _ => false,
+        }
+    }
+
+    /// The variables of the environment `e` reads, when it holds nothing but what `env()` with a
+    /// name written in the program and text written in it make (and their text's own methods, as
+    /// `replace("/v1", "")`); None when anything else goes into it (FEEDBACK85.md, Q-1348; branch
+    /// feedback82-85).
+    fn env_only(&self, e: &Expr) -> Option<Vec<String>> {
+        let mut names = Vec::new();
+        self.env_into(e, &mut names, 0).then_some(names)
+    }
+
+    fn env_into(&self, e: &Expr, names: &mut Vec<String>, depth: usize) -> bool {
+        // Deep text is not a setting's; and a deep tree is no stack's end.
+        if depth > 32 {
+            return false;
+        }
+        let mut add = |n: &str| {
+            if !names.iter().any(|x| x == n) {
+                names.push(n.to_string());
+            }
+        };
+        match e {
+            Expr::Lit(Lit::Str(_)) => true,
+            Expr::Ident(n, _) => match self.url_env.get(n.as_str()) {
+                // A local of that name hides the top level's.
+                Some(found) if !self.is_local(n) => {
+                    for x in found {
+                        add(x);
+                    }
+                    true
+                }
+                _ => false,
+            },
+            Expr::Call(f, args, _) => match &**f {
+                Expr::Ident(n, _) if n == "env" && !self.is_local(n) => match args.as_slice() {
+                    [Expr::Lit(Lit::Str(name)), rest @ ..] if rest.len() <= 1 => {
+                        add(name);
+                        rest.iter().all(|x| self.env_into(x, names, depth + 1))
+                    }
+                    _ => false,
+                },
+                Expr::Field(base, m, _) if matches!(m.as_str(), "trim" | "lower" | "upper" | "replace") => {
+                    self.env_into(base, names, depth + 1) && args.iter().all(|x| self.env_into(x, names, depth + 1))
+                }
+                _ => false,
+            },
+            Expr::Template(parts) => parts.iter().all(|p| match p {
+                TPart::Lit(_) => true,
+                TPart::Expr(x) => self.env_into(x, names, depth + 1),
+            }),
+            Expr::Binary(BinOp::Add, a, b, _) | Expr::Coalesce(a, b) => self.env_into(a, names, depth + 1) && self.env_into(b, names, depth + 1),
+            Expr::Field(base, _, _) => self.env_into(base, names, depth + 1),
+            Expr::Map(fields) => fields.iter().all(|(_, x)| self.env_into(x, names, depth + 1)),
             _ => false,
         }
     }
@@ -10966,7 +11052,12 @@ impl Checker {
             Some(f) => (f.allowed, f.restrictor.clone()),
             None => (crate::policy::ceiling(), None),
         };
-        let needs = if sig.builtin { sig.effects.unwrap_or(0) } else { sig.effects.unwrap_or(0) };
+        let mut needs = if sig.builtin { sig.effects.unwrap_or(0) } else { sig.effects.unwrap_or(0) };
+        // An answer saved to a file writes one: fs too, as `write_file` needs (FEEDBACK85.md,
+        // Q-1342; branch feedback82-85).
+        if sig.builtin && crate::fetch::save_written(&sig.name, arg_exprs, args.len().saturating_sub(arg_exprs.len())) {
+            needs |= crate::ast::effect_bit("fs");
+        }
         if needs & !allowed != 0 && needs == ALL_EFFECTS && sig.native.is_some() {
             let msg = crate::native::undeclared(name, sig.native.as_deref().unwrap_or(""), restrictor.as_ref().map(|(f, _)| f.as_str()));
             self.error(msg);
@@ -13998,6 +14089,9 @@ impl<'a, 'c> GetWalk<'a, 'c> {
                         match full.as_str() {
                             f if f.starts_with("db.") => self.db(name, first, f, line),
                             "http.post" | "http.put" | "http.patch" | "http.delete" | "image.convert" | "notification.send" => self.write(format!("`{}`", full), line),
+                            // An answer saved writes a file, as `write_file` does (FEEDBACK85.md,
+                            // Q-1342, found in review; branch feedback82-85).
+                            "http.get" | "http.request" if crate::fetch::save_written(&full, args, usize::from(piped.is_some())) => self.write(format!("`{}` with `save`", full), line),
                             "http.request" => {
                                 if let Some(Expr::Lit(Lit::Str(method))) = first.map(|f| self.text_of(f)) {
                                     if !["GET", "HEAD", "OPTIONS"].iter().any(|g| method.eq_ignore_ascii_case(g)) {

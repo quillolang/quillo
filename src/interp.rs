@@ -99,6 +99,10 @@ pub(crate) const CHANGES: &[&str] = &[
 pub(crate) fn changes_as_called(name: &str, args: &[Value]) -> bool {
     let reads = |m: &Value| matches!(m, Value::Str(m) if ["GET", "HEAD", "OPTIONS"].iter().any(|r| m.trim().eq_ignore_ascii_case(r)));
     match name {
+        // An answer saved writes a file, as `write_file` does: a prefetch, a hover's guess or a
+        // move in place saved it as the visitor (FEEDBACK85.md, Q-1342, found in review; branch
+        // feedback82-85).
+        "http.get" | "http.request" if crate::fetch::saves(name, args) => true,
         "http.request" => !args.first().is_some_and(reads),
         // As `fetch::stream` reads it: the method given, else POST with a body, else GET.
         "http.stream" => match args.get(2) {
@@ -6115,7 +6119,11 @@ impl Interp {
 
     #[cold]
     fn check_builtin_effect(&self, name: &str, args: &[Value], line: u32) -> Result<(), Ctrl> {
-        let need = builtin_effect(name);
+        let mut need = builtin_effect(name);
+        // An answer saved to a file writes one (FEEDBACK85.md, Q-1342; branch feedback82-85).
+        if name.starts_with("http.") && crate::fetch::saves(name, args) {
+            need |= crate::ast::effect_bit("fs");
+        }
         if need & !self.allowed != 0 {
             if need == ALL_EFFECTS && name.starts_with("native:") {
                 return fail(line, crate::native::undeclared(crate::native::display_name(name), &crate::native::file_of(name), self.restrictor.as_ref().map(|f| f.name.as_str())));
@@ -6125,7 +6133,13 @@ impl Interp {
             if let ("__site_call", [Value::Map(m), Value::Str(f), ..]) = (name, args) {
                 return fail(line, self.effect_denied(&format!("{}.{}", m.get("$site").map_or(String::new(), |s| s.display()), f), need));
             }
-            return fail(line, self.effect_denied(name, need));
+            // A plugin's function by its name, and what is missing of what it needs: since a
+            // function may say less than its file, `with fs` around one that needs `fs, net` is
+            // told of `net` (FEEDBACK85.md, Q-1342 and Q-1344; branch feedback82-85).
+            if name.starts_with("native:") {
+                return fail(line, self.effect_denied(crate::native::display_name(name), need & !self.allowed));
+            }
+            return fail(line, self.effect_denied(name, if name.starts_with("http.") { need & !self.allowed } else { need }));
         }
         Ok(())
     }

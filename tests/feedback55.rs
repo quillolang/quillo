@@ -3220,8 +3220,9 @@ fn files_judges_a_link_by_where_it_leads() {
     for f in ["public/docs", "public/docs2", "public/sub", "public/.well-known", "pub2", "conf", ".git"] {
         std::fs::create_dir_all(d.join(f)).unwrap();
     }
-    // A folder `--allow-path` names: an index there through a link is not served by `files`, as a
-    // link there named itself is not; `file` serves it, named on purpose.
+    // A folder `--allow-path` names: served by `files` through a link, as by `file`, since
+    // FEEDBACK85.md, Q-1340 (the user's decision 2026-11-22, as its suggestion; branch
+    // feedback82-85); before, `files` refused it with no word whatever `--allow-path` said.
     let outside = support::temp_dir("feedback55-links-outside");
     std::fs::write(outside.join("out.html"), "outside page").unwrap();
     link(&outside.join("out.html").to_string_lossy(), &d.join("public/docs2/index.html"));
@@ -3278,11 +3279,11 @@ fn files_judges_a_link_by_where_it_leads() {
             ("/s/gone.txt", 404),
             ("/s/hard-env.txt", 404),
             ("/s/hard-src.txt", 404),
-            ("/s/ext.html", 404),
-            ("/s/ext", 404),
+            ("/s/ext.html", 200),
+            ("/s/ext", 200),
             // An index, a name found with its extension and the page of a miss are judged too.
             ("/s/docs/", 404),
-            ("/s/docs2/", 404),
+            ("/s/docs2/", 200),
             ("/s/about", 404),
             ("/s/missing", 404),
             ("/x/settings.txt", 404),

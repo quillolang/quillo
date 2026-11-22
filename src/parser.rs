@@ -1196,6 +1196,13 @@ impl Parser {
                         return self.err_at(format!("`{}` is no keyword: did you mean `{}`?", w, k));
                     }
                 }
+                // `"""`, Python's text over several lines: `""` and then a string (FEEDBACK85.md,
+                // Q-1345; branch feedback82-85).
+                let triple = self.lx.triple;
+                if matches!(other, Tok::Str(_)) && triple.is_some() && triple == Some(self.line()?) {
+                    let q = if self.lx.text().get(self.lx.pos.saturating_sub(1)) == Some(&'\'') { "'''" } else { "\"\"\"" };
+                    return self.err_at(format!("`{}` is not a string here: text over several lines is a backtick string, `line one ...` (`${{` interpolates)", q));
+                }
                 match other {
                     Tok::Comma => self.err_at("expected end of statement, found `,`: there is one `let` to a line"),
                     Tok::Colon => self.err_at("expected end of statement, found `:`: a map's key is a name or text, and for one in a variable use `set(m, k, v)`"),

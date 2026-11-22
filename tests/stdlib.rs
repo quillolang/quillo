@@ -356,7 +356,8 @@ fn files_are_written_and_deleted_inside_the_program_folder() {
     assert!(!d.join("sub").exists());
     assert_eq!(run_in(&d, "delete_file(\"never-was.txt\")"), "null");
     let e = run_in(&d, "delete_file(\"../x\")");
-    assert_eq!(e, "err(\"delete_file: path must be inside the program's folder: ../x\")");
+    // With the way out named since FEEDBACK85.md, Q-1341 (branch feedback82-85).
+    assert_eq!(e, "err(\"delete_file: path must be inside the program's folder: ../x; `--allow-path ..` (on `quillo run` or `quillo mcp`) lets the program delete it\")");
     let e = run_in(&d, "delete_file(\".\")");
     assert_eq!(e, "err(\"delete_file: path must be inside the program's folder: .\")");
     assert!(d.exists(), "the folder itself stays");

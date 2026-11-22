@@ -86,6 +86,10 @@ pub struct Parsed {
     pub problems: Vec<(u32, String)>,
     /// `//! effects: db, http` (or `none`): what its functions may do; `None` when not said.
     pub effects: Option<u8>,
+    /// What makes the file one Quillo does not load, by line: a function's `/// effects:` line
+    /// that names an effect its file's line does not (FEEDBACK85.md, Q-1344; branch
+    /// feedback82-85).
+    pub errors: Vec<(u32, String)>,
 }
 
 /// The `//!` lines at the top of a file: each one's line (from 0) and its text after `//!` and one
@@ -317,11 +321,62 @@ pub fn parse(src: &str) -> Parsed {
         let bad = e.params.iter().map(|(_, t)| t.as_str()).chain(e.ret.as_deref()).find_map(|t| quillo_type(t).err());
         match bad {
             Some(msg) => out.problems.push((e.line, format!("`{}` is not exported: {}", e.name, msg))),
-            None => keep.push(Export { effects: out.effects.unwrap_or(crate::ast::ALL_EFFECTS), ..e }),
+            None => {
+                let file = out.effects.unwrap_or(crate::ast::ALL_EFFECTS);
+                let (effects, doc) = own_effects(&e, file, out.effects.is_some(), &mut out);
+                keep.push(Export { effects, doc, ..e });
+            }
         }
     }
     out.exports = keep;
     out
+}
+
+/// A `pub fn`'s own `/// effects: fs` line: what it may do, within what its file's `//! effects:`
+/// line says, and its documentation without that line. A file's line was for all of its functions,
+/// so one that reached the network made every small helper beside it need `net` (FEEDBACK85.md,
+/// Q-1344; branch feedback82-85). The line narrows, never widens: one that names an effect the
+/// file's line does not is an error naming both, and the function keeps the file's.
+fn own_effects(e: &Export, file: u8, declared: bool, out: &mut Parsed) -> (u8, String) {
+    let mut doc = Vec::new();
+    let mut own: Option<u8> = None;
+    for (k, l) in e.doc.lines().enumerate() {
+        let Some(list) = l.trim().strip_prefix("effects:") else {
+            doc.push(l);
+            continue;
+        };
+        let at = e.line.saturating_sub(e.doc.lines().count() as u32) + k as u32;
+        if own.is_some() {
+            out.errors.push((at, format!("`{}` says its effects twice: one `/// effects:` line", e.name)));
+            continue;
+        }
+        let mut mask = 0;
+        for x in list.split(',').map(str::trim).filter(|x| !x.is_empty() && *x != "none") {
+            match crate::ast::effect_bit(x.split('.').next().unwrap_or(x)) {
+                0 => out.problems.push((at, format!("`{}` is not an effect (they are {}, or none)", x, crate::ast::EFFECTS.join(", ")))),
+                b => mask |= b,
+            }
+        }
+        let wider = mask & !file;
+        if wider != 0 {
+            let names = crate::ast::effect_names(wider);
+            let theirs = if declared { crate::ast::effect_names(file).join(", ") } else { String::new() };
+            out.errors.push((
+                at,
+                format!(
+                    "`{}`'s `/// effects: {}` names {}, which the file's `//! effects: {}` does not: a function's line narrows its file's, never widens it",
+                    e.name,
+                    list.trim(),
+                    names.join(", "),
+                    if theirs.is_empty() { "none".to_string() } else { theirs }
+                ),
+            ));
+            own = Some(file);
+            continue;
+        }
+        own = Some(mask);
+    }
+    (own.unwrap_or(file), doc.join("\n").trim_end().to_string())
 }
 
 /// A type with each reference in it made a value of its own: `Option<&str>` is `Option<String>`,
@@ -2079,6 +2134,12 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
     // with the version that runs now).
     let built = it.unlocked(move || build_with(&path, here));
     let (lib_path, parsed) = built.map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
+    // Not loaded with a function's effects wider than its file's, as `quillo check` says
+    // (FEEDBACK85.md, Q-1344; branch feedback82-85).
+    if let Some((l, msg)) = parsed.errors.first() {
+        let file = qwer.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        return Err(Ctrl::Error(Box::new(crate::error::QuilloError::new(format!("{}:{}: {}", file, l, msg), line))));
+    }
     let lib = open(&lib_path, parsed.exports.len()).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
     loaded(&lib_path);
     let file = qwer.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();

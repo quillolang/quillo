@@ -1866,7 +1866,9 @@ pub(crate) fn open_hosted(served: &Path, program: &Path, full: &Path) -> Result<
         return Err(Replaced);
     }
     let (program, served) = (crate::statics::real_dir(program).ok_or(Refused)?, crate::statics::real_dir(served).ok_or(Refused)?);
-    if !real.starts_with(&program) || hidden_target(&program, &served, &real) {
+    // Or in a folder `--allow-path` named, which `files` serves as `file` does (FEEDBACK85.md,
+    // Q-1340; branch feedback82-85).
+    if !(real.starts_with(&program) || allowed_dir(&real).is_some()) || hidden_target(&program, &served, &real) {
         return Err(Refused);
     }
     if crate::db::journal_of(&real).is_some_and(|db| crate::db::sqlite_file(&db)) {
@@ -2094,10 +2096,12 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let hidden = hidden_path(rel) || policy_in_use(&base.join(rel));
     // What a link leads to is judged as its name is: `notes.txt -> ../main.qwe` served the
     // program's source and `settings.txt -> ../.env` its settings (FEEDBACK55.md, Q-701; branch
-    // feedback55). A link out of the folder is not served, as `stays_in` says, though it leads
-    // into a folder `--allow-path` names: an index, a name found with its extension or the page of
-    // a miss is judged as the path asked for is, which no `--allow-path` let out either; `file`
-    // serves one, named on purpose.
+    // feedback55). A link out of the folder is not served, as `stays_in` says, unless it leads
+    // into a folder `--allow-path` names, as for `file`, whose word in the log it says when it
+    // does not: `files` refused such a link with no word and whatever `--allow-path` said
+    // (FEEDBACK85.md, Q-1340; branch feedback82-85). An index, a name found with its extension or
+    // the page of a miss is judged so too.
+    let led_by = |it: &Interp, full: &Path| leads_to(&it.base_dir, full).or_else(|| led_out(it, full).map(Some));
     let judged = |it: &Interp, led: &Option<Option<std::path::PathBuf>>| match led {
         None => false,
         Some(None) => true,
@@ -2116,12 +2120,12 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // (FEEDBACK55.md, Q-701; branch feedback55).
     let found = |it: &Interp, full: &Path, way: &Option<Option<std::path::PathBuf>>| match std::fs::symlink_metadata(full) {
         Ok(m) if m.is_file() && way == &Some(None) => Some(true),
-        Ok(m) if m.is_file() || (m.file_type().is_symlink() && full.is_file()) => Some(judged(it, &leads_to(&it.base_dir, full))),
+        Ok(m) if m.is_file() || (m.file_type().is_symlink() && full.is_file()) => Some(judged(it, &led_by(it, full))),
         _ => None,
     };
     let joined = |rel: &str| if rel.is_empty() { dir.to_string() } else { format!("{}/{}", dir.trim_end_matches('/'), rel) };
     // Judged before it is looked at: whether a folder outside is there is not said (Q-475).
-    let led = if hidden || rel.split('/').any(|s| s == "..") { None } else { leads_to(&it.base_dir, &base.join(rel)) };
+    let led = if hidden || rel.split('/').any(|s| s == "..") { None } else { led_by(it, &base.join(rel)) };
     let mut answer = None;
     let asked = |it: &mut Interp| match it.request_value() {
         Some(Value::Map(r)) => (r.get("path").map(|p| p.display()), r.get("query_string").map(|q| q.display()).filter(|q| !q.is_empty())),
@@ -2190,7 +2194,7 @@ fn files(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if let Some(a) = answer.filter(|a| !matches!(a, Value::Response(r) if r.status == 404)) {
         return Ok(a);
     }
-    if let Some(page) = not_found_page.filter(|p| base.join(p).is_file() && judged(it, &leads_to(&it.base_dir, &base.join(p)))) {
+    if let Some(page) = not_found_page.filter(|p| base.join(p).is_file() && judged(it, &led_by(it, &base.join(p)))) {
         // The page whole, whatever the request's conditionals and range, which are of the URL
         // asked for: its 206 or 304 was thrown away for the plain page (FEEDBACK55.md, Q-722;
         // branch feedback55).
@@ -2282,9 +2286,24 @@ fn hidden_target(program: &Path, served: &Path, real: &Path) -> bool {
         let kept = |(i, p): (usize, &String)| p.starts_with('.') && !(i == 0 && p == ".well-known") && !store(i) && !tool(i);
         return folders.iter().enumerate().any(kept) || hidden_path(name);
     }
-    let Ok(rel) = real.strip_prefix(program) else { return true };
+    // Out of the program's folder, into one `--allow-path` named: judged by its name there, as
+    // in the program's own (FEEDBACK85.md, Q-1340; branch feedback82-85).
+    let rel = match real.strip_prefix(program) {
+        Ok(rel) => rel,
+        Err(_) => match allowed_dir(real) {
+            Some(d) => return real.strip_prefix(&d).map_or(true, |rel| hidden_path(&rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"))),
+            None => return true,
+        },
+    };
     let parts: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
     hidden_path(&parts.join("/"))
+}
+
+/// The folder `--allow-path` named that `real`, a path as it really is, is in (FEEDBACK85.md,
+/// Q-1340; branch feedback82-85).
+fn allowed_dir(real: &Path) -> Option<std::path::PathBuf> {
+    let dirs = ALLOWED_PATHS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    dirs.iter().find(|d| real.starts_with(d)).cloned()
 }
 
 /// Seconds from `3600` or `"1h"` (s, m, h, d, w, y).
@@ -2928,10 +2947,18 @@ pub(crate) fn inside(it: &Interp, full: std::path::PathBuf) -> Option<std::path:
     if stays_in(&it.base_dir, &full) {
         return Some(full);
     }
+    led_out(it, &full).map(|_| full)
+}
+
+/// Where `full`, a path under the program's folder that a link leads out of it, really is, when
+/// that is in a folder `--allow-path` named; else None, and the log says why, once. `file`'s and
+/// `files`'s, so a folder linked into the program is served by both or by neither, with the same
+/// word (FEEDBACK85.md, Q-1340; branch feedback82-85).
+pub(crate) fn led_out(it: &Interp, full: &Path) -> Option<std::path::PathBuf> {
     let dirs = ALLOWED_PATHS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let real = real_path(&full);
-    if real.as_ref().is_some_and(|r| dirs.iter().any(|d| r.starts_with(d))) {
-        return Some(full);
+    let real = real_path(full);
+    if let Some(r) = real.as_ref().filter(|r| dirs.iter().any(|d| r.starts_with(d))) {
+        return Some(r.clone());
     }
     // Said once, as a deploy's `uploads -> ../shared/uploads` is then a 404 with no other word.
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2939,7 +2966,7 @@ pub(crate) fn inside(it: &Interp, full: std::path::PathBuf) -> Option<std::path:
         let to = real.map_or_else(|| "nowhere (the link is dangling)".to_string(), |r| r.display().to_string());
         eprintln!(
             "quillo: {} leads out of the program's folder through a link, to {}, and is refused; `--allow-path FOLDER` lets the program reach a folder outside",
-            full.strip_prefix(&*it.base_dir).unwrap_or(&full).display(),
+            full.strip_prefix(&*it.base_dir).unwrap_or(full).display(),
             to
         );
     }
@@ -3164,11 +3191,31 @@ fn local_path_fn(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     })
 }
 
+/// The way out of the folder, for a refusal of a path outside it: `--allow-path` and the folder to
+/// name, as written; `file`'s word in the log names it, `read_file`'s did not, and a program grew
+/// a Rust function to read one file (FEEDBACK85.md, Q-1341; branch feedback82-85).
+pub(crate) fn way_out(p: &str, verb: &str) -> String {
+    if p.is_empty() {
+        return String::new();
+    }
+    let path = Path::new(p);
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d.display().to_string(),
+        _ => p.to_string(),
+    };
+    format!("; `--allow-path {}` (on `quillo run` or `quillo mcp`) lets the program {} it", dir, verb)
+}
+
+/// Whether `p` names the program's folder itself, which no `--allow-path` lets a program delete.
+fn full_is_base(it: &Interp, p: &str) -> bool {
+    p.is_empty() || local_path(it, p).is_some_and(|f| f.as_path() == &*it.base_dir)
+}
+
 /// `read_file(path)`: the file's text, or an error value.
 fn read_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let p = s_arg(&args, 0, "read_file", line)?;
     let Some(full) = local_path(it, &p) else {
-        return Ok(Value::err(Value::str(format!("read_file: path must stay inside the program's folder: {}", p))));
+        return Ok(Value::err(Value::str(format!("read_file: path must stay inside the program's folder: {}{}", p, way_out(&p, "read")))));
     };
     // Its bytes and its text, asked about first under `--max-memory`, by the size the open file
     // gives, as `fs::read` reads one: what it does, and the same calls (FEEDBACK71.md, Q-977;
@@ -3220,7 +3267,7 @@ fn write_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // A list's text held as `str` holds it (FEEDBACK71.md, Q-977; branch security).
     let text = arg(&args, 1).display_held().map_err(|o| o.at(line))?;
     let Some(full) = local_path(it, &p) else {
-        return Ok(Value::err(Value::str(format!("write_file: path must stay inside the program's folder: {}", p))));
+        return Ok(Value::err(Value::str(format!("write_file: path must stay inside the program's folder: {}{}", p, way_out(&p, "write")))));
     };
     if let Some(why) = own_file(it, &full, false) {
         return Ok(Value::err(Value::str(format!("write_file: will not write {}: {}", p, why))));
@@ -3286,7 +3333,7 @@ fn check_program(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn delete_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let p = s_arg(&args, 0, "delete_file", line)?;
     let Some(full) = local_path(it, &p).filter(|f| f.as_path() != &*it.base_dir) else {
-        return Ok(Value::err(Value::str(format!("delete_file: path must be inside the program's folder: {}", p))));
+        return Ok(Value::err(Value::str(format!("delete_file: path must be inside the program's folder: {}{}", p, if full_is_base(it, &p) { String::new() } else { way_out(&p, "delete") }))));
     };
     if let Some(why) = own_file(it, &full, false) {
         return Ok(Value::err(Value::str(format!("delete_file: will not delete {}: {}", p, why))));
