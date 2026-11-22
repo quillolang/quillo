@@ -31,6 +31,28 @@ pub fn is_url(s: &str) -> bool {
     s.starts_with("postgres://") || s.starts_with("postgresql://")
 }
 
+/// The hosts a connection to `url` goes to, as the driver reads them (`tokio_postgres::Config`
+/// from the same string `Pool::open_as` parses): its hosts and its `hostaddr`s, percent-decoded,
+/// the user being all before the first `@` (FEEDBACK83.md, Q-1300, found in review 3; branch
+/// feedback82-85). A Unix socket is no host, and said.
+pub fn hosts(url: &str) -> Result<Vec<String>, String> {
+    let Options { url, .. } = take_options(url)?;
+    let config: tokio_postgres::Config = url.parse().map_err(|e| format!("bad Postgres URL: {}", e))?;
+    let mut out = Vec::new();
+    for h in config.get_hosts() {
+        match h {
+            tokio_postgres::config::Host::Tcp(name) => out.push(name.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase()),
+            #[cfg(unix)]
+            tokio_postgres::config::Host::Unix(p) => return Err(format!("a database reached through the socket {} is not held to confirmed hosts; give its host", p.display())),
+        }
+    }
+    out.extend(config.get_hostaddrs().iter().map(|ip| ip.to_string()));
+    if out.is_empty() {
+        out.push("localhost".into());
+    }
+    Ok(out)
+}
+
 // ---- connections ---------------------------------------------------------
 
 /// One connection and the statements prepared on it.

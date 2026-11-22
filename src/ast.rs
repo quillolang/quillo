@@ -119,19 +119,24 @@ impl Ty {
     }
 }
 
-/// Effects a function can declare with `with`, and the builtins that use them.
-pub const EFFECTS: &[&str] = &["db", "http", "fs", "env", "time", "random", "net"];
-pub const ALL_EFFECTS: u8 = 0b111_1111;
+/// Effects a function can declare with `with`, and the builtins that use them. `run`, starting
+/// another program, is a Rust file's to declare: no builtin needs it, and a policy can refuse it
+/// (FEEDBACK83.md, Q-1308; branch feedback82-85).
+pub const EFFECTS: &[&str] = &["db", "http", "fs", "env", "time", "random", "net", "run"];
+/// A set of effects, one bit each: sixteen, with room for more than the eight there are
+/// (FEEDBACK83.md, Q-1308, found in review; branch feedback82-85).
+pub type Effects = u16;
+pub const ALL_EFFECTS: Effects = ((1u32 << EFFECTS.len()) - 1) as Effects;
 
-pub fn effect_bit(name: &str) -> u8 {
+pub fn effect_bit(name: &str) -> Effects {
     EFFECTS.iter().position(|e| *e == name).map_or(0, |i| 1 << i)
 }
 
-pub fn effect_mask(names: &[String]) -> u8 {
+pub fn effect_mask(names: &[String]) -> Effects {
     names.iter().fold(0, |m, n| m | effect_bit(n))
 }
 
-pub fn effect_names(mask: u8) -> Vec<&'static str> {
+pub fn effect_names(mask: Effects) -> Vec<&'static str> {
     EFFECTS.iter().enumerate().filter(|(i, _)| mask & (1 << i) != 0).map(|(_, e)| *e).collect()
 }
 
@@ -174,7 +179,7 @@ pub fn key_is_name(k: &str) -> bool {
 }
 
 /// The effect a builtin needs, by its name; 0 for pure builtins.
-pub fn builtin_effect(name: &str) -> u8 {
+pub fn builtin_effect(name: &str) -> Effects {
     // Reads an error value it is given; asks the database nothing.
     if name == "db.error_kind" || name == "db.sql_name" {
         return 0;

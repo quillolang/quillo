@@ -737,6 +737,14 @@ fn rtp(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if tracks.is_empty() {
         return fail(line, "`media.rtp` needs a video port, an audio port, or both".to_string());
     }
+    // A port others reach (`host` not this machine's loopback), held to what its file was
+    // confirmed for, as `udp.listen`'s (FEEDBACK83.md, Q-1300, found in review 3; branch
+    // feedback82-85).
+    for (port, _) in &tracks {
+        if let Err(why) = crate::confirm::listen_ok(it.cur_file.as_deref(), &host, *port) {
+            return Ok(Value::err(Value::str(format!("media.rtp: {}", why))));
+        }
+    }
     let s = stream(&key(&name, it.tenant().as_deref()), &name);
     for (port, codec) in tracks {
         if let Err(e) = listen(&host, port, Track { stream: s.clone(), codec, closed: false, released: false }) {

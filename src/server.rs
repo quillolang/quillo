@@ -1392,7 +1392,7 @@ impl Interp {
                         resp.headers.push(("vary".into(), "Cookie".into()));
                     }
                 }
-                tags.push_str(&format!("<script{}>{}</script>", if in_place { " data-quillo" } else { "" }, island_loader(&srcs, std::mem::take(&mut self.scroll_island), in_place.then(|| key.as_ref().map_or("", |k| k.0.as_str())))));
+                tags.push_str(&format!("<script{}>{}</script>", if in_place { " data-quillo" } else { "" }, island_loader(&srcs, &self.integrities(&srcs), std::mem::take(&mut self.scroll_island), in_place.then(|| key.as_ref().map_or("", |k| k.0.as_str())))));
             } else {
                 bundle_styles = self.styles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ids();
                 if let Some((i18n, l)) = &i18n {
@@ -2146,6 +2146,18 @@ impl Interp {
     /// cookie) is `Cache-Control: private` with `Vary: Cookie`, so a shared cache does not hand
     /// it to the next visitor, and a page is not framed by another site, `X-Frame-Options:
     /// SAMEORIGIN` (FEEDBACK31.md, Q-391; branch feedback27-35-fixes).
+    /// Each page script's integrity hash, as the library that loads it was confirmed with one
+    /// (FEEDBACK83.md, Q-1304, found in review; branch feedback82-85): none where nothing is held.
+    fn integrities(&self, srcs: &[String]) -> Vec<Option<String>> {
+        if !crate::confirm::held() {
+            return Vec::new();
+        }
+        // As each library's file confirmed it: a hash any of the libraries of that address was
+        // confirmed with holds its bytes, whichever library comes first, as one address has one
+        // script on a page (found in review 2).
+        srcs.iter().map(|s| self.js_libs.values().filter(|l| l.src == *s && !l.refused).find_map(|l| l.integrity.clone())).collect()
+    }
+
     fn site_headers_into(&self, path: &str, sets_cookie: bool, resp: &mut HttpResponse) {
         // The path as routes read it (Q-537) for the rules, and for what is said of it below, made
         // only when something is: the rules' step made it first, and said the path as sent once it
@@ -2162,6 +2174,17 @@ impl Interp {
             || want.iter().any(|(k, v)| k == "content-security-policy" && v.as_deref().is_some_and(|c| c.contains("frame-ancestors")));
         if html && !framed_by_policy && !want.iter().any(|(k, _)| k == "x-frame-options") {
             want.push(("x-frame-options".into(), Some("SAMEORIGIN".into())));
+        }
+        // A program held to its `quillo.confirmed`: its pages say what they were confirmed to load
+        // and call, report-only, where the program sets no policy of its own (FEEDBACK83.md,
+        // Q-1303; branch feedback82-85).
+        if html {
+            if let Some(csp) = crate::confirm::page_policy() {
+                let own = |k: &str| k.eq_ignore_ascii_case("content-security-policy") || k.eq_ignore_ascii_case("content-security-policy-report-only");
+                if !resp.headers.iter().any(|(k, _)| own(k)) && !want.iter().any(|(k, _)| own(k)) {
+                    want.push(("content-security-policy-report-only".into(), Some(csp.to_string())));
+                }
+            }
         }
         // Whatever the status: a 403 or a 404 naming the visitor is theirs too, and a cache keeps
         // those as well (FEEDBACK55.md, Q-886; branch feedback55).
@@ -6792,8 +6815,19 @@ fn ready_response(it: &mut Interp, req: &HttpRequest) -> HttpResponse {
     r
 }
 
-fn island_loader(srcs: &[String], scroll: bool, in_place: Option<&str>) -> String {
-    let src = serde_json::to_string(srcs).unwrap_or_default().replace("</", "<\\/");
+fn island_loader(srcs: &[String], sri: &[Option<String>], scroll: bool, in_place: Option<&str>) -> String {
+    // A script confirmed with its integrity hash is loaded with it, as `[address, hash]`
+    // (FEEDBACK83.md, Q-1304; branch feedback82-85); with none, the list and the loader are as
+    // they were.
+    let (src, set) = if sri.iter().any(Option::is_some) {
+        let list: Vec<serde_json::Value> = srcs.iter().zip(sri).map(|(s, h)| match h {
+            Some(h) => serde_json::json!([s, h]),
+            None => serde_json::json!(s),
+        }).collect();
+        (serde_json::to_string(&list).unwrap_or_default().replace("</", "<\\/"), "if(Array.isArray(s)){t.src=s[0];t.integrity=s[1];t.crossOrigin=\"anonymous\"}else t.src=s;")
+    } else {
+        (serde_json::to_string(srcs).unwrap_or_default().replace("</", "<\\/"), "t.src=s;")
+    };
     // A page with a component that listens to scrolls (`data-sc`): a scroll in it, which does not
     // bubble and may come with no pointer, touch, focus or key (a script or a link moving the box),
     // loads the bundle too, heard as it goes down; the element is kept, and once the component is
@@ -6813,7 +6847,7 @@ fn island_loader(srcs: &[String], scroll: bool, in_place: Option<&str>) -> Strin
         concat!(
             "(()=>{{const d=document,W=window,k=Symbol.for(\"quillo\"),w=W[k]||(W[k]={{}}),q=w.q=[];let go=0;",
             // In order: the runtime file first, when there is one.
-            "const load=()=>{{if(go)return;go=1;for(const s of {}){{const t=d.createElement(\"script\");t.src=s;t.async=false;t.onerror=fail;d.head.appendChild(t)}}}};",
+            "const load=()=>{{if(go)return;go=1;for(const s of {}){{const t=d.createElement(\"script\");{}t.async=false;t.onerror=fail;d.head.appendChild(t)}}}};",
             "const isl=(e)=>e.target&&e.target.closest&&e.target.closest(\"quillo-island,[data-qi]\");",
             // What a mouse or pointer event said, to make it again: where, with
             // which buttons and keys, how many clicks (branch early-events).
@@ -6837,6 +6871,7 @@ fn island_loader(srcs: &[String], scroll: bool, in_place: Option<&str>) -> Strin
             "{}d.readyState===\"loading\"?d.addEventListener(\"DOMContentLoaded\",idle):idle()}})()"
         ),
         src,
+        set,
         // Moves in place: the bundle on every page, for its links, which it asks for ahead where
         // pages are (FEEDBACK84.md, Q-1323, Q-1330; branch feedback82-85).
         // Its key, which a page moved to must have too (see `in_place_key`).

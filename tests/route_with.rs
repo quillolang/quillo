@@ -104,7 +104,7 @@ fn a_group_narrows_and_never_widens() {
     );
     assert_eq!(
         diags("route GET /x with disk = \"x\"\n"),
-        ["1 expected an effect after `with` (db, http, fs, env, time, random, net), found `disk`"]
+        ["1 expected an effect after `with` (db, http, fs, env, time, random, net, run), found `disk`"]
     );
 }
 

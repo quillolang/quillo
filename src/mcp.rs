@@ -233,7 +233,7 @@ fn a_record(types: &HashMap<String, Types>, k: &str) -> bool {
 ///   its code: a native plugin's function is not seen, whatever its file says (found in review).
 /// - Without a `with`, it may do anything: both are MCP's defaults, unless the checker sees all
 ///   its code and it uses no effect, writes nothing and calls nothing outside.
-fn hints(declared: Option<u8>, f: &ToolFacts) -> (bool, bool) {
+fn hints(declared: Option<crate::ast::Effects>, f: &ToolFacts) -> (bool, bool) {
     let [fs, net, http] = [effect_bit("fs"), effect_bit("net"), effect_bit("http")];
     let sure = f.uncertain.is_none();
     match declared {
@@ -3358,6 +3358,9 @@ fn say_dev_door(it: &Interp) {
 /// where the program was not checked as it loaded (`--no-check`, `--split`'s app checked before),
 /// read now when it declares any. None for a program with no tools, or one run as a service.
 pub fn open_door(it: &mut Interp, path: &Path, tools: Option<Vec<Tool>>) {
+    // A taken file's tool, offered only where it was confirmed (FEEDBACK83.md, Q-1301, found in
+    // review; branch feedback82-85).
+    let tools = tools.map(|t| t.into_iter().filter(|t| crate::confirm::tool_ok(&t.name)).collect::<Vec<_>>());
     it.mcp = None;
     it.offered_tools = None;
     // A tool of its own, or a service's it offers (FEEDBACK56.md, Part F; branch feedback56).

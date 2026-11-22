@@ -75,6 +75,10 @@ usage:
                                     setting with the file it came from (exit 1:
                                     a layer asked for is not there; 2: one is
                                     there but broken)
+  quillo confirm [<file.qwe>]       what the program's files reach (hosts, paths,
+               [PATH...] [--yes]    scripts, plugins) that is not confirmed yet:
+               [--list]             asks, and writes quillo.confirmed, which
+                                    `run` then holds the program to
   quillo <file.qwe>                 same as `quillo run`
 
 The program is the first argument that is not an option, wherever the options
@@ -247,7 +251,7 @@ fn main() {
 const VALUE_OPTIONS: &[&str] = &[
     "--host", "--port", "--listen", "--socket-mode", "--policy", "--workers", "--register", "--service", "--service-url", "--service-name", "--base",
     "--max-body", "--max-compute", "--max-memory", "--drain", "--max-tool-calls", "--allow-path", "--trust-proxy", "--live-per-client", "--max-connections", "--connections-per-client", "--allowed-hosts", "--instances", "--wt-port", "--tls-cert", "--tls-key", "--log", "--open", "--env-file",
-    "--scale", "--join", "--with", "--allow-join", "--join-as", "--client-cert-header", "--user-header",
+    "--scale", "--join", "--with", "--allow-join", "--join-as", "--client-cert-header", "--user-header", "--program-root",
 ];
 
 /// Options of `run`, `app` and `check` that take no value.
@@ -544,6 +548,9 @@ fn real_main(args: Vec<String>) -> i32 {
         }),
         // Plugins from quillolang.org's catalog, into the program's folder.
         Some("install") => quillo::install::main(&args[2..]),
+        // What the program's files reach, confirmed once per project (FEEDBACK83.md, Q-1300, Part
+        // D; branch feedback82-85).
+        Some("confirm") => quillo::confirm::main(&args[2..]),
         // A program to start from (FEEDBACK34.md, Q-422; branch feedback27-35-fixes).
         Some("new") => quillo::new::main(&args[2..]),
         Some("serve") => serve(&args[2..]),
@@ -710,7 +717,7 @@ fn docs(args: &[String]) -> i32 {
 /// The commands, for the nearest to a misspelt one (FEEDBACK31.md, Q-389; `serve`, `classes` and
 /// `fcgi` too: FEEDBACK55.md, Q-852; branch feedback55; `mcp`: FEEDBACK56.md, C.1; branch
 /// feedback56).
-const COMMANDS: &[&str] = &["run", "check", "docs", "build", "fix", "install", "repl", "lsp", "dap", "app", "new", "serve", "classes", "fcgi", "mcp", "policy", "version", "help"];
+const COMMANDS: &[&str] = &["run", "check", "docs", "build", "fix", "install", "repl", "lsp", "dap", "app", "new", "serve", "classes", "fcgi", "mcp", "policy", "confirm", "version", "help"];
 
 /// The options of `quillo policy`.
 const POLICY_OPTIONS: &[&str] = &["--policy"];
@@ -844,6 +851,11 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
     if let Err(code) = before_the_program(file, &o) {
         return code;
     }
+    // Held to its quillo.confirmed as `quillo run` is; never asked, as stdin is the client's
+    // (FEEDBACK83.md, Q-1300; branch feedback82-85).
+    if let Err(code) = quillo::confirm::at_start(Path::new(file), false) {
+        return code;
+    }
     if let Ok(files) = quillo::native::rust_files(Path::new(file)) {
         quillo::native::prebuild(&files);
     }
@@ -970,6 +982,7 @@ fn help_asked(args: &[String]) -> Option<&'static str> {
     args[2..].iter().any(|a| a == "-h" || a == "--help").then(|| match c {
         "install" => quillo::install::USAGE,
         "new" => quillo::new::USAGE,
+        "confirm" => quillo::confirm::USAGE,
         _ => USAGE,
     })
 }
@@ -1022,6 +1035,11 @@ struct RunOptions {
     split: bool,
     /// Run as a service (`--as-service`): server fns only for other services.
     as_service: bool,
+    /// `--program-root DIR`, from the app that starts a service apart: its folder, where its
+    /// `quillo.confirmed` and its private names' tags are; taken only with `--as-service`, and
+    /// never from the environment, which `.env` can set (FEEDBACK83.md, Q-1300, found in review 2;
+    /// branch feedback82-85).
+    program_root: Option<PathBuf>,
     /// The service this is, when not its file's name (`--service-name`).
     service_name: Option<String>,
     /// The `.env` to read, when not the one beside the program (`--env-file`).
@@ -1065,6 +1083,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
         instances: 1,
         service_urls: Vec::new(),
         base: None,
+        program_root: None,
         split: false,
         as_service: false,
         service_name: None,
@@ -1139,6 +1158,7 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
                 }
             },
             ("--service-name", Some(v)) => o.service_name = Some(v.clone()),
+            ("--program-root", Some(v)) => o.program_root = Some(PathBuf::from(v)),
             ("--env-file", Some(v)) => o.env_file = Some(v.clone()),
             ("--with", Some(v)) if !v.trim().is_empty() => o.with.push(v.clone()),
             ("--scale", Some(v)) => match v.split_once('=').map(|(n, c)| (n, c.parse::<usize>())) {
@@ -1523,7 +1543,7 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     }
     // A service the app started apart: the app's folder (Q-807).
     if o.as_service {
-        if let Some(dir) = std::env::var_os(quillo::privacy::ROOT_ENV).filter(|d| !d.is_empty()) {
+        if let Some(dir) = o.program_root.as_ref() {
             quillo::privacy::set_root(Path::new(&dir));
         }
     }
@@ -2083,6 +2103,23 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
     if let Err(code) = before_the_program(file, &o) {
         return code;
     }
+    // Held to its quillo.confirmed, asked on a terminal, before any plugin is built
+    // (FEEDBACK83.md, Q-1300, D.2; branch feedback82-85).
+    let ask = std::io::IsTerminal::is_terminal(&std::io::stdin()) && std::io::IsTerminal::is_terminal(&std::io::stderr()) && !o.as_service && !FCGI.load(std::sync::atomic::Ordering::Relaxed);
+    // A service its app started apart: the app's quillo.confirmed, in the app's folder, which the
+    // app passes on (FEEDBACK83.md, Q-1300, found in review; branch feedback82-85).
+    if o.program_root.is_some() && !o.as_service {
+        eprintln!("quillo: `--program-root` is for a service its app starts apart (with --as-service)");
+        return 2;
+    }
+    let app_dir = o.program_root.clone().filter(|_| o.as_service);
+    let held = match &app_dir {
+        Some(dir) => quillo::confirm::at_start_in(Path::new(file), dir, false),
+        None => quillo::confirm::at_start(Path::new(file), ask),
+    };
+    if let Err(code) = held {
+        return code;
+    }
     // The Rust files not built yet, in one cargo call before the program runs, rather than one
     // `use` after another (FEEDBACK37.md, Q-454; branch feedback36-39).
     if let Ok(files) = quillo::native::rust_files(Path::new(file)) {
@@ -2175,9 +2212,6 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
         }
         // The services' processes count their private names' tags from the app's folder, as
         // they do in its process (FEEDBACK55.md, Q-807; branch feedback55).
-        if let Some(dir) = path.canonicalize().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
-            std::env::set_var(quillo::privacy::ROOT_ENV, dir);
-        }
         match quillo::service::split(path, o.watch, o.reload, o.static_check, o.checked, &o.scale, &app_url) {
             Ok(s) => Some(s),
             Err(e) => {
@@ -2343,7 +2377,11 @@ fn with_policy(main: &Path, extra: &[PathBuf], say: bool) -> Result<(), i32> {
 }
 
 fn check(file: &str, opts: quillo::check::Options) -> i32 {
-    let analysis = quillo::check::check_file_opts(Path::new(file), Default::default(), opts);
+    let mut analysis = quillo::check::check_file_opts(Path::new(file), Default::default(), opts);
+    // What its files reach: against the policy's hosts and its quillo.confirmed (FEEDBACK83.md,
+    // Q-1300 to Q-1305; branch feedback82-85).
+    let reach = quillo::confirm::for_check(Path::new(file), &analysis.parsed);
+    analysis.diagnostics.extend(reach);
     for d in &analysis.diagnostics {
         eprintln!("{}", d);
     }

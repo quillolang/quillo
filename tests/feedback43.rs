@@ -75,7 +75,7 @@ fn a_plugins_effects_are_what_its_header_says() {
     // An alias is the db effect; a word that is not an effect is said.
     let p = quillo::native::parse("//! effects: db.analytics, disk\npub fn f() -> bool { true }\n");
     assert_eq!(p.exports[0].effects, quillo::ast::effect_bit("db"));
-    assert_eq!(p.problems, [(1, "`disk` is not an effect (they are db, http, fs, env, time, random, net, or none)".to_string())]);
+    assert_eq!(p.problems, [(1, "`disk` is not an effect (they are db, http, fs, env, time, random, net, run, or none)".to_string())]);
     // Nothing said: anything.
     assert_eq!(quillo::native::parse("pub fn f() -> bool { true }\n").exports[0].effects, quillo::ast::ALL_EFFECTS);
     assert_eq!(quillo::ast::builtin_effect("native:/nowhere/lib.so:f"), quillo::ast::ALL_EFFECTS);

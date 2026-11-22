@@ -222,6 +222,11 @@ fn listen(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         Some(v) => return fail(line, format!("`udp.listen` expects options as a map, got {}", v.type_name())),
     }
+    // Others reach a port not on this machine's loopback: held to what its file was confirmed
+    // for (FEEDBACK83.md, Q-1300, found in review 2; branch feedback82-85).
+    if let Err(why) = crate::confirm::listen_ok(it.cur_file.as_deref(), &host, port) {
+        return Ok(Value::err(Value::str(format!("udp.listen: {}", why))));
+    }
     let site = Arc::make_mut(&mut it.site);
     if site.udp.iter().any(|l| l.port == port) {
         return fail(line, format!("`udp.listen`: the program already listens on UDP port {}", port));
@@ -604,6 +609,11 @@ fn packet_value(p: Packet, port: u16) -> Value {
     m.insert("from".into(), Value::map(from));
     m.insert("port".into(), Value::Int(port as i64));
     m.insert("at".into(), Value::Int(p.at as i64));
+    // Where the run is held, the mark that lets `udp.reply` answer this sender, which no map
+    // the program makes has (FEEDBACK83.md, Q-1300, found in review 2; branch feedback82-85).
+    if let Some(mark) = crate::confirm::udp_mark(port, &p.from) {
+        m.insert("mark".into(), Value::str(mark));
+    }
     Value::map(m)
 }
 
@@ -637,6 +647,13 @@ fn any_socket(v6: bool) -> std::io::Result<&'static UdpSocket> {
 }
 
 fn send_from(it: &mut Interp, from: Option<u16>, host: &str, port: u16, data: Vec<u8>, f: &str, line: u32) -> R {
+    // The hosts its file was confirmed for (FEEDBACK83.md, Q-1300, found in review; branch
+    // feedback82-85); a reply to a packet's own sender is judged by its mark (`reply`).
+    if crate::confirm::held() && f != "udp.reply.marked" {
+        if let Err(why) = crate::confirm::host_ok(it.cur_file.as_deref(), host) {
+            return Ok(Value::err(Value::str(format!("{}: {}", f.trim_end_matches(".marked"), why))));
+        }
+    }
     // An address as written needs no lookup; a name may wait on DNS.
     let to = match host.parse::<std::net::IpAddr>() {
         Ok(ip) => Some(SocketAddr::new(ip, port)),
@@ -656,7 +673,7 @@ fn send_from(it: &mut Interp, from: Option<u16>, host: &str, port: u16, data: Ve
     let sent = match from {
         Some(p) => match lock(sockets()).get(&p).cloned() {
             Some(b) => b.socket.send_to(&data, to),
-            None => return fail(line, format!("`{}`: the program does not listen on UDP port {}", f, p)),
+            None => return fail(line, format!("`{}`: the program does not listen on UDP port {}", f.trim_end_matches(".marked"), p)),
         },
         None => any_socket(to.is_ipv6()).and_then(|s| s.send_to(&data, to)),
     };
@@ -698,7 +715,12 @@ fn reply(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (Some(Value::Str(host) | Value::Css(host)), Some(Value::Int(to))) = (from.get("host"), from.get("port")) else { return bad() };
     let (port, host, to) = (*port as u16, host.to_string(), *to as u16);
     let data = payload(args.get(1).unwrap_or(&Value::Nil), "udp.reply", line)?;
-    send_from(it, Some(port), &host, to, data, "udp.reply", line)
+    // A packet the program was handed, unchanged where it says who sent it: back to that sender,
+    // whatever its file was confirmed for. Any other map is judged by its host, as `udp.send` is
+    // (FEEDBACK83.md, Q-1300, found in review 2; branch feedback82-85).
+    let marked = crate::confirm::held()
+        && matches!(p.get("mark"), Some(Value::Str(m)) if host.parse::<std::net::IpAddr>().is_ok_and(|ip| crate::confirm::udp_marked(port, &SocketAddr::new(ip, to), m)));
+    send_from(it, Some(port), &host, to, data, if marked { "udp.reply.marked" } else { "udp.reply" }, line)
 }
 
 #[cfg(test)]

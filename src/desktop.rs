@@ -82,6 +82,11 @@ fn window(file: &str, flags: &[String]) -> i32 {
     if let Err(code) = crate::before_the_program(file, &o) {
         return code;
     }
+    // Held to its quillo.confirmed as `quillo run` is (FEEDBACK83.md, Q-1300, found in review;
+    // branch feedback82-85).
+    if let Err(code) = quillo::confirm::at_start(Path::new(file), false) {
+        return code;
+    }
     // Commands beside the program are in process groups of their own, so a
     // signal reaches them only from here (FEEDBACK16.md, Q-124; branch
     // feedback20-fixes).

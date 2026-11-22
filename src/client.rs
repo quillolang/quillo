@@ -212,12 +212,17 @@ pub struct JsLib {
     pub order: usize,
     pub hint: Option<LibHint>,
     pub export: Option<String>,
+    /// Not confirmed for the file that takes it: left out of the pages (FEEDBACK83.md, Q-1300;
+    /// branch feedback82-85).
+    pub refused: bool,
+    /// The integrity hash it was confirmed with, which the page loads it with (Q-1304).
+    pub integrity: Option<String>,
 }
 
 /// The scripts of the libraries a compile's code uses, in the order the program
 /// names them: a page loads them before its bundle (branch js-libraries).
 fn libs_of(it: &Interp, c: &Compiler) -> Vec<String> {
-    let mut libs: Vec<&JsLib> = c.globals.keys().filter_map(|k| it.js_libs.get(k)).filter(|l| l.export.is_none()).collect();
+    let mut libs: Vec<&JsLib> = c.globals.keys().filter_map(|k| it.js_libs.get(k)).filter(|l| l.export.is_none() && !l.refused).collect();
     libs.sort_by_key(|l| l.order);
     let mut out: Vec<String> = Vec::new();
     for l in libs {
@@ -244,7 +249,7 @@ pub fn all_states(it: &Interp) -> Arc<Vec<String>> {
 }
 
 pub fn all_libs(it: &Interp) -> Vec<String> {
-    let mut libs: Vec<&JsLib> = it.js_libs.values().filter(|l| l.export.is_none()).collect();
+    let mut libs: Vec<&JsLib> = it.js_libs.values().filter(|l| l.export.is_none() && !l.refused).collect();
     libs.sort_by_key(|l| l.order);
     let mut out: Vec<String> = Vec::new();
     for l in libs {
@@ -262,14 +267,16 @@ pub fn all_libs(it: &Interp) -> Vec<String> {
 /// module is fetched with CORS: `modulepreload` is, and a connection needs saying so
 /// (branch library-hints).
 fn hint_links<'a>(it: &Interp, libs: impl Iterator<Item = &'a JsLib>) -> String {
-    let mut libs: Vec<&JsLib> = libs.collect();
+    let mut libs: Vec<&JsLib> = libs.filter(|l| !l.refused).collect();
     libs.sort_by_key(|l| l.order);
     let mut out = String::new();
     for l in libs {
         let module = l.export.is_some();
+        // Fetched as the page's loader fetches it, with its integrity hash (Q-1304).
+        let sri = l.integrity.as_ref().map_or(String::new(), |h| format!(" integrity=\"{}\" crossorigin=\"anonymous\"", crate::interp::escape(h)));
         let link = match (l.hint, crate::ast::script_origin(&l.src)) {
             (Some(LibHint::Preload), _) if module => format!("<link rel=\"modulepreload\" href=\"{}\">", crate::interp::escape(&script_src(it, &l.src))),
-            (Some(LibHint::Preload), _) => format!("<link rel=\"preload\" as=\"script\" href=\"{}\">", crate::interp::escape(&script_src(it, &l.src))),
+            (Some(LibHint::Preload), _) => format!("<link rel=\"preload\" as=\"script\" href=\"{}\"{}>", crate::interp::escape(&script_src(it, &l.src)), sri),
             (Some(LibHint::Preconnect), Some(origin)) => {
                 format!("<link rel=\"preconnect\" href=\"{}\"{}>", crate::interp::escape(origin), if module { " crossorigin" } else { "" })
             }
@@ -305,7 +312,7 @@ fn boot_line(it: &Interp, c: &Compiler) -> String {
     // feedback22-fixes).
     let start = "const go = () => { if (document.readyState === \"loading\") document.addEventListener(\"DOMContentLoaded\", boot); else boot(); }; if (document.prerendering) document.addEventListener(\"prerenderingchange\", go, { once: true }); else go();";
     let mut mods: Vec<(&String, &JsLib)> = c.globals.keys().filter_map(|k| it.js_libs.get_key_value(k)).collect();
-    mods.retain(|(_, l)| l.export.is_some());
+    mods.retain(|(_, l)| l.export.is_some() && !l.refused);
     mods.sort_by_key(|(_, l)| l.order);
     if mods.is_empty() {
         return format!("{}\n", start);
@@ -2966,7 +2973,7 @@ impl<'a> Compiler<'a> {
         }
         self.globals.insert(name.to_string(), (js.clone(), false));
         self.states.push(name.to_string());
-        let init = self.it.page_states.iter().find(|(n, _)| n.as_str() == name).map(|(_, e)| e.clone());
+        let init = self.it.page_states.iter().find(|(n, ..)| n.as_str() == name).map(|(_, e, _)| e.clone());
         let code = match init {
             Some(e) => {
                 let def = FnDef {

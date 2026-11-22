@@ -1431,6 +1431,11 @@ fn file_once(it: &mut Interp, args: &[Value], line: u32, hosted: Option<&Path>, 
         return Ok(Some(not_found()));
     }
     let Some(full) = inside(it, it.base_dir.join(rel)) else { return Ok(Some(not_found())) };
+    // A path its file was not confirmed to read is not there for it (FEEDBACK83.md, Q-1300, found
+    // in review; branch feedback82-85): one look at the hold where nothing is held.
+    if crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &p, false).is_err() {
+        return Ok(Some(not_found()));
+    }
     let Ok(info) = crate::statics::info(&full) else { return Ok(Some(not_found())) };
     // For `files`: the program's own under another name, and the journal of a database by the
     // name asked for, at once; then a small file's copy in memory, which it judged, or the file
@@ -1741,6 +1746,8 @@ pub const OWN_TLS_KEY: &str = "it is the server's TLS key";
 /// A policy the program runs under, by its file's identity: a hard link to it under another name
 /// was served (FEEDBACK75.md, Q-1088, found in review; branch feedback75).
 pub const OWN_POLICY: &str = "it is the program's policy";
+/// What the program's files were confirmed to reach (FEEDBACK83.md, Q-1300; branch feedback82-85).
+pub const OWN_CONFIRMED: &str = "it is what the program was confirmed to reach (quillo.confirmed)";
 
 /// Notes `p`, if it is there, as one of the program's own files. A source file's earlier
 /// versions at that path are let go, so `--watch` saving one again and again keeps one each; the
@@ -2351,6 +2358,11 @@ fn save_upload(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     };
     if let Some(why) = own_file(it, &full, true) {
         return Ok(Value::err(Value::str(format!("save_upload: will not write {}: {}; save uploads under a folder of their own, such as uploads/", dest, why))));
+    }
+    // The paths its file was confirmed to write (FEEDBACK83.md, Q-1300, found in review; branch
+    // feedback82-85).
+    if let Err(why) = crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &dest, true) {
+        return Ok(Value::err(Value::str(format!("save_upload: {}", why))));
     }
     let written = it.unlocked(move || {
         if let Some(dir) = full.parent() {
@@ -3070,6 +3082,11 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
     if folded == ".env" || folded.starts_with(".env.") {
         return Some(OWN_SETTINGS);
     }
+    // What the program was confirmed to reach, by its name whether it is there yet or not
+    // (FEEDBACK83.md, Q-1300, found in review; branch feedback82-85).
+    if folded == crate::confirm::FILE {
+        return Some(OWN_CONFIRMED);
+    }
     // One of them under another name: a second hard link writes into it (FEEDBACK55.md, Q-701;
     // branch feedback55).
     for f in &both {
@@ -3217,6 +3234,10 @@ fn read_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(full) = local_path(it, &p) else {
         return Ok(Value::err(Value::str(format!("read_file: path must stay inside the program's folder: {}{}", p, way_out(&p, "read")))));
     };
+    // The paths its file was confirmed for (FEEDBACK83.md, Q-1300; branch feedback82-85).
+    if let Err(why) = crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &p, false) {
+        return Ok(Value::err(Value::str(format!("read_file: {}", why))));
+    }
     // Its bytes and its text, asked about first under `--max-memory`, by the size the open file
     // gives, as `fs::read` reads one: what it does, and the same calls (FEEDBACK71.md, Q-977;
     // branch security). Where the limit is set, read no further than it, whatever the size said:
@@ -3269,6 +3290,9 @@ fn write_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(full) = local_path(it, &p) else {
         return Ok(Value::err(Value::str(format!("write_file: path must stay inside the program's folder: {}{}", p, way_out(&p, "write")))));
     };
+    if let Err(why) = crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &p, true) {
+        return Ok(Value::err(Value::str(format!("write_file: {}", why))));
+    }
     if let Some(why) = own_file(it, &full, false) {
         return Ok(Value::err(Value::str(format!("write_file: will not write {}: {}", p, why))));
     }
@@ -3289,6 +3313,9 @@ fn check_program(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let Some(full) = local_path(it, &p) else {
         return Ok(Value::err(Value::str(format!("check_program: path must stay inside the program's folder: {}", p))));
     };
+    if let Err(why) = crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &p, false) {
+        return Ok(Value::err(Value::str(format!("check_program: {}", why))));
+    }
     // The file checked is read as Quillo too, as what it uses is: not `.env` (FEEDBACK55.md,
     // Q-703; branch feedback55). One in a folder `--allow-path` named is the program's to name.
     let plain = Path::new(&*p).components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
@@ -3337,6 +3364,9 @@ fn delete_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     };
     if let Some(why) = own_file(it, &full, false) {
         return Ok(Value::err(Value::str(format!("delete_file: will not delete {}: {}", p, why))));
+    }
+    if let Err(why) = crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &p, true) {
+        return Ok(Value::err(Value::str(format!("delete_file: {}", why))));
     }
     let r = if full.is_dir() { std::fs::remove_dir_all(&full) } else { std::fs::remove_file(&full) };
     Ok(match r {

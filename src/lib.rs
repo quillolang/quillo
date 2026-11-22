@@ -49,6 +49,9 @@ pub mod svcauth;
 pub mod embed;
 pub mod fcgi;
 pub mod policy;
+// What a program's files reach, and what was confirmed of it (FEEDBACK83.md, Q-1300; branch
+// feedback82-85).
+pub mod confirm;
 
 /// Standard base64, padded (`btoa`'s).
 pub fn crypto_b64(bytes: &[u8]) -> String {

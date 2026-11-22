@@ -267,6 +267,11 @@ fn install_one(agent: &ureq::Agent, registry: &str, e: &Entry, o: &Options, dir:
         if !o.force {
             match version_cmp(&mine, &e.version) {
                 std::cmp::Ordering::Less => {}
+                // Only an `//! effects:` line added, as a policy asks: the catalog's file still,
+                // not one changed by hand; one the catalog now has replaces it (FEEDBACK83.md,
+                // Q-1306; branch feedback82-85).
+                std::cmp::Ordering::Equal if hex_sha256(&without_effects(old)) == e.sha256 => return Ok(Done::UpToDate),
+                std::cmp::Ordering::Equal if old_differs_only_in_effects(agent, registry, e, old) => {}
                 std::cmp::Ordering::Equal => return Ok(Done::Kept(format!("{} {} here differs from the catalog's: changed by hand? --force replaces it", e.name, mine))),
                 std::cmp::Ordering::Greater => return Ok(Done::Kept(format!("{} {} here is newer than the catalog's {}; --force replaces it", e.name, mine, e.version))),
             }
@@ -287,6 +292,50 @@ fn install_one(agent: &ureq::Agent, registry: &str, e: &Entry, o: &Options, dir:
         Some(old) => Done::Updated(header_version(&String::from_utf8_lossy(&old)).unwrap_or_else(|| "?".into())),
         None => Done::Installed,
     })
+}
+
+/// A plugin's text without the `//! effects:` lines of its header, the `//!` lines at its top:
+/// one anywhere else is code, or a comment, the catalog's own (found in review 2).
+fn without_effects(bytes: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(bytes);
+    let header: std::collections::HashSet<usize> = crate::native::header_lines(&text, true).into_iter().filter(|(_, l)| l.trim_start().starts_with("effects:")).map(|(n, _)| n).collect();
+    let mut out = String::with_capacity(text.len());
+    for (n, l) in text.split_inclusive('\n').enumerate() {
+        if !header.contains(&n) {
+            out.push_str(l);
+        }
+    }
+    out.into_bytes()
+}
+
+/// Whether the copy here is the catalog's but for its `//! effects:` line, the catalog's having
+/// one of its own now.
+fn old_differs_only_in_effects(agent: &ureq::Agent, registry: &str, e: &Entry, old: &[u8]) -> bool {
+    match download(agent, &absolute(registry, &e.file)) {
+        Ok(new) => hex_sha256(&new) == e.sha256 && without_effects(&new) == without_effects(old),
+        Err(_) => false,
+    }
+}
+
+/// The plugin at `path` as `quillo install` checked it, kept in the `quillo.confirmed` of this
+/// folder when the project has one: its SHA-256 and its effects line, so that a file changed
+/// afterwards does not load (FEEDBACK83.md, Q-1307; branch feedback82-85). None is made here:
+/// writing one holds the whole program to it.
+/// The program's is the one in the folder installed into, or else in this folder, the one the
+/// program is run from; the plugin is named from where that file is, an absolute `--dir` too
+/// (found in review).
+fn keep_confirmed(path: &Path, dir: &Path) -> Result<Option<PathBuf>, String> {
+    let file = [dir.join(crate::confirm::FILE), PathBuf::from(crate::confirm::FILE)].into_iter().find(|f| f.exists()).unwrap_or_else(|| PathBuf::from(crate::confirm::FILE));
+    let Some(mut conf) = crate::confirm::read(&file)? else { return Ok(None) };
+    let bytes = crate::error::read_file(path).map_err(|e| format!("{}: {}", path.display(), e))?;
+    let parsed = crate::native::parse(&String::from_utf8_lossy(&bytes));
+    let name = crate::confirm::name_from(&crate::confirm::dir_of(&file.with_file_name("main.qwe")), path);
+    let b = conf.entry(name).or_default();
+    b.rust = true;
+    b.sha256 = Some(hex_sha256(&bytes));
+    b.effects = parsed.effects.map(|m| if m == 0 { "none".into() } else { crate::ast::effect_names(m).join(", ") });
+    crate::confirm::write(&file, &conf)?;
+    Ok(Some(file))
 }
 
 /// With --example: the plugin's example program and the files it reads, beside it. One
@@ -416,6 +465,7 @@ pub fn main(args: &[String]) -> i32 {
         }
         match install_one(&agent, &registry, e, &o, &dir) {
             Ok(done) => {
+                let keep = matches!(done, Done::Installed | Done::Updated(_) | Done::UpToDate);
                 match done {
                     Done::Installed => {
                         println!("installed {} {} into {}", e.name, e.version, dir.join(format!("{}.qwer", e.name)).display());
@@ -424,6 +474,21 @@ pub fn main(args: &[String]) -> i32 {
                     Done::Updated(from) => println!("updated {} {} → {}", e.name, from, e.version),
                     Done::UpToDate => println!("{} {} is up to date", e.name, e.version),
                     Done::Kept(why) => println!("kept {}", why),
+                }
+                if keep {
+                    // What it says it does, as the catalog gives it (FEEDBACK83.md, Q-1306).
+                    let text = crate::error::read_file(&dir.join(format!("{}.qwer", e.name))).unwrap_or_default();
+                    if let Some(m) = crate::native::parse(&String::from_utf8_lossy(&text)).effects {
+                        println!("  its effects: {}", if m == 0 { "none".to_string() } else { crate::ast::effect_names(m).join(", ") });
+                    }
+                    match keep_confirmed(&dir.join(format!("{}.qwer", e.name)), &dir) {
+                        Ok(Some(f)) => println!("  {} keeps its SHA-256", f.display()),
+                        Ok(None) => {}
+                        Err(err) => {
+                            eprintln!("quillo install: {}", err);
+                            failed += 1;
+                        }
+                    }
                 }
                 if o.example {
                     if let Err(err) = install_extras(&agent, &registry, e, &o, &dir) {

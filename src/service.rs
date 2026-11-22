@@ -3473,6 +3473,12 @@ pub fn split(path: &Path, watch: bool, reload: bool, static_check: bool, checked
     let mut running = Vec::new();
     for (name, prefix, file, port) in &copies {
         let mut args: Vec<String> = vec!["run".into(), file.display().to_string(), "--port".into(), port.to_string(), "--as-service".into(), "--service-name".into(), name.clone()];
+        // The app's folder, by argument: its quillo.confirmed holds the service, and its private
+        // names' tags count from it (FEEDBACK83.md, Q-1300, found in review 2; FEEDBACK55.md,
+        // Q-807; branch feedback82-85).
+        if let Some(root) = path.canonicalize().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
+            args.extend(["--program-root".to_string(), root.display().to_string()]);
+        }
         if let Some(p) = prefix {
             args.extend(["--base".to_string(), p.clone()]);
         }

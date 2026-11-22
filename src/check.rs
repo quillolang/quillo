@@ -938,7 +938,7 @@ const CAUGHT_DEFERRED: u8 = 2;
 /// What `render_effects` found for one route: (what needs it, the effects it lacks, how it is
 /// caught) -> an error, what to say, and the components and views that call it, the one said of
 /// first. A call caught by `??` and one not are said apart, each with its own end (found in review).
-type Found = HashMap<(Arc<str>, u8, u8), (bool, (String, String, String, String), Vec<String>)>;
+type Found = HashMap<(Arc<str>, Effects, u8), (bool, (String, String, String, String), Vec<String>)>;
 
 /// The calls and tags of `e` the server runs as it makes a page (`RenderRef`): not in a function
 /// written there, which runs later, in the browser (a handler's, a timer's), nor under a name `e`
@@ -1941,7 +1941,7 @@ struct Sig {
     /// Declared return type, or a builtin's.
     ret: Option<T>,
     err: Option<u16>,
-    effects: Option<u8>,
+    effects: Option<Effects>,
     server: bool,
     component: bool,
     builtin: bool,
@@ -2223,6 +2223,10 @@ pub struct Analysis {
     /// the order of those lines: each one's own tools and types, as its own check read them, for
     /// the program's door to list as `billing.<name>` (FEEDBACK56.md, Part F; branch feedback56).
     pub service_tools: Vec<ServiceTools>,
+    /// Each `.qwe` file of the program as it was parsed, by its path as it really is: what
+    /// `quillo check` reads for what the files reach, without parsing them again (FEEDBACK83.md,
+    /// Q-1300; branch feedback82-85).
+    pub parsed: HashMap<PathBuf, Arc<Vec<Stmt>>>,
 }
 
 /// A service's tools, offered by the program checked (`Analysis::service_tools`).
@@ -2243,7 +2247,7 @@ pub struct ToolFacts {
     pub def: Arc<FnDef>,
     pub file: String,
     /// The effects the code reaches.
-    pub effects: u8,
+    pub effects: Effects,
     /// Why the checker cannot see all it may run: a call of a parameter or variable, `js` or
     /// `run_script`, a native plugin's function, the program's variable that may hold a
     /// function, or a module or service passed as a value. None: it sees every call.
@@ -2302,7 +2306,7 @@ struct ServiceFn {
 /// What some code was found to do (`ToolFacts`' findings, without whose they are).
 #[derive(Debug, Clone, Default)]
 struct Seen {
-    effects: u8,
+    effects: Effects,
     uncertain: Option<String>,
     writes: Option<String>,
     open: Option<String>,
@@ -2615,8 +2619,14 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
     // `use` paths count from the folder of the file a main file that is a link leads to; the
     // rest from the folder given (FEEDBACK55.md, Q-817; branch feedback55).
     let src_dir = crate::modules::source_dir_or(Path::new(file), base_dir);
-    match parsed.map(Arc::new).and_then(|stmts| c.link(stmts, src, file, &src_dir)) {
+    let mut main_parsed = None;
+    match parsed.map(Arc::new).and_then(|stmts| {
+        main_parsed = Some(stmts.clone());
+        c.link(stmts, src, file, &src_dir)
+    }) {
         Ok(stmts) => {
+            c.out.parsed = c.links.parsed.clone();
+            c.out.parsed.extend(main_parsed.take().map(|m| (crate::modules::key(Path::new(file)), m)));
             let mut seen = HashSet::new();
             if let Ok(p) = Path::new(file).canonicalize() {
                 seen.insert(p);
@@ -2773,7 +2783,7 @@ struct FnCtx {
     ret: Option<T>,
     err: Option<u16>,
     /// Effects allowed here, and the `with` function that limited them.
-    allowed: u8,
+    allowed: Effects,
     restrictor: Option<(String, Vec<String>)>,
     /// Inside a component: the code also runs in the browser.
     component: Option<String>,
@@ -2856,7 +2866,7 @@ struct Checker {
     /// feedback72-81).
     render_refs_cache: HashMap<usize, Arc<[RenderRef]>>,
     /// `render_effects_possible`, by the effects a route allows.
-    render_possible: HashMap<u8, bool>,
+    render_possible: HashMap<Effects, bool>,
     /// The blocks whose last statement's value nothing takes, marked before they are checked, and
     /// how it is said of (`mark_tails`; FEEDBACK80.md, Q-1267; branch feedback72-81).
     drop_marks: HashMap<*const Expr, DropHow>,
@@ -2879,7 +2889,7 @@ struct Checker {
     assigned_globals: HashSet<String>,
     ret_cache: HashMap<usize, T>,
     in_progress: HashSet<usize>,
-    effect_cache: HashMap<usize, u8>,
+    effect_cache: HashMap<usize, Effects>,
     /// Whether a call of the program's function can change anything, by its definition
     /// (`changes_anything`; FEEDBACK64.md, Q-931; branch feedback64).
     changes_cache: HashMap<usize, Result<bool, usize>>,
@@ -6671,7 +6681,7 @@ impl Checker {
 
     /// Effects a top-level function may use, declared or worked out from
     /// what it calls.
-    fn fn_effects(&mut self, sig: &Sig) -> u8 {
+    fn fn_effects(&mut self, sig: &Sig) -> Effects {
         if let Some(e) = sig.effects {
             return e;
         }
@@ -6734,7 +6744,7 @@ impl Checker {
             components: Vec<String>,
             routes: Vec<(Arc<str>, u32, String, String)>,
         }
-        let mut said: Vec<((Arc<str>, u8, bool, u8), Said)> = Vec::new();
+        let mut said: Vec<((Arc<str>, Effects, bool, u8), Said)> = Vec::new();
         for (file, r) in routes {
             let decl = r.effects.clone().unwrap_or_default();
             let allowed = effect_mask(&decl);
@@ -6800,7 +6810,7 @@ impl Checker {
                     let missing = needs & !allowed;
                     let mut through: Vec<String> = Vec::new();
                     if let (Some(d), false) = (&def, declared || missing == 0) {
-                        for bit in (0..8).map(|i| 1u8 << i).filter(|b| missing & b != 0) {
+                        for bit in (0..EFFECTS.len()).map(|i| (1 as Effects) << i).filter(|b| missing & b != 0) {
                             if let Some(n) = self.effect_source(d, bit).filter(|n| !through.contains(n)) {
                                 through.push(n);
                             }
@@ -6816,7 +6826,7 @@ impl Checker {
                     }
                 }
             }
-            let mut found: Vec<((Arc<str>, u8, u8), (bool, (String, String, String, String), Vec<String>))> = found.into_iter().collect();
+            let mut found: Vec<((Arc<str>, Effects, u8), (bool, (String, String, String, String), Vec<String>))> = found.into_iter().collect();
             found.sort_by(|a, b| (&a.0 .0, a.0 .1, a.0 .2).cmp(&(&b.0 .0, b.0 .1, b.0 .2)));
             for ((n, missing, kind), (error, msg, components)) in found {
                 let route = (file.clone(), r.line, r.shown(), decl.join(", "));
@@ -6857,7 +6867,7 @@ impl Checker {
     /// One call of `render_effects` that lacks `missing`: kept, with what to say, the error
     /// winning over the warning for one route, and every component or view that calls it.
     #[allow(clippy::too_many_arguments)]
-    fn render_need(&mut self, found: &mut Found, route_file: &Arc<str>, rf: &RenderRef, c: &Arc<FnDef>, missing: u8, declared: bool, sure: bool, caught: u8, through: Vec<String>) {
+    fn render_need(&mut self, found: &mut Found, route_file: &Arc<str>, rf: &RenderRef, c: &Arc<FnDef>, missing: Effects, declared: bool, sure: bool, caught: u8, through: Vec<String>) {
         if missing == 0 {
             return;
         }
@@ -6913,7 +6923,7 @@ impl Checker {
     /// Whether any component of the program runs, as it renders, something needing an effect
     /// `allowed` lacks: worked out once for each `with`, so that, as in most programs, when none
     /// does, no route's page is read for it (Q-1261).
-    fn render_effects_possible(&mut self, allowed: u8) -> bool {
+    fn render_effects_possible(&mut self, allowed: Effects) -> bool {
         if let Some(b) = self.render_possible.get(&allowed) {
             return *b;
         }
@@ -6952,7 +6962,7 @@ impl Checker {
     /// those they call, nearest first: what the run names when the call is made (Q-1261). Read as
     /// `fn_effects` reads them, with a list of what is left to read and not by recursion, so a long
     /// chain of calls takes no stack.
-    fn effect_source(&mut self, d: &Arc<FnDef>, missing: u8) -> Option<String> {
+    fn effect_source(&mut self, d: &Arc<FnDef>, missing: Effects) -> Option<String> {
         let mut seen: HashSet<usize> = HashSet::new();
         let mut todo: std::collections::VecDeque<Arc<FnDef>> = std::collections::VecDeque::from([d.clone()]);
         seen.insert(def_key(d));
@@ -7343,7 +7353,7 @@ impl Checker {
         }
     }
 
-    fn effect_error(&mut self, what: &str, missing: u8, restrictor: Option<&(String, Vec<String>)>) {
+    fn effect_error(&mut self, what: &str, missing: Effects, restrictor: Option<&(String, Vec<String>)>) {
         let names = effect_names(missing);
         let need = format!("the {} effect{}", names.join(", "), if names.len() == 1 { "" } else { "s" });
         // An effect the `with` names but the policy took away is the policy's to explain

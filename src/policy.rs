@@ -162,7 +162,7 @@ pub struct Policy {
     /// Each layer's plugins: `name` or `name@version`, the version a prefix of the plugin's.
     pub plugins: Vec<(PathBuf, Vec<String>)>,
     /// The effects every layer allows.
-    pub effects: u8,
+    pub effects: crate::ast::Effects,
     /// The first layer that took effects away.
     pub effects_from: Option<PathBuf>,
     /// May `http` reach loopback, private and link-local addresses.
@@ -234,7 +234,7 @@ pub fn set(p: Policy) {
 }
 
 /// The effects nothing in the program may go past.
-pub fn ceiling() -> u8 {
+pub fn ceiling() -> crate::ast::Effects {
     get().effects
 }
 
@@ -787,7 +787,22 @@ impl Policy {
                             }
                         }
                     }
-                    self.plugins.push((file.to_path_buf(), allow));
+                    self.plugins_of_layer(file, allow);
+                }
+                // Only the catalog's files, each as the catalog has it: by the SHA-256 a copy of
+                // its index gives, which the provider keeps (`true`: `catalog.json` beside the
+                // file that says it). A plugin is then held as one pinned by its source's hash, so
+                // it is built here from the bytes hashed (FEEDBACK82.md, Q-1285, and FEEDBACK83.md,
+                // Q-1307; branch feedback82-85).
+                ("plugins", "catalog", V::Bool(false)) => {}
+                ("plugins", "catalog", V::Bool(true) | V::Str(_)) => {
+                    let named = match &v {
+                        V::Str(s) => PathBuf::from(s),
+                        _ => PathBuf::from("catalog.json"),
+                    };
+                    let index = if named.is_absolute() { named } else { file.parent().unwrap_or(Path::new("/")).join(named) };
+                    let pins = catalog_pins(&index).map_err(|e| at(line, e))?;
+                    self.plugins_of_layer(file, pins);
                 }
                 ("effects", "allow", _) => {
                     let mut mask = 0;
@@ -961,7 +976,7 @@ impl Policy {
                 }
                 (s, k, _) => {
                     let known = [
-                        "plugins.build", "plugins.allow", "effects.allow", "http.private", "http.hosts", "env.names", "env.set", "limits.workers", "limits.max_compute", "limits.max_body", "limits.max_tool_calls", "limits.max_memory",
+                        "plugins.build", "plugins.allow", "plugins.catalog", "effects.allow", "http.private", "http.hosts", "env.names", "env.set", "limits.workers", "limits.max_compute", "limits.max_body", "limits.max_tool_calls", "limits.max_memory",
                         "run.trust_proxy", "run.with", "run.watch", "run.describe", "run.plain_http", "run.split", "run.join", "run.check", "run.instances", "run.max_connections", "run.connections_per_client", "run.live_per_client",
                         "run.drain", "run.socket_mode", "run.listen", "run.base", "run.log", "fs.paths",
                     ];
@@ -982,6 +997,16 @@ impl Policy {
             }
         }
         Ok(())
+    }
+
+    /// A layer's plugins: its `allow` and its `catalog`'s are one list, either letting a plugin in,
+    /// as both are the one provider's; the layers' lists each must let it in (FEEDBACK82.md,
+    /// Q-1285, found in review 2 of FEEDBACK83.md; branch feedback82-85).
+    fn plugins_of_layer(&mut self, file: &Path, list: Vec<String>) {
+        match self.plugins.iter_mut().find(|(f, _)| f == file) {
+            Some((_, have)) => have.extend(list),
+            None => self.plugins.push((file.to_path_buf(), list)),
+        }
     }
 
     /// `[env] set`'s `name` = `value`: a name an earlier layer set keeps its value.
@@ -1060,7 +1085,9 @@ impl Policy {
                     Some(h) if pinned => format!(" (its SHA-256 is {})", h),
                     _ => String::new(),
                 };
-                return Err(format!("the plugin `{}`{} is not in the plugins {} allows: {}{}", name, said, file.display(), allow.join(", "), its));
+                // A catalog's index names hundreds: said by their number (FEEDBACK82.md, Q-1285).
+                let list = if allow.len() > 12 { format!("{} plugins, each by its SHA-256", allow.len()) } else { allow.join(", ") };
+                return Err(format!("the plugin `{}`{} is not in the plugins {} allows: {}{}", name, said, file.display(), list, its));
             }
         }
         Ok(())
@@ -1084,6 +1111,19 @@ impl Policy {
     /// Whether `http` is held to hosts or kept from private addresses.
     pub fn limits_http(&self) -> bool {
         !self.hosts.is_empty() || !self.private
+    }
+
+    /// Why `http` may not reach `host`, as `quillo check` can say before a deploy: a host no layer
+    /// allows (FEEDBACK83.md, Q-1302; branch feedback82-85). `private = false` is judged as the
+    /// call runs, by where the name leads then.
+    pub fn refuses_host(&self, host: &str) -> Option<String> {
+        let host = host.trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase();
+        for (file, hosts) in &self.hosts {
+            if !hosts.iter().any(|h| host_matches(h, &host)) {
+                return Some(format!("{} is not among the hosts {} allows: {}", host, file.display(), hosts.join(", ")));
+            }
+        }
+        None
     }
 
     /// Why `http` may not reach `url`, if it may not: a host no layer allows, or (with `private =
@@ -1304,6 +1344,24 @@ impl Policy {
             }
         }
     }
+}
+
+/// Each plugin of a catalog's index (`plugins/index.json`, format 1, as `quillo install` reads it)
+/// as `name@sha256:hex`; why not, naming the file.
+fn catalog_pins(index: &Path) -> Result<Vec<String>, String> {
+    let text = crate::error::read_text(index).map_err(|e| format!("the catalog's index {}: {}", index.display(), e))?;
+    let j: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("the catalog's index {} is not JSON: {}", index.display(), e))?;
+    if j["format"].as_u64() != Some(1) {
+        return Err(format!("the catalog's index {} is not one this quillo reads (format 1)", index.display()));
+    }
+    let mut pins = Vec::new();
+    for p in j["plugins"].as_array().into_iter().flatten() {
+        let (Some(name), Some(h)) = (p["name"].as_str(), p["sha256"].as_str()) else { continue };
+        if h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()) && !name.is_empty() {
+            pins.push(format!("{}@sha256:{}", name, h.to_ascii_lowercase()));
+        }
+    }
+    Ok(pins)
 }
 
 /// `*` any host, `*.example.com` its subdomains (not itself), else the host itself.

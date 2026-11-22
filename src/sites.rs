@@ -37,7 +37,7 @@ pub fn is_site(v: &Value) -> bool {
 }
 
 /// `__site(name, url)`: the value `site` declares.
-pub fn declare(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+pub fn declare(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (Some(Value::Str(name) | Value::Css(name)), Some(url)) = (args.first(), args.get(1)) else {
         return fail(line, "`site` takes a name and an address: site shop = \"https://shop.example.com\"");
     };
@@ -56,11 +56,16 @@ pub fn declare(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let mut m = Map::new();
     m.insert("$site".into(), Value::Str(name.clone()));
     m.insert("$url".into(), Value::str(u));
+    // Its host as the file that declares it was confirmed for: a site not confirmed is declared,
+    // and each call of it refused (FEEDBACK83.md, Q-1300, found in review; branch feedback82-85).
+    if let Err(why) = crate::confirm::http_ok(crate::confirm::held_id(it.cur_file.as_deref()), u) {
+        m.insert("$refused".into(), Value::str(why));
+    }
     // The same declaration run again (a reload, a script) is the one made before: the list
     // holds each site once.
     let mut all = DECLARED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let same = |d: &Map, k: &str| matches!((d.get(k), m.get(k)), (Some(Value::Str(a) | Value::Css(a)), Some(Value::Str(b) | Value::Css(b))) if a == b);
-    let m = match all.iter().find(|d| same(d, "$site") && same(d, "$url")) {
+    let m = match all.iter().find(|d| same(d, "$site") && same(d, "$url") && d.contains_key("$refused") == m.contains_key("$refused")) {
         Some(d) => d.clone(),
         None => {
             let m = Arc::new(m);
@@ -171,6 +176,9 @@ pub fn call(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return fail(line, "a site's function is called on a value a `site` declaration made");
     };
     let name = site.get("$site").map(|v| v.display()).unwrap_or_default();
+    if let Some(why) = site.get("$refused") {
+        return Ok(Value::err(Value::str(format!("site {}: not called: {}", name, why.display()))));
+    }
     let url = site.get("$url").map(|v| v.display()).unwrap_or_default();
     let body = serde_json::Value::Array(args.map(|a| crate::interp::island_json(&a)).collect()).to_string();
     let keeps = keeps_cookies();

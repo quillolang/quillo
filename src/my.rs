@@ -40,6 +40,17 @@ pub fn is_url(s: &str) -> bool {
 /// - `built_in_roots=true`: the public CAs as well as those in `ssl_ca`;
 /// - `ssl_cert` and `ssl_key`: a certificate and its key, for servers that
 ///   ask for one (`REQUIRE X509`).
+/// The host a connection to `url` goes to, as the driver reads it (`Opts::from_url` of the same
+/// string `opts_of` makes) (FEEDBACK83.md, Q-1300, found in review 3; branch feedback82-85). A
+/// Unix socket is no host, and said.
+pub fn hosts(url: &str) -> Result<Vec<String>, String> {
+    let opts = opts_of(url)?;
+    if let Some(s) = opts.socket() {
+        return Err(format!("a database reached through the socket {} is not held to confirmed hosts; give its host", s));
+    }
+    Ok(vec![opts.ip_or_hostname().trim_start_matches('[').trim_end_matches(']').to_ascii_lowercase()])
+}
+
 fn opts_of(url: &str) -> Result<Opts, String> {
     // `mariadb://` is the same protocol.
     let url = match url.strip_prefix("mariadb://") {

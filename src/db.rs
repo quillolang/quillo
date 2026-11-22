@@ -74,6 +74,23 @@ pub fn is_mysql_url(s: &str) -> bool {
     s.starts_with("mysql://") || s.starts_with("mariadb://")
 }
 
+/// The hosts a database target's driver connects to, as each driver reads its address; None for a
+/// target that is no server's (a SQLite file): the one place that tells them apart, for
+/// `quillo.confirmed`'s scan and hold as for opening (FEEDBACK83.md, Q-1300, found in review 3;
+/// branch feedback82-85).
+pub fn server_hosts(target: &str) -> Option<Result<Vec<String>, String>> {
+    if pg::is_url(target) {
+        return Some(pg::hosts(target));
+    }
+    if is_mysql_url(target) {
+        #[cfg(feature = "mysql")]
+        return Some(crate::my::hosts(target));
+        #[cfg(not(feature = "mysql"))]
+        return Some(Err("this Quillo was built without MySQL".into()));
+    }
+    None
+}
+
 /// Whether the program's database is MySQL (or will be, once opened):
 /// `sql_name` quotes names as it reads them.
 pub(crate) fn program_db_is_mysql(it: &Interp) -> bool {
@@ -300,6 +317,10 @@ pub struct TenantDbs {
     /// again. Connections are not shared between tenants: they keep statements prepared
     /// against one schema (FEEDBACK20.md, Q-168; branch feedback20-fixes).
     most_open: Option<usize>,
+    /// The code that declared it, as `quillo.confirmed` holds it (`confirm::held_id`): each
+    /// tenant's connection is held to that file's confirmed hosts and paths (FEEDBACK83.md, Q-1300,
+    /// found in review 2; branch feedback82-85).
+    held: u32,
 }
 
 /// Where a tenant's database is: `{tenant}` in a path or URL, or what a
@@ -315,7 +336,7 @@ impl TenantDbs {
             Target::Text(t) => t.split_once('?').and_then(|(_, q)| q.split('&').find_map(|p| p.strip_prefix("open_tenants=")?.parse().ok())),
             Target::Fn(_) => None,
         };
-        TenantDbs { target, open: Mutex::new(Default::default()), migrations: Mutex::new(None), most_open }
+        TenantDbs { target, open: Mutex::new(Default::default()), migrations: Mutex::new(None), most_open, held: 0 }
     }
 
     fn template(&self) -> Option<&str> {
@@ -1123,6 +1144,9 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
     // A request's host can name any tenant, so only the program makes one
     // (`new_tenant`, when signing a tenant up): made-up names make nothing.
     let make = it.tenant_named;
+    // Where the declaring file was confirmed to reach, before any folder is made for it
+    // (FEEDBACK83.md, Q-1300, found in reviews 2 and 3; branch feedback82-85).
+    crate::confirm::db_ok(dbs.held, &it.base_dir, &target).map_err(|e| format!("tenant {}: {}", name, e))?;
     if !is_server_url(&target) && target != ":memory:" {
         let full = if Path::new(&target).is_absolute() { Path::new(&target).to_path_buf() } else { it.base_dir.join(&target) };
         if !make && !full.exists() {
@@ -1450,6 +1474,11 @@ pub(crate) fn claim_tenant(it: &mut Interp, name: &str, line: u32) -> Result<boo
         Ok(None) => return fail(line, format!("`new_tenant`: the function for tenants' databases gave null for {:?}", name)),
         Err(e) => return fail(line, format!("`new_tenant`: {}", e)),
     };
+    // Made, file or schema, only where the declaring file was confirmed to reach (FEEDBACK83.md,
+    // Q-1300, found in review 3; branch feedback82-85).
+    if let Err(e) = crate::confirm::db_ok(dbs.held, &it.base_dir, &target) {
+        return fail(line, format!("`new_tenant`: {}", e));
+    }
     let made = if pg::is_url(&target) {
         it.unlocked(move || pg::Pool::claim(&target))
     } else if is_mysql_url(&target) {
@@ -2090,7 +2119,17 @@ fn tenants(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
 
 /// A database slot for `db.open`'s or `db.connect`'s target: one per
 /// tenant (a `{tenant}` template, or a function), or one opened now.
+/// `open_backend`, held first to what the code `held` (`confirm::held_id`) was confirmed for.
+fn open_held(it: &mut Interp, target: &str, held: u32) -> Result<Arc<Backend>, String> {
+    crate::confirm::db_ok(held, &it.base_dir, target)?;
+    open_backend(it, target)
+}
+
 fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Result<DbSlot, String>, Ctrl> {
+    // `db.open`, `db.connect`: each database the program's code opens, its replicas and its
+    // tenants', held to what the file that opens it was confirmed for (FEEDBACK83.md, Q-1300,
+    // found in review 2; branch feedback82-85).
+    let held = crate::confirm::held_id(it.cur_file.as_deref());
     // `{ replicas: [...] }`: read replicas of a database (one, not one per tenant).
     if let Some(opts) = args.get(1) {
         let Value::Map(o) = opts else {
@@ -2111,13 +2150,13 @@ fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Resul
         if !urls.is_empty() && !is_server_url(&primary) {
             return fail(line, format!("`{}`: replicas are of a PostgreSQL or MySQL database, not SQLite", f));
         }
-        let b = match open_backend(it, &primary) {
+        let b = match open_held(it, &primary, held) {
             Ok(b) => b,
             Err(e) => return Ok(Err(e)),
         };
         let mut list = Vec::new();
         for u in &urls {
-            match open_backend(it, u) {
+            match open_held(it, u, held) {
                 Ok(r) => list.push(r),
                 // Named without its user and password, as `db.connect`'s errors are: the URL
                 // went to the log whole (FEEDBACK51.md, Q-659; branch feedback51-fixes).
@@ -2134,11 +2173,11 @@ fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Resul
     match args.first() {
         Some(Value::Str(t) | Value::Css(t)) if t.contains("{tenant}") => {
             tenant_template(&it.base_dir, t);
-            Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs::new(Target::Text(t.to_string()))))))
+            Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs { held, ..TenantDbs::new(Target::Text(t.to_string())) }))))
         }
-        Some(Value::Str(t) | Value::Css(t)) => Ok(open_backend(it, t).map(DbSlot::One)),
+        Some(Value::Str(t) | Value::Css(t)) => Ok(open_held(it, t, held).map(DbSlot::One)),
         // Where each tenant's database is, opened when its tenant first uses it.
-        Some(fv @ (Value::Func(_) | Value::Builtin(..))) => Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs::new(Target::Fn(fv.clone())))))),
+        Some(fv @ (Value::Func(_) | Value::Builtin(..))) => Ok(Ok(DbSlot::PerTenant(Arc::new(TenantDbs { held, ..TenantDbs::new(Target::Fn(fv.clone())) })))),
         other => fail(
             line,
             format!("`{}` expects a path, a URL, or a function giving one for each tenant, got {}", f, other.map_or("nothing", |v| v.type_name())),
@@ -2635,7 +2674,8 @@ fn system(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if t.contains("{tenant}") {
         return fail(line, "`db.system` is one database for every tenant: no {tenant} in it");
     }
-    let b = match open_backend(it, t) {
+    let held = crate::confirm::held_id(it.cur_file.as_deref());
+    let b = match open_held(it, t, held) {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };

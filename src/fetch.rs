@@ -84,9 +84,13 @@ struct Opts {
     /// A `site`'s call (src/sites.rs), no option of the program's: a redirect to another origin,
     /// or to what is not http(s), is not followed but is the answer.
     same_origin: bool,
+    /// The hosts the calling file was confirmed for, by its block (`confirm::held_id`; 0: none
+    /// held), each address and redirect held to them (FEEDBACK83.md, Q-1300, D.4; branch
+    /// feedback82-85).
+    held: u32,
 }
 
-const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0, timeout_ms: 0, tls: 0, same_origin: false };
+const DEFAULT_OPTS: Opts = Opts { redirects: 5, public_only: false, cache: 0, timeout_ms: 0, tls: 0, same_origin: false, held: 0 };
 
 /// The options there are; `http.stream`'s map also has its request's. `save`, a file to write the
 /// answer's body to, with `max_bytes`, the most it writes: the others' alone, as `http.stream`
@@ -289,7 +293,7 @@ fn opts_of(v: Option<&Value>, fname: &str, line: u32, base: &std::path::Path, sa
     if cert.is_some() != key.is_some() {
         return fail(line, format!("`{}`: `cert` and `key` go together: a certificate, and its key", fname));
     }
-    Ok(Opts { redirects, public_only, cache, timeout_ms, tls: tls_number(ca, cert, key), same_origin: false })
+    Ok(Opts { redirects, public_only, cache, timeout_ms, tls: tls_number(ca, cert, key), same_origin: false, held: 0 })
 }
 
 /// The server's own network is not where a component's calls go (see the
@@ -505,8 +509,10 @@ fn follow(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, St
     let until = (o.timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(o.timeout_ms as u64));
     loop {
         // Each address, the first and each one it is sent on to (FEEDBACK41.md, Q-478; branch
-        // feedback40-43).
-        crate::policy::get().http(&url)?;
+        // feedback40-43). A refusal is said once for each host, where it was an error value that
+        // nothing in the log showed (FEEDBACK83.md, Q-1302; branch feedback82-85).
+        crate::policy::get().http(&url).inspect_err(|e| refused_once(&url, e))?;
+        crate::confirm::http_ok(o.held, &url)?;
         let left = match until.map(|u| u.saturating_duration_since(Instant::now())) {
             Some(d) if d.is_zero() => return Err(timed_out(o, &url, "timed out".into())),
             left => left,
@@ -539,6 +545,17 @@ fn follow(o: Opts, stream: bool, method: &str, url: &str, headers: &[(String, St
             headers.retain(|(k, _)| ["accept", "accept-language", "content-type", "user-agent"].iter().any(|h| k.eq_ignore_ascii_case(h)));
         }
         url = next;
+    }
+}
+
+/// Says in the log, once for each host, that the policy refused a call to it.
+fn refused_once(url: &str, why: &str) {
+    static SAID: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let host = host_of(url);
+    let mut said = SAID.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if said.len() < 256 && !said.contains(&host) {
+        eprintln!("quillo: a call to {} was refused: {}", host, why);
+        said.push(host);
     }
 }
 
@@ -777,6 +794,10 @@ fn save_to(it: &Interp, fname: &str, opts: Option<&Value>, o: Opts, line: u32) -
     let Some(full) = crate::builtins::local_path(it, &p) else {
         return said(format!("path must stay inside the program's folder: {}{}", p, crate::builtins::way_out(&p, "write")));
     };
+    // The paths its file was confirmed for (FEEDBACK83.md, Q-1300; branch feedback82-85).
+    if let Err(why) = crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &p, true) {
+        return said(why);
+    }
     if let Some(why) = crate::builtins::own_file(it, &full, false) {
         return said(format!("will not write {}: {}", p, why));
     }
@@ -1118,8 +1139,8 @@ fn cache() -> std::sync::MutexGuard<'static, (HashMap<String, Cached>, usize)> {
 /// the client drops) was the same call as one with headers that held the rest (FEEDBACK71.md,
 /// Q-974; branch security). Each option is named, so that one added later cannot be left out.
 fn cache_key(o: Opts, method: &str, url: &str, headers: &[(String, String)], body: Option<&(String, Vec<u8>)>) -> String {
-    let Opts { redirects, public_only, cache, timeout_ms, tls, same_origin } = o;
-    let opts = format!("{} {} {} {} {} {}", redirects, public_only, cache, timeout_ms, tls, same_origin);
+    let Opts { redirects, public_only, cache, timeout_ms, tls, same_origin, held } = o;
+    let opts = format!("{} {} {} {} {} {} {}", redirects, public_only, cache, timeout_ms, tls, same_origin, held);
     let mut hs: Vec<(String, &str)> = headers.iter().map(|(k, v)| (k.to_ascii_lowercase(), v.as_str())).collect();
     hs.sort();
     let (ctype, bytes) = body.map_or(("", &[][..]), |(t, b)| (t.as_str(), b.as_slice()));
@@ -1183,7 +1204,8 @@ fn keep(key: String, secs: u32, reply: &Reply) {
 fn do_request(it: &mut Interp, fname: &str, method: &str, url: &Value, body: &Value, headers: &Value, opts: Option<&Value>, line: u32) -> R {
     not_in_component(it, fname, line)?;
     let mut saving = false;
-    let o = opts_of(opts, fname, line, &it.base_dir.clone(), &mut saving)?;
+    let mut o = opts_of(opts, fname, line, &it.base_dir.clone(), &mut saving)?;
+    o.held = crate::confirm::held_id(it.cur_file.as_deref());
     if o.cache > 0 && method != "GET" {
         return fail(line, format!("`{}`: `cache` keeps the answers of GET requests, not {}", fname, method));
     }
@@ -1497,7 +1519,8 @@ fn stream(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Ok(Value::err(Value::str(format!("http: not an http(s) URL: {}", url))));
     }
-    let o = opts_of(Some(&Value::Map(opts.clone())), "http.stream", line, &it.base_dir.clone(), &mut false)?;
+    let mut o = opts_of(Some(&Value::Map(opts.clone())), "http.stream", line, &it.base_dir.clone(), &mut false)?;
+    o.held = crate::confirm::held_id(it.cur_file.as_deref());
     if o.cache > 0 {
         return fail(line, "`http.stream`: `cache` keeps whole answers, of `http.get`");
     }

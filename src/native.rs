@@ -72,7 +72,7 @@ pub struct Export {
     pub doc: String,
     /// What it may do, from the file's `//! effects:` line: every effect when the file
     /// declares none (FEEDBACK41.md, Q-476; FEEDBACK43.md, Q-489; branch feedback40-43).
-    pub effects: u8,
+    pub effects: crate::ast::Effects,
     /// What its `#[cfg(...)]` attributes say, each: its glue is built where it is (Q-813).
     pub cfg: Vec<String>,
 }
@@ -85,7 +85,7 @@ pub struct Parsed {
     /// What cannot be exported, by line.
     pub problems: Vec<(u32, String)>,
     /// `//! effects: db, http` (or `none`): what its functions may do; `None` when not said.
-    pub effects: Option<u8>,
+    pub effects: Option<crate::ast::Effects>,
     /// What makes the file one Quillo does not load, by line: a function's `/// effects:` line
     /// that names an effect its file's line does not (FEEDBACK85.md, Q-1344; branch
     /// feedback82-85).
@@ -337,9 +337,9 @@ pub fn parse(src: &str) -> Parsed {
 /// so one that reached the network made every small helper beside it need `net` (FEEDBACK85.md,
 /// Q-1344; branch feedback82-85). The line narrows, never widens: one that names an effect the
 /// file's line does not is an error naming both, and the function keeps the file's.
-fn own_effects(e: &Export, file: u8, declared: bool, out: &mut Parsed) -> (u8, String) {
+fn own_effects(e: &Export, file: crate::ast::Effects, declared: bool, out: &mut Parsed) -> (crate::ast::Effects, String) {
     let mut doc = Vec::new();
-    let mut own: Option<u8> = None;
+    let mut own: Option<crate::ast::Effects> = None;
     for (k, l) in e.doc.lines().enumerate() {
         let Some(list) = l.trim().strip_prefix("effects:") else {
             doc.push(l);
@@ -1640,6 +1640,11 @@ pub fn prebuild(files: &[PathBuf]) {
         if plugin_check(f) != Ok(false) {
             continue;
         }
+        // Nor what is not confirmed, nor what is built apart from its confirmed bytes
+        // (FEEDBACK83.md, Q-1300, found in review; branch feedback82-85).
+        if crate::confirm::plugin_ok(f).is_err() || crate::confirm::pinned(f) {
+            continue;
+        }
         let Ok(src) = crate::error::read_text(f) else { continue };
         let lib = lib_path(f, &src);
         if !lib.is_file() || (has_lock(&lib) && not_as_built(&lib).is_some()) {
@@ -1830,11 +1835,11 @@ struct Function {
     params: Vec<String>,
     /// Whether each parameter's type has a `serde_json::Value` in it, which holds no NaN.
     any: Vec<bool>,
-    effects: u8,
+    effects: crate::ast::Effects,
 }
 
 /// What a `.qwer` function may do, by its builtin name: every effect when its file says nothing.
-pub fn effects_of(name: &str) -> u8 {
+pub fn effects_of(name: &str) -> crate::ast::Effects {
     functions().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).map_or(crate::ast::ALL_EFFECTS, |f| f.effects)
 }
 
@@ -2122,6 +2127,137 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
     }
 }
 
+/// A Rust file `quillo.confirmed` holds to its SHA-256: only a library this machine built from those
+/// bytes loads, never one a cloned or unpacked `.quillo/native` brought along (FEEDBACK83.md,
+/// Q-1300, found in review; branch feedback82-85). What it built is kept in a record outside
+/// any project (`built_record`): the library in `.quillo/native` loads when its SHA-256 is the
+/// one recorded for this source, at the cost of hashing it; else it is built apart, as a source
+/// pin is (`build_private`), copied there and recorded, so a change is built once and later
+/// starts are as fast as before. With building off and no such record, it is refused.
+/// Whether a layer of the policy pins plugin `qwer` by the SHA-256 of the library in
+/// `.quillo/native` that it would load.
+fn library_pin_met(qwer: &Path) -> bool {
+    let p = crate::policy::get();
+    if !p.pins_by_hash() {
+        return false;
+    }
+    let name = stem(qwer);
+    let Some(have) = library_path(qwer).filter(|l| l.is_file()).and_then(|l| file_hash(&l).ok()) else { return false };
+    // Only the host's layers: the program's own quillo.policy, or a --policy its developer gives,
+    // is in the repository's hands, and named the library it brought along (found in review 3).
+    let host = |f: &Path| p.files.iter().zip(p.kinds.iter()).any(|(lf, k)| lf == f && matches!(k, crate::policy::Kind::Host | crate::policy::Kind::Included | crate::policy::Kind::Dropin | crate::policy::Kind::PathVar));
+    p.plugins.iter().filter(|(f, _)| host(f)).any(|(_, allow)| allow.iter().any(|a| a.split_once('@').is_some_and(|(n, v)| n == name && v.strip_prefix("sha256:").is_some_and(|h| h.eq_ignore_ascii_case(&have)))))
+}
+
+fn build_confirmed(qwer: &Path, program: &Path) -> Result<(PathBuf, Parsed), String> {
+    let bytes = crate::error::read_file(qwer).map_err(|e| format!("cannot read {}: {}", qwer.display(), e))?;
+    let source = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
+    let src = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8 text", qwer.display()))?;
+    let lib = lib_path(qwer, &src);
+    let key = format!("{} {} {}-{}", source, lib_name(&lib), std::env::consts::ARCH, std::env::consts::OS);
+    let record = built_record(program);
+    if lib.is_file() {
+        // Opened by what was hashed, as a pinned build's is (`checked_lib`; found in review 2).
+        if let Some(want) = record.as_ref().and_then(|r| record_get(r, &key)) {
+            if let Ok(checked) = checked_lib(&lib, &want) {
+                return Ok((checked, parse(src.strip_prefix('\u{FEFF}').unwrap_or(&src))));
+            }
+        }
+    }
+    if no_build() {
+        return Err(format!(
+            "{} is confirmed by its SHA-256, so only a library this machine built from it loads, and building is off (build = false or --no-build): {}; start it once where building is on, or have the policy pin its library by its own SHA-256",
+            qwer.display(),
+            if lib.is_file() { "the one in .quillo/native was not built here" } else { "none is built" }
+        ));
+    }
+    let (private, parsed) = build_private(qwer)?;
+    // Kept for the next start, and recorded; a library that cannot be kept is built again then.
+    if let Some(dir) = lib.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // The bytes copied are the ones recorded, never what is at the path after the rename.
+    let tmp = lib.with_extension(format!("part{}", std::process::id()));
+    let copied = std::fs::read(&private).ok().filter(|b| std::fs::write(&tmp, b).is_ok());
+    match copied {
+        Some(b) if std::fs::rename(&tmp, &lib).is_ok() => {
+            if let Some(r) = record.as_ref() {
+                record_put(r, &key, &crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&b)));
+            }
+        }
+        _ => {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    Ok((private, parsed))
+}
+
+/// The record of the libraries this machine built from confirmed sources: in the user's cache
+/// (`$XDG_CACHE_HOME/quillo/built.txt`, else `~/.cache/quillo/built.txt`), never from what `.env`
+/// set, nor in the program's folder or one it may reach, which a repository or an archive could
+/// bring; `QUILLO_BUILT_RECORD_DIR` names another folder for the tests. None where there is no
+/// such place, or it is not this user's alone: then every start builds apart.
+fn built_record(program: &Path) -> Option<PathBuf> {
+    let real = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty() && !crate::dotenv::set_by_file(k)).map(PathBuf::from);
+    let dir = real("QUILLO_BUILT_RECORD_DIR").or_else(|| real("XDG_CACHE_HOME").map(|c| c.join("quillo"))).or_else(|| real("HOME").map(|h| h.join(".cache").join("quillo")))?;
+    let dir = std::path::absolute(&dir).ok()?;
+    let mut made = std::fs::DirBuilder::new();
+    made.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut made, 0o700);
+    made.create(&dir).ok()?;
+    let dir = dir.canonicalize().ok()?;
+    // In the program's folder, or one it may reach, it is the program's to write: not where it is
+    // started from, which may be the home the cache is in (found in review 2).
+    let mut reach: Vec<PathBuf> = crate::builtins::allowed_paths();
+    reach.extend(program.canonicalize().ok());
+    if reach.iter().filter(|r| r.parent().is_some()).any(|r| dir.starts_with(r)) {
+        return None;
+    }
+    let file = dir.join("built.txt");
+    (own_alone(&dir) && (!file.exists() || own_alone(&file))).then_some(file)
+}
+
+/// Whether `p` is this user's, no link, and no one else may write it.
+fn own_alone(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        std::fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_symlink() && m.uid() == me && m.mode() & 0o022 == 0)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::symlink_metadata(p).is_ok_and(|m| !m.file_type().is_symlink())
+    }
+}
+
+/// The library's SHA-256 recorded for `key`.
+fn record_get(record: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(record).ok()?;
+    text.lines().rev().find_map(|l| l.strip_prefix(key).and_then(|r| r.strip_prefix(' ')).map(|h| h.trim().to_string()))
+}
+
+/// Records `hash` for `key`, the file written apart and renamed into place, 0600; the last 1,000.
+fn record_put(record: &Path, key: &str, hash: &str) {
+    let _one = BUILDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let old = std::fs::read_to_string(record).unwrap_or_default();
+    let mut lines: Vec<&str> = old.lines().filter(|l| !l.starts_with(&format!("{} ", key))).collect();
+    let line = format!("{} {}", key, hash);
+    lines.push(&line);
+    let keep = &lines[lines.len().saturating_sub(1000)..];
+    let tmp = record.with_extension(format!("{}.{}", std::process::id(), crate::service::new_id(8)));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let written = o.open(&tmp).and_then(|mut f| std::io::Write::write_all(&mut f, format!("{}\n", keep.join("\n")).as_bytes()));
+    if written.is_err() || std::fs::rename(&tmp, record).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 /// `use "x.qwer"`: builds and loads it, and defines its functions.
 /// `renames`: what the file that takes them defines the names it takes as, where another file
 /// has the same spelling for another function, or (`None`) that it does not, as a name it takes
@@ -2130,9 +2266,19 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
     let path = qwer.to_path_buf();
     // A plugin the policy names, at a version it names (FEEDBACK41.md, Q-478; branch feedback40-43).
     let here = plugin_check(qwer).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
+    // Only the file confirmed, by its SHA-256, where the program has a `quillo.confirmed`
+    // (FEEDBACK83.md, Q-1300 and Q-1307; branch feedback82-85).
+    crate::confirm::plugin_ok(qwer).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
+    // And confirmed by its SHA-256, only a library built here from those bytes loads, never one a
+    // cloned `.quillo/native` brought along; with building off, the one brought is the one meant
+    // (FEEDBACK83.md, Q-1300, found in review; branch feedback82-85).
+    // A pin of this plugin's own library by its SHA-256, met: that library is the one meant, as
+    // before; a pin of another plugin's is not this one's (found in review 2).
+    let confirmed = !here && !library_pin_met(qwer) && crate::confirm::pinned(qwer);
+    let program = it.base_dir.to_path_buf();
     // A build takes seconds: other requests go on meanwhile (on a reload,
     // with the version that runs now).
-    let built = it.unlocked(move || build_with(&path, here));
+    let built = it.unlocked(move || if confirmed { build_confirmed(&path, &program) } else { build_with(&path, here) });
     let (lib_path, parsed) = built.map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
     // Not loaded with a function's effects wider than its file's, as `quillo check` says
     // (FEEDBACK85.md, Q-1344; branch feedback82-85).
@@ -2412,6 +2558,22 @@ pub fn build_all(main: &Path) -> Result<Vec<PathBuf>, String> {
 
 fn build_all_now(main: &Path) -> Result<Vec<PathBuf>, String> {
     let files = rust_files(main)?;
+    // Nothing is built that the program's quillo.confirmed does not have at its SHA-256: a
+    // build runs the crates' build scripts (FEEDBACK83.md, Q-1300, found in review; branch
+    // feedback82-85). What it has is built as a start builds it, apart and recorded, so a
+    // `quillo run --no-build` after it loads it (found in review 2).
+    if crate::confirm::rust_confirmed(main, &files)? {
+        let program = crate::confirm::dir_of(main);
+        return files
+            .iter()
+            .map(|f| {
+                let (l, _) = build_confirmed(f, &program)?;
+                // Nothing is loaded here: the private folder of a build apart goes now.
+                loaded(&l);
+                Ok(library_path(f).unwrap_or(l))
+            })
+            .collect();
+    }
     prebuild(&files);
     files.iter().map(|f| build(f).map(|(l, _)| l)).collect()
 }

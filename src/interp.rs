@@ -38,7 +38,7 @@ pub(crate) struct Entered {
     cur_file: Option<Arc<str>>,
     caller_file: Option<Arc<str>>,
     in_component: bool,
-    allowed: u8,
+    allowed: crate::ast::Effects,
     restrictor: Option<Arc<FnDef>>,
 }
 
@@ -164,8 +164,11 @@ impl Interp {
         // What they read of the request (`session()`, `url()`) is the request's: its path and
         // query, as a route's before its own parameters (FEEDBACK68.md, Q-985; branch pwa).
         self.pending_request = Some(crate::server::PendingRequest::of_url(&req.url));
-        for (name, e) in self.page_states.clone().iter() {
-            let v = match self.eval(e, &globals) {
+        for (name, e, file) in self.page_states.clone().iter() {
+            let was = std::mem::replace(&mut self.cur_file, file.clone());
+            let v = self.eval(e, &globals);
+            self.cur_file = was;
+            let v = match v {
                 Ok(v) => v,
                 Err(Ctrl::Error(e)) => {
                     eprintln!("quillo: the page's state `{}`: {}", name, e);
@@ -256,12 +259,12 @@ pub struct Interp {
     /// (`run_script`); `u64::MAX` everywhere else.
     pub(crate) fuel: u64,
     /// Effects the running code may use, and the `with` function that limited them.
-    pub(crate) allowed: u8,
+    pub(crate) allowed: crate::ast::Effects,
     /// While a sandboxed script runs: its outermost scope, the effects
     /// the program had (see `script_mask`), and when it is stopped with the
     /// milliseconds that says (`run_script`'s `timeout`; FEEDBACK75.md, Q-1055;
     /// branch feedback75).
-    pub(crate) script: Option<(Env, u8, std::time::Instant, u64)>,
+    pub(crate) script: Option<(Env, crate::ast::Effects, std::time::Instant, u64)>,
     /// The runs of the sandboxed scripts this handle is running, the innermost last (each its
     /// world's address, `script::run_of`): a function one made runs only while its run is here.
     /// On the handle, a request's own: requests take turns on a thread, and a list kept for the
@@ -356,7 +359,10 @@ pub struct Interp {
     islands: Vec<(Map, Map)>,
     /// The program's page states (`state cart = []` at the top) and their initializers, in
     /// order: each request for a page starts with its own (FEEDBACK68.md; branch global-state).
-    pub(crate) page_states: Arc<Vec<(Sym, Expr)>>,
+    /// Each with the file it is written in, which its initializer runs as: a taken file's
+    /// reached what the main file was confirmed for (FEEDBACK83.md, Q-1300, found in review 2;
+    /// branch feedback82-85).
+    pub(crate) page_states: Arc<Vec<(Sym, Expr, Option<Arc<str>>)>>,
     /// The value of the `<select>` whose start tag is being written, then what its options are
     /// rendered against (see `render_option_into`; FEEDBACK55.md, Q-758; branch feedback55).
     select_pending: Option<Value>,
@@ -656,6 +662,13 @@ fn parse_cached(src: &str, abs: Option<Arc<str>>, file: &str, names: Option<&std
         kept.push((abs, hash, stmts.clone()));
     }
     Ok(stmts)
+}
+
+/// A file parsed as a program's load parses it, and kept for that load: what `quillo run` reads
+/// of a program's reach before it loads is not parsed twice (FEEDBACK83.md, Q-1300; branch
+/// feedback82-85).
+pub(crate) fn parse_kept(src: &str, full: &Path) -> Option<Arc<Vec<Stmt>>> {
+    parse_cached(src, source_path(full), &full.display().to_string(), None).ok()
 }
 
 fn source_path(file: &Path) -> Option<Arc<str>> {
@@ -3726,12 +3739,20 @@ impl Interp {
         match s {
             Stmt::Fn(def) => {
                 define(env, &def.name, Value::Func(Arc::new(Closure { def: def.clone(), env: env.clone() })));
-                if def.server && !self.server_fns.contains(&def.name) {
+                // A taken file's `server fn`, called from the browser only where it was confirmed
+                // (FEEDBACK83.md, Q-1301, found in review; branch feedback82-85).
+                let offered = || !crate::confirm::held() || crate::confirm::route_ok(self.cur_file.as_deref(), &format!("server fn {}", def.name));
+                if def.server && !self.server_fns.contains(&def.name) && offered() {
                     Arc::make_mut(&mut self.server_fns).push(def.name.clone());
                 }
                 Ok(Value::Nil)
             }
             Stmt::Route(r) => {
+                // A taken file's route, served only where it was confirmed (FEEDBACK83.md, Q-1301;
+                // branch feedback82-85).
+                if crate::confirm::held() && !crate::confirm::route_ok(self.cur_file.as_deref(), &r.shown()) {
+                    return Ok(Value::Nil);
+                }
                 Arc::make_mut(&mut self.routes).push(r.clone());
                 Ok(Value::Nil)
             }
@@ -3819,8 +3840,8 @@ impl Interp {
                 // At the top: the page's, never the globals' (FEEDBACK68.md; branch global-state).
                 if self.islands.is_empty() && Arc::ptr_eq(env, &self.globals) {
                     let mut all = (*self.page_states).clone();
-                    all.retain(|(n, _)| n.as_str() != name.as_str());
-                    all.push((Sym::from(name.as_str()), e.clone()));
+                    all.retain(|(n, ..)| n.as_str() != name.as_str());
+                    all.push((Sym::from(name.as_str()), e.clone(), self.cur_file.clone()));
                     self.page_states = Arc::new(all);
                     define(env, name, crate::value::page_state_marker());
                     return Ok(Value::Nil);
@@ -3861,6 +3882,10 @@ impl Interp {
     #[cold]
     #[inline(never)]
     fn use_script(&mut self, path: &str, names: &[(String, String)], line: &u32, options: &LibOptions, env: &Env) -> Result<Value, Ctrl> {
+        // A script from another host, as it was confirmed for this file: left out of the pages
+        // when it was not, loaded with its integrity hash when it was confirmed with one
+        // (FEEDBACK83.md, Q-1300 and Q-1304; branch feedback82-85).
+        let (refused, integrity) = if crate::ast::is_address(path) { crate::confirm::script(self.cur_file.as_deref(), path) } else { (false, None) };
         for (global, name) in names {
             // A module's exports go by the program's name for them, in the
             // runtime (branch library-hints).
@@ -3872,7 +3897,7 @@ impl Interp {
             }
             let libs = Arc::make_mut(&mut self.js_libs);
             let order = libs.get(name).map_or(libs.len(), |l| l.order);
-            libs.insert(name.clone(), crate::client::JsLib { global: page_name, src: path.to_string(), order, hint: options.hint, export });
+            libs.insert(name.clone(), crate::client::JsLib { global: page_name, src: path.to_string(), order, hint: options.hint, export, refused, integrity: integrity.clone() });
             define(env, name, Value::Builtin("__jslib", crate::builtins::js_lib));
         }
         Ok(Value::Nil)
@@ -5863,7 +5888,7 @@ impl Interp {
     }
 
     #[inline(always)]
-    fn call_closure_masked(&mut self, c: &Closure, mask: Option<(u8, bool)>, args: impl IntoIterator<Item = Option<Value>>, nargs: usize, line: u32) -> Result<Value, Ctrl> {
+    fn call_closure_masked(&mut self, c: &Closure, mask: Option<(crate::ast::Effects, bool)>, args: impl IntoIterator<Item = Option<Value>>, nargs: usize, line: u32) -> Result<Value, Ctrl> {
         let def = c.def.clone();
         let outer = mask.map(|(m, _)| std::mem::replace(&mut self.allowed, m));
         let r = self.enter_call(&def, nargs, line, |this| this.call_closure_inner(c, &def, args, line));
@@ -6011,7 +6036,7 @@ impl Interp {
         r
     }
 
-    fn effect_denied(&self, what: &str, missing: u8) -> String {
+    fn effect_denied(&self, what: &str, missing: crate::ast::Effects) -> String {
         let names = effect_names(missing);
         let need = format!("the {} effect{}", names.join(", "), if names.len() == 1 { "" } else { "s" });
         // An effect the `with` names but the policy took away (a route's, narrowed by the
@@ -6037,7 +6062,7 @@ impl Interp {
     /// and is not run (`run_ended`; Q-1274, found reviewing the trusted CSS of
     /// FEEDBACK79.md's Q-1250; branch feedback72-81).
     #[cold]
-    fn script_mask(&self, c: &Closure) -> Option<(u8, bool)> {
+    fn script_mask(&self, c: &Closure) -> Option<(crate::ast::Effects, bool)> {
         let (root, outer, ..) = self.script.as_ref()?;
         if c.def.run != 0 {
             // The innermost script's at a glance: its run is its world's address (`script::run_of`).

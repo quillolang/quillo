@@ -223,12 +223,28 @@ fn path_arg(it: &Interp, args: &[Value], i: usize, f: &str, line: u32) -> Result
     }
 }
 
+/// An error value where a path among `args` (each by its place, and whether it is written) is
+/// not what its file was confirmed for, as the file builtins refuse one (FEEDBACK83.md, Q-1300,
+/// found in review; branch feedback82-85).
+fn unconfirmed(it: &Interp, args: &[Value], at: &[(usize, bool)]) -> Option<Value> {
+    if !crate::confirm::held() {
+        return None;
+    }
+    at.iter().find_map(|(i, write)| match args.get(*i) {
+        Some(Value::Str(p) | Value::Css(p)) => crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, p, *write).err().map(err_value),
+        _ => None,
+    })
+}
+
 fn err_value(e: String) -> Value {
     Value::err(Value::str(format!("image: {}", e)))
 }
 
 /// Size and kind, from the file's header (the pixels are not decoded).
 fn info(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    if let Some(e) = unconfirmed(it, &args, &[(0, false)]) {
+        return Ok(e);
+    }
     let path = path_arg(it, &args, 0, "image.info", line)?;
     // Headers read a few at once: a profile may take megabytes as it is inflated (FEEDBACK75.md,
     // Q-1051; branch feedback75).
@@ -497,6 +513,9 @@ fn cost_of(src: &Path, job: &Job) -> Result<u64, String> {
 }
 
 fn convert(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    if let Some(e) = unconfirmed(it, &args, &[(0, false), (1, true)]) {
+        return Ok(e);
+    }
     let src = path_arg(it, &args, 0, "image.convert", line)?;
     let dest = path_arg(it, &args, 1, "image.convert", line)?;
     // Not over the program's own files, as `write_file` will not: `.env`, `main.qwe` and the
