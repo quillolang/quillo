@@ -1970,7 +1970,8 @@ route GET /docs/*p = files("manual", p, { index: "home.htm", extensions: ["htm"]
   the file system: `lib.QWE` on macOS and Windows, `lib.qwe.` and `lib.qwe::$DATA` on
   Windows *(since 0.7)*, and a Windows short name (`ENV~1`) is refused. Each file goes as `file()`
   sends it, its `ETag`, ranges and type included. A path that leads out of the program's
-  folder through a link is a miss, whether what it leads to is there or not (see [Paths
+  folder through a link is a miss, whether what it leads to is there or not, unless it
+  leads into a folder [`--allow-path`](#options-of-quillo-run) names *(since 0.8.11)* (see [Paths
   and links](#paths-and-links)). `files` and `file` need the `fs` effect.
 - A file is judged by where it leads, not by the name asked for: the index, extension and
   `404.html` pages too. A link inside the folder to an ordinary file in it is served; a

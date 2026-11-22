@@ -20,7 +20,8 @@ cargo test
 ```
 
 This guide is for Quillo 0.8.10, and [CHANGELOG.md](CHANGELOG.md) says what it changed.
-Features marked *(since 0.7)* came in 0.7.0. On an older release, read that release's guide:
+Features marked *(since 0.8.11)* are built and not released yet: they come in the next
+release, and its "Unreleased" part of the changelog lists them. Features marked *(since 0.7)* came in 0.7.0. On an older release, read that release's guide:
 https://github.com/quillolang/quillo/blob/v0.7.0/USERGUIDE.md or
 https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md.
 
@@ -54,7 +55,7 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--watch`, `-w` | while you work on the program: reload when it or a `use`d file changes (a symbolic link pointed elsewhere, to a file or a folder, counts, within a second), show errors on the page, and refresh open pages; a file the program served with `file()` that changes refreshes them too, and a stylesheet is swapped in them as they are, keeping what they show (for one another tool writes, such as Tailwind's). Started, or reloaded, while a file is broken or missing, it watches every file that load read or tried and the folders of those not there, so fixing or making one loads the program; each error is said once. A save that does not load while one that did is served is said over the open pages, which keep what they hold, until a save loads. A page whose HTML and code a change left alone (an edit to a route it never calls) is not refreshed, a component whose code changed is swapped into the open pages in place, keeping its states, and a page's own HTML is put in place without a reload (see [What a save keeps](#what-a-save-keeps)); `--watch=reload` refreshes every page at every change, and so does a page with `<html data-reload>`. The server's own data, a top-level `let` the program changes, is kept across a save too. With no `QUILLO_SECRET`, sessions are signed with a key kept in `.quillo/.quillo-secret`, so a restart does not sign you out. The folders `db.migrate` reads are watched too, so a migration that arrives is applied, and one that stopped the start is tried again once fixed *(since 0.8.6)*. With `--host` on an address beyond this machine (`0.0.0.0`, to try the program from a phone) it says so at start, as anyone on the network can then reach the program and see its errors in full *(since 0.8.6)*. A page a service worker answers from its cache cannot be refreshed: it reloads once, then stops and says so, in the page's error overlay and in the console (this page came from a service worker's cache, so `--watch` cannot refresh it: unregister the worker, or have it go to the server first for pages); so under `--watch=reload`, and after a restart *(since 0.8.7: it reloaded without end, or never showed the change)*. `app.toml` and the icon it names are watched as the program's files are (see [Installable apps](#installable-apps)), and no page registers Quillo's service worker: `/_quillo/sw.js` is then one that takes itself away, with what Quillo's worker kept (see [Pages that work offline](#pages-that-work-offline)). Not in production |
 | `--reload` | in production, for a program whose files change while it runs (a deploy that copies new files, a plugin editor): reload when files change, with no errors shown on pages and no page refreshes; with `--instances`, each instance loads the change, the first checking it, so one that does not check reaches none; `--split` passes it to its services |
 | `--env-file F` | when the settings are not in the `.env` beside the program: a file kept outside the site's folder, or one file per place (`--env-file prod.env`); a path from the folder `quillo` runs in, which must exist |
-| `--policy FILE` *(since 0.7)* | before a deploy, or on a server you share: narrow what the program may do, after `/etc/quillo/policy.toml` and before the `quillo.policy` beside it; may be given more than once (see [The policy](#the-policy)) |
+| `--policy FILE` *(since 0.7)* | before a deploy, or on a server you share: narrow what the program may do, after the host's layers (`/etc/quillo/policy.toml`, what it includes, `policy.d/`, `$QUILLO_POLICY_PATH`) and before the `quillo.policy` beside it; may be given more than once (see [The policy](#the-policy)). `quillo policy` shows what is in force |
 | `--no-build` *(since 0.7)* | on a server with no Rust, or one that must never run cargo: load only libraries `quillo build` made, as `.quillo/plugins.lock` names them (see [Rust](#rust)) |
 | `--no-check` | when the program is known to check (a deploy that ran `quillo check` already) and starting must be quick: skip the static checks |
 | `--max-body N` | when visitors send larger files or bodies than 10MB: the largest request body to accept, a size such as `50MB` (`KB`, `MB` and `GB`, in any case, are 1024-based) or bytes; default 10MB; a larger body gets 413 (see [Uploads](#uploads)) |
@@ -64,12 +65,12 @@ too, but for a few each refuses ([below](#other-commands)). The options, and whe
 | `--max-tool-calls 60` | how many tool calls a minute each user of the MCP door may make (60 by default); one more is a `429` with `Retry-After` (see [Tools for AI clients](#tools-for-ai-clients)) |
 | `--workers N` | requests that can wait at once (for a database, the network), each on a thread (default 64). Give fewer where an account limits its threads (shared hosting), more for many slow calls at once |
 | `--instances N` | to use N cores on one machine: run the program N times over, one event loop each, each with its own variables (see [Concurrency](#concurrency-and-reloading)); not with `--watch`, `--register` or `--split`; more than the machine's cores is warned of |
-| `--trust-proxy 10.0.0.0/8` *(since 0.7)* | when a proxy (limer, nginx, Apache) is in front: believe `X-Forwarded-For` and `X-Forwarded-Proto` from these addresses, so `request.ip`, the limits per client and the request's scheme are the visitor's (see [Live data](#live-data)). The first time an `X-Forwarded-Proto` would have counted (a write with an `Origin`, a `delete_cookie`, a push subscription) but came from an address it does not name, the log says so once, with that address (`...if that address is your proxy, --trust-proxy <it>; if not, a visitor sent it and it is ignored`) *(since 0.8.7: anyone's `X-Forwarded-Proto` decided `delete_cookie`'s `Secure` and a push subscription's origin)* |
+| `--trust-proxy 10.0.0.0/8` *(since 0.7)* | when a proxy (limer, nginx, Apache) is in front: believe `X-Forwarded-For` and `X-Forwarded-Proto` from these addresses, so `request.ip`, the limits per client and the request's scheme are the visitor's (see [Live data](#live-data)). The first time an `X-Forwarded-Proto` would have counted (a write with an `Origin`, a `delete_cookie`, a push subscription) but came from an address it does not name, the log says so once, with that address (`...if that address is your proxy, --trust-proxy <it>; if not, a visitor sent it and it is ignored`) *(since 0.8.7: anyone's `X-Forwarded-Proto` decided `delete_cookie`'s `Secure` and a push subscription's origin)*. A policy's `[run] trust_proxy` *(since 0.8.11)* sets it, and the option may then only name networks inside it |
 | `--client-cert-header NAME` *(since 0.8.9)* | when that proxy ends mutual TLS: `request.client_cert` is the certificate it checked, from this header, Envoy's `x-forwarded-client-cert` form; with `--client-cert-subject`, the header holds the subject alone, as nginx's `$ssl_client_s_dn` (see [Who a proxy says the visitor is](#who-a-proxy-says-the-visitor-is)). Needs `--trust-proxy` |
 | `--user-header NAME` *(since 0.8.9)* | when that proxy signs people in (Kerberos by SPNEGO: Apache's mod_auth_gssapi, IIS): `request.remote_user` is the user it names in this header. Needs `--trust-proxy` |
 | `--live-per-client N` *(since 0.7)* | when one address is many visitors (an office behind one address): the pages one client may have waiting for live data (default 256) |
 | `--plain-http` | when the site is served over plain HTTP on purpose, on a network you trust (a factory's kiosks at `http://10.0.0.5:8080`): cookies are not `Secure`, which browsers would drop there (see [Cookies and sessions](#cookies-and-sessions)) |
-| `--allow-path DIR` *(since 0.7)* | when a script used as a tool must read or write files outside its folder, or a deploy links a folder from elsewhere (`uploads -> /srv/shared/uploads`): `read_file` and `write_file` may use `DIR` too; any part of the program may then, routes too (see [Paths and links](#paths-and-links)) |
+| `--allow-path DIR` *(since 0.7)* | when a script used as a tool must read or write files outside its folder, or a deploy links a folder from elsewhere (`uploads -> /srv/shared/uploads`): `read_file` and `write_file` may use `DIR` too, and `files()` serves a link into it; any part of the program may then, routes too (see [Paths and links](#paths-and-links)). Under a policy's `[fs] paths` *(since 0.8.11)*, `DIR` must be inside one of them |
 | `-- a b` *(since 0.7)* | for a script: after the program, what follows is the program's, and `args()` gives `["a", "b"]`; before it, `--` ends the options (`quillo run -- a.qwe x`). A stray word elsewhere is told it goes after `--` (see [Scripts as tools](#scripts-as-tools)) |
 | `--with CMD` | when a tool must run beside the program while you work (Tailwind's watcher): run a command (through `sh -c`, in its folder), its lines marked with its name, stopped with it however it ends, a Ctrl-C or `SIGTERM` while it loads, a panic and a `SIGKILL` too (more than once for several): `--with "npx tailwindcss -i src/app.css -o public/app.css --watch"` |
 | `--log F` | the request log on stderr: `text` (the default), `json` (one object per line) for a log collector, or `off` when another layer logs requests (see [Logs and metrics](#logs-and-metrics)) |
@@ -125,7 +126,10 @@ they are, as a static host serves it; see [Static files](#static-files)), `quill
 <file.qwe>` *(since 0.7)* (the classes the program's markup writes, one a line; see [HTML
 literals](#html-literals)), `quillo fcgi <file.qwe>` *(since 0.7)* (the program behind FastCGI, for
 `mod_fcgid` or nginx's `fastcgi_pass`; see [Quillo on a shared
-server](#quillo-on-a-shared-server-cpanel)), `quillo repl`, `quillo lsp`, `quillo dap`,
+server](#quillo-on-a-shared-server-cpanel)), `quillo policy [main.qwe]` *(since 0.8.11)* (the
+policy the program would run under, layer by layer; see [The policy](#the-policy)), `quillo
+confirm [main.qwe]` *(since 0.8.11)* (what the program's files reach, asked once and written to
+`quillo.confirmed`; see [What a program reaches](#what-a-program-reaches)), `quillo repl`, `quillo lsp`, `quillo dap`,
 `quillo version` (or `--version`, `-V`), which names the commit: from a source archive
 it reads the `COMMIT` file `git archive` writes, else says `(commit unknown)`. `quillo
 <file.qwe>` is `quillo run <file.qwe>`, options and all, whatever the case of its
@@ -156,14 +160,20 @@ Their options, given after the command as `quillo run`'s are:
 | `quillo check --strict-null` | to find where a value may be null and null does not work (see [Checking](#checking)); `check` only, not `run` |
 | `quillo check --policy FILE` *(since 0.7)* | before a deploy to a server with a policy: check the program as it would run under it (see [The policy](#the-policy)) |
 | `quillo new --minimal`, `--binary` | three files instead of the to-do app; a copy of this `quillo` in the new folder, for a machine that has none |
-| `quillo app --open PATH` | the page the window opens on (`/` by default); `app` takes `run`'s options but `--host`, `--register`, `--service`, `--port` and `--listen`: its window asks the program directly, with no socket (see [Desktop apps](#desktop-apps)); nor `--drain`: it stops with its window |
+| `quillo app --open PATH` | the page the window opens on (`/` by default); `app` takes `run`'s options but `--host`, `--register`, `--service`, `--port` and `--listen`: its window asks the program directly, with no socket (see [Desktop apps](#desktop-apps)); nor `--drain`: it stops with its window. It runs under the whole policy, `--policy` too, as `run` does, and a phone app under its `quillo.policy` *(since 0.8.11: neither read one, and `--policy` was taken and ignored)* |
 | `quillo serve <folder>` | `run`'s options, such as `--port` (see [Static files](#static-files)) |
 | `quillo fcgi <file.qwe>` | `run`'s options but `--split`, `--instances`, `--register` and `--join`; `--listen unix:PATH` or `--port` when no FastCGI manager hands it a socket (see [Quillo on a shared server](#quillo-on-a-shared-server-cpanel)) |
 | `quillo install --example`, `--update`, `--list [word]`, `--force`, `--dir DIR`, `--registry URL` | a plugin's example program too; the plugins here the catalog has newer; what the catalog has; replace a file changed by hand; install elsewhere; another catalog (see [Plugins from the catalog](#plugins-from-the-catalog)) |
 | `quillo repl -i` | keep the greeting and prompts when the input comes from a pipe (see [The REPL](#the-repl)) |
 | `quillo mcp <file.qwe>` | serve the program's tools to an AI client over stdin and stdout (see [Tools for AI clients](#tools-for-ai-clients)); takes `--env-file`, `--policy`, `--allow-path`, `--no-build`, `--drain` and `-- args`, and refuses the options of serving |
+| `quillo mcp <file.qwe> --serve [--port N]` *(since 0.8.11)* | when a tool uses the program's own pages: serve its routes too, in the same process, on 127.0.0.1 (`$PORT`, else 8080, unless `--port`); `--port` without `--serve` exits 2 |
+| `quillo policy [<file.qwe>] [--policy FILE]` *(since 0.8.11)* | each layer of the policy in the order read, the places that had none, and each value in force with the file it came from (`env.set` by name only); exit 1 when a layer that is asked for is not there, 2 when one is there but broken (see [The policy](#the-policy)) |
+| `quillo confirm [<file.qwe>] [PATH...]` *(since 0.8.11)* | list what the program's files reach that is not confirmed yet, ask, and write `quillo.confirmed`; `PATH`s take only the files in those folders, or those files (`quillo confirm lib/`) (see [What a program reaches](#what-a-program-reaches)) |
+| `quillo confirm --yes`, `--list`, `--effects FILE...` | confirm the list without asking, once you have read it (in CI run `quillo check` instead); list everything each file reaches and write nothing; the `//! effects:` line a reading of each Rust file proposes, and where its own line leaves that out (exit 1 then) |
 
-`quillo build`, `fix` and `classes` take a program and no options; `quillo docs --mcp` prints what an AI client is told, `server/discover` on stdio and over HTTP and `tools/list`, as JSON (a program with no tools is refused).
+`quillo build`, `fix` and `classes` take a program and no options (`quillo build` builds
+no Rust file that the program's `quillo.confirmed` does not have at its SHA-256, and nothing
+under a policy's `build = false`); `quillo docs --mcp` prints what an AI client is told, `server/discover` on stdio and over HTTP and `tools/list`, as JSON (a program with no tools is refused).
 
 ### Settings and the environment
 
@@ -189,6 +199,14 @@ well, in one process and under [`--split`](#options-of-quillo-run) alike: its va
 (the app's reach it too), and after the environment's. Keep `.env` out of version
 control.
 
+Under a provider's policy *(since 0.8.11)*, what the host sets comes first: a policy's `[env]
+set` is what `env()` gives, whatever `.env` or the shell says, and a `.env` may not set the
+variables that steer Quillo, its builds or its policy (`QUILLO_POLICY*`, `QUILLO_HOST*`,
+`LD_*`, `DYLD_*`, `CARGO*`, `RUSTC*`, `RUSTUP_*`, `RUSTFLAGS`, `RUSTDOCFLAGS`,
+`QUILLO_NATIVE_CACHE`, `XDG_CACHE_HOME`, `HOME`, `TMPDIR`, `TMP`, `TEMP`, `PATH`, `USER`):
+one that does stops the start, naming the line. `QUILLO_POLICY_PATH` is never taken from a
+`.env`, with a host layer or without.
+
 Everything Quillo reads from the environment:
 
 | Variable | |
@@ -205,12 +223,16 @@ Everything Quillo reads from the environment:
 | `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY` *(since 0.7)* | the proxy `http.*` calls go through, and the hosts that do not (see [HTTP client](#http-client)) |
 | `LIMER_ADMIN_SECRET` | for [`--register`](#options-of-quillo-run) (see [Several servers](#several-servers)) |
 | `QUILLO_NATIVE_CACHE`, `CARGO` | where `.qwer` files are built, and with what (see [Rust](#rust)) |
+| `QUILLO_POLICY_PATH` *(since 0.8.11)* | a provider's policy files, a list as `PATH` is (`:`, `;` on Windows), read after `/etc/quillo/policy.toml` and its `policy.d/` (see [The policy](#the-policy)); never read from a `.env` |
 | `PUBLIC_...` | any such variable may be read in a component (see [What the browser can reach](#what-the-browser-can-reach)) |
 | `QUILLO_PUSH_LOCAL` | `1`: `notification.send` may post to a push service on this machine over plain http, for tests that play one (see [Notifications](#notifications)) |
 | `QUILLO_CHROME`, `QUILLO_TEST_PG_BIN`, `QUILLO_TEST_MYSQL_BIN`, `QUILLO_TEST_LOG`, `LIMER` | `cargo test`: where Chrome, PostgreSQL, MariaDB and limer are; show the test servers' output |
 
-The one other configuration is the policy, which only takes away: `/etc/quillo/policy.toml`,
-[`--policy FILE`](#options-of-quillo-run) and `quillo.policy` beside the program (see [The policy](#the-policy)).
+The one other configuration is the policy, which only takes away: `/etc/quillo/policy.toml`
+and the host's other layers, [`--policy FILE`](#options-of-quillo-run) and `quillo.policy`
+beside the program (see [The policy](#the-policy)); and, since 0.8.11, `quillo.confirmed`
+beside the program, what its files were confirmed to reach (see [What a program
+reaches](#what-a-program-reaches)).
 `HOST` is not read ([`--host`](#options-of-quillo-run) is), and `RUST_LOG`
 and `NO_COLOR` do nothing. The program's paths (`use`, `db.open`, `read_file`, `.env`,
 `quillo.policy`, `quillo-system.db`, `.quillo/native`) count from the program file's folder, whatever
@@ -1445,11 +1467,12 @@ The effects, and the builtins behind each:
 |---|---|
 | `db` | every `db.*` but `db.error_kind` and `db.sql_name`, and the same on a connection from `db.connect` (`analytics.query`); `idempotent`, `later.status` |
 | `http` | `http.*`, and calls to services |
-| `fs` | `file`, `files`, `read_file`, `write_file`, `delete_file`, `save_upload`, `check_program`, `image.info`, `image.convert` |
+| `fs` | `file`, `files`, `read_file`, `write_file`, `delete_file`, `save_upload`, `check_program`, `image.info`, `image.convert`; an `http.*` call with `save:` too |
 | `env` | `env`, `args`, `stdin`, `read_line`, `exit` |
 | `time` | `now`, `sleep`, `date.today`, `date.now` |
 | `random` | `random`, `random_int`, `uuid`, `crypto.token`, `crypto.hash_password` (its salt) |
 | `net` | `udp.listen`, `udp.send`, `udp.reply`, `media.rtp`, `channel.send`, `channel.broadcast` |
+| `run` *(since 0.8.11)* | none: starting another program (ffmpeg, a converter), which only a Rust file does, and says in its `//! effects:` line (the catalog's `cli_run` and `ffmpeg_cli`) |
 
 Inside a `with` function, a builtin that needs another effect,
 or a function declared with more effects, is an error, both at runtime and in
@@ -1495,7 +1518,10 @@ as a function does (see [Scheduled jobs](#scheduled-jobs)).
   inside one, at run time and by `quillo check`: `` `hi` is Rust whose file does not say
   what it does, so it may do anything and is refused in `greet` ``. An editor's hover
   shows `(effects: not declared)` for them. Quillo cannot see inside the Rust: the line
-  is the file's word, not a proof (see [Rust](#rust)).
+  is the file's word, not a proof (see [Rust](#rust)). A `pub fn`'s own `/// effects: fs`
+  line *(since 0.8.11)* narrows the file's for that function, so a file whose one function
+  starts programs can still offer small file helpers to a `with fs` caller; a line that
+  names more than the file's is an error, at check and at load.
 - **The policy** sets a `with` on the whole program from outside it: its `[effects]
   allow` is what every route, job and function may use at most, and a Rust file with no
   `//! effects:` line is refused anywhere under it (see [The policy](#the-policy)).
@@ -1509,6 +1535,36 @@ fn stamp() with time = store_put(str(now()))        // error: store_put needs fs
 fn greet() with time = hi("Ana")                    // error: hi.qwer says nothing
 print(hi("Ana"))                                    // outside any `with`: runs
 ```
+
+A Rust file whose functions do different things, `tools.rs`:
+
+```rust
+//! effects: fs, run
+
+/// Starts ffprobe on a clip, and gives what it prints.
+pub fn probe(path: &str) -> Result<String, String> {
+    let out = std::process::Command::new("ffprobe").arg(path).output().map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// The size of a file, in bytes.
+/// effects: fs
+pub fn size_of(path: &str) -> i64 {
+    std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(-1)
+}
+```
+
+```quillo noexec
+import tools.rs use size_of, probe
+
+fn clip_size(name: str) -> int with fs = size_of(`clips/${name}`)      // allowed: size_of says fs
+fn clip_info(name: str) -> str with fs = probe(`clips/${name}`) ?? ""  // error: probe needs the run effect
+```
+
+The `/// effects:` line is taken out of the function's documentation, so an editor's hover
+shows the rest. A line `/// effects: fs, http` under `//! effects: fs` is told
+`` `size_of`'s `/// effects: fs, http` names http, which the file's `//! effects: fs` does not:
+a function's line narrows its file's, never widens it ``.
 
 ### HTML literals
 
@@ -3067,6 +3123,145 @@ full page load starts every state afresh: keep what must survive one on the serv
 in `localStorage` through `js`. See
 [spa.qwe](https://github.com/quillolang/examples/blob/main/spa.qwe), which also answers 404 on the server for unknown paths.
 
+`navigate(path, { replace, scroll })` *(since 0.8.11)*: `replace: true` takes the place of
+the current history entry instead of adding one, and `scroll: false` stays where the page
+is. Back and Forward give each page its scroll back, once the page is long enough again (at
+most 2 s, and not when the person scrolls first). After a move to another path by a link,
+focus goes to the new page's `<main>`, else its first `<h1>`, and the new title is said to a
+screen reader; never while a field has focus, so a search box that navigates as it is typed
+in keeps it. A link pressed while its page is on the way waits for it (3 s at most) rather
+than asking twice.
+
+#### The page's head
+
+`page_head({ title, description, image, canonical })` *(since 0.8.11)* sets the head of the
+page it is called in: `<title>` and `og:title`, the description and `og:description`,
+`og:image`, and the canonical link with `og:url`. A layout, a page inside it, or a
+component deep in the page may call it, and the innermost call wins, key by key; what it
+leaves out stays the outer call's, or the head's own:
+
+```quillo
+view Layout(title: str, children) {
+    page_head({ title: `${title} · Shop`, description: "Teapots and kettles" })
+    return <html lang="en">
+        <head><meta charset="utf-8"/><title>Shop</title></head>
+        <body><nav><a href="/">Home</a> <a href="/teapots/2">Teapot 2</a></nav>{children}</body>
+    </html>
+}
+
+view Teapot(id: int) {
+    page_head({ title: `Teapot ${id} · Shop`, image: "/img/teapot.png", canonical: `/teapots/${id}` })
+    return <article><h1>Teapot {id}</h1></article>
+}
+
+route GET / = <Layout title="Home"><main><h1>Home</h1></main></Layout>
+route GET /teapots/:id(int) = <Layout title="Teapots"><main><Teapot id={id}/></main></Layout>
+```
+
+`/teapots/2` is sent with `<title>Teapot 2 · Shop</title>`, the layout's description, and
+`og:image` and the canonical link as whole addresses (`https://shop.example/img/teapot.png`,
+from [`page_url`](#the-pages-address)); the layout's own `<title>` is replaced, not written
+twice.
+
+- The values are text, escaped; `null` says nothing (the outer value stands). `image` and
+  `canonical` take a path starting with `/` or an `http(s)://` address; `javascript:` and
+  `data:` are refused. Any other key is an error that names it (`` `page_head` has no key
+  `titel`: it takes title, description, image and canonical ``).
+- On the server it writes the head the page is sent with, so a link's preview and a search
+  engine read it. In the browser it follows state: a component's `page_head({ title:
+  `${n} unread` })` changes the tab's title as `n` changes, and when the component goes, its
+  values go with it. A page with no `<head>` gets one; a part of a page (a route that gives
+  an `<li>`) gets nothing.
+- In a deferred part (`state x = defer(...)`), it reaches the browser only, after the page
+  is sent, and the log says so.
+- A component inside `<head>` is an error in `quillo check` (`a component cannot stand in
+  <head>`: the island it is written as would end the head there); call `page_head` from it
+  instead. A `view` there is fine.
+- A program's own function named `page_head`, `page_url` or `moves_in_place` hides the
+  builtin, with a warning (`` `page_url` hides the builtin `page_url`: the program's own is
+  used everywhere, so pick another name ``).
+
+#### The page's address
+
+`page_url()` *(since 0.8.11)* is the page's public address, `page_url("/img/card.png")`
+another path's: scheme, host, the [`--base`](#options-of-quillo-run) prefix, and the
+path, for an `og:url`, a share link or an email:
+
+```quillo
+route GET /posts/:id(int) = <html>
+    <head><meta property="og:url" content={page_url()}/></head>
+    <body><a href={page_url("/img/card.png")}>Card</a></body>
+</html>
+```
+
+The scheme is `https` only behind a proxy [`--trust-proxy`](#options-of-quillo-run) names
+(or FastCGI's word), as a visitor's `X-Forwarded-Proto` is not taken; the host is the first
+name of [`--allowed-hosts`](#options-of-quillo-run) when it is given, else the request's.
+An address that is already whole is given back as it is; a path not starting with `/`, and
+`//host`, are errors.
+
+#### Routes that move in place
+
+`moves_in_place()` *(since 0.8.11)*, at the top of the program, makes every page of the
+program a page of one app: a same-site link, or `navigate`, fetches the route's page and
+puts it in place of the current one, with no load, and Back and Forward do the same.
+Without it, links and `url()` work as above.
+
+```quillo
+moves_in_place()                       // at the top: links and navigate() move in place
+
+state visits = 0                       // page state: kept across moves
+
+component Cart() {
+    state items = 0                    // on every page, the same props: kept too
+    <button onclick={() => { items = items + 1 }}>Cart: {items}</button>
+}
+
+component Search() {
+    state q = ""
+    <input value={q} oninput={(e) => { q = e.target.value }}/>
+}
+
+view Layout(title: str, children) {
+    page_head({ title: `${title} · Shop` })
+    return <html lang="en">
+        <head><meta charset="utf-8"/><title>Shop</title></head>
+        <body>
+            <nav><a href="/">Home</a> <a href="/about">About</a> <Cart/></nav>
+            <main>{children}</main>
+        </body>
+    </html>
+}
+
+route GET / = <Layout title="Home"><h1>Home</h1><Search/></Layout>
+route GET /about = <Layout title="About"><h1>About</h1></Layout>
+```
+
+From `/` to `/about` and back, the cart keeps its count: page states keep their values,
+and a component that is on both pages, the same component, the same one of its name (the
+first `Cart`), with the same props, keeps its state. The rest (`Search` here) start from
+what the server sent. The head is the new page's, its title said to a screen reader.
+
+- The page is fetched read-only, as a prefetch is: a `GET` that would write (a
+  [`route writes`](#routes), or one that writes as it runs) is answered so, and the page is
+  loaded the usual way instead, so its effects run once. A move is never served from the
+  browser's cache.
+- A move is a full load instead when the two pages differ in what a swap would carry over
+  wrongly: another program or mount, another version of the program (a deploy since), other
+  scripts in the head, another content security policy or frame and permission headers, or
+  another visitor (signed out, or in as someone else). Each page carries a key of these,
+  signed with `QUILLO_SECRET`; a page whose key differs, or that has none, is loaded. A page
+  whose key holds the visitor is sent `cache-control: private`.
+- Only `GET` pages move in place. Back to the page a form's `POST` answered is the
+  browser's, and posts nothing again.
+- A program that moves in place gives each page the whole program's components, so any
+  page can show any of them. A page with a script of its own (`<script>` in its body) is
+  loaded, not moved into, so the script runs; Quillo's own scripts carry `data-quillo`. A
+  redirect is followed, and the address is where it ended; a link to a file, or with
+  `data-reload`, a modifier key or `target`, is the browser's as before.
+- A real load (a reload, a link with `data-reload`, another site and back) starts every
+  state afresh.
+
 ### Live data
 
 `live(load, ...args)` makes component state follow the server: `load` (a `server fn`)
@@ -3629,6 +3824,17 @@ message, and once the call in progress is answered while it answers one, however
 takes, saying so every 5 s (`--drain 30s` cuts the call off after that long; a second SIGTERM
 ends it at once). There are no tokens on stdio: the person who starts it is the caller.
 
+**`quillo mcp app.qwe --serve`** *(since 0.8.11)* also serves the program's routes, for a tool
+that uses the program's own pages (a preview the client opens, a page that renders what the
+tool made), in the same process: the program is loaded once, its routes are served on
+127.0.0.1 (`$PORT`, else 8080; `--port N` for another), and the stdio door answers its tools
+beside them as a request is answered: one program, its top level run once, its data shared
+with the pages. It is
+held to the policy as `quillo run` is (one that says `listen = "unix"` refuses it). Closing
+stdin, or `SIGTERM`, stops it as `quillo run` stops: the requests in progress are answered
+first (`--drain` gives a time). `--port` without `--serve` exits 2: ``quillo: `--port` goes
+with `--serve`, which serves the program's routes beside its tools``.
+
 Quillo speaks MCP's revision 2026-07-28 only. A client of the earlier revision, which opens with
 `initialize` (Claude Code before 2.1.319, for one), is told the version is not supported. What a
 client gets from a call:
@@ -3641,6 +3847,14 @@ client gets from a call:
   returning its value), a page, and `internal error` when the tool failed (the real message on
   stderr).
 - The protocol's own errors for an unknown tool, a malformed message and the wrong version.
+  A request whose `params` lack `_meta`'s two keys is told both, and what they hold, to copy
+  *(since 0.8.11)*: ``Invalid params: `_meta` must carry
+  `io.modelcontextprotocol/protocolVersion` ("2026-07-28") and
+  `io.modelcontextprotocol/clientCapabilities` ({})``. A message written by hand:
+
+  ```json
+  {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+  ```
 - An answer past what the door takes in (10 MiB of JSON, or 128 levels deep) is an `isError`
   saying so, never a cut or empty answer; a tool that crashes answers `internal error` and the
   door goes on serving.
@@ -6243,7 +6457,8 @@ route GET /docs/*p = files("manual", p, { index: "home.htm", extensions: ["htm"]
   the file system: `lib.QWE` on macOS and Windows, `lib.qwe.` and `lib.qwe::$DATA` on
   Windows *(since 0.7)*, and a Windows short name (`ENV~1`) is refused. Each file goes as `file()`
   sends it, its `ETag`, ranges and type included. A path that leads out of the program's
-  folder through a link is a miss, whether what it leads to is there or not (see [Paths
+  folder through a link is a miss, whether what it leads to is there or not, unless it
+  leads into a folder [`--allow-path`](#options-of-quillo-run) names *(since 0.8.11)* (see [Paths
   and links](#paths-and-links)). `files` and `file` need the `fs` effect.
 - A file is judged by where it leads, not by the name asked for: the index, extension and
   `404.html` pages too. A link inside the folder to an ordinary file in it is served; a
@@ -7517,7 +7732,8 @@ stays the simpler choice when the next move depends on the answer.
   text,
   `check_program`, `run_script`, `delete_file`, `save_upload`, `read_upload`,
   `schedule`, `idempotent`, `parallel`, `ready`, `style_with`, `classes`, `accept_calls`, `allow_cross_site`,
-  `tenant`, `tenant_from`, `with_tenant`, `platform` (below), and in components `url`, `navigate`, `every`,
+  `tenant`, `tenant_from`, `with_tenant`, `platform` (below), `page_head`, `page_url` and
+  `moves_in_place` *(since 0.8.11)* (see [Single-page apps](#single-page-apps)), and in components `url`, `navigate`, `every`,
   `ask`, `notify`, `js`, `js_new`, `live`, `waiting`, `publish`, `watch`, `unwatched`: each is
   described where it is used.
 - **Where the program runs:** `platform()` *(since 0.7)* gives a map: `os` (`"ios"`, `"android"`,
@@ -7607,9 +7823,16 @@ What is not in the standard library, and what to do instead:
 - **`url_decode`.** Not built in: query strings, forms and cookies arrive decoded (the
   `encoding` plugin has `url_decode` and `form_decode` for other text).
 - **A seed for `random`.** None: runs are not repeatable.
-- **Other processes.** A program cannot run a command: `env`, files, and a command started
+- **Other processes.** No builtin runs a command: `env`, files, and a command started
   beside it with the option [`--with`](#options-of-quillo-run) (`quillo run main.qwe --with "npx tailwindcss ..."`). A script reads its arguments with `args()` and its input with `stdin()` and
-  `read_line()` (see [Scripts as tools](#scripts-as-tools)).
+  `read_line()` (see [Scripts as tools](#scripts-as-tools)). To run ffmpeg, a converter or
+  a Node script from the program, take the catalog's `cli_run` plugin (`quillo install
+  cli_run`): `cli_run("ffprobe", ["-i", path], { timeout_ms: 10000 })` takes the arguments as
+  a list, never through a shell, so a file name someone uploaded stays one argument, ends
+  the whole process group at its timeout, and gives `{ ok, status, signal, stdout, stderr
+  }`; `ffmpeg_cli` probes, makes thumbnails, trims and transcodes the same way. Both say
+  `run` among their effects *(since 0.8.11)*, so a policy can refuse them (see
+  [Effects](#effects)).
 - **Hashing a value.** `crypto.sha256(json.stringify(v))`. Values never change, so
   nothing needs copying.
 - **Building a long string.** `+` makes a new string each time: push the pieces to a
@@ -7861,9 +8084,16 @@ path is judged where it really leads, with its links followed:
   `--allow-path /srv/shared/uploads`.
 
 What is refused is what any refused path is: an error value from `read_file`,
-`write_file` and `delete_file` (`read_file: path must stay inside the program's folder:
-data/s.txt`), a 404 from `file` and `files` (the same whether the folder outside is
+`write_file` and `delete_file`, which ends with the way out *(since 0.8.11)*
+(``read_file: path must stay inside the program's folder: ../secret.txt; `--allow-path ..` (on
+`quillo run` or `quillo mcp`) lets the program read it``), a 404 from `file` and `files` (the same whether the folder outside is
 there or not), and a runtime error from `save_upload`.
+
+`files()` judges a link as `file()` does *(since 0.8.11: it refused every link out of the
+folder without a word, whatever `--allow-path` said)*: one that leads into a folder
+`--allow-path` names is served, and one that leads anywhere else is a 404, with `file()`'s
+line in the log. Inside such a folder, what `files()` never serves stays a 404: dot files,
+`.qwe` and Rust files, the policy, and links on to folders not allowed.
 
 ```quillo noexec
 // alias -> real (inside), data -> ../outside, dangling -> ../outside/gone.txt
@@ -7871,6 +8101,10 @@ print(read_file("alias/in.txt"))                 // inner
 print(read_file("data/s.txt") ?? "refused")      // refused
 print(write_file("dangling", "x") | is_err)      // true
 ```
+
+Under a policy's `[fs] paths` *(since 0.8.11)*, `--allow-path` may name only folders inside
+those (see [The policy](#the-policy)), and under a program's `quillo.confirmed` each file may
+use only the paths it was confirmed for (see [What a program reaches](#what-a-program-reaches)).
 
 Only the path's parts are looked at, and only a path with a link in it is resolved, so a
 static file costs what it did. A link changed between the check and the open is not
@@ -9252,7 +9486,8 @@ header names in lower case, a header sent more than once joined with `, ` (two `
 one `</x>; rel=a, </y>; rel=b`), `set-cookie`'s lines joined by a line break, as they
 cannot be by a comma, and also given one by one in `cookies`, a list; `body` as text
 (bytes that are not UTF-8 replaced), `json` the body parsed, or `null`. A body longer than
-64 MiB is an error value that says to read it with `http.stream` *(since 0.7: it was cut
+64 MiB is an error value that says to read it with `http.stream` (or write it to a file
+with `save:`, below) *(since 0.7: it was cut
 there, and cut JSON was `null`)*. The answers being read whole, every call's at once, take
 at most 256 MiB past the first MiB of each, counted as they arrive: a call whose answer
 would pass that is an error value (``...: the answers being read at once would take more
@@ -9332,6 +9567,30 @@ http.get(url, {}, { timeout: 5 })                   // an error value after 5 se
 http.get("https://ledger.internal/balance", {}, { ca: "certs/internal-ca.pem" })
 http.post("https://api.bank.example/payments", order, {}, { cert: "certs/client.pem", key: "certs/client.key" })
 ```
+
+- `save: path` *(since 0.8.11)* writes the answer's body to a file as it arrives, for a
+  download that is not text (a PDF, an image, a video) or larger than a body read whole;
+  `max_bytes` is the most it writes (64 MiB unless given, counted on the decoded body). The
+  call then gives `{ status, ok, headers, file, bytes }`, with `file` the path written and
+  `bytes` its size:
+
+  ```quillo noexec
+  let r = http.get("https://example.com/report.pdf", {}, { save: "downloads/report.pdf", max_bytes: 20 * 1024 * 1024 })
+  print(r.ok ? `${r.bytes} bytes in ${r.file}` : `not saved: ${r.status}`)
+  ```
+
+  Only a 2xx answer is written; another is read as its text, into `body`, with `file` null.
+  The body goes into a new file beside the target, 64 KiB at a time, which takes the
+  target's place once it has all come, so a failure, or an answer past `max_bytes`, leaves
+  the file that was there as it was. Redirects are followed, each held to the policy's
+  `[http] hosts`. The path is held as `write_file`'s is: inside the program's folder or one
+  [`--allow-path`](#options-of-quillo-run) names, and never `.env`, the program's own files,
+  an open database or the policy (``http.get: save: will not write t.qwe: it is one of the
+  program's own files``); a file that was there keeps its read, write and run bits. A save
+  needs the `fs` effect as well as `http`, and it is a write: a prefetch, a hover's guess
+  or a move in place never makes one, and a `GET` route that saves and reads who the
+  visitor is gets `writes`' warning (see [Routes](#routes)). `save` with `cache`, on
+  `http.stream`, or in a component is an error.
 
 Another option is an error, in `quillo check` when the options are written in the call,
 and when it runs: `{ timout: 5 }` is not ignored.
@@ -9456,6 +9715,31 @@ It also warns of what a page does:
 - A sheet under `public/` has its unused classes warned of only in a program that serves
   pages, and classes written in `public/**/*.html` and in the `.html` files and scripts of
   `files()` folders count as written.
+- A component inside `<head>`, an error *(since 0.8.11)*: call `page_head` from it (see [The
+  page's head](#the-pages-head)); and `{json.stringify(x)}` as the whole of an
+  `application/ld+json` script, a warning: it is written as a JSON string, so give the map,
+  `{x}`.
+
+And of what the program's files reach *(since 0.8.11)* (see [What a program
+reaches](#what-a-program-reaches)):
+
+- A file taken for some of its names (`import lib/geo.qwe use lookup`) that also adds a route
+  or a tool, or reaches out as the program starts, a warning: ``lib/geo.qwe is taken for
+  lookup, and also adds GET /x``.
+- A Rust file whose `//! effects:` line leaves out what its code plainly calls, a warning
+  that names the call and its line (``tools.rs says `effects: fs`, and calls
+  std::process::Command::new (line 5): a reading of its text, not a proof``).
+- An `http.*` call whose written host the policy's `[http] hosts` refuses, an error at the
+  call, where it was an error value at run time.
+- Once the program has a `quillo.confirmed`, each thing a file reaches that it does not
+  confirm, an error at its line (``reaches example.com: not confirmed for this file``), and
+  a Rust file that is not the one confirmed by its SHA-256.
+- Under a provider's policy, a program with no `quillo.confirmed`, or one that leaves
+  something out: a warning in 0.8.11, which says the release it stops in, and an error from
+  0.8.12.
+- A host that comes only from `env()` (and text written in the program, and their trims) is
+  warned of as the operator's setting, not a visitor's (``the host `http.get` goes to comes
+  from `API_HOST`, the operator's setting: say { public_only: false } ...``).
 
 A type grows as the code is read (a list of maps of lists, made again on each line), so
 the check keeps each to 1,000,000 parts and 64 levels, and takes what grows past them as
@@ -9485,6 +9769,10 @@ warning: ...`; with errors it ends `quillo: N errors` and exits 1; else it write
 `main.qwe: ok (12 routes, 40 functions, 9 components, in 18 files)` to stdout (with the
 warnings counted) and exits 0. Its two options, given after the program as `quillo run`'s are,
 are [`--strict-null`](#other-commands) (below) and `--policy FILE` (above).
+
+A `"""` or `'''`, as Python and Kotlin write text over several lines, is told what Quillo
+writes *(since 0.8.11)*: ``tq.qwe:1: error: `"""` is not a string here: text over several lines
+is a backtick string, `line one ...` (`${` interpolates)``.
 
 After a syntax error that a newer Quillo might accept (an unknown character or escape,
 an unexpected keyword, an unknown word), `quillo check`, `quillo run` and the language
@@ -10218,12 +10506,29 @@ It is off by default, since anyone who can reach the server could read it.
 `with` limits what a function may do, from inside the program. A policy limits what the
 whole program may do, from outside it *(since 0.7)*: the host's, for every program on a server, and
 the site owner's, for one deploy. Policies are small TOML files, read as the program
-starts, by `quillo run`, `quillo fcgi` and `quillo check`:
+starts, by `quillo run`, `quillo fcgi`, `quillo mcp`, `quillo app` and `quillo check`. The
+layers, in the order read:
 
-1. `/etc/quillo/policy.toml`, the host's, whenever it is there (one that is there and
-   cannot be read stops the program);
-2. each [`--policy FILE`](#options-of-quillo-run), in order;
-3. `quillo.policy` beside the program's main file.
+1. `/etc/quillo/policy.toml`, the host's (on Windows `%ProgramData%\quillo\policy.toml`
+   *(since 0.8.11: it was `\etc\quillo\policy.toml` on whichever drive the program ran
+   from)*), whenever it is there;
+2. the files it names in `include = [...]`, by their whole path *(since 0.8.11)*;
+3. `policy.d/*.toml` beside it, in name order *(since 0.8.11)*: a provider's plans as files
+   of their own;
+4. each file `QUILLO_POLICY_PATH` names, a list as `PATH` is *(since 0.8.11)*, for a provider
+   that starts each account's process with its own (set where the process starts: a
+   `.env` never sets it);
+5. each [`--policy FILE`](#options-of-quillo-run), in order;
+6. `quillo.policy` beside the program's main file.
+
+The first four are the provider's, the host's layers; the last two are the developer's.
+Every file a layer names must be there: an `include` or `QUILLO_POLICY_PATH` naming a
+file that is not stops the program. A layer that is there but cannot be read (a link to
+nothing, a folder, a file without read permission) stops it too, with exit 2, naming it
+*(since 0.8.11: a broken `quillo.policy` was skipped without a word)*. Only the host's file may
+say `include` and `require_path = true`, which stops a start without `QUILLO_POLICY_PATH`
+rather than run it without the provider's limits. A provider's own build of Quillo can
+compile its anchor in (`QUILLO_HOST_POLICY` at build time) in place of `/etc`.
 
 Each file only narrows what the ones before it allow: a list is a condition every file
 must meet, so a later file cannot give back what an earlier one took away. A file that
@@ -10264,13 +10569,17 @@ hosts = ["api.stripe.com", "*.mapbox.com"]
 | Section | |
 |---|---|
 | `[plugins] build` | `false`: never build a Rust file, as [`--no-build`](#options-of-quillo-run) (see [Rust](#rust)) |
-| `[plugins] allow` | the plugins a program may `use`, by file name: `"qr"` at any version, `"csv@1"` or `"csv@1.4.2"` by the file's `//! version:` line. A plugin not listed is refused, by `quillo check` too, before anything is built. It names plugins; it does not prove their code |
+| `[plugins] allow` | the plugins a program may `use`, by file name: `"qr"` at any version, `"csv@1"` or `"csv@1.4.2"` by the file's `//! version:` line. A plugin not listed is refused, by `quillo check` too, before anything is built. By name it does not prove their code; `"qr@sha256:<hex>"` *(since 0.8.11)* does (below) |
+| `[plugins] catalog` *(since 0.8.11)* | `true`, or the path of a catalog's index (`plugins/index.json`, as `quillo install` reads it; `true` is `catalog.json` beside the policy file): every plugin of that catalog, each pinned by the SHA-256 the index gives for it, as an `allow` of them all |
 | `[effects] allow` | the effects anything in the program may use, as a `with` on its top level, routes, jobs and functions alike; a Rust file with no `//! effects:` line is refused anywhere under it |
 | `[http] hosts` | the hosts `http.*` and `site` calls may reach: `api.stripe.com`, `*.mapbox.com` (its subdomains, not itself), `*`. Each redirect is judged before it is followed |
 | `[http] private` | `false`: `http.*` and `site` calls reach nothing on this machine or its networks (loopback, private, link-local and the cloud's metadata at `169.254.169.254`, carrier-grade NAT, IPv6's unique-local), as the name resolves when it connects |
 | `[env] names` | the variables `env()` may read; any other reads as not set, so `env("HOME") ?? "none"` gives `"none"` |
 | `[limits] workers`, `max_compute`, `max_body`, `max_memory` | the most [`--workers`](#options-of-quillo-run), [`--max-compute`](#options-of-quillo-run), [`--max-body`](#options-of-quillo-run) and [`--max-memory`](#options-of-quillo-run) may be (`max_memory` *(since 0.8.7)*: no one value a request makes may be bigger; its stop says `the policy p.toml allows (max_memory, N bytes)`): a smaller value given on the command line stays (`"10s"`, `"500ms"`, `"2m"`; `"10MB"`, `"512KB"` or bytes). Each takes what the option takes: 0 is refused (`p.toml:2: `max_body` is a size larger than 0`), as the option refuses it |
 | `[limits] max_tool_calls` | the most tool calls a minute each user of the MCP door may make: it can lower `--max-tool-calls`, not raise it |
+| `[run]` *(since 0.8.11)* | what `quillo run` may be started with (below) |
+| `[fs] paths` *(since 0.8.11)* | the folders [`--allow-path`](#options-of-quillo-run) may name, or folders inside them; `[]` allows none. Each is judged where it really is, once, at the start |
+| `[env] set` *(since 0.8.11)* | `set = { APP_ENV = "production" }`: what `env()` gives for those names, ahead of `.env` and the shell. The host's layers only (a `--policy` or `quillo.policy` that says it stops the start); never `QUILLO_POLICY*`, `LD_*` or `DYLD_*`; two layers that set one name differently stop the start, naming the name and not the value |
 
 Under the two files above, with `APP_NAME=Shop`:
 
@@ -10288,6 +10597,80 @@ be refused, as errors (see [Checking](#checking)):
 quillo: policy host.toml + quillo.policy (effects: db, http, fs, env, time, random; no builds; no private addresses)
 main.qwe:6: error: `udp.listen` needs the net effect, which host.toml does not allow
 ```
+
+#### What a provider holds a program to
+
+*(since 0.8.11)* A provider that runs other people's programs (a host, a school, a company's
+platform) writes down how they may be started, and nothing the developer controls (the
+command line, `.env`, `quillo.policy`) widens it:
+
+```toml
+# a provider's plan: what each account's program may be started with
+[run]
+watch = false                     # no --watch or --reload in production
+with = false                      # no --with commands
+check = true                      # no --no-check
+log = "json"                      # the request log as JSON, whatever --log says
+trust_proxy = ["127.0.0.1"]       # the proxy in front; --trust-proxy may only narrow it
+instances = 2                     # ceilings: the least of these and the option wins
+max_connections = 500
+drain = "30s"
+
+[fs]
+paths = ["/srv/shared"]           # --allow-path only inside these; [] allows none
+
+[env]
+set = { APP_ENV = "production" }  # what env("APP_ENV") gives, whatever .env says
+```
+
+`[run]` says three kinds of thing:
+
+| Kind | Keys | |
+|---|---|---|
+| Off switches, `false` | `with` (`--with`), `watch` (`--watch`, `-w`, `--watch=reload`, `--reload`), `describe` (`--describe`), `plain_http` (`--plain-http`), `split` (`--split`, `--scale`, `--as-service`), `join` (`--join`, `--register`, `--allow-join`, `--join-as`, `--service`) | the option is refused with exit 2, naming the file: `quillo: --watch is turned off by the policy host.toml (run.watch = false)` |
+| Forced values | `check = true`, `log` (`"text"`, `"json"` or `"off"`), `base` (`"/shop"`), `listen = "unix"`, `trust_proxy` (a list of networks) | `check` refuses `--no-check`, and a start under `--watch` whose check fails stops; `base` refuses `--split`, whose services each take their own; `listen = "unix"` takes only `--listen unix:PATH` or `quillo fcgi`, with WebTransport off; `trust_proxy` is what every layer allows, and `--trust-proxy` may only name networks inside it |
+| Ceilings | `instances`, `max_connections`, `connections_per_client`, `live_per_client`, `drain` (`"30s"`), `socket_mode` (`"660"`) | the least of the layers' and the option's holds, as `[limits]`' do; `max_connections` replaces the default the file descriptors give |
+
+A plugin pinned by its hash *(since 0.8.11)*: `allow = ["qr@sha256:9f86d0..."]` lets `qr` load
+only as that file. The hash may be the source's, the `.qwer` file's SHA-256 (what the catalog's
+index gives): the plugin is then built on this machine from the very bytes hashed, in a new
+folder of its own (0700) outside the program's reach, with a cleared environment and the
+`cargo` on `PATH`, and loaded from a private copy whose hash is checked. Or it may be the built
+library's own SHA-256 (as `.quillo/plugins.lock` lists it), and then only that prebuilt
+library loads. Only the host's layers may pin a library: a pin in `quillo.policy` or a
+`--policy` is the repository's, and would let the library it brought load. A developer who
+controls their account's cargo home or toolchain can still steer a build from source, so
+where that matters, pin the library and build it yourself.
+
+`quillo policy main.qwe` shows what is in force, layer by layer: the files in the order read,
+the places that had none, and each value with the file it came from (`env.set` by name, never
+its value). It exits 1 when a layer that is asked for is not there (an `include`,
+`QUILLO_POLICY_PATH`'s file, `require_path` without the variable) and 2 when one is there but
+broken:
+
+```
+$ QUILLO_POLICY_PATH=/etc/plans/small.toml quillo policy main.qwe
+the policy for main.qwe
+layers, in the order read (each only narrows the ones before it):
+  /etc/plans/small.toml (QUILLO_POLICY_PATH)
+not there:
+  /etc/quillo/policy.toml (the host's file)
+  /etc/quillo/policy.d/ (policy.d)
+  quillo.policy (the program's)
+in force:
+  env.set.APP_ENV (set) (/etc/plans/small.toml)
+  fs.paths: in every one of [/srv/shared] (/etc/plans/small.toml)
+  run.watch = false (--watch, -w, --watch=reload, --reload) (/etc/plans/small.toml)
+  run.check = true (/etc/plans/small.toml)
+  run.instances = 2 (/etc/plans/small.toml)
+```
+
+A provider's layer also asks for a complete `quillo.confirmed`, the list of what the
+program's files reach (see [What a program reaches](#what-a-program-reaches)): any layer
+but `quillo.policy`, `--policy` too. In 0.8.11 a program with none, or one that leaves
+something out, starts with a warning that names the release it will stop in (``the policy
+host.toml asks for a complete quillo.confirmed, and quillo.confirmed leaves 2 things out:
+from Quillo 0.8.12 it will not start so``); from 0.8.12, it does not start.
 
 - `quillo check` and `quillo run` always read the host's file and `quillo.policy`;
   `--policy` adds one, and `check` names the files only when one is given. A byte-order
@@ -10307,9 +10690,125 @@ main.qwe:6: error: `udp.listen` needs the net effect, which host.toml does not a
 - A policy binds the `quillo` that reads it. On a shared server, a user who can upload a
   binary of their own can run it without one: the boundary between accounts is the
   system's (Unix users, CloudLinux's CageFS and LVE limits).
-- Not built yet: a catalog whose entries are signed, a policy that allows catalog
-  plugins only, and a sandbox from the system (`--sandbox`, seccomp and Landlock) or for
-  plugins (WebAssembly).
+- `quillo repl` reads no policy.
+- Not built yet: a catalog whose entries are signed (`[plugins] catalog` pins by the hashes
+  of an index the provider keeps), and a sandbox from the system (`--sandbox`, seccomp and
+  Landlock) or for plugins (WebAssembly).
+
+### What a program reaches
+
+*(since 0.8.11)* A component file taken from another project, or a plugin from elsewhere,
+runs with the program's rights: it may post `.env` to another server as the program starts,
+and `quillo check` would say ok. `quillo confirm` reads every file of the program (the main
+file, and each file `use`, `import`, `mount` and `service` take, followed through), lists
+what each one reaches, asks once, and writes the answer to `quillo.confirmed` beside
+`main.qwe`. Commit it: the answer is the project's, and every clone, CI run and server reads
+the same one. From then on the program is held to it.
+
+```
+$ quillo confirm
+quillo: 2 files reach something not confirmed yet
+  lib/geo.qwe
+    reaches       nominatim.openstreetmap.org              line 2
+    reads         uploads/logo.svg                         line 6
+
+  main.qwe
+    writes        notes/                                   line 4
+
+  [y] confirm all   [f] file by file   [n] none: y
+quillo: wrote ./quillo.confirmed (2 files confirmed)
+```
+
+```toml
+# quillo.confirmed: what this program's files reach, as confirmed.
+# Written by `quillo confirm`. Commit it: the answer is the project's.
+
+["lib/geo.qwe"]
+http = ["nominatim.openstreetmap.org"]
+files = ["uploads/logo.svg"]
+
+["main.qwe"]
+writes = ["notes/"]
+```
+
+Each file has a block, named by its path from the main file's folder, and these lists:
+
+| Key | What the file reaches |
+|---|---|
+| `http` | the hosts its `http.*` and `site` calls, its UDP sends and its databases (as their drivers read the address) reach; `*.stripe.com`, written by hand, covers the subdomains, and `quillo confirm` keeps it |
+| `files` | the paths its file builtins read (`read_file`, `file`, `files`, `image.info`); a folder ends with `/` and covers what is in it |
+| `writes` | the paths it writes or deletes (`write_file`, `delete_file`, `save_upload`, `image.convert`'s, an `http.*` call's `save:`, a SQLite database's file); a path confirmed in `files` only is read, never written |
+| `listens` | the UDP ports it listens on at an address others reach (`udp 514`); this machine's own loopback needs none |
+| `scripts` | the scripts its pages load (`client "https://..."`), each with the `sha384-...` integrity hash `quillo confirm` fetched it for |
+| `loads`, `calls` | the hosts its markup loads from (`src`), and its pages call (`js("fetch", "https://...")`) |
+| `routes` | for a file taken for some of its names (`import lib/x.qwe use f`), the routes, `server fn`s and tools (`fn mcp`) it adds beyond the names taken |
+| `sha256`, `effects` | for a Rust file: its SHA-256, and what its `//! effects:` line said; Quillo cannot hold Rust to a list, only to the file |
+
+What is held, once the file is there (`quillo run`, `quillo mcp`, `quillo app`, `quillo
+build`, and a `--split` service, by its app's `quillo.confirmed`):
+
+- A call to a host, or a file builtin on a path, its file was not confirmed for is an error
+  value at the call, said once in the log. Paths are judged where they really are, links
+  followed: `uploads/x` leading to `.env` is `.env`. Each redirect of a call is judged too.
+- A route, `server fn` or tool that a file taken for some of its names adds, and that was
+  not confirmed, is not served (a 404; a tool is not offered), said at the start: `quillo:
+  lib/geo.qwe: the route GET /x is not served: it is not confirmed for this file`. The main
+  file's routes and a mounted program's are the program's own, and so is a `server fn` or tool
+  the `use` names (`import lib/notes.qwe use load_notes`).
+- A page script not confirmed is left out of the page; a confirmed one is loaded with its
+  `integrity` attribute, so a changed copy on the CDN does not run.
+- A held program's pages carry a `content-security-policy-report-only` of what its files
+  were confirmed to load and call, when the program sets no policy of its own: the browser
+  reports what goes beyond, and blocks nothing yet.
+- A Rust file that is not confirmed at its SHA-256 does not load, and the start stops:
+  `` tools.rs is not confirmed (its SHA-256 is ...); Rust cannot be held to a list, so it does
+  not load (`quillo confirm` asks about it) ``. `quillo build` builds none that is not.
+- A confirmed Rust file loads only a library this machine built from those bytes, never one
+  a cloned repository or an unpacked `.quillo/native` brought along. What was built is
+  recorded outside any project (`$XDG_CACHE_HOME/quillo/built.txt`, else
+  `~/.cache/quillo/built.txt`, the user's alone, 0600): the first start after a change
+  builds it apart, as a pinned build is built, and later starts load it as fast as before.
+  `quillo build` records too, so a `quillo run --no-build` after it, on the same machine,
+  loads what it built. With building off (`--no-build`, `build = false`) and no record, the
+  library is refused, unless the host's policy pins it by its own SHA-256 (see [The
+  policy](#the-policy)). A program run with `quillo.confirmed` and then without it, and back,
+  builds again each time.
+
+A program with no `quillo.confirmed` runs as before, and `quillo check` says only what it
+always says plus the [warnings](#checking) about taken files and effects lines. Under a
+provider's policy, which asks for a complete one, it starts with a warning in 0.8.11 and does
+not start from 0.8.12 (see [The policy](#the-policy)).
+
+Asking, and who answers:
+
+- `quillo confirm` asks at a terminal: `y` all, `f` file by file, `n` none. Where no one can
+  answer (CI, systemd, a container) it exits 1 and says so. `quillo confirm --yes` confirms the
+  list it printed, once you have read it; `quillo confirm lib/` takes only the files under
+  `lib/`; `--list` prints everything each file reaches and writes nothing.
+- `quillo run` at a terminal asks about what is not confirmed before it starts (`[y] confirm
+  them [n] not now`); elsewhere it starts, and refuses each such thing as it is reached:
+  ``quillo: 2 things in 1 file are not confirmed (quillo.confirmed): each is refused as it is
+  reached; `quillo confirm` lists them``.
+- **In CI, run `quillo check`, never `quillo confirm --yes`**: once there is a
+  `quillo.confirmed`, `check` fails, exit 1, on each thing a change brought that is not in it
+  (``lib/geo.qwe:8: error: reaches example.com: not confirmed for this file``), and `--yes`
+  would confirm whatever the change brought.
+- What the policy refuses stays refused: a confirmed host outside its `[http] hosts` is
+  noted (`note: lib/geo.qwe: example.com stays refused: ...`). A list only narrows.
+- An item the files no longer have leaves the file at the next `quillo confirm`; a file the
+  program no longer takes leaves with it.
+- `quillo install` *(since 0.8.11)* writes the SHA-256 it checked, and the plugin's effects
+  line, into the project's `quillo.confirmed` when there is one, so a plugin changed after it
+  was installed does not load (see [Plugins from the catalog](#plugins-from-the-catalog)).
+- `quillo confirm --effects tools.rs` reads a Rust file for what it does (the standard
+  library's file, network and process calls, the crates that do them) and proposes its
+  `//! effects:` line, saying where the file's own leaves something out. It is a reading of
+  the text, not a proof: a crate can do what it does unseen.
+
+Not held yet: [`--watch`](#options-of-quillo-run) does not read `quillo.confirmed` again
+when it changes (restart after `quillo confirm`); what a page loads and calls is only
+reported, by the report-only policy; a database's address in upper case
+(`POSTGRES://...`) or as a `conninfo` string is listed as a path, and refused when reached.
 
 ### Quillo on a shared server (cPanel)
 
@@ -10594,14 +11093,24 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   may follow `//` comments, blank lines, block comments and `#![...]` attributes at the
   top of the file.
 - **`//! effects: fs, http`**, a header line, says what the file's functions do, in the
-  words of `with` (`db`, `http`, `fs`, `env`, `time`, `random`, `net`; `db.analytics` is
-  `db`), or `//! effects: none`. It is what lets a `with` function call them: a function
+  words of `with` (`db`, `http`, `fs`, `env`, `time`, `random`, `net`, and `run` *(since
+  0.8.11)* for starting another program; `db.analytics` is `db`), or `//! effects: none`.
+  It is what lets a `with` function call them: a function
   declared `with fs` may call `brightness`, one declared `with time` may not. A file
   without the line may do anything: its functions are refused inside any `with`, and
   anywhere under a policy that narrows effects (see [Effects](#effects)). A word that is
   not an effect is said by `quillo check` at its line. Quillo cannot see what Rust does,
   so the line is the author's claim, read as a promise: write what the code really
-  reaches, and review it in a plugin from elsewhere.
+  reaches, and review it in a plugin from elsewhere. `quillo check` reads the file's text
+  against it *(since 0.8.11)*, and warns where the code plainly calls what the line leaves
+  out (`std::process::Command` under a line without `run`, `TcpStream` without `net`, a
+  crate such as `reqwest` without `http`); `quillo confirm --effects x.rs` proposes the line.
+- **A function's own line**, `/// effects: fs` in its documentation *(since 0.8.11)*, narrows
+  the file's for that function: callers need only the function's effects, so one file can
+  hold a function that starts programs beside small helpers a `with fs` function may call
+  (see [Effects](#effects)). It never widens the file's: a line that names more is an
+  error, at check and at load, and a refusal names the function and the effect it lacks.
+  Under a file with no `//! effects:` line, a function's line says all that function does.
 - **Taking names.** `import redis.qwer use cache_get, cache_set` takes only those
   functions; `as` gives one another name, `import redis.qwer use cache_get as redis_get`,
   and it is not there under its own. A name the file does not export is an error that
@@ -10698,7 +11207,13 @@ How it runs:
   version, `"csv@1"` or `"csv@1.4.2"` by the file's `//! version:` line (`1` takes
   `1.4.2`, not `10.0`). A plugin it does not name is refused before anything is built:
   `` the plugin `pdf` 2.0.1 is not in the plugins /etc/quillo/policy.toml allows: csv@1, qr ``.
-  It names plugins by their file's name and header; it does not prove their code.
+  By name, it names plugins by their file's name and header; it does not prove their code.
+  `"qr@sha256:<hex>"` *(since 0.8.11)* does: by the source's hash the plugin is built here
+  from the bytes hashed, and by the library's only that library loads; `[plugins] catalog`
+  pins a whole catalog by its index (see [What a provider holds a program to](#what-a-provider-holds-a-program-to)).
+- **A program's `quillo.confirmed`** *(since 0.8.11)* holds each Rust file to its SHA-256,
+  and loads only a library this machine built from it (see [What a program
+  reaches](#what-a-program-reaches)).
 - A call runs off the event loop, without the lock Quillo code holds, on the threads
   that also wait for databases ([`--workers`](#options-of-quillo-run)): a slow function holds up no one, and
   calls from several requests run on several cores at once; many long calls at once
@@ -10750,11 +11265,18 @@ quillo install --list pdf          # what the catalog has, matching "pdf"
 - Then `use csv.qwer`, or only what you need, `import csv use csv_parse, csv_write`: the
   first run builds it with cargo, as any `.qwer` file.
 - A catalog plugin is called inside a `with` function only once its header has a
-  `//! effects:` line, as any Rust file (see [Rust](#rust)). The catalog's files do not
-  have it yet: add it to your copy after reading what the plugin does.
+  `//! effects:` line, as any Rust file (see [Rust](#rust)). The catalog's files carry one
+  *(since 0.8.11's catalog; `cli_run` says `env, time, run`)*, and `install` prints it (`its
+  effects: env, time, run`). A copy whose only change is an effects line you added is still
+  the catalog's file to `install --update`, not one changed by hand.
+- When the project has a `quillo.confirmed`, `install` writes the SHA-256 it checked, and the
+  effects line, into it *(since 0.8.11)* (`./quillo.confirmed keeps its SHA-256`), so a
+  plugin changed after it was installed does not load (see [What a program
+  reaches](#what-a-program-reaches)). It makes none: writing one holds the whole program.
 - `install` checks a file against the catalog it came from, which a changed server
   could change too: the catalog's entries are not signed yet. A host can still list the
-  plugins and versions it takes, in a policy's `[plugins] allow`.
+  plugins and versions it takes, in a policy's `[plugins] allow`, or pin them by hash,
+  one by one or the whole catalog with `[plugins] catalog` *(since 0.8.11)*.
 
 ### Other stores
 
@@ -10868,6 +11390,8 @@ does not do it today; the way around it follows.
 | have pages open with no network? | Yes: `route offline GET /x`, and Quillo writes the service worker. See [Pages that work offline](#pages-that-work-offline) |
 | write a service worker of my own? | Yes, served by a route, in place of Quillo's. See [A service worker of your own](#a-service-worker-of-your-own) |
 | compile components to WebAssembly? | Not yet: they compile to JavaScript |
+| set each page's title and `og:` tags, in a single-page app too? | Yes *(since 0.8.11)*: `page_head({ title, description, image, canonical })`, from any view or component, following state. See [The page's head](#the-pages-head) |
+| move between the program's routes without a page load, keeping state? | Yes *(since 0.8.11)*: `moves_in_place()` at the top. See [Routes that move in place](#routes-that-move-in-place) |
 
 ### Serving
 
@@ -10879,7 +11403,7 @@ does not do it today; the way around it follows.
 | serve a folder of HTML and other files as they are? | Yes: `quillo serve site`, or `files("site", path)` in a route, with `index.html`, clean URLs and `404.html`. See [Static files](#static-files) |
 | serve a React or Vite app's build, deep links included? | Yes: `files("dist/assets", path, { cache: "1y" })` for its hashed files and a last `route GET /*path = file("dist/index.html")`; the app is rendered in the browser and calls the program on its own origin. See [A front end built elsewhere](#a-front-end-built-elsewhere-react-vite) |
 | open WebSockets of my own? | No: `live`, `events` with `listen`, and channels are the ways to push. See [Channels](#channels) |
-| receive or send binary data? | Only as files: `file()`, uploads, `image.*`. There is no bytes value; bodies are text |
+| receive or send binary data? | Only as files: `file()`, uploads, `image.*`, and an `http.*` answer written to a file with `save:` *(since 0.8.11)*. There is no bytes value; bodies are text. See [HTTP client](#http-client) |
 | stream a response? | Yes: `stream`, `events`. See [Streaming](#streaming) |
 | limit how often a client calls? | Not built in: count in a table of your own. See [What a route cannot do](#what-a-route-cannot-do) |
 | put a time limit on a route? | No: only sockets time out |
@@ -10947,7 +11471,9 @@ does not do it today; the way around it follows.
 | run untrusted users' code? | Yes, sandboxed: `run_script`. Never as `.qwer`. See [Scripts from users](#scripts-from-users) |
 | get structured logs and metrics? | JSON request lines ([`--log json`](#options-of-quillo-run)) and Prometheus metrics ([`--metrics`](#options-of-quillo-run)); errors are text lines. See [Logs and metrics](#logs-and-metrics) |
 | configure with a file? | Only `.env`, and a policy that takes away; everything else is an option. See the options at the start of this guide |
-| limit what a program may do from outside it? | Yes, with a policy: plugins, effects, hosts, variables, limits. See [The policy](#the-policy) |
+| limit what a program may do from outside it? | Yes, with a policy: plugins, effects, hosts, variables, limits, and *(since 0.8.11)* how `quillo run` may be started, `--allow-path`'s folders and values `env()` gives. See [The policy](#the-policy) |
+| know what a component or plugin from elsewhere reaches before it runs? | Yes *(since 0.8.11)*: `quillo confirm` lists each file's hosts, paths, scripts and Rust files, and the program is held to what was confirmed. See [What a program reaches](#what-a-program-reaches) |
+| run ffmpeg or another program? | Through the catalog's `cli_run` plugin, its arguments as a list, never a shell; held by the `run` effect *(since 0.8.11)*. See [Standard library](#standard-library) |
 | sandbox a program with the system's help (seccomp, Landlock)? | Not yet: a policy holds Quillo code, not a plugin's Rust |
 
 ## Not built yet
@@ -10964,8 +11490,12 @@ does not do it today; the way around it follows.
   there `keys({ "10": 1, "2": 2 })` is `["2", "10"]`, as JavaScript orders them
 - Linux builds linked with musl, or static: not planned, since a static binary cannot
   load plugins. The releases from 0.7.0 on are linked against glibc 2.17 instead
-- a catalog whose entries are signed, its plugins prebuilt for Linux, and `//! effects:`
-  on each of them; a policy that allows catalog plugins only (`local = false`)
+- a catalog whose entries are signed, and its plugins prebuilt for Linux (a policy's
+  `[plugins] catalog` pins its plugins by the hashes of an index the provider keeps, and
+  the catalog's files carry `//! effects:` lines *(since 0.8.11)*)
+- `quillo confirm`'s report-only page policy turned into one that blocks, and `--watch`
+  reading `quillo.confirmed` again when it changes
+- `quillo repl` under a policy
 - `quillo run --sandbox` (seccomp and Landlock on Linux), and plugins built to
   WebAssembly and run sandboxed
 - a policy's `private = false` for `db.connect` and UDP (it covers `http.*` only)
@@ -11005,6 +11535,8 @@ src/script.rs      run_script: code a program's users write, sandboxed
 src/native.rs      Rust in a program: .qwer files read, built, loaded and called;
                    .quillo/plugins.lock and --no-build
 src/policy.rs      the policy: what whoever runs Quillo lets a program do
+src/confirm.rs     quillo confirm and quillo.confirmed: what a program's files reach, and
+                   the run held to it
 
 The standard library
 src/builtins.rs    the builtins every program can call
@@ -11018,7 +11550,7 @@ src/crypto.rs      crypto: hashes, signatures, tokens, passwords
 src/imaging.rs     image: what an image file is, and new files made from it
 src/highlight.rs   highlight(code, lang): source code as HTML
 src/i18n.rs        translations
-src/fetch.rs       http: the HTTP client, its cache, and http.stream
+src/fetch.rs       http: the HTTP client, its cache, http.stream, and save:
 
 Databases
 src/db.rs          db: SQLite, connections, tenants, transactions, and the shared API
@@ -11031,6 +11563,7 @@ src/sqlinfo.rs     which tables a statement reads and writes, for live updates
 Serving
 src/httpd.rs       the event loop: connections, requests as coroutines, waiting off the loop
 src/server.rs      request matching, server fns, responses, --watch
+src/head.rs        page_head: the head a page is sent with
 src/stream.rs      answers sent as they are made: stream, events, send
 src/fcgi.rs        quillo fcgi: FastCGI requests made HTTP requests for the server
 src/service.rs     services: in this process or elsewhere, signed calls, retries and

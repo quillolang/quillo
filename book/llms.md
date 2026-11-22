@@ -39,6 +39,8 @@ each builtin's edge cases are only there. Rules for working on a Quillo program:
 | `migrations/NNN_name.sql` | the database's tables, run once each, in order, by `db.migrate("migrations")` |
 | `public/` | files served as they are (with a route: `route GET /assets/*path = files("public", path)`) |
 | `*.qwer`, `*.rs` *(since 0.7)* | Rust a program `use`s (`quillo install <name>` fetches a `.qwer` plugin from quillolang.org/plugins) |
+| `quillo.policy` | what this program may do, narrowed further (TOML); `quillo policy` shows every layer in force |
+| `quillo.confirmed` *(since 0.8.11)* | what each file was confirmed to reach (hosts, paths, scripts, Rust files by SHA-256), written by `quillo confirm` and committed; `run` holds the program to it, and `quillo check` fails on what it leaves out. Never write it by hand to make a check pass: ask the user to run `quillo confirm` |
 
 `quillo new my-app` *(since 0.7)* makes a program to start from (`--minimal` for a page and a
 component).
@@ -208,6 +210,9 @@ route GET /assets/*path = files("public", path)
 - A route gives: HTML (200 html), a string (200 text), a map, list, number or bool
   (200 JSON), `null` (204), `respond(status, body, headers)`, `redirect(url)`,
   `file(path)`, `stream(...)` or `events(...)`.
+- `http.get(url, {}, { save: "downloads/a.pdf" })` *(since 0.8.11)* writes a 2xx body to a
+  file and gives `{ status, ok, headers, file, bytes }` (needs `fs` as well as `http`);
+  without `save` a body is text.
 - `request` has `path`, `query`, `form`, `json`, `body`, `headers`, `cookies`, `files`,
   `ip`. Prefer patterns in the route line to reading `request` by hand: a route whose
   pattern does not match lets the next route try.
@@ -294,6 +299,29 @@ component Tasks() {
 - `live(load, ...args)` passes the arguments after `load` to it one by one, and runs it
   again when one changes: `state found = live(search, q)` for `server fn search(q: str)`,
   not `live(search, [q])`.
+- `page_head({ title, description, image, canonical })` *(since 0.8.11)*, in any view or
+  component, sets the page's `<title>`, description, `og:` tags and canonical link; the
+  innermost call wins, and in the browser it follows state. Not `<title>` in a component,
+  and no component inside `<head>`. `page_url()` is the page's public address.
+- `moves_in_place()` *(since 0.8.11)* at the top of the program makes links and `navigate`
+  move between routes without a page load, keeping page states and components on both
+  pages. `navigate(path, { replace: true, scroll: false })`.
+
+```quillo
+moves_in_place()
+
+view Page(title: str, children) {
+    page_head({ title: `${title} · Shop`, description: "Teapots" })
+    return <html lang="en">
+        <head><meta charset="utf-8"/><title>Shop</title></head>
+        <body><nav><a href="/shop">Home</a> <a href="/shop/about">About</a></nav><main>{children}</main></body>
+    </html>
+}
+
+route GET /shop = <Page title="Home"><h1>Home</h1></Page>
+route GET /shop/about = <Page title="About"><h1>About</h1></Page>
+```
+
 - `ask(message, { title, ok, cancel, tone })` waits for a yes or no in a dialog, and
   `notify(message, { title, tone, seconds })` shows a note that goes by itself, in the
   browser only. Both are plain markup with `q-` classes (`q-dialog`, `q-toast`, ...) that
@@ -333,7 +361,8 @@ db.transaction(() => {
 - `last_id` is the one inserted row's id, else `null` (always `null` on PostgreSQL: write
   `insert ... returning id` with `db.one`); `changes` is the rows matched, on every database.
 - `with db` on a function says it uses the database; a function with `with` may do only
-  what it declares (`db`, `http`, `fs`, `env`, `time`, `random`, `net`). Routes and
+  what it declares (`db`, `http`, `fs`, `env`, `time`, `random`, `net`, and `run` *(since
+  0.8.11)*, which only a Rust file's `//! effects:` line names: starting another program). Routes and
   route groups take it too *(since 0.7)*, before the body: `route GET /report with db = ...`,
   `routes /admin | signed_in with db { ... }`.
 
@@ -345,3 +374,5 @@ db.transaction(() => {
 - Each link and redirect goes to a route the program has; each `<img>` has an `alt`.
 - `0` and `""` were not used as false.
 - No builtin was guessed: each is in the list below.
+- With a `quillo.confirmed`, a new host, path or script a change reaches makes `quillo check`
+  fail: tell the user to run `quillo confirm`, do not edit the file.

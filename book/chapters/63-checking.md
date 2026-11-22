@@ -106,6 +106,31 @@ It also warns of what a page does:
 - A sheet under `public/` has its unused classes warned of only in a program that serves
   pages, and classes written in `public/**/*.html` and in the `.html` files and scripts of
   `files()` folders count as written.
+- A component inside `<head>`, an error *(since 0.8.11)*: call `page_head` from it (see [The
+  page's head](#the-pages-head)); and `{json.stringify(x)}` as the whole of an
+  `application/ld+json` script, a warning: it is written as a JSON string, so give the map,
+  `{x}`.
+
+And of what the program's files reach *(since 0.8.11)* (see [What a program
+reaches](#what-a-program-reaches)):
+
+- A file taken for some of its names (`import lib/geo.qwe use lookup`) that also adds a route
+  or a tool, or reaches out as the program starts, a warning: ``lib/geo.qwe is taken for
+  lookup, and also adds GET /x``.
+- A Rust file whose `//! effects:` line leaves out what its code plainly calls, a warning
+  that names the call and its line (``tools.rs says `effects: fs`, and calls
+  std::process::Command::new (line 5): a reading of its text, not a proof``).
+- An `http.*` call whose written host the policy's `[http] hosts` refuses, an error at the
+  call, where it was an error value at run time.
+- Once the program has a `quillo.confirmed`, each thing a file reaches that it does not
+  confirm, an error at its line (``reaches example.com: not confirmed for this file``), and
+  a Rust file that is not the one confirmed by its SHA-256.
+- Under a provider's policy, a program with no `quillo.confirmed`, or one that leaves
+  something out: a warning in 0.8.11, which says the release it stops in, and an error from
+  0.8.12.
+- A host that comes only from `env()` (and text written in the program, and their trims) is
+  warned of as the operator's setting, not a visitor's (``the host `http.get` goes to comes
+  from `API_HOST`, the operator's setting: say { public_only: false } ...``).
 
 A type grows as the code is read (a list of maps of lists, made again on each line), so
 the check keeps each to 1,000,000 parts and 64 levels, and takes what grows past them as
@@ -135,6 +160,10 @@ warning: ...`; with errors it ends `quillo: N errors` and exits 1; else it write
 `main.qwe: ok (12 routes, 40 functions, 9 components, in 18 files)` to stdout (with the
 warnings counted) and exits 0. Its two options, given after the program as `quillo run`'s are,
 are [`--strict-null`](#other-commands) (below) and `--policy FILE` (above).
+
+A `"""` or `'''`, as Python and Kotlin write text over several lines, is told what Quillo
+writes *(since 0.8.11)*: ``tq.qwe:1: error: `"""` is not a string here: text over several lines
+is a backtick string, `line one ...` (`${` interpolates)``.
 
 After a syntax error that a newer Quillo might accept (an unknown character or escape,
 an unexpected keyword, an unknown word), `quillo check`, `quillo run` and the language

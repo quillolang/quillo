@@ -112,7 +112,8 @@
   text,
   `check_program`, `run_script`, `delete_file`, `save_upload`, `read_upload`,
   `schedule`, `idempotent`, `parallel`, `ready`, `style_with`, `classes`, `accept_calls`, `allow_cross_site`,
-  `tenant`, `tenant_from`, `with_tenant`, `platform` (below), and in components `url`, `navigate`, `every`,
+  `tenant`, `tenant_from`, `with_tenant`, `platform` (below), `page_head`, `page_url` and
+  `moves_in_place` *(since 0.8.11)* (see [Single-page apps](#single-page-apps)), and in components `url`, `navigate`, `every`,
   `ask`, `notify`, `js`, `js_new`, `live`, `waiting`, `publish`, `watch`, `unwatched`: each is
   described where it is used.
 - **Where the program runs:** `platform()` *(since 0.7)* gives a map: `os` (`"ios"`, `"android"`,
@@ -202,9 +203,16 @@ What is not in the standard library, and what to do instead:
 - **`url_decode`.** Not built in: query strings, forms and cookies arrive decoded (the
   `encoding` plugin has `url_decode` and `form_decode` for other text).
 - **A seed for `random`.** None: runs are not repeatable.
-- **Other processes.** A program cannot run a command: `env`, files, and a command started
+- **Other processes.** No builtin runs a command: `env`, files, and a command started
   beside it with the option [`--with`](#options-of-quillo-run) (`quillo run main.qwe --with "npx tailwindcss ..."`). A script reads its arguments with `args()` and its input with `stdin()` and
-  `read_line()` (see [Scripts as tools](#scripts-as-tools)).
+  `read_line()` (see [Scripts as tools](#scripts-as-tools)). To run ffmpeg, a converter or
+  a Node script from the program, take the catalog's `cli_run` plugin (`quillo install
+  cli_run`): `cli_run("ffprobe", ["-i", path], { timeout_ms: 10000 })` takes the arguments as
+  a list, never through a shell, so a file name someone uploaded stays one argument, ends
+  the whole process group at its timeout, and gives `{ ok, status, signal, stdout, stderr
+  }`; `ffmpeg_cli` probes, makes thumbnails, trims and transcodes the same way. Both say
+  `run` among their effects *(since 0.8.11)*, so a policy can refuse them (see
+  [Effects](#effects)).
 - **Hashing a value.** `crypto.sha256(json.stringify(v))`. Values never change, so
   nothing needs copying.
 - **Building a long string.** `+` makes a new string each time: push the pieces to a
@@ -456,9 +464,16 @@ path is judged where it really leads, with its links followed:
   `--allow-path /srv/shared/uploads`.
 
 What is refused is what any refused path is: an error value from `read_file`,
-`write_file` and `delete_file` (`read_file: path must stay inside the program's folder:
-data/s.txt`), a 404 from `file` and `files` (the same whether the folder outside is
+`write_file` and `delete_file`, which ends with the way out *(since 0.8.11)*
+(``read_file: path must stay inside the program's folder: ../secret.txt; `--allow-path ..` (on
+`quillo run` or `quillo mcp`) lets the program read it``), a 404 from `file` and `files` (the same whether the folder outside is
 there or not), and a runtime error from `save_upload`.
+
+`files()` judges a link as `file()` does *(since 0.8.11: it refused every link out of the
+folder without a word, whatever `--allow-path` said)*: one that leads into a folder
+`--allow-path` names is served, and one that leads anywhere else is a 404, with `file()`'s
+line in the log. Inside such a folder, what `files()` never serves stays a 404: dot files,
+`.qwe` and Rust files, the policy, and links on to folders not allowed.
 
 ```quillo noexec
 // alias -> real (inside), data -> ../outside, dangling -> ../outside/gone.txt
@@ -466,6 +481,10 @@ print(read_file("alias/in.txt"))                 // inner
 print(read_file("data/s.txt") ?? "refused")      // refused
 print(write_file("dangling", "x") | is_err)      // true
 ```
+
+Under a policy's `[fs] paths` *(since 0.8.11)*, `--allow-path` may name only folders inside
+those (see [The policy](#the-policy)), and under a program's `quillo.confirmed` each file may
+use only the paths it was confirmed for (see [What a program reaches](#what-a-program-reaches)).
 
 Only the path's parts are looked at, and only a path with a link in it is resolved, so a
 static file costs what it did. A link changed between the check and the open is not
@@ -1847,7 +1866,8 @@ header names in lower case, a header sent more than once joined with `, ` (two `
 one `</x>; rel=a, </y>; rel=b`), `set-cookie`'s lines joined by a line break, as they
 cannot be by a comma, and also given one by one in `cookies`, a list; `body` as text
 (bytes that are not UTF-8 replaced), `json` the body parsed, or `null`. A body longer than
-64 MiB is an error value that says to read it with `http.stream` *(since 0.7: it was cut
+64 MiB is an error value that says to read it with `http.stream` (or write it to a file
+with `save:`, below) *(since 0.7: it was cut
 there, and cut JSON was `null`)*. The answers being read whole, every call's at once, take
 at most 256 MiB past the first MiB of each, counted as they arrive: a call whose answer
 would pass that is an error value (``...: the answers being read at once would take more
@@ -1927,6 +1947,30 @@ http.get(url, {}, { timeout: 5 })                   // an error value after 5 se
 http.get("https://ledger.internal/balance", {}, { ca: "certs/internal-ca.pem" })
 http.post("https://api.bank.example/payments", order, {}, { cert: "certs/client.pem", key: "certs/client.key" })
 ```
+
+- `save: path` *(since 0.8.11)* writes the answer's body to a file as it arrives, for a
+  download that is not text (a PDF, an image, a video) or larger than a body read whole;
+  `max_bytes` is the most it writes (64 MiB unless given, counted on the decoded body). The
+  call then gives `{ status, ok, headers, file, bytes }`, with `file` the path written and
+  `bytes` its size:
+
+  ```quillo noexec
+  let r = http.get("https://example.com/report.pdf", {}, { save: "downloads/report.pdf", max_bytes: 20 * 1024 * 1024 })
+  print(r.ok ? `${r.bytes} bytes in ${r.file}` : `not saved: ${r.status}`)
+  ```
+
+  Only a 2xx answer is written; another is read as its text, into `body`, with `file` null.
+  The body goes into a new file beside the target, 64 KiB at a time, which takes the
+  target's place once it has all come, so a failure, or an answer past `max_bytes`, leaves
+  the file that was there as it was. Redirects are followed, each held to the policy's
+  `[http] hosts`. The path is held as `write_file`'s is: inside the program's folder or one
+  [`--allow-path`](#options-of-quillo-run) names, and never `.env`, the program's own files,
+  an open database or the policy (``http.get: save: will not write t.qwe: it is one of the
+  program's own files``); a file that was there keeps its read, write and run bits. A save
+  needs the `fs` effect as well as `http`, and it is a write: a prefetch, a hover's guess
+  or a move in place never makes one, and a `GET` route that saves and reads who the
+  visitor is gets `writes`' warning (see [Routes](#routes)). `save` with `cache`, on
+  `http.stream`, or in a component is an error.
 
 Another option is an error, in `quillo check` when the options are written in the call,
 and when it runs: `{ timout: 5 }` is not ignored.

@@ -1195,6 +1195,145 @@ full page load starts every state afresh: keep what must survive one on the serv
 in `localStorage` through `js`. See
 [spa.qwe](https://github.com/quillolang/examples/blob/main/spa.qwe), which also answers 404 on the server for unknown paths.
 
+`navigate(path, { replace, scroll })` *(since 0.8.11)*: `replace: true` takes the place of
+the current history entry instead of adding one, and `scroll: false` stays where the page
+is. Back and Forward give each page its scroll back, once the page is long enough again (at
+most 2 s, and not when the person scrolls first). After a move to another path by a link,
+focus goes to the new page's `<main>`, else its first `<h1>`, and the new title is said to a
+screen reader; never while a field has focus, so a search box that navigates as it is typed
+in keeps it. A link pressed while its page is on the way waits for it (3 s at most) rather
+than asking twice.
+
+### The page's head
+
+`page_head({ title, description, image, canonical })` *(since 0.8.11)* sets the head of the
+page it is called in: `<title>` and `og:title`, the description and `og:description`,
+`og:image`, and the canonical link with `og:url`. A layout, a page inside it, or a
+component deep in the page may call it, and the innermost call wins, key by key; what it
+leaves out stays the outer call's, or the head's own:
+
+```quillo
+view Layout(title: str, children) {
+    page_head({ title: `${title} · Shop`, description: "Teapots and kettles" })
+    return <html lang="en">
+        <head><meta charset="utf-8"/><title>Shop</title></head>
+        <body><nav><a href="/">Home</a> <a href="/teapots/2">Teapot 2</a></nav>{children}</body>
+    </html>
+}
+
+view Teapot(id: int) {
+    page_head({ title: `Teapot ${id} · Shop`, image: "/img/teapot.png", canonical: `/teapots/${id}` })
+    return <article><h1>Teapot {id}</h1></article>
+}
+
+route GET / = <Layout title="Home"><main><h1>Home</h1></main></Layout>
+route GET /teapots/:id(int) = <Layout title="Teapots"><main><Teapot id={id}/></main></Layout>
+```
+
+`/teapots/2` is sent with `<title>Teapot 2 · Shop</title>`, the layout's description, and
+`og:image` and the canonical link as whole addresses (`https://shop.example/img/teapot.png`,
+from [`page_url`](#the-pages-address)); the layout's own `<title>` is replaced, not written
+twice.
+
+- The values are text, escaped; `null` says nothing (the outer value stands). `image` and
+  `canonical` take a path starting with `/` or an `http(s)://` address; `javascript:` and
+  `data:` are refused. Any other key is an error that names it (`` `page_head` has no key
+  `titel`: it takes title, description, image and canonical ``).
+- On the server it writes the head the page is sent with, so a link's preview and a search
+  engine read it. In the browser it follows state: a component's `page_head({ title:
+  `${n} unread` })` changes the tab's title as `n` changes, and when the component goes, its
+  values go with it. A page with no `<head>` gets one; a part of a page (a route that gives
+  an `<li>`) gets nothing.
+- In a deferred part (`state x = defer(...)`), it reaches the browser only, after the page
+  is sent, and the log says so.
+- A component inside `<head>` is an error in `quillo check` (`a component cannot stand in
+  <head>`: the island it is written as would end the head there); call `page_head` from it
+  instead. A `view` there is fine.
+- A program's own function named `page_head`, `page_url` or `moves_in_place` hides the
+  builtin, with a warning (`` `page_url` hides the builtin `page_url`: the program's own is
+  used everywhere, so pick another name ``).
+
+### The page's address
+
+`page_url()` *(since 0.8.11)* is the page's public address, `page_url("/img/card.png")`
+another path's: scheme, host, the [`--base`](#options-of-quillo-run) prefix, and the
+path, for an `og:url`, a share link or an email:
+
+```quillo
+route GET /posts/:id(int) = <html>
+    <head><meta property="og:url" content={page_url()}/></head>
+    <body><a href={page_url("/img/card.png")}>Card</a></body>
+</html>
+```
+
+The scheme is `https` only behind a proxy [`--trust-proxy`](#options-of-quillo-run) names
+(or FastCGI's word), as a visitor's `X-Forwarded-Proto` is not taken; the host is the first
+name of [`--allowed-hosts`](#options-of-quillo-run) when it is given, else the request's.
+An address that is already whole is given back as it is; a path not starting with `/`, and
+`//host`, are errors.
+
+### Routes that move in place
+
+`moves_in_place()` *(since 0.8.11)*, at the top of the program, makes every page of the
+program a page of one app: a same-site link, or `navigate`, fetches the route's page and
+puts it in place of the current one, with no load, and Back and Forward do the same.
+Without it, links and `url()` work as above.
+
+```quillo
+moves_in_place()                       // at the top: links and navigate() move in place
+
+state visits = 0                       // page state: kept across moves
+
+component Cart() {
+    state items = 0                    // on every page, the same props: kept too
+    <button onclick={() => { items = items + 1 }}>Cart: {items}</button>
+}
+
+component Search() {
+    state q = ""
+    <input value={q} oninput={(e) => { q = e.target.value }}/>
+}
+
+view Layout(title: str, children) {
+    page_head({ title: `${title} · Shop` })
+    return <html lang="en">
+        <head><meta charset="utf-8"/><title>Shop</title></head>
+        <body>
+            <nav><a href="/">Home</a> <a href="/about">About</a> <Cart/></nav>
+            <main>{children}</main>
+        </body>
+    </html>
+}
+
+route GET / = <Layout title="Home"><h1>Home</h1><Search/></Layout>
+route GET /about = <Layout title="About"><h1>About</h1></Layout>
+```
+
+From `/` to `/about` and back, the cart keeps its count: page states keep their values,
+and a component that is on both pages, the same component, the same one of its name (the
+first `Cart`), with the same props, keeps its state. The rest (`Search` here) start from
+what the server sent. The head is the new page's, its title said to a screen reader.
+
+- The page is fetched read-only, as a prefetch is: a `GET` that would write (a
+  [`route writes`](#routes), or one that writes as it runs) is answered so, and the page is
+  loaded the usual way instead, so its effects run once. A move is never served from the
+  browser's cache.
+- A move is a full load instead when the two pages differ in what a swap would carry over
+  wrongly: another program or mount, another version of the program (a deploy since), other
+  scripts in the head, another content security policy or frame and permission headers, or
+  another visitor (signed out, or in as someone else). Each page carries a key of these,
+  signed with `QUILLO_SECRET`; a page whose key differs, or that has none, is loaded. A page
+  whose key holds the visitor is sent `cache-control: private`.
+- Only `GET` pages move in place. Back to the page a form's `POST` answered is the
+  browser's, and posts nothing again.
+- A program that moves in place gives each page the whole program's components, so any
+  page can show any of them. A page with a script of its own (`<script>` in its body) is
+  loaded, not moved into, so the script runs; Quillo's own scripts carry `data-quillo`. A
+  redirect is followed, and the address is where it ended; a link to a file, or with
+  `data-reload`, a modifier key or `target`, is the browser's as before.
+- A real load (a reload, a link with `data-reload`, another site and back) starts every
+  state afresh.
+
 ## Live data
 
 `live(load, ...args)` makes component state follow the server: `load` (a `server fn`)
@@ -1757,6 +1896,17 @@ message, and once the call in progress is answered while it answers one, however
 takes, saying so every 5 s (`--drain 30s` cuts the call off after that long; a second SIGTERM
 ends it at once). There are no tokens on stdio: the person who starts it is the caller.
 
+**`quillo mcp app.qwe --serve`** *(since 0.8.11)* also serves the program's routes, for a tool
+that uses the program's own pages (a preview the client opens, a page that renders what the
+tool made), in the same process: the program is loaded once, its routes are served on
+127.0.0.1 (`$PORT`, else 8080; `--port N` for another), and the stdio door answers its tools
+beside them as a request is answered: one program, its top level run once, its data shared
+with the pages. It is
+held to the policy as `quillo run` is (one that says `listen = "unix"` refuses it). Closing
+stdin, or `SIGTERM`, stops it as `quillo run` stops: the requests in progress are answered
+first (`--drain` gives a time). `--port` without `--serve` exits 2: ``quillo: `--port` goes
+with `--serve`, which serves the program's routes beside its tools``.
+
 Quillo speaks MCP's revision 2026-07-28 only. A client of the earlier revision, which opens with
 `initialize` (Claude Code before 2.1.319, for one), is told the version is not supported. What a
 client gets from a call:
@@ -1769,6 +1919,14 @@ client gets from a call:
   returning its value), a page, and `internal error` when the tool failed (the real message on
   stderr).
 - The protocol's own errors for an unknown tool, a malformed message and the wrong version.
+  A request whose `params` lack `_meta`'s two keys is told both, and what they hold, to copy
+  *(since 0.8.11)*: ``Invalid params: `_meta` must carry
+  `io.modelcontextprotocol/protocolVersion` ("2026-07-28") and
+  `io.modelcontextprotocol/clientCapabilities` ({})``. A message written by hand:
+
+  ```json
+  {"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}
+  ```
 - An answer past what the door takes in (10 MiB of JSON, or 128 levels deep) is an `isError`
   saying so, never a cut or empty answer; a tool that crashes answers `internal error` and the
   door goes on serving.

@@ -703,12 +703,29 @@ It is off by default, since anyone who can reach the server could read it.
 `with` limits what a function may do, from inside the program. A policy limits what the
 whole program may do, from outside it *(since 0.7)*: the host's, for every program on a server, and
 the site owner's, for one deploy. Policies are small TOML files, read as the program
-starts, by `quillo run`, `quillo fcgi` and `quillo check`:
+starts, by `quillo run`, `quillo fcgi`, `quillo mcp`, `quillo app` and `quillo check`. The
+layers, in the order read:
 
-1. `/etc/quillo/policy.toml`, the host's, whenever it is there (one that is there and
-   cannot be read stops the program);
-2. each [`--policy FILE`](#options-of-quillo-run), in order;
-3. `quillo.policy` beside the program's main file.
+1. `/etc/quillo/policy.toml`, the host's (on Windows `%ProgramData%\quillo\policy.toml`
+   *(since 0.8.11: it was `\etc\quillo\policy.toml` on whichever drive the program ran
+   from)*), whenever it is there;
+2. the files it names in `include = [...]`, by their whole path *(since 0.8.11)*;
+3. `policy.d/*.toml` beside it, in name order *(since 0.8.11)*: a provider's plans as files
+   of their own;
+4. each file `QUILLO_POLICY_PATH` names, a list as `PATH` is *(since 0.8.11)*, for a provider
+   that starts each account's process with its own (set where the process starts: a
+   `.env` never sets it);
+5. each [`--policy FILE`](#options-of-quillo-run), in order;
+6. `quillo.policy` beside the program's main file.
+
+The first four are the provider's, the host's layers; the last two are the developer's.
+Every file a layer names must be there: an `include` or `QUILLO_POLICY_PATH` naming a
+file that is not stops the program. A layer that is there but cannot be read (a link to
+nothing, a folder, a file without read permission) stops it too, with exit 2, naming it
+*(since 0.8.11: a broken `quillo.policy` was skipped without a word)*. Only the host's file may
+say `include` and `require_path = true`, which stops a start without `QUILLO_POLICY_PATH`
+rather than run it without the provider's limits. A provider's own build of Quillo can
+compile its anchor in (`QUILLO_HOST_POLICY` at build time) in place of `/etc`.
 
 Each file only narrows what the ones before it allow: a list is a condition every file
 must meet, so a later file cannot give back what an earlier one took away. A file that
@@ -749,13 +766,17 @@ hosts = ["api.stripe.com", "*.mapbox.com"]
 | Section | |
 |---|---|
 | `[plugins] build` | `false`: never build a Rust file, as [`--no-build`](#options-of-quillo-run) (see [Rust](#rust)) |
-| `[plugins] allow` | the plugins a program may `use`, by file name: `"qr"` at any version, `"csv@1"` or `"csv@1.4.2"` by the file's `//! version:` line. A plugin not listed is refused, by `quillo check` too, before anything is built. It names plugins; it does not prove their code |
+| `[plugins] allow` | the plugins a program may `use`, by file name: `"qr"` at any version, `"csv@1"` or `"csv@1.4.2"` by the file's `//! version:` line. A plugin not listed is refused, by `quillo check` too, before anything is built. By name it does not prove their code; `"qr@sha256:<hex>"` *(since 0.8.11)* does (below) |
+| `[plugins] catalog` *(since 0.8.11)* | `true`, or the path of a catalog's index (`plugins/index.json`, as `quillo install` reads it; `true` is `catalog.json` beside the policy file): every plugin of that catalog, each pinned by the SHA-256 the index gives for it, as an `allow` of them all |
 | `[effects] allow` | the effects anything in the program may use, as a `with` on its top level, routes, jobs and functions alike; a Rust file with no `//! effects:` line is refused anywhere under it |
 | `[http] hosts` | the hosts `http.*` and `site` calls may reach: `api.stripe.com`, `*.mapbox.com` (its subdomains, not itself), `*`. Each redirect is judged before it is followed |
 | `[http] private` | `false`: `http.*` and `site` calls reach nothing on this machine or its networks (loopback, private, link-local and the cloud's metadata at `169.254.169.254`, carrier-grade NAT, IPv6's unique-local), as the name resolves when it connects |
 | `[env] names` | the variables `env()` may read; any other reads as not set, so `env("HOME") ?? "none"` gives `"none"` |
 | `[limits] workers`, `max_compute`, `max_body`, `max_memory` | the most [`--workers`](#options-of-quillo-run), [`--max-compute`](#options-of-quillo-run), [`--max-body`](#options-of-quillo-run) and [`--max-memory`](#options-of-quillo-run) may be (`max_memory` *(since 0.8.7)*: no one value a request makes may be bigger; its stop says `the policy p.toml allows (max_memory, N bytes)`): a smaller value given on the command line stays (`"10s"`, `"500ms"`, `"2m"`; `"10MB"`, `"512KB"` or bytes). Each takes what the option takes: 0 is refused (`p.toml:2: `max_body` is a size larger than 0`), as the option refuses it |
 | `[limits] max_tool_calls` | the most tool calls a minute each user of the MCP door may make: it can lower `--max-tool-calls`, not raise it |
+| `[run]` *(since 0.8.11)* | what `quillo run` may be started with (below) |
+| `[fs] paths` *(since 0.8.11)* | the folders [`--allow-path`](#options-of-quillo-run) may name, or folders inside them; `[]` allows none. Each is judged where it really is, once, at the start |
+| `[env] set` *(since 0.8.11)* | `set = { APP_ENV = "production" }`: what `env()` gives for those names, ahead of `.env` and the shell. The host's layers only (a `--policy` or `quillo.policy` that says it stops the start); never `QUILLO_POLICY*`, `LD_*` or `DYLD_*`; two layers that set one name differently stop the start, naming the name and not the value |
 
 Under the two files above, with `APP_NAME=Shop`:
 
@@ -773,6 +794,80 @@ be refused, as errors (see [Checking](#checking)):
 quillo: policy host.toml + quillo.policy (effects: db, http, fs, env, time, random; no builds; no private addresses)
 main.qwe:6: error: `udp.listen` needs the net effect, which host.toml does not allow
 ```
+
+### What a provider holds a program to
+
+*(since 0.8.11)* A provider that runs other people's programs (a host, a school, a company's
+platform) writes down how they may be started, and nothing the developer controls (the
+command line, `.env`, `quillo.policy`) widens it:
+
+```toml
+# a provider's plan: what each account's program may be started with
+[run]
+watch = false                     # no --watch or --reload in production
+with = false                      # no --with commands
+check = true                      # no --no-check
+log = "json"                      # the request log as JSON, whatever --log says
+trust_proxy = ["127.0.0.1"]       # the proxy in front; --trust-proxy may only narrow it
+instances = 2                     # ceilings: the least of these and the option wins
+max_connections = 500
+drain = "30s"
+
+[fs]
+paths = ["/srv/shared"]           # --allow-path only inside these; [] allows none
+
+[env]
+set = { APP_ENV = "production" }  # what env("APP_ENV") gives, whatever .env says
+```
+
+`[run]` says three kinds of thing:
+
+| Kind | Keys | |
+|---|---|---|
+| Off switches, `false` | `with` (`--with`), `watch` (`--watch`, `-w`, `--watch=reload`, `--reload`), `describe` (`--describe`), `plain_http` (`--plain-http`), `split` (`--split`, `--scale`, `--as-service`), `join` (`--join`, `--register`, `--allow-join`, `--join-as`, `--service`) | the option is refused with exit 2, naming the file: `quillo: --watch is turned off by the policy host.toml (run.watch = false)` |
+| Forced values | `check = true`, `log` (`"text"`, `"json"` or `"off"`), `base` (`"/shop"`), `listen = "unix"`, `trust_proxy` (a list of networks) | `check` refuses `--no-check`, and a start under `--watch` whose check fails stops; `base` refuses `--split`, whose services each take their own; `listen = "unix"` takes only `--listen unix:PATH` or `quillo fcgi`, with WebTransport off; `trust_proxy` is what every layer allows, and `--trust-proxy` may only name networks inside it |
+| Ceilings | `instances`, `max_connections`, `connections_per_client`, `live_per_client`, `drain` (`"30s"`), `socket_mode` (`"660"`) | the least of the layers' and the option's holds, as `[limits]`' do; `max_connections` replaces the default the file descriptors give |
+
+A plugin pinned by its hash *(since 0.8.11)*: `allow = ["qr@sha256:9f86d0..."]` lets `qr` load
+only as that file. The hash may be the source's, the `.qwer` file's SHA-256 (what the catalog's
+index gives): the plugin is then built on this machine from the very bytes hashed, in a new
+folder of its own (0700) outside the program's reach, with a cleared environment and the
+`cargo` on `PATH`, and loaded from a private copy whose hash is checked. Or it may be the built
+library's own SHA-256 (as `.quillo/plugins.lock` lists it), and then only that prebuilt
+library loads. Only the host's layers may pin a library: a pin in `quillo.policy` or a
+`--policy` is the repository's, and would let the library it brought load. A developer who
+controls their account's cargo home or toolchain can still steer a build from source, so
+where that matters, pin the library and build it yourself.
+
+`quillo policy main.qwe` shows what is in force, layer by layer: the files in the order read,
+the places that had none, and each value with the file it came from (`env.set` by name, never
+its value). It exits 1 when a layer that is asked for is not there (an `include`,
+`QUILLO_POLICY_PATH`'s file, `require_path` without the variable) and 2 when one is there but
+broken:
+
+```
+$ QUILLO_POLICY_PATH=/etc/plans/small.toml quillo policy main.qwe
+the policy for main.qwe
+layers, in the order read (each only narrows the ones before it):
+  /etc/plans/small.toml (QUILLO_POLICY_PATH)
+not there:
+  /etc/quillo/policy.toml (the host's file)
+  /etc/quillo/policy.d/ (policy.d)
+  quillo.policy (the program's)
+in force:
+  env.set.APP_ENV (set) (/etc/plans/small.toml)
+  fs.paths: in every one of [/srv/shared] (/etc/plans/small.toml)
+  run.watch = false (--watch, -w, --watch=reload, --reload) (/etc/plans/small.toml)
+  run.check = true (/etc/plans/small.toml)
+  run.instances = 2 (/etc/plans/small.toml)
+```
+
+A provider's layer also asks for a complete `quillo.confirmed`, the list of what the
+program's files reach (see [What a program reaches](#what-a-program-reaches)): any layer
+but `quillo.policy`, `--policy` too. In 0.8.11 a program with none, or one that leaves
+something out, starts with a warning that names the release it will stop in (``the policy
+host.toml asks for a complete quillo.confirmed, and quillo.confirmed leaves 2 things out:
+from Quillo 0.8.12 it will not start so``); from 0.8.12, it does not start.
 
 - `quillo check` and `quillo run` always read the host's file and `quillo.policy`;
   `--policy` adds one, and `check` names the files only when one is given. A byte-order
@@ -792,9 +887,125 @@ main.qwe:6: error: `udp.listen` needs the net effect, which host.toml does not a
 - A policy binds the `quillo` that reads it. On a shared server, a user who can upload a
   binary of their own can run it without one: the boundary between accounts is the
   system's (Unix users, CloudLinux's CageFS and LVE limits).
-- Not built yet: a catalog whose entries are signed, a policy that allows catalog
-  plugins only, and a sandbox from the system (`--sandbox`, seccomp and Landlock) or for
-  plugins (WebAssembly).
+- `quillo repl` reads no policy.
+- Not built yet: a catalog whose entries are signed (`[plugins] catalog` pins by the hashes
+  of an index the provider keeps), and a sandbox from the system (`--sandbox`, seccomp and
+  Landlock) or for plugins (WebAssembly).
+
+## What a program reaches
+
+*(since 0.8.11)* A component file taken from another project, or a plugin from elsewhere,
+runs with the program's rights: it may post `.env` to another server as the program starts,
+and `quillo check` would say ok. `quillo confirm` reads every file of the program (the main
+file, and each file `use`, `import`, `mount` and `service` take, followed through), lists
+what each one reaches, asks once, and writes the answer to `quillo.confirmed` beside
+`main.qwe`. Commit it: the answer is the project's, and every clone, CI run and server reads
+the same one. From then on the program is held to it.
+
+```
+$ quillo confirm
+quillo: 2 files reach something not confirmed yet
+  lib/geo.qwe
+    reaches       nominatim.openstreetmap.org              line 2
+    reads         uploads/logo.svg                         line 6
+
+  main.qwe
+    writes        notes/                                   line 4
+
+  [y] confirm all   [f] file by file   [n] none: y
+quillo: wrote ./quillo.confirmed (2 files confirmed)
+```
+
+```toml
+# quillo.confirmed: what this program's files reach, as confirmed.
+# Written by `quillo confirm`. Commit it: the answer is the project's.
+
+["lib/geo.qwe"]
+http = ["nominatim.openstreetmap.org"]
+files = ["uploads/logo.svg"]
+
+["main.qwe"]
+writes = ["notes/"]
+```
+
+Each file has a block, named by its path from the main file's folder, and these lists:
+
+| Key | What the file reaches |
+|---|---|
+| `http` | the hosts its `http.*` and `site` calls, its UDP sends and its databases (as their drivers read the address) reach; `*.stripe.com`, written by hand, covers the subdomains, and `quillo confirm` keeps it |
+| `files` | the paths its file builtins read (`read_file`, `file`, `files`, `image.info`); a folder ends with `/` and covers what is in it |
+| `writes` | the paths it writes or deletes (`write_file`, `delete_file`, `save_upload`, `image.convert`'s, an `http.*` call's `save:`, a SQLite database's file); a path confirmed in `files` only is read, never written |
+| `listens` | the UDP ports it listens on at an address others reach (`udp 514`); this machine's own loopback needs none |
+| `scripts` | the scripts its pages load (`client "https://..."`), each with the `sha384-...` integrity hash `quillo confirm` fetched it for |
+| `loads`, `calls` | the hosts its markup loads from (`src`), and its pages call (`js("fetch", "https://...")`) |
+| `routes` | for a file taken for some of its names (`import lib/x.qwe use f`), the routes, `server fn`s and tools (`fn mcp`) it adds beyond the names taken |
+| `sha256`, `effects` | for a Rust file: its SHA-256, and what its `//! effects:` line said; Quillo cannot hold Rust to a list, only to the file |
+
+What is held, once the file is there (`quillo run`, `quillo mcp`, `quillo app`, `quillo
+build`, and a `--split` service, by its app's `quillo.confirmed`):
+
+- A call to a host, or a file builtin on a path, its file was not confirmed for is an error
+  value at the call, said once in the log. Paths are judged where they really are, links
+  followed: `uploads/x` leading to `.env` is `.env`. Each redirect of a call is judged too.
+- A route, `server fn` or tool that a file taken for some of its names adds, and that was
+  not confirmed, is not served (a 404; a tool is not offered), said at the start: `quillo:
+  lib/geo.qwe: the route GET /x is not served: it is not confirmed for this file`. The main
+  file's routes and a mounted program's are the program's own, and so is a `server fn` or tool
+  the `use` names (`import lib/notes.qwe use load_notes`).
+- A page script not confirmed is left out of the page; a confirmed one is loaded with its
+  `integrity` attribute, so a changed copy on the CDN does not run.
+- A held program's pages carry a `content-security-policy-report-only` of what its files
+  were confirmed to load and call, when the program sets no policy of its own: the browser
+  reports what goes beyond, and blocks nothing yet.
+- A Rust file that is not confirmed at its SHA-256 does not load, and the start stops:
+  `` tools.rs is not confirmed (its SHA-256 is ...); Rust cannot be held to a list, so it does
+  not load (`quillo confirm` asks about it) ``. `quillo build` builds none that is not.
+- A confirmed Rust file loads only a library this machine built from those bytes, never one
+  a cloned repository or an unpacked `.quillo/native` brought along. What was built is
+  recorded outside any project (`$XDG_CACHE_HOME/quillo/built.txt`, else
+  `~/.cache/quillo/built.txt`, the user's alone, 0600): the first start after a change
+  builds it apart, as a pinned build is built, and later starts load it as fast as before.
+  `quillo build` records too, so a `quillo run --no-build` after it, on the same machine,
+  loads what it built. With building off (`--no-build`, `build = false`) and no record, the
+  library is refused, unless the host's policy pins it by its own SHA-256 (see [The
+  policy](#the-policy)). A program run with `quillo.confirmed` and then without it, and back,
+  builds again each time.
+
+A program with no `quillo.confirmed` runs as before, and `quillo check` says only what it
+always says plus the [warnings](#checking) about taken files and effects lines. Under a
+provider's policy, which asks for a complete one, it starts with a warning in 0.8.11 and does
+not start from 0.8.12 (see [The policy](#the-policy)).
+
+Asking, and who answers:
+
+- `quillo confirm` asks at a terminal: `y` all, `f` file by file, `n` none. Where no one can
+  answer (CI, systemd, a container) it exits 1 and says so. `quillo confirm --yes` confirms the
+  list it printed, once you have read it; `quillo confirm lib/` takes only the files under
+  `lib/`; `--list` prints everything each file reaches and writes nothing.
+- `quillo run` at a terminal asks about what is not confirmed before it starts (`[y] confirm
+  them [n] not now`); elsewhere it starts, and refuses each such thing as it is reached:
+  ``quillo: 2 things in 1 file are not confirmed (quillo.confirmed): each is refused as it is
+  reached; `quillo confirm` lists them``.
+- **In CI, run `quillo check`, never `quillo confirm --yes`**: once there is a
+  `quillo.confirmed`, `check` fails, exit 1, on each thing a change brought that is not in it
+  (``lib/geo.qwe:8: error: reaches example.com: not confirmed for this file``), and `--yes`
+  would confirm whatever the change brought.
+- What the policy refuses stays refused: a confirmed host outside its `[http] hosts` is
+  noted (`note: lib/geo.qwe: example.com stays refused: ...`). A list only narrows.
+- An item the files no longer have leaves the file at the next `quillo confirm`; a file the
+  program no longer takes leaves with it.
+- `quillo install` *(since 0.8.11)* writes the SHA-256 it checked, and the plugin's effects
+  line, into the project's `quillo.confirmed` when there is one, so a plugin changed after it
+  was installed does not load (see [Plugins from the catalog](#plugins-from-the-catalog)).
+- `quillo confirm --effects tools.rs` reads a Rust file for what it does (the standard
+  library's file, network and process calls, the crates that do them) and proposes its
+  `//! effects:` line, saying where the file's own leaves something out. It is a reading of
+  the text, not a proof: a crate can do what it does unseen.
+
+Not held yet: [`--watch`](#options-of-quillo-run) does not read `quillo.confirmed` again
+when it changes (restart after `quillo confirm`); what a page loads and calls is only
+reported, by the report-only policy; a database's address in upper case
+(`POSTGRES://...`) or as a `conninfo` string is listed as a path, and refused when reached.
 
 ## Quillo on a shared server (cPanel)
 

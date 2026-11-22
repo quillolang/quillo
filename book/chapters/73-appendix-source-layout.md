@@ -21,6 +21,8 @@ src/script.rs      run_script: code a program's users write, sandboxed
 src/native.rs      Rust in a program: .qwer files read, built, loaded and called;
                    .quillo/plugins.lock and --no-build
 src/policy.rs      the policy: what whoever runs Quillo lets a program do
+src/confirm.rs     quillo confirm and quillo.confirmed: what a program's files reach, and
+                   the run held to it
 
 The standard library
 src/builtins.rs    the builtins every program can call
@@ -34,7 +36,7 @@ src/crypto.rs      crypto: hashes, signatures, tokens, passwords
 src/imaging.rs     image: what an image file is, and new files made from it
 src/highlight.rs   highlight(code, lang): source code as HTML
 src/i18n.rs        translations
-src/fetch.rs       http: the HTTP client, its cache, and http.stream
+src/fetch.rs       http: the HTTP client, its cache, http.stream, and save:
 
 Databases
 src/db.rs          db: SQLite, connections, tenants, transactions, and the shared API
@@ -47,6 +49,7 @@ src/sqlinfo.rs     which tables a statement reads and writes, for live updates
 Serving
 src/httpd.rs       the event loop: connections, requests as coroutines, waiting off the loop
 src/server.rs      request matching, server fns, responses, --watch
+src/head.rs        page_head: the head a page is sent with
 src/stream.rs      answers sent as they are made: stream, events, send
 src/fcgi.rs        quillo fcgi: FastCGI requests made HTTP requests for the server
 src/service.rs     services: in this process or elsewhere, signed calls, retries and

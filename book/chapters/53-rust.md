@@ -73,14 +73,24 @@ route GET /photos/:name = { brightness: brightness(`photos/${name}.jpg`)? }
   may follow `//` comments, blank lines, block comments and `#![...]` attributes at the
   top of the file.
 - **`//! effects: fs, http`**, a header line, says what the file's functions do, in the
-  words of `with` (`db`, `http`, `fs`, `env`, `time`, `random`, `net`; `db.analytics` is
-  `db`), or `//! effects: none`. It is what lets a `with` function call them: a function
+  words of `with` (`db`, `http`, `fs`, `env`, `time`, `random`, `net`, and `run` *(since
+  0.8.11)* for starting another program; `db.analytics` is `db`), or `//! effects: none`.
+  It is what lets a `with` function call them: a function
   declared `with fs` may call `brightness`, one declared `with time` may not. A file
   without the line may do anything: its functions are refused inside any `with`, and
   anywhere under a policy that narrows effects (see [Effects](#effects)). A word that is
   not an effect is said by `quillo check` at its line. Quillo cannot see what Rust does,
   so the line is the author's claim, read as a promise: write what the code really
-  reaches, and review it in a plugin from elsewhere.
+  reaches, and review it in a plugin from elsewhere. `quillo check` reads the file's text
+  against it *(since 0.8.11)*, and warns where the code plainly calls what the line leaves
+  out (`std::process::Command` under a line without `run`, `TcpStream` without `net`, a
+  crate such as `reqwest` without `http`); `quillo confirm --effects x.rs` proposes the line.
+- **A function's own line**, `/// effects: fs` in its documentation *(since 0.8.11)*, narrows
+  the file's for that function: callers need only the function's effects, so one file can
+  hold a function that starts programs beside small helpers a `with fs` function may call
+  (see [Effects](#effects)). It never widens the file's: a line that names more is an
+  error, at check and at load, and a refusal names the function and the effect it lacks.
+  Under a file with no `//! effects:` line, a function's line says all that function does.
 - **Taking names.** `import redis.qwer use cache_get, cache_set` takes only those
   functions; `as` gives one another name, `import redis.qwer use cache_get as redis_get`,
   and it is not there under its own. A name the file does not export is an error that
@@ -177,7 +187,13 @@ How it runs:
   version, `"csv@1"` or `"csv@1.4.2"` by the file's `//! version:` line (`1` takes
   `1.4.2`, not `10.0`). A plugin it does not name is refused before anything is built:
   `` the plugin `pdf` 2.0.1 is not in the plugins /etc/quillo/policy.toml allows: csv@1, qr ``.
-  It names plugins by their file's name and header; it does not prove their code.
+  By name, it names plugins by their file's name and header; it does not prove their code.
+  `"qr@sha256:<hex>"` *(since 0.8.11)* does: by the source's hash the plugin is built here
+  from the bytes hashed, and by the library's only that library loads; `[plugins] catalog`
+  pins a whole catalog by its index (see [What a provider holds a program to](#what-a-provider-holds-a-program-to)).
+- **A program's `quillo.confirmed`** *(since 0.8.11)* holds each Rust file to its SHA-256,
+  and loads only a library this machine built from it (see [What a program
+  reaches](#what-a-program-reaches)).
 - A call runs off the event loop, without the lock Quillo code holds, on the threads
   that also wait for databases ([`--workers`](#options-of-quillo-run)): a slow function holds up no one, and
   calls from several requests run on several cores at once; many long calls at once
@@ -229,11 +245,18 @@ quillo install --list pdf          # what the catalog has, matching "pdf"
 - Then `use csv.qwer`, or only what you need, `import csv use csv_parse, csv_write`: the
   first run builds it with cargo, as any `.qwer` file.
 - A catalog plugin is called inside a `with` function only once its header has a
-  `//! effects:` line, as any Rust file (see [Rust](#rust)). The catalog's files do not
-  have it yet: add it to your copy after reading what the plugin does.
+  `//! effects:` line, as any Rust file (see [Rust](#rust)). The catalog's files carry one
+  *(since 0.8.11's catalog; `cli_run` says `env, time, run`)*, and `install` prints it (`its
+  effects: env, time, run`). A copy whose only change is an effects line you added is still
+  the catalog's file to `install --update`, not one changed by hand.
+- When the project has a `quillo.confirmed`, `install` writes the SHA-256 it checked, and the
+  effects line, into it *(since 0.8.11)* (`./quillo.confirmed keeps its SHA-256`), so a
+  plugin changed after it was installed does not load (see [What a program
+  reaches](#what-a-program-reaches)). It makes none: writing one holds the whole program.
 - `install` checks a file against the catalog it came from, which a changed server
   could change too: the catalog's entries are not signed yet. A host can still list the
-  plugins and versions it takes, in a policy's `[plugins] allow`.
+  plugins and versions it takes, in a policy's `[plugins] allow`, or pin them by hash,
+  one by one or the whole catalog with `[plugins] catalog` *(since 0.8.11)*.
 
 ## Other stores
 

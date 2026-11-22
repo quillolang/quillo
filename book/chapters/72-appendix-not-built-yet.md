@@ -12,8 +12,12 @@
   there `keys({ "10": 1, "2": 2 })` is `["2", "10"]`, as JavaScript orders them
 - Linux builds linked with musl, or static: not planned, since a static binary cannot
   load plugins. The releases from 0.7.0 on are linked against glibc 2.17 instead
-- a catalog whose entries are signed, its plugins prebuilt for Linux, and `//! effects:`
-  on each of them; a policy that allows catalog plugins only (`local = false`)
+- a catalog whose entries are signed, and its plugins prebuilt for Linux (a policy's
+  `[plugins] catalog` pins its plugins by the hashes of an index the provider keeps, and
+  the catalog's files carry `//! effects:` lines *(since 0.8.11)*)
+- `quillo confirm`'s report-only page policy turned into one that blocks, and `--watch`
+  reading `quillo.confirmed` again when it changes
+- `quillo repl` under a policy
 - `quillo run --sandbox` (seccomp and Landlock on Linux), and plugins built to
   WebAssembly and run sandboxed
 - a policy's `private = false` for `db.connect` and UDP (it covers `http.*` only)

@@ -574,11 +574,12 @@ The effects, and the builtins behind each:
 |---|---|
 | `db` | every `db.*` but `db.error_kind` and `db.sql_name`, and the same on a connection from `db.connect` (`analytics.query`); `idempotent`, `later.status` |
 | `http` | `http.*`, and calls to services |
-| `fs` | `file`, `files`, `read_file`, `write_file`, `delete_file`, `save_upload`, `check_program`, `image.info`, `image.convert` |
+| `fs` | `file`, `files`, `read_file`, `write_file`, `delete_file`, `save_upload`, `check_program`, `image.info`, `image.convert`; an `http.*` call with `save:` too |
 | `env` | `env`, `args`, `stdin`, `read_line`, `exit` |
 | `time` | `now`, `sleep`, `date.today`, `date.now` |
 | `random` | `random`, `random_int`, `uuid`, `crypto.token`, `crypto.hash_password` (its salt) |
 | `net` | `udp.listen`, `udp.send`, `udp.reply`, `media.rtp`, `channel.send`, `channel.broadcast` |
+| `run` *(since 0.8.11)* | none: starting another program (ffmpeg, a converter), which only a Rust file does, and says in its `//! effects:` line (the catalog's `cli_run` and `ffmpeg_cli`) |
 
 Inside a `with` function, a builtin that needs another effect,
 or a function declared with more effects, is an error, both at runtime and in
@@ -624,7 +625,10 @@ as a function does (see [Scheduled jobs](#scheduled-jobs)).
   inside one, at run time and by `quillo check`: `` `hi` is Rust whose file does not say
   what it does, so it may do anything and is refused in `greet` ``. An editor's hover
   shows `(effects: not declared)` for them. Quillo cannot see inside the Rust: the line
-  is the file's word, not a proof (see [Rust](#rust)).
+  is the file's word, not a proof (see [Rust](#rust)). A `pub fn`'s own `/// effects: fs`
+  line *(since 0.8.11)* narrows the file's for that function, so a file whose one function
+  starts programs can still offer small file helpers to a `with fs` caller; a line that
+  names more than the file's is an error, at check and at load.
 - **The policy** sets a `with` on the whole program from outside it: its `[effects]
   allow` is what every route, job and function may use at most, and a Rust file with no
   `//! effects:` line is refused anywhere under it (see [The policy](#the-policy)).
@@ -638,6 +642,36 @@ fn stamp() with time = store_put(str(now()))        // error: store_put needs fs
 fn greet() with time = hi("Ana")                    // error: hi.qwer says nothing
 print(hi("Ana"))                                    // outside any `with`: runs
 ```
+
+A Rust file whose functions do different things, `tools.rs`:
+
+```rust
+//! effects: fs, run
+
+/// Starts ffprobe on a clip, and gives what it prints.
+pub fn probe(path: &str) -> Result<String, String> {
+    let out = std::process::Command::new("ffprobe").arg(path).output().map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// The size of a file, in bytes.
+/// effects: fs
+pub fn size_of(path: &str) -> i64 {
+    std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(-1)
+}
+```
+
+```quillo noexec
+import tools.rs use size_of, probe
+
+fn clip_size(name: str) -> int with fs = size_of(`clips/${name}`)      // allowed: size_of says fs
+fn clip_info(name: str) -> str with fs = probe(`clips/${name}`) ?? ""  // error: probe needs the run effect
+```
+
+The `/// effects:` line is taken out of the function's documentation, so an editor's hover
+shows the rest. A line `/// effects: fs, http` under `//! effects: fs` is told
+`` `size_of`'s `/// effects: fs, http` names http, which the file's `//! effects: fs` does not:
+a function's line narrows its file's, never widens it ``.
 
 ## HTML literals
 

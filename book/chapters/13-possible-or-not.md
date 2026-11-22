@@ -41,6 +41,8 @@ does not do it today; the way around it follows.
 | have pages open with no network? | Yes: `route offline GET /x`, and Quillo writes the service worker. See [Pages that work offline](#pages-that-work-offline) |
 | write a service worker of my own? | Yes, served by a route, in place of Quillo's. See [A service worker of your own](#a-service-worker-of-your-own) |
 | compile components to WebAssembly? | Not yet: they compile to JavaScript |
+| set each page's title and `og:` tags, in a single-page app too? | Yes *(since 0.8.11)*: `page_head({ title, description, image, canonical })`, from any view or component, following state. See [The page's head](#the-pages-head) |
+| move between the program's routes without a page load, keeping state? | Yes *(since 0.8.11)*: `moves_in_place()` at the top. See [Routes that move in place](#routes-that-move-in-place) |
 
 ## Serving
 
@@ -52,7 +54,7 @@ does not do it today; the way around it follows.
 | serve a folder of HTML and other files as they are? | Yes: `quillo serve site`, or `files("site", path)` in a route, with `index.html`, clean URLs and `404.html`. See [Static files](#static-files) |
 | serve a React or Vite app's build, deep links included? | Yes: `files("dist/assets", path, { cache: "1y" })` for its hashed files and a last `route GET /*path = file("dist/index.html")`; the app is rendered in the browser and calls the program on its own origin. See [A front end built elsewhere](#a-front-end-built-elsewhere-react-vite) |
 | open WebSockets of my own? | No: `live`, `events` with `listen`, and channels are the ways to push. See [Channels](#channels) |
-| receive or send binary data? | Only as files: `file()`, uploads, `image.*`. There is no bytes value; bodies are text |
+| receive or send binary data? | Only as files: `file()`, uploads, `image.*`, and an `http.*` answer written to a file with `save:` *(since 0.8.11)*. There is no bytes value; bodies are text. See [HTTP client](#http-client) |
 | stream a response? | Yes: `stream`, `events`. See [Streaming](#streaming) |
 | limit how often a client calls? | Not built in: count in a table of your own. See [What a route cannot do](#what-a-route-cannot-do) |
 | put a time limit on a route? | No: only sockets time out |
@@ -120,5 +122,7 @@ does not do it today; the way around it follows.
 | run untrusted users' code? | Yes, sandboxed: `run_script`. Never as `.qwer`. See [Scripts from users](#scripts-from-users) |
 | get structured logs and metrics? | JSON request lines ([`--log json`](#options-of-quillo-run)) and Prometheus metrics ([`--metrics`](#options-of-quillo-run)); errors are text lines. See [Logs and metrics](#logs-and-metrics) |
 | configure with a file? | Only `.env`, and a policy that takes away; everything else is an option. See the options in [Running quillo](#running-quillo) |
-| limit what a program may do from outside it? | Yes, with a policy: plugins, effects, hosts, variables, limits. See [The policy](#the-policy) |
+| limit what a program may do from outside it? | Yes, with a policy: plugins, effects, hosts, variables, limits, and *(since 0.8.11)* how `quillo run` may be started, `--allow-path`'s folders and values `env()` gives. See [The policy](#the-policy) |
+| know what a component or plugin from elsewhere reaches before it runs? | Yes *(since 0.8.11)*: `quillo confirm` lists each file's hosts, paths, scripts and Rust files, and the program is held to what was confirmed. See [What a program reaches](#what-a-program-reaches) |
+| run ffmpeg or another program? | Through the catalog's `cli_run` plugin, its arguments as a list, never a shell; held by the `run` effect *(since 0.8.11)*. See [Standard library](#standard-library) |
 | sandbox a program with the system's help (seccomp, Landlock)? | Not yet: a policy holds Quillo code, not a plugin's Rust |
