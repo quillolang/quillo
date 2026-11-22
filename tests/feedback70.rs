@@ -63,6 +63,15 @@ fn warned(line: usize, route: &str, writes: &str, reads: &str) -> String {
     )
 }
 
+/// What `quillo check` says of a GET route that writes and reads no one (FEEDBACK70.md, Q-965,
+/// the user's decision of 2026-11-23; branch feedback82-85).
+fn prefetched(line: usize, route: &str, writes: &str) -> String {
+    format!(
+        "main.qwe:{}: warning: `{}` writes ({}) but is not declared `route writes`: a hover's prefetch, or a move in place, runs it until that write is refused. Write `route writes {}`, or make it a `POST`",
+        line, route, writes, route
+    )
+}
+
 /// The report's program: `/posts/delete-all` deletes the signed-in visitor's posts.
 const REPORT: &str = r#"db.open(":memory:")
 db.exec("create table posts (id integer primary key, owner int not null)")
@@ -87,7 +96,16 @@ route GET /posts/delete-all {
 fn q965_the_reports_route_is_warned_of() {
     assert_eq!(
         check_src("report", REPORT),
-        (true, vec![warned(10, "GET /posts/delete-all", "`db.exec(\"delete from posts where owner = ?\")`", "`session()`")])
+        (
+            true,
+            vec![
+                // `/login` writes the database and reads no one: said since the user's decision of
+                // 2026-11-23 that a GET that writes is warned of, a prefetch running it (FEEDBACK70.md,
+                // Q-965; branch feedback82-85). Its `set_session` alone would not be.
+                prefetched(4, "GET /login", "`db.exec(\"insert into posts (owner) values (1), (1), (1)\")` at line 6"),
+                warned(10, "GET /posts/delete-all", "`db.exec(\"delete from posts where owner = ?\")`", "`session()`"),
+            ]
+        )
     );
 }
 
@@ -304,6 +322,11 @@ route GET /r19 {
                 "main.qwe:40: warning: `onclick` here never runs: the page of `GET /r8` is made on the server, and only a component's handlers reach the browser: put this markup in a component".to_string(),
                 warned(65, "ANY /r15", "`db.exec(\"delete from notes where owner = ?\")`", "`session()`"),
                 warned(69, "GET /r16", "`http.request(\"DELETE\", ...)`", "`cookie()`"),
+                // `/r17` and `/r18` write and read no one (the host is nobody's): said since the
+                // user's decision of 2026-11-23 (FEEDBACK70.md, Q-965; branch feedback82-85).
+                // `/r7`'s program variable and `/r13`'s `publish` leave nothing behind, and are not.
+                prefetched(74, "GET /r17", "`db.exec(\"delete from notes\")` at line 75"),
+                prefetched(78, "GET /r18", "`db.exec(\"delete from notes\")` at line 80"),
             ]
         )
     );

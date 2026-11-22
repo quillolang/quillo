@@ -74,6 +74,9 @@ fn get_writes(said: &[String]) -> Vec<String> {
 /// src/check.rs `stream_sends_in_transactions`; coverage of 0.8.9; branch feedback75).
 #[test]
 fn a_send_bound_again_or_a_function_handed_to_the_transaction_is_not_warned() {
+    // `/b.txt` is `route writes`: `save` writes, and a GET that writes and reads no one is now
+    // warned of by itself (FEEDBACK70.md, Q-965, the user's decision of 2026-11-23; branch
+    // feedback82-85), which is not what this test is about.
     let src = r#"db.open(":memory:")
 db.exec("create table if not exists t (n int)")
 fn save() {
@@ -83,7 +86,7 @@ route GET /a.txt = stream((send) => {
     let rows = [1, 2].map((send) => db.transaction(() => send + 1))
     send(str(rows))
 })
-route GET /b.txt = stream((send) => {
+route writes GET /b.txt = stream((send) => {
     let r = db.transaction(save)
     send(str(r))
 })

@@ -108,6 +108,14 @@ impl Kind {
             Kind::Program => "the program's",
         }
     }
+
+    /// A provider's layer: the host's file and what it brings in (`include`, `policy.d`), and
+    /// `QUILLO_POLICY_PATH`, set by whoever starts Quillo. A `--policy FILE` is the developer's,
+    /// like the program's own `quillo.policy`: in the repository's hands (FEEDBACK83.md, question
+    /// 5 as the user revised it on 2026-11-23; branch feedback82-85).
+    pub fn is_providers(self) -> bool {
+        matches!(self, Kind::Host | Kind::Included | Kind::Dropin | Kind::PathVar)
+    }
 }
 
 /// A network as `--trust-proxy` takes one: an address and how many of its bits.

@@ -863,8 +863,10 @@ in force:
 ```
 
 A provider's layer also asks for a complete `quillo.confirmed`, the list of what the
-program's files reach (see [What a program reaches](#what-a-program-reaches)): any layer
-but `quillo.policy`, `--policy` too. In 0.8.11 a program with none, or one that leaves
+program's files reach (see [What a program reaches](#what-a-program-reaches)): the host's
+file, what it includes, `policy.d` and `QUILLO_POLICY_PATH`. A file given with `--policy` does
+not ask, as the program's own `quillo.policy` does not: both are the developer's, the rule a
+library's pin follows too. In 0.8.11 a program with none, or one that leaves
 something out, starts with a warning that names the release it will stop in (``the policy
 host.toml asks for a complete quillo.confirmed, and quillo.confirmed leaves 2 things out:
 from Quillo 0.8.12 it will not start so``); from 0.8.12, it does not start.
@@ -973,7 +975,8 @@ build`, and a `--split` service, by its app's `quillo.confirmed`):
 
 A program with no `quillo.confirmed` runs as before, and `quillo check` says only what it
 always says plus the [warnings](#checking) about taken files and effects lines. Under a
-provider's policy, which asks for a complete one, it starts with a warning in 0.8.11 and does
+provider's policy (the host's layers and `QUILLO_POLICY_PATH`, not `--policy`), which asks for
+a complete one, it starts with a warning in 0.8.11 and does
 not start from 0.8.12 (see [The policy](#the-policy)).
 
 Asking, and who answers:

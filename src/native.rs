@@ -2145,7 +2145,7 @@ fn library_pin_met(qwer: &Path) -> bool {
     let Some(have) = library_path(qwer).filter(|l| l.is_file()).and_then(|l| file_hash(&l).ok()) else { return false };
     // Only the host's layers: the program's own quillo.policy, or a --policy its developer gives,
     // is in the repository's hands, and named the library it brought along (found in review 3).
-    let host = |f: &Path| p.files.iter().zip(p.kinds.iter()).any(|(lf, k)| lf == f && matches!(k, crate::policy::Kind::Host | crate::policy::Kind::Included | crate::policy::Kind::Dropin | crate::policy::Kind::PathVar));
+    let host = |f: &Path| p.files.iter().zip(p.kinds.iter()).any(|(lf, k)| lf == f && k.is_providers());
     p.plugins.iter().filter(|(f, _)| host(f)).any(|(_, allow)| allow.iter().any(|a| a.split_once('@').is_some_and(|(n, v)| n == name && v.strip_prefix("sha256:").is_some_and(|h| h.eq_ignore_ascii_case(&have)))))
 }
 

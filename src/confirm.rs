@@ -31,7 +31,8 @@
 //! not, is an error value at the call, said once in the log; a script not confirmed is left out
 //! of the page; a Rust file not confirmed at its hash does not load, and the start stops (the
 //! user's decision: "refuse"). A program with no `quillo.confirmed` runs as it did, but under a
-//! provider's policy, which asks for a complete one (the user's decision: "policy must require
+//! provider's policy (the host's layers and `QUILLO_POLICY_PATH`; not a `--policy` file, the
+//! user's revision of 2026-11-23), which asks for a complete one (the user's decision: "policy must require
 //! complete"); in the first release that has this, that is a warning naming the release from
 //! which it stops the start (`STOPS_FROM`; the user's decision of 2026-11-22).
 
@@ -1765,11 +1766,14 @@ fn path_within(c: &str, p: &str) -> bool {
 
 // ---- the provider's policy ---------------------------------------------------------------------
 
-/// The first layer of the policy in force that is a provider's (any but the program's own
-/// `quillo.policy`): it asks for a complete `quillo.confirmed` (the user's decision, question 5).
+/// The first layer of the policy in force that is a provider's: it asks for a complete
+/// `quillo.confirmed` (the user's decision, question 5). Only the host's layers ask; a `--policy`
+/// file no longer does, as the program's own `quillo.policy` never did, the rule library pins
+/// follow (`native::library_pin_met`; FEEDBACK83.md, question 5 as the user revised it on
+/// 2026-11-23; branch feedback82-85).
 pub fn asked_by() -> Option<PathBuf> {
     let p = crate::policy::get();
-    p.files.iter().zip(p.kinds.iter()).find(|(_, k)| **k != crate::policy::Kind::Program).map(|(f, _)| f.clone())
+    p.files.iter().zip(p.kinds.iter()).find(|(_, k)| k.is_providers()).map(|(f, _)| f.clone())
 }
 
 /// What a provider's policy says of a program that is not completely confirmed: `what` is missing.

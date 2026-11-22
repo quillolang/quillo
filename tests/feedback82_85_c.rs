@@ -19,12 +19,18 @@ use support::{port_in_log, send, temp_dir, Guard};
 
 /// `quillo` with `args` in `dir`, ended after `secs`: its exit code and what it wrote.
 fn quillo_for(dir: &Path, args: &[&str], secs: u64) -> (Option<i32>, String) {
+    quillo_env(dir, args, secs, &[])
+}
+
+/// `quillo_for`, with `vars` set too (`QUILLO_POLICY_PATH`, a provider's layer).
+fn quillo_env(dir: &Path, args: &[&str], secs: u64, vars: &[(&str, &str)]) -> (Option<i32>, String) {
     let log = dir.join("cmd.log");
     let file = std::fs::File::create(&log).unwrap();
     let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
         .args(args)
         .current_dir(dir)
         .env_remove("QUILLO_POLICY_PATH")
+        .envs(vars.iter().copied())
         .env_remove("CARGO_TARGET_DIR")
         .env("QUILLO_BUILT_RECORD_DIR", record_dir(dir))
         .env("QUILLO_SECRET", "test secret for the tests, 32 bytes or more")
@@ -60,6 +66,11 @@ fn quillo(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
 
 /// `quillo run` of main.qwe in `dir` on a port the system picks: the guard, the port, the log.
 fn serve(dir: &Path, opts: &[&str]) -> (Guard, u16, std::path::PathBuf) {
+    serve_env(dir, opts, &[])
+}
+
+/// `serve`, with `vars` set too.
+fn serve_env(dir: &Path, opts: &[&str], vars: &[(&str, &str)]) -> (Guard, u16, std::path::PathBuf) {
     let log = dir.join("run.log");
     let file = std::fs::File::create(&log).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
@@ -67,6 +78,7 @@ fn serve(dir: &Path, opts: &[&str]) -> (Guard, u16, std::path::PathBuf) {
         .args(opts)
         .current_dir(dir)
         .env_remove("QUILLO_POLICY_PATH")
+        .envs(vars.iter().copied())
         .env_remove("CARGO_TARGET_DIR")
         .env("QUILLO_BUILT_RECORD_DIR", record_dir(dir))
         .env("QUILLO_SECRET", "test secret for the tests, 32 bytes or more")
@@ -641,13 +653,18 @@ fn a_policy_takes_only_the_catalogs_plugins() {
 
 #[test]
 fn a_providers_policy_warns_of_an_incomplete_file_this_release() {
+    // Changed for the user's decision of 2026-11-23 (FEEDBACK83.md, question 5 revised; branch
+    // feedback82-85): only a provider's layers ask for a complete quillo.confirmed, so the policy
+    // here comes by QUILLO_POLICY_PATH, not `--policy` (which no longer asks: the next test).
     let d = temp_dir("c-provider");
     write(&d, "main.qwe", "route GET / = http.get(\"https://api.example.com/x\").status ?? 0\n");
     write(&d, "p.toml", "[http]\nhosts = [\"*\"]\n");
-    let (code, out) = quillo(&d, &["check", "main.qwe", "--policy", "p.toml"]);
+    let pv = d.join("p.toml").display().to_string();
+    let var: &[(&str, &str)] = &[("QUILLO_POLICY_PATH", &pv)];
+    let (code, out) = quillo_env(&d, &["check", "main.qwe"], 60, var);
     assert_eq!(code, Some(0), "{}", out);
-    assert!(out.contains("warning: the policy p.toml asks for a complete quillo.confirmed, and ./quillo.confirmed has none: from Quillo 0.8.12 it will not start so"), "{}", out);
-    let (g, port, log) = serve(&d, &["--policy", "p.toml"]);
+    assert!(out.contains(&format!("warning: the policy {} asks for a complete quillo.confirmed, and ./quillo.confirmed has none: from Quillo 0.8.12 it will not start so", pv)), "{}", out);
+    let (g, port, log) = serve_env(&d, &[], var);
     assert_eq!(send(port, "GET", "/", &[], "").status, 200);
     drop(g);
     assert!(read(&log).contains("from Quillo 0.8.12 it will not start so"), "{}", read(&log));
@@ -658,14 +675,115 @@ fn a_providers_policy_warns_of_an_incomplete_file_this_release() {
     std::fs::rename(d.join("quillo.policy"), d.join("p.toml")).unwrap();
     // Complete: nothing said.
     assert_eq!(quillo(&d, &["confirm", "--yes"]).0, Some(0));
-    let (code, out) = quillo(&d, &["check", "main.qwe", "--policy", "p.toml"]);
+    let (code, out) = quillo_env(&d, &["check", "main.qwe"], 60, var);
     assert_eq!(code, Some(0), "{}", out);
     assert!(!out.contains("asks for a complete"), "{}", out);
     // One thing left out: said, by its number.
     write(&d, "main.qwe", "route GET / = http.get(\"https://api.example.com/x\").status ?? 0\nroute GET /b = http.get(\"https://b.example/\").status ?? 0\n");
-    let (code, out) = quillo(&d, &["check", "main.qwe", "--policy", "p.toml"]);
+    let (code, out) = quillo_env(&d, &["check", "main.qwe"], 60, var);
     assert_eq!(code, Some(1), "{}", out);
     assert!(out.contains("quillo.confirmed leaves 1 thing out"), "{}", out);
+}
+
+// The user's decision of 2026-11-23 (FEEDBACK83.md, question 5 revised; branch feedback82-85): a
+// file given with `--policy` is the developer's, as the program's own quillo.policy is, and asks
+// for no complete quillo.confirmed; the same file named by QUILLO_POLICY_PATH still does.
+#[test]
+fn a_policy_given_with_the_option_asks_for_no_complete_file() {
+    let d = temp_dir("c-provider-named");
+    write(&d, "main.qwe", "route GET / = http.get(\"https://api.example.com/x\").status ?? 0\n");
+    write(&d, "p.toml", "[http]\nhosts = [\"*\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe", "--policy", "p.toml"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(!out.contains("asks for a complete"), "{}", out);
+    let (g, port, log) = serve(&d, &["--policy", "p.toml"]);
+    assert_eq!(send(port, "GET", "/", &[], "").status, 200);
+    drop(g);
+    assert!(!read(&log).contains("asks for a complete"), "{}", read(&log));
+    // Under QUILLO_POLICY_PATH as well as --policy: the provider's layer asks, and names its file.
+    let pv = d.join("p.toml").display().to_string();
+    let (code, out) = quillo_env(&d, &["check", "main.qwe", "--policy", "p.toml"], 60, &[("QUILLO_POLICY_PATH", &pv)]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains(&format!("warning: the policy {} asks for a complete quillo.confirmed", pv)), "{}", out);
+}
+
+// ---- FEEDBACK70.md, Q-965, decided 2026-11-23: a GET that writes and reads no one ------------
+
+// A GET route that writes lastingly and reads no one, not declared `route writes`, is warned of: a
+// hover's prefetch, or a move in place, runs it as far as its first write (the user's decision of
+// 2026-11-23; branch feedback82-85). Not said: `route writes`, a POST, a read, the visitor's own
+// session, a program variable and a message; three routes through one helper's write said once, at
+// it; one that also reads who the visitor is keeps its own warning, and gets no second.
+#[test]
+fn a_get_that_writes_and_reads_no_one_is_warned_of() {
+    let d = temp_dir("c-q965-prefetch");
+    write(&d, "main.qwe", r#"db.open(":memory:")
+db.exec("create table hits (n int)")
+let views = 0
+
+fn bump() {
+    db.exec("insert into hits values (1)")
+}
+
+route GET /count {
+    db.exec("insert into hits values (1)")
+    return "ok"
+}
+route writes GET /meant {
+    db.exec("insert into hits values (1)")
+    return "ok"
+}
+route GET /signin {
+    set_session({ user: 1 })
+    return "in"
+}
+route GET /seen {
+    views += 1
+    publish("hits")
+    return str(views)
+}
+route GET /list = db.query("select n from hits")
+route GET /a = { bump()
+ "a" }
+route GET /b = { bump()
+ "b" }
+route GET /c = { bump()
+ "c" }
+route GET /file = write_file("x.txt", "hi")
+route GET /fetch = http.get("https://example.com/a.pdf", {}, { save: "a.pdf" }).status ?? 0
+route ANY /any = db.exec("delete from hits")
+route POST /post = db.exec("delete from hits")
+route GET /mine {
+    let u = session().user ?? 0
+    db.exec("insert into hits values (?)", u)
+    return "ok"
+}
+"#);
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    let said: Vec<&str> = out.lines().filter(|l| l.contains("not declared `route writes`")).collect();
+    assert_eq!(said, [
+        "main.qwe:6: warning: this write (`db.exec(\"insert into hits values (1)\")`, in `bump`) is done by 3 GET routes not declared `route writes`: `GET /a` (line 27), `GET /b` (line 29) and `GET /c` (line 31). A hover's prefetch, or a move in place, runs them until that write is refused. Tag them, `route writes GET ...`, `routes writes /...`, or make them `POST`s",
+        "main.qwe:9: warning: `GET /count` writes (`db.exec(\"insert into hits values (1)\")` at line 10) but is not declared `route writes`: a hover's prefetch, or a move in place, runs it until that write is refused. Write `route writes GET /count`, or make it a `POST`",
+        "main.qwe:33: warning: `GET /file` writes (`write_file` at line 33) but is not declared `route writes`: a hover's prefetch, or a move in place, runs it until that write is refused. Write `route writes GET /file`, or make it a `POST`",
+        "main.qwe:34: warning: `GET /fetch` writes (`http.get` with `save` at line 34) but is not declared `route writes`: a hover's prefetch, or a move in place, runs it until that write is refused. Write `route writes GET /fetch`, or make it a `POST`",
+        "main.qwe:35: warning: `ANY /any` writes (`db.exec(\"delete from hits\")` at line 35) but is not declared `route writes`: a hover's prefetch, or a move in place, runs it until that write is refused. Write `route writes ANY /any`, or make it a `POST`",
+    ], "{}", out);
+    // The route that reads the session has the warning of a link from another site, only.
+    assert!(out.contains("main.qwe:37: warning: `GET /mine` writes (`db.exec(\"insert into hits values (?)\")`) and reads who the visitor is (`session()`)"), "{}", out);
+    assert!(out.contains("6 warnings"), "{}", out);
+    // Two routes through one helper: each said by itself, the helper's file and line named.
+    write(&d, "lib.qwe", "fn bump() {\n    db.exec(\"insert into hits values (1)\")\n}\n");
+    write(&d, "main.qwe", "import lib.qwe use bump\ndb.open(\":memory:\")\ndb.exec(\"create table hits (n int)\")\nroute GET /a = { bump()\n \"a\" }\nroute GET /b = { bump()\n \"b\" }\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("main.qwe:4: warning: `GET /a` writes (`db.exec(\"insert into hits values (1)\")`, in `bump` at lib.qwe:2) but is not declared `route writes`"), "{}", out);
+    assert!(out.contains("main.qwe:6: warning: `GET /b` writes ("), "{}", out);
+    // Tagged, or made a POST: nothing said.
+    write(&d, "main.qwe", "import lib.qwe use bump\ndb.open(\":memory:\")\ndb.exec(\"create table hits (n int)\")\nroute writes GET /a = { bump()\n \"a\" }\nroute POST /b = { bump()\n \"b\" }\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(!out.contains("warning"), "{}", out);
 }
 
 // ---- review 1 of slice C ---------------------------------------------------------------------

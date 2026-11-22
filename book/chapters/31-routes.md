@@ -26,8 +26,19 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
   (a form or a button), which Quillo refuses from other sites, or tag it where the write is
   meant, as for a confirm-your-address link, a sign-in callback or a presence ping. Three or
   more routes that warn through one write (a helper they all call, a group's middleware) are said
-  once, at the write. Only a `GET` or an `ANY` route takes the tag; `writes` is a name anywhere
-  else.
+  once, at the write. A `GET` (or `ANY`) route that writes and reads no one is warned of too
+  *(since 0.8.11)*: a hover's prefetch, or a move in place, runs it until that write is
+  refused (see [Prefetching](#routes-prefetching)), where one tagged
+  `writes` is refused before it runs (``main.qwe:9: warning: `GET /count` writes
+  (`db.exec("insert into visits values (1)")` at line 10) but is not declared `route
+  writes`: a hover's prefetch, or a move in place, runs it until that write is refused.
+  Write `route writes GET /count`, or make it a `POST` ``). What it says are lasting
+  writes: the database, files (`write_file`, `delete_file`, `save_upload`, an `http.*`
+  answer kept with `save:`), another server (`http.post`, `notification.send`) and a
+  service; a write to the visitor's own session or cookies, a program variable assigned (a
+  count kept in memory) and a message (`publish`, `channel.send`, `udp.send`) are not said
+  of such a route, as a `GET` is expected to make them. Only a `GET` or an `ANY` route
+  takes the tag; `writes` is a name anywhere else.
 - **Methods:** `GET POST PUT PATCH DELETE OPTIONS ANY`. `ANY` takes every method. A
   `HEAD` request is served by the `GET` route: the route runs (what it does, it does),
   and the body is dropped. A `route HEAD` is accepted but never matches. An `OPTIONS`
@@ -1360,7 +1371,10 @@ has logged in or out.
   then made, as usual, when the link is followed. So pointing at a `GET` that does something (a
   logout link, a counter) never does it; following a link does, from another site too, with the
   visitor's session: a write they would not want done for them belongs in a `POST` (see
-  `writes` under [Routes](#routes)). A page prerendered runs none
+  `writes` under [Routes](#routes)). A prefetch runs such a `GET` as far as its first write:
+  `quillo check` warns of one that writes the database, a file, another server or a service
+  and is not tagged `route writes` *(since 0.8.11)*, which a prefetch refuses before it runs.
+  A page prerendered runs none
   of its components, `server fn`s or live updates until someone opens it.
 - **Links a page's components follow** are fetched for the state of the components on the
   page they lead to, so those start with their data and no `null` first (see

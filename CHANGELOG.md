@@ -10,7 +10,8 @@ studio onto Quillo (FEEDBACK85.md, Q-1340 to Q-1348). The user decided the forms
 2026-11-21 and 2026-11-22: `page_head`, not a `<head>` block; routes moved in place as an
 opt-in; `[run]`, `[fs] paths` and `[env] set`; `QUILLO_POLICY_PATH` with `include` and
 `require_path`; a broken layer stops; every file scanned, held, unconfirmed refused, the catalog
-included, a complete `quillo.confirmed` asked by a provider's policy, a warning in this release
+included, a complete `quillo.confirmed` asked by a provider's policy (not by `--policy`, revised
+2026-11-23), a warning in this release
 and a stop from 0.8.12; `save:` on the HTTP calls; per-function effects lines that only narrow;
 `quillo mcp --serve`. Q-1343 is answered in the guide (the catalog's `cli_run` and
 `ffmpeg_cli`).
@@ -85,7 +86,9 @@ What a program may notice:
   it stays a 404, now with `file()`'s log line (FEEDBACK85.md, Q-1340).
 - **Under a provider's policy, a program with no `quillo.confirmed`, or one that leaves
   something out, is warned of at start and in `quillo check`**, naming 0.8.12, from which it
-  will not start (FEEDBACK83.md, decisions 5 and 6).
+  will not start (FEEDBACK83.md, decisions 5 and 6). Only a provider's layers ask (the host's
+  file, what it includes, `policy.d`, `QUILLO_POLICY_PATH`); a file given with `--policy` is
+  the developer's, as `quillo.policy` is, and does not (the user's revision of 2026-11-23).
 - **A program with `quillo.confirmed`**: `quillo check` exits 1 on what it leaves out, and
   `quillo build` builds no Rust file it does not have at its hash.
 - **Moves in place are opt-in**: without `moves_in_place()`, links, `url()` and `navigate`
@@ -174,6 +177,13 @@ What a program may notice:
   warned of as the operator's setting, not as one a visitor can choose (Q-1348).
 - **A `save:` in a `GET` route that reads who the visitor is** gets `route writes`' warning
   (Q-965), and `save` with `cache`, on `http.stream` or in a component is an error.
+- **A `GET` route that writes and reads no one, not declared `route writes`**, is warned of
+  (FEEDBACK70.md, Q-965, decided 2026-11-23): a hover's prefetch, or a move in place, ran it
+  as far as its first write, with nothing said. Lasting writes only: the database, files
+  (`write_file`, `delete_file`, `save_upload`, `save:`), another server and a service; the
+  visitor's session or cookies, a program variable and a message (`publish`, a channel's,
+  UDP) are not said. Three or more routes through one helper's write are said once, at it.
+  quillolang.org's site has one: `GET /newsletter/confirm`.
 
 ### The guide
 

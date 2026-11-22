@@ -125,8 +125,8 @@ reaches](#what-a-program-reaches)):
 - Once the program has a `quillo.confirmed`, each thing a file reaches that it does not
   confirm, an error at its line (``reaches example.com: not confirmed for this file``), and
   a Rust file that is not the one confirmed by its SHA-256.
-- Under a provider's policy, a program with no `quillo.confirmed`, or one that leaves
-  something out: a warning in 0.8.11, which says the release it stops in, and an error from
+- Under a provider's policy (the host's layers and `QUILLO_POLICY_PATH`; a `--policy` file
+  does not ask), a program with no `quillo.confirmed`, or one that leaves something out: a warning in 0.8.11, which says the release it stops in, and an error from
   0.8.12.
 - A host that comes only from `env()` (and text written in the program, and their trims) is
   warned of as the operator's setting, not a visitor's (``the host `http.get` goes to comes

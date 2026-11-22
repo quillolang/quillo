@@ -558,7 +558,10 @@ fn http_to_a_host_from_a_value_is_worth_a_word() {
     clean("server fn a(id: int) = http.request(\"GET\", if id > 0 { \"https://a.test/\" } else { \"https://b.test/\" })");
     // From a value: said either way, it is the program's choice.
     one("server fn a(u: str) = http.get(u)", warn);
-    one("route GET /p = http.post(request.query.u, { a: 1 })", warn);
+    // `writes`: an `http.post` on a GET is a write a prefetch runs into, now warned of by itself
+    // (FEEDBACK70.md, Q-965, the user's decision of 2026-11-23; branch feedback82-85), and not
+    // what this test is about.
+    one("route writes GET /p = http.post(request.query.u, { a: 1 })", warn);
     one("server fn a(h: str) = http.get(`https://${h}/x`)", warn);
     one("server fn a(p: str) = http.get(\"https://api.test\" + p)", warn);
     one("server fn a(u: str) {\n let url = u + \"/x\"\n http.get(url)\n}", warn);

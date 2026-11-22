@@ -7082,6 +7082,12 @@ impl Checker {
     // and surely reads who the visitor is, where the text makes both certain: SQL built as the
     // program runs is not guessed at. `route writes GET /x` says the write is meant. Check time
     // only: nothing of it runs at run time.
+    //
+    // A GET that writes and reads no one is said too (the user's decision of 2026-11-23,
+    // FEEDBACK70.md, Q-965; branch feedback82-85): a hover's prefetch, or a move in place, runs it
+    // until its first write is refused, where `route writes` refuses it before it runs. A write to
+    // the visitor's own session or cookies, a program variable and a message are not said of it
+    // (`passing_write`).
 
     /// Each GET route that writes and reads who the visitor is, said; three or more whose one write
     /// is the same (a helper's, a group's middleware's) said once, at it; and `offline` with
@@ -7094,6 +7100,8 @@ impl Checker {
         let mut related: Vec<(Arc<str>, u32, Vec<(Arc<str>, u32, String)>)> = Vec::new();
         // The routes whose writes are the same, by those writes (in file and line order).
         let mut by_write: Vec<(Vec<GetWrite>, Vec<(Arc<str>, u32, String, String)>)> = Vec::new();
+        // Those that read no one: the prefetch's warning (the user's decision of 2026-11-23).
+        let mut by_prefetch: Vec<(Vec<GetWrite>, Vec<(Arc<str>, u32, String, String)>)> = Vec::new();
         for it in order {
             let Stmt::Route(r) = &it.stmt else { continue };
             if r.method != "GET" && r.method != "ANY" {
@@ -7114,15 +7122,29 @@ impl Checker {
             // Most routes reach no write, or no read: said by what each function can reach, worked
             // out once a check, before any walk of the route's own.
             let can_write = !root.writes.is_empty() || root.calls.iter().any(|c| self.reaches(c, &cx, &mut seen).0);
-            let can_read = root.reads.is_some() || pattern_read.is_some() || root.calls.iter().any(|c| self.reaches(c, &cx, &mut seen).1);
-            if !(can_write && can_read) {
+            if !can_write {
                 continue;
             }
             let mut facts = self.get_facts(&root, &it.file, &cx, &mut seen, true);
             if facts.reads.is_none() {
                 facts.reads = pattern_read.map(|f| (format!("its request pattern takes the request's {}", f), None));
             }
-            let Some(v) = facts.reads else { continue };
+            // A GET that writes and reads no one is still run by a prefetch, a hover's or a move in
+            // place's, until its first write refuses it: said too, but for a write to the visitor's
+            // own session or cookies, which a GET is expected to do, and what leaves nothing behind
+            // (`passing_write`; the user's decision of 2026-11-23: FEEDBACK70.md, Q-965; branch
+            // feedback82-85).
+            let Some(v) = facts.reads else {
+                let ws: Vec<GetWrite> = facts.writes.into_iter().filter(|w| !passing_write(&w.what)).collect();
+                if !ws.is_empty() {
+                    let route = (it.file.clone(), r.line, r.shown(), String::new());
+                    match by_prefetch.iter_mut().find(|(k, _)| *k == ws) {
+                        Some((_, routes)) => routes.push(route),
+                        None => by_prefetch.push((ws, vec![route])),
+                    }
+                }
+                continue;
+            };
             if facts.writes.is_empty() {
                 continue;
             }
@@ -7165,6 +7187,37 @@ impl Checker {
             let (these, are) = if ws.len() == 1 { ("this write", "is") } else { ("these writes", "are") };
             said.push((w.file.clone(), w.line, format!(
                 "{} ({}) {} done by {} GET routes that read who the visitor is: {} and {}. A link on another site, in an email or in a chat runs them with the visitor's session (`SameSite=Lax` cookies go with a followed link). Make them `POST`s, or, if the write is meant (a presence ping, a page's count of views), tag them: `route writes GET ...`, `routes writes /...`",
+                these, listed(&ws), are, routes.len(), list.join(", "), last
+            )));
+            related.push((w.file.clone(), w.line, routes.iter().map(|(f, l, shown, _)| (f.clone(), *l, format!("`{}`", shown))).collect()));
+        }
+        // A write as the prefetch's warning shows it: what, and where (`at line 7`, or the file's).
+        let where_ = |w: &GetWrite, route_file: &Arc<str>| if w.file == *route_file { format!("{} at line {}", w.shown(), w.line) } else { format!("{} at {}", w.shown(), self.shown_at(&w.file, w.line)) };
+        for (ws, routes) in by_prefetch {
+            if routes.len() < 3 {
+                for (file, line, shown, _) in &routes {
+                    let mut list: Vec<String> = ws.iter().take(3).map(|w| where_(w, file)).collect();
+                    if ws.len() > 3 {
+                        list.push(format!("and {} more", ws.len() - 3));
+                    }
+                    said.push((file.clone(), *line, format!(
+                        "`{}` writes ({}) but is not declared `route writes`: a hover's prefetch, or a move in place, runs it until that write is refused. Write `route writes {}`, or make it a `POST`",
+                        shown, list.join("; "), shown
+                    )));
+                }
+                continue;
+            }
+            // Three or more with the same writes (a helper's): said once, at the first.
+            let w = &ws[0];
+            let at = |(f, l, shown, _): &(Arc<str>, u32, String, String)| if *f == w.file { format!("`{}` (line {})", shown, l) } else { format!("`{}` ({})", shown, self.shown_at(f, *l)) };
+            let mut list: Vec<String> = routes.iter().take(3).map(at).collect();
+            if routes.len() > 3 {
+                list.push(format!("{} more", routes.len() - 3));
+            }
+            let last = list.pop().unwrap_or_default();
+            let (these, are) = if ws.len() == 1 { ("this write", "is") } else { ("these writes", "are") };
+            said.push((w.file.clone(), w.line, format!(
+                "{} ({}) {} done by {} GET routes not declared `route writes`: {} and {}. A hover's prefetch, or a move in place, runs them until that write is refused. Tag them, `route writes GET ...`, `routes writes /...`, or make them `POST`s",
                 these, listed(&ws), are, routes.len(), list.join(", "), last
             )));
             related.push((w.file.clone(), w.line, routes.iter().map(|(f, l, shown, _)| (f.clone(), *l, format!("`{}`", shown))).collect()));
@@ -13544,6 +13597,16 @@ fn sql_shown(sql: &str) -> String {
 /// functions are read in `Checker::get_call`, and `db.atomic` is what its function does
 /// (FEEDBACK70.md, Q-965; branch security).
 const GET_WRITES: &[&str] = &["idempotent", "set_cookie", "delete_cookie", "set_session", "end_session", "mcp_token", "revoke_mcp_token", "write_file", "delete_file", "save_upload", "publish"];
+
+/// A write a GET that reads no one is not warned of (the user's decision of 2026-11-23:
+/// FEEDBACK70.md, Q-965; branch feedback82-85): one to the visitor's own session or cookies, which a
+/// GET is expected to do; and what leaves nothing behind once the process is gone, a program
+/// variable assigned (a count of views) and a message sent (to a channel's pages, a UDP packet,
+/// `publish`). What is said: the database, files, another server, a service's writes.
+fn passing_write(what: &str) -> bool {
+    matches!(what, "`set_cookie`" | "`delete_cookie`" | "`set_session`" | "`end_session`" | "`publish`" | "`channel.send`" | "`channel.broadcast`" | "`udp.send`" | "`udp.reply`")
+        || what.starts_with("assigns the program's variable ")
+}
 
 /// What one function's own code, or a route's, surely does, read once (`GetWalk`): its writes and
 /// the lines they are on, its first read of who the visitor is, and the program's functions it
