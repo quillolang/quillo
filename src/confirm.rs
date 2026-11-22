@@ -10,12 +10,16 @@
 //!
 //! ```toml
 //! ["lib/outside.qwe"]
-//! http = ["nominatim.openstreetmap.org"]
-//! files = ["uploads/"]
+//! http = ["nominatim.openstreetmap.org", "*.stripe.com"]
+//! files = ["data/"]          # read only
+//! writes = ["uploads/"]      # read and written
+//! listens = ["udp 514"]      # a UDP port others reach
+//! routes = ["GET /export", "server fn export"]   # a taken file's ways in
 //!
 //! ["ui/map.qwe"]
 //! scripts = ["https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js sha384-..."]
 //! loads = ["tile.openstreetmap.org"]
+//! calls = ["api.example.com"]
 //!
 //! ["airtable.qwer"]
 //! sha256 = "..."
@@ -93,6 +97,10 @@ pub struct Block {
     /// A Rust file's written paths and addresses, and the effects a reading finds. Found only.
     pub written: Items,
     pub found_effects: crate::ast::Effects,
+    /// The `server fn`s and tools of a taken file that the program took by name (`use x.qwe use
+    /// load_notes`): the program's own ways in, never held (FEEDBACK83.md, Q-1301, found writing
+    /// the guide: llms.py's note_list example; branch feedback82-85). Found only.
+    pub named: Vec<String>,
     /// A file taken for some of its names, whose routes are held to the list. Found only.
     pub taken: bool,
     /// Its tools (`fn mcp`), whichever way it is taken. Found only.
@@ -299,6 +307,7 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
                 Stmt::Route(rd) if b.taken => routes.push((rd.shown(), rd.line)),
                 // A taken file's `server fn` is called from the browser, and its `fn mcp` by an AI
                 // client: ways in, as its routes are (Q-1301, found in review).
+                Stmt::Fn(d) if b.taken && (d.server || d.mcp) && names.is_some_and(|n| n.contains(&d.name)) => b.named.push(entry_name(d)),
                 Stmt::Fn(d) if b.taken && (d.server || d.mcp) => routes.push((entry_name(d), d.line)),
                 Stmt::Let(_, e, line) | Stmt::Expr(e @ Expr::Call(_, _, line)) if b.taken && reaches_out(e) => at_start.push(*line),
                 _ => {}
@@ -378,7 +387,7 @@ fn scan_taken(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>>>)
         for s in stmts.iter() {
             match s {
                 Stmt::Route(r) => routes.push((r.shown(), r.line)),
-                Stmt::Fn(d) if d.server || d.mcp => routes.push((entry_name(d), d.line)),
+                Stmt::Fn(d) if (d.server || d.mcp) && !names.contains(&d.name) => routes.push((entry_name(d), d.line)),
                 Stmt::Let(_, e, line) | Stmt::Expr(e @ Expr::Call(_, _, line)) if reaches_out(e) => at_start.push(*line),
                 _ => {}
             }
@@ -1368,6 +1377,8 @@ struct Hold {
     main: String,
     /// The blocks whose routes are held: of files taken by `use` (Q-1301).
     routes_held: HashSet<u32>,
+    /// The ways in of taken files that the program took by name: its own (`Block::named`).
+    named: HashSet<(u32, String)>,
     /// Block 0 is an empty one: a file with no block is confirmed for nothing.
     blocks: Vec<Block>,
     by_name: HashMap<String, u32>,
@@ -1407,6 +1418,7 @@ fn hold(dir: &Path, main: &Path, conf: &Confirmed, found: &Scan) {
         }
     }
     let routes_held: HashSet<u32> = found.files.iter().filter(|(_, b)| b.taken).filter_map(|(f, _)| by_name.get(f).copied()).collect();
+    let named: HashSet<(u32, String)> = found.files.iter().filter(|(_, b)| b.taken).filter_map(|(f, b)| by_name.get(f).map(|i| (*i, b))).flat_map(|(i, b)| b.named.iter().map(move |n| (i, n.clone()))).collect();
     let mut refused_tools = HashSet::new();
     for (f, b) in found.files.iter().filter(|(_, b)| b.taken) {
         let confirmed = conf.get(f).map(|c| &c.routes);
@@ -1422,7 +1434,7 @@ fn hold(dir: &Path, main: &Path, conf: &Confirmed, found: &Scan) {
     let current: Confirmed = conf.iter().filter(|(f, _)| found.files.contains_key(*f)).map(|(f, b)| (f.clone(), b.clone())).collect();
     let page_policy = Some(page_policy_of(&current));
     let main = rel_name(&dir, main);
-    let _ = HOLD.set(Hold { dir: dir.canonicalize().unwrap_or(dir), main, routes_held, blocks, by_name, seen: RwLock::new(HashMap::new()), said: Mutex::new(HashSet::new()), integrity, refused_tools, known_tools, reals: RwLock::new(HashMap::new()), page_policy });
+    let _ = HOLD.set(Hold { dir: dir.canonicalize().unwrap_or(dir), main, routes_held, named, blocks, by_name, seen: RwLock::new(HashMap::new()), said: Mutex::new(HashSet::new()), integrity, refused_tools, known_tools, reals: RwLock::new(HashMap::new()), page_policy });
 }
 
 /// The `content-security-policy-report-only` of a held program's pages: what its files' scripts,
@@ -1694,8 +1706,8 @@ pub fn tool_ok(name: &str) -> bool {
 }
 
 /// Whether the Rust file `qwer` is held to a confirmed SHA-256: then only a library built here
-/// from it loads, never one a cloned `.quillo/native` brought (found in review). Not under
-/// `--no-build` or `build = false`, where the libraries brought along are the ones meant.
+/// from it loads, never one a cloned `.quillo/native` brought (found in review); with building
+/// off, only one this machine's build record knows.
 pub fn pinned(qwer: &Path) -> bool {
     HOLD.get().is_some_and(|h| h.by_name.get(&rel_name(&h.dir, qwer)).is_some_and(|i| h.blocks[*i as usize].sha256.is_some()))
 }
@@ -1712,7 +1724,7 @@ pub fn route_ok(cur_file: Option<&str>, shown: &str) -> bool {
         h.say(format!("{}: {} is not served: its file was not read as the program started (restart it once it is confirmed)", cur_file.map_or_else(|| "a file".to_string(), |f| rel_name(&h.dir, Path::new(f))), shown));
         return false;
     }
-    if !h.routes_held.contains(&i) || h.blocks[i as usize].routes.contains_key(shown) {
+    if !h.routes_held.contains(&i) || h.blocks[i as usize].routes.contains_key(shown) || h.named.contains(&(i, shown.to_string())) {
         return true;
     }
     let what = if shown.starts_with("server fn ") || shown.starts_with("fn mcp ") { format!("{} is not offered", shown) } else { format!("the route {} is not served", shown) };

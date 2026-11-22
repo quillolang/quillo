@@ -821,6 +821,29 @@ fn what_a_taken_file_takes_is_held_and_its_server_fns_too() {
     assert!(read(&log).contains("server fn leak is not offered"), "{}", read(&log));
 }
 
+// A `server fn` the program takes by name is its own way in: not noted, not held; the same file's
+// other server fn still is (found writing the guide: llms.py's note_list example).
+#[test]
+fn a_server_fn_taken_by_name_is_the_programs_own() {
+    let d = temp_dir("c-d-named");
+    write(&d, "main.qwe", "import lib/notes.qwe use load_notes\nroute GET / = \"main\"\n");
+    write(&d, "lib/notes.qwe", "server fn load_notes() = \"notes\"\nserver fn other() = \"other\"\n");
+    let (_, out) = quillo(&d, &["check", "main.qwe"]);
+    assert!(!out.contains("server fn load_notes"), "{}", out);
+    assert!(out.contains("server fn other"), "{}", out);
+    let (code, out) = quillo(&d, &["confirm", "--list"]);
+    assert_eq!(code, Some(0));
+    assert!(!out.contains("server fn load_notes") && out.contains("server fn other"), "{}", out);
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n[\"lib/notes.qwe\"]\n");
+    let (g, port, _) = serve(&d, &[]);
+    let call = |name: &str| send(port, "POST", &format!("/_quillo/rpc/{}", name), &[("x-quillo-rpc", "1"), ("Sec-Fetch-Site", "same-origin")], "[]");
+    let named = call("load_notes");
+    assert!(named.status == 200 && named.body.contains("notes"), "{} {}", named.status, named.body);
+    let other = call("other");
+    assert!(other.status >= 400 && !other.body.contains("\"other\""), "{} {}", other.status, other.body);
+    drop(g);
+}
+
 // Fix 6: a mounted program's `use` is its own folder's, and its Rust file is held (the
 // reviewer's p5).
 #[test]

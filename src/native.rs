@@ -2270,8 +2270,9 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
     // (FEEDBACK83.md, Q-1300 and Q-1307; branch feedback82-85).
     crate::confirm::plugin_ok(qwer).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
     // And confirmed by its SHA-256, only a library built here from those bytes loads, never one a
-    // cloned `.quillo/native` brought along; with building off, the one brought is the one meant
-    // (FEEDBACK83.md, Q-1300, found in review; branch feedback82-85).
+    // cloned `.quillo/native` brought along: with building off, only one this machine's record
+    // knows, else the start is refused (FEEDBACK83.md, Q-1300, found in review; branch
+    // feedback82-85).
     // A pin of this plugin's own library by its SHA-256, met: that library is the one meant, as
     // before; a pin of another plugin's is not this one's (found in review 2).
     let confirmed = !here && !library_pin_met(qwer) && crate::confirm::pinned(qwer);
