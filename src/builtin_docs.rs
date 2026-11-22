@@ -112,6 +112,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("check_program", "path, files", "What `quillo check` says of a program, as maps; `files` gives text for disk's. Past its budget, one error: too complex."),
     ("run_script", "source, vars, options", "Runs users' code in a sandbox that sees `vars`, for 100 ms unless `options.timeout` says; its last value, or an error value."),
     ("allow_cross_site", "path", "Lets routes under `path` take form posts from other sites' pages, otherwise refused."),
+    ("moves_in_place", "", "At the top: same-site links move to their route's page in place, keeping page states and components on both pages."),
     ("site_headers", "path, headers", "At the top: headers for every answer (under `path`) that sets none of its own; null takes one of Quillo's away."),
     ("ready", "name, f", "Adds a check to `/_quillo/ready`: `name` is ready while `f` gives `true`."),
     ("style_with", "cmd", "Passes every component's and view's `style` through the command `cmd` as the program loads."),
@@ -144,7 +145,9 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("with_tenant", "name, f", "Runs `f` for that tenant, with its database and live updates; a new tenant's database is made."),
     // Components
     ("url", "", "`{ path, query, hash }` of the request, or of the address bar in the browser, where it is followed."),
-    ("navigate", "path", "Goes to `path` from a page's code; on the server it does nothing, and `redirect` is the way."),
+    ("navigate", "path, options=", "Goes to `path` from a page's code; on the server it does nothing, and `redirect` is the way."),
+    ("page_head", "head", "Sets the page's title, description, image and canonical link (and og: tags); the innermost call wins, following state."),
+    ("page_url", "path=", "The page's public address (scheme, host, prefix, path), or that of `path`."),
     ("every", "ms, f, options", "Calls `f` every `ms` milliseconds: on the server at a program's top, in the browser in a component."),
     ("ask", "message, options", "Asks in a dialog on the page and waits for true or false; an error on the server, where a tool asks with `about` or `confirm`."),
     // Once `ask` with three arguments (FEEDBACK56.md, the user's decision 2026-11-09; branch

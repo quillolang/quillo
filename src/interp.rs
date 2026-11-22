@@ -331,6 +331,8 @@ pub struct Interp {
     /// development, made when first asked for (see `client_js`).
     pub client_js: Arc<String>,
     client_lazy: Arc<std::sync::OnceLock<Arc<String>>>,
+    /// A hash of the bundle's text, kept with it (see `client_js_hash`).
+    client_hash: Arc<std::sync::OnceLock<String>>,
     /// Whether the program names `db.atomic` (then transactions it left
     /// prepared are looked after: see `db::recover`). Noted as the files are
     /// read: it was found by printing the whole program as text and searching
@@ -557,6 +559,12 @@ pub struct Interp {
     /// And one whose component listens to scrolls (`data-sc`), which the page's loader takes up on
     /// a scroll (FEEDBACK72.md, Q-1010; branch feedback72-81).
     pub scroll_island: bool,
+    /// What the page's `page_head` calls said, for its head once it is made, and how deep the
+    /// render is for them (see src/head.rs; FEEDBACK84.md, Q-1320, Q-1321; branch feedback82-85).
+    pub(crate) page_head: Option<Box<crate::head::Head>>,
+    /// The head the page went out with, for a part sent later (src/defer.rs).
+    pub(crate) head_sent: Option<Box<crate::head::Head>>,
+    pub(crate) head_depth: i32,
     /// The components this request's page was rendered with: the browser
     /// loads a bundle of those (and what they use) alone.
     pub island_names: Vec<String>,
@@ -2716,6 +2724,7 @@ impl Interp {
             program: Arc::new(Vec::new()),
             client_js: Arc::new(String::new()),
             client_lazy: Default::default(),
+            client_hash: Default::default(),
             uses_atomic: false,
             bundles: Default::default(),
             styles: Default::default(),
@@ -2796,6 +2805,9 @@ impl Interp {
             mount_rules: Vec::new(),
             rendered_island: false,
             scroll_island: false,
+            page_head: None,
+            head_sent: None,
+            head_depth: 0,
             island_names: Vec::new(),
             styles_used: Vec::new(),
             deferred: Vec::new(),
@@ -2857,6 +2869,7 @@ impl Interp {
             program: self.program.clone(),
             client_js: self.client_js.clone(),
             client_lazy: self.client_lazy.clone(),
+            client_hash: self.client_hash.clone(),
             uses_atomic: self.uses_atomic,
             bundles: self.bundles.clone(),
             styles: self.styles.clone(),
@@ -2937,6 +2950,9 @@ impl Interp {
             mount_rules: Vec::new(),
             rendered_island: false,
             scroll_island: false,
+            page_head: None,
+            head_sent: None,
+            head_depth: 0,
             island_names: Vec::new(),
             styles_used: Vec::new(),
             deferred: Vec::new(),
@@ -3523,6 +3539,7 @@ impl Interp {
         // In development the whole program's bundle is made when first asked
         // for: each page compiles its own components, and a reload is a
         // third quicker without it (FEEDBACK15.md, Q-098; branch dev-maps-once).
+        self.client_hash = Default::default();
         let runtime = if crate::client::DEV.load(std::sync::atomic::Ordering::Relaxed) {
             self.client_js = Arc::new(String::new());
             self.client_lazy = Default::default();
@@ -3543,6 +3560,12 @@ impl Interp {
     /// no longer kept. In development it is made here, the first time; a
     /// component that cannot run in the browser then says so in the
     /// browser's console instead of at load.
+    /// A hash of the bundle `client_js` gives, made once for it, for a page that moves in place
+    /// (`server::in_place_key`; review of slice H).
+    pub(crate) fn client_js_hash(&self) -> String {
+        self.client_hash.get_or_init(|| crate::client::hash_text(&self.client_js())).clone()
+    }
+
     pub fn client_js(&self) -> Arc<String> {
         if !self.client_js.is_empty() {
             return self.client_js.clone();
@@ -6195,6 +6218,22 @@ impl Interp {
 
     /// Calls `c` and renders what it returns into `out`, writing its HTML
     /// as it goes (see `render_expr_into`).
+    /// How many components the render is inside, for `page_head` (src/head.rs).
+    pub(crate) fn islands_open(&self) -> usize {
+        self.islands.len()
+    }
+
+    /// A view's or component's body, called from a tag, one deeper for `page_head` than what calls
+    /// it; one that takes `children`, a layout, one less deep, outside its caller (src/head.rs;
+    /// FEEDBACK84.md, Q-1321; branch feedback82-85).
+    fn render_body_into(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, out: &mut Held, layout: bool) -> Result<(), Ctrl> {
+        let step = if layout { -1 } else { 1 };
+        self.head_depth += step;
+        let r = self.render_call_into(c, args, line, out);
+        self.head_depth -= step;
+        r
+    }
+
     fn render_call_into(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, out: &mut Held) -> Result<(), Ctrl> {
         // A declared result type is checked on the value. A script's function as a tag: called as
         // it is anywhere, under its script's limits while it runs, an error after (Q-1274, found
@@ -7831,7 +7870,11 @@ impl Interp {
             // HTML where it is HTML already: as here.
             let at = at.filter(|a| a.now != Ns::Html || self.ns.now != Ns::Html);
             let outer = at.map(|a| std::mem::replace(&mut self.ns, a));
+            // Inside the view they are given to, for `page_head` (src/head.rs; FEEDBACK84.md,
+            // Q-1321; branch feedback82-85).
+            self.head_depth += 1;
             let r = el.children.iter().try_for_each(|ch| self.render_child(ch, env, &mut held));
+            self.head_depth -= 1;
             if let Some(o) = outer {
                 self.ns = o;
             }
@@ -7859,7 +7902,7 @@ impl Interp {
                     _ => None,
                 });
             }
-            return self.render_call_into(&c, args, line, out);
+            return self.render_body_into(&c, args, line, out, takes_children);
         }
         let (spread, explicit) = self.eval_attrs(el, env)?;
         let mut given: Vec<(String, Value)> = explicit.into_iter().filter(|(n, _)| n != "key").collect();
@@ -7893,7 +7936,7 @@ impl Interp {
             return fail(line, format!("<{}> has no parameter `{}`", el.tag, n));
         }
         if !component {
-            return self.render_call_into(&c, args, line, out);
+            return self.render_body_into(&c, args, line, out, takes_children);
         }
         // A component renders inside an island that carries its props and
         // state to the browser, which takes over from there. A component
@@ -7922,7 +7965,7 @@ impl Interp {
         let marked = self.marked;
         // The component an error shown in it is said in (Q-1272).
         let outer = std::mem::replace(&mut self.rendering, Some(c.def.clone()));
-        let r = crate::value::js_numbers(true, || self.render_call_into(&c, args, line, &mut held));
+        let r = crate::value::js_numbers(true, || self.render_body_into(&c, args, line, &mut held, takes_children));
         self.rendering = outer;
         self.in_component = was;
         let (mut state, mut live) = self.islands.pop().unwrap_or_default();

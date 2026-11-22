@@ -50,7 +50,7 @@ const CLIENT_BUILTINS: &[&str] = &[
     "max", "sort", "sort_by", "reverse", "first", "last", "push", "range", "enumerate", "keys", "values", "get", "has",
     "set", "remove", "merge", "err", "is_err", "error", "unwrap", "run_after", "page_updated", "js_has", "cursor_index", "raw", "escape", "now", "random", "random_int", "uuid", "abs",
     "round", "floor", "ceil", "sqrt", "pow", "unique", "flatten", "zip", "take", "drop", "count", "group_by",
-    "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "__concat", "__css_value", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
+    "index_of", "repeat", "format_number", "url", "url_encode", "navigate", "page_head", "page_url", "markdown", "css", "sql", "parallel", "every", "listen", "receive", "__record", "__merge", "__concat", "__css_value", "t", "locale", "js", "js_new", "highlight", "ask", "notify",
     // FEEDBACK13.md, Q-091; branch feedback13-fixes.
     "waiting",
     // In the browser, `defer(x)` is `x` (src/defer.rs; branch defer).
@@ -96,7 +96,9 @@ fn compiled<'a>(it: &'a Interp, roots: Option<&[String]>) -> Result<(Compiler<'a
     for (name, _) in &names {
         c.global(name, 0)?;
     }
-    Ok((c, !names.is_empty()))
+    // Moves in place start from the bundle, on a page with no component too (FEEDBACK84.md,
+    // Q-1323; branch feedback82-85).
+    Ok((c, !names.is_empty() || it.site.in_place))
 }
 
 /// The components a compile made: the roots and every one they show.
@@ -343,11 +345,18 @@ fn program_text(it: &Interp, c: &Compiler, boots: bool, with_base: bool) -> Stri
         }
         program.push_str("window.quillo = { server, components: C, rpc };\n");
     }
+    if it.site.in_place {
+        program.push_str(IN_PLACE_LINE);
+    }
     if boots {
         program.push_str(&boot_line(it, c));
     }
     program
 }
+
+/// What starts moves in place, for a program that says `moves_in_place()`; the runtime's code for
+/// them goes only with it (FEEDBACK84.md, Q-1323; branch feedback82-85).
+const IN_PLACE_LINE: &str = "W.inPlace();\n";
 
 /// A page's bundle: the components it was rendered with, every component
 /// they show (all of which it can come to show without loading more), and
@@ -706,6 +715,9 @@ mod dev {
                 let _ = writeln!(boot, "server[{}] = W.server({});", js_str(name), js_str(name));
             }
             boot.push_str("window.quillo = { server, components: C, rpc };\n");
+        }
+        if it.site.in_place {
+            boot.push_str(super::IN_PLACE_LINE);
         }
         if boots {
             boot.push_str(&super::boot_line(it, c));

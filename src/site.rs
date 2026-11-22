@@ -31,6 +31,10 @@ pub struct Site {
     /// Path prefixes that take form posts from other sites (a payment
     /// provider's return, a single sign-on callback).
     pub cross_site_ok: Vec<String>,
+    /// `moves_in_place()` at the top: every same-site link moves to its route's page in place,
+    /// every page carrying the program's bundle for it (FEEDBACK84.md, Q-1323, Q-1327; branch
+    /// feedback82-85).
+    pub in_place: bool,
     /// The folder `db.migrate` applies, again for each database opened later.
     pub migrations: Option<std::path::PathBuf>,
     /// What `translations` loaded.

@@ -1586,6 +1586,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("t", "str, map | null=", "str"),
     ("schedule", "str | int, fn, map | null=", "null"),
     ("allow_cross_site", "str", "null"),
+    ("moves_in_place", "", "null"),
     ("site_headers", "str | map, map=", "null"),
     ("tenant", "", "str | null"),
     ("tenant_from", "str | fn", "null"),
@@ -1608,7 +1609,10 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("ready", "str, fn", "null"),
     ("style_with", "str | fn", "null"),
     ("sql", "str", "str"),
-    ("navigate", "str", "null"),
+    ("navigate", "str, map | null=", "null"),
+    // FEEDBACK84.md, Q-1320, Q-1328; branch feedback82-85.
+    ("page_head", "map", "null"),
+    ("page_url", "str | null=", "str"),
     ("waiting", "any", "bool"),
     // What a `routes` group's middleware gave: a response answers (branch route-groups).
     ("__answer", "any, str=", "null"),
@@ -1904,7 +1908,7 @@ const BROWSER_ONLY_SERVER: &[&str] =
     &["env", "sleep", "file", "redirect", "respond", "read_file", "write_file", "delete_file", "check_program", "publish", "watch", "unwatched", "crypto.sha256",
       "crypto.hmac", "crypto.token", "crypto.hash_password", "crypto.verify_password", "crypto.equal", "set_cookie",
       "delete_cookie", "session", "cookie", "set_session", "end_session", "mcp_token", "mcp_tokens", "revoke_mcp_token", "confirm", "about", "translations", "locale_from", "with_locale",
-      "schedule", "stream", "events", "image.info", "image.convert", "later.status", "args", "stdin", "read_line", "exit", "allow_cross_site", "site_headers", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform", "markdown_page", "files", "classes", "accept_calls"];
+      "schedule", "stream", "events", "image.info", "image.convert", "later.status", "args", "stdin", "read_line", "exit", "allow_cross_site", "moves_in_place", "site_headers", "tenant_from", "with_tenant", "save_upload", "read_upload", "platform", "markdown_page", "files", "classes", "accept_calls"];
 
 fn parse_t(s: &str) -> T {
     let mut t = T::NEVER;
@@ -11254,6 +11258,7 @@ impl Checker {
         if !is_view {
             self.shown_only(el);
             self.markup_habits(el);
+            self.head_habits(el);
         }
         // Where a link goes (FEEDBACK79.md, Q-1251; branch feedback72-81): an element's `href`, not a
         // view's or component's prop of that name, which may be anything (found in review).
@@ -11503,6 +11508,34 @@ impl Checker {
     /// modifiers, `v-model` and `v-on:` (FEEDBACK72.md, Q-1031), a click on an element the keyboard
     /// never reaches and an image with no `alt` (Q-1019), and CSS put together from values with `+`
     /// or a template (Q-1017; branch feedback72-81).
+    /// A component written in `<head>`, which the browser ends the head at (FEEDBACK84.md, Q-1322),
+    /// and `json.stringify(...)` as a JSON-LD script's whole content, which writes it as a JSON
+    /// string (Q-1329; branch feedback82-85).
+    fn head_habits(&mut self, el: &HtmlEl) {
+        if el.tag.eq_ignore_ascii_case("head") {
+            for c in &el.children {
+                if let HtmlChild::El(k) = c {
+                    let component = k.tag.starts_with(|c: char| c.is_uppercase()) && self.ident(&k.tag).1.and_then(|s| s.def.clone()).is_some_and(|d| d.component);
+                    if component {
+                        self.line = k.line;
+                        self.error(format!(
+                            "a component cannot stand in <head>: the page's <{}> is written as an element the browser ends the head at, and what comes after it lands in the body; set the head with `page_head({{ title, description }})` in the component",
+                            k.tag
+                        ));
+                    }
+                }
+            }
+        }
+        let ld = el.tag.eq_ignore_ascii_case("script")
+            && el.attrs.iter().any(|(a, v)| a.eq_ignore_ascii_case("type") && matches!(v, AttrVal::Expr(Expr::Lit(Lit::Str(s))) if s.trim().eq_ignore_ascii_case("application/ld+json")));
+        if let (true, [HtmlChild::Expr(Expr::Call(f, _, _))]) = (ld, el.children.as_slice()) {
+            if matches!(&**f, Expr::Field(m, n, _) if n == "stringify" && matches!(&**m, Expr::Ident(j, _) if j == "json")) {
+                self.line = el.line;
+                self.warn("`json.stringify(...)` in a JSON-LD script writes the data as one JSON string, which no search engine reads as structured data: write the map itself, `{item}`, which is written as JSON with `</script>` escaped");
+            }
+        }
+    }
+
     fn markup_habits(&mut self, el: &HtmlEl) {
         let has = |n: &str| el.attrs.iter().any(|(a, _)| a.eq_ignore_ascii_case(n));
         let spread = el.attrs.iter().any(|(_, v)| matches!(v, AttrVal::Spread(_)));

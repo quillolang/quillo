@@ -832,6 +832,108 @@ fn identity_unread(name: &str, why: &str) {
 
 impl Interp {
     /// Runs the first route whose method, path and patterns all match.
+    /// What a page that moves in place must share with the page it moves to, or the move is a
+    /// load (review of slice H; FEEDBACK84.md, Q-1323; branch feedback82-85): the program's code
+    /// (its prefix, its scripts' addresses, its bundle's own text, and the scripts its page's head
+    /// was written with, as a set), so another program's page, a mounted one's, or one a new
+    /// version made, is no page of this one's; the answer's policies (a page that may not be
+    /// framed, or has a stricter policy, is loaded with its own); and who the visitor is (the
+    /// request's cookies, the ones the answer sets, its `Authorization`, and what a proxy said of
+    /// the user and the client's certificate): a sign-in or a sign-out keeps nothing from before.
+    /// One HMAC of them under the session key (`QUILLO_SECRET`), so nothing of a visitor's can be
+    /// read back or made up; and whether a visitor's own part was in it.
+    fn in_place_key(&self, srcs: &[String], req: &HttpRequest, resp: &HttpResponse) -> (String, bool) {
+        const POLICIES: [&str; 7] = [
+            "content-security-policy",
+            "content-security-policy-report-only",
+            "x-frame-options",
+            "cross-origin-opener-policy",
+            "cross-origin-embedder-policy",
+            "permissions-policy",
+            "referrer-policy",
+        ];
+        let mut said = format!("{}\n{}\n{}\n", self.base, srcs.join(" "), self.client_js_hash());
+        for t in crate::head::head_scripts(&resp.body) {
+            said.push_str(&t);
+            said.push('\n');
+        }
+        for name in POLICIES {
+            for (k, v) in &resp.headers {
+                if k.eq_ignore_ascii_case(name) {
+                    said.push_str(name);
+                    said.push(':');
+                    said.push_str(v);
+                    said.push('\n');
+                }
+            }
+        }
+        let (cert, user) = crate::httpd::identity_headers();
+        let mut who = String::new();
+        // The cookies the browser holds once this answer has come: those asked with, as the answer
+        // sets or takes them away (an empty value, `Max-Age` 0 or less, an `Expires` gone by), so that
+        // the page that signs in and the next have one key. Quillo's session alone, unless the
+        // request read cookies or headers of its own (`cookie()`, `request.cookies`): then all of
+        // them; a cookie a script changes on each page (analytics) moves nothing else to a load.
+        let all = self.visitor_other;
+        let counts = |n: &str| all || n.contains("quillo_session");
+        let mut jar: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        for (k, v) in &req.headers {
+            let k = k.to_ascii_lowercase();
+            if k == "cookie" {
+                for c in v.split(';').map(str::trim).filter(|c| !c.is_empty()) {
+                    let (n, val) = c.split_once('=').unwrap_or((c, ""));
+                    if counts(n.trim()) {
+                        jar.insert(n.trim().to_string(), val.trim().to_string());
+                    }
+                }
+            } else if k == "authorization" || user.is_some_and(|u| *u == k) || cert.is_some_and(|c| c.0 == k) {
+                who.push_str(&k);
+                who.push(':');
+                who.push_str(v);
+                who.push('\n');
+            }
+        }
+        for (k, v) in &resp.headers {
+            if k.eq_ignore_ascii_case("set-cookie") {
+                let mut parts = v.split(';');
+                let first = parts.next().unwrap_or("");
+                let (n, val) = first.split_once('=').unwrap_or((first, ""));
+                if !counts(n.trim()) {
+                    continue;
+                }
+                if val.trim().is_empty() || parts.any(cookie_ended) {
+                    jar.remove(n.trim());
+                } else {
+                    jar.insert(n.trim().to_string(), val.trim().to_string());
+                }
+            }
+        }
+        for (n, val) in &jar {
+            who.push_str("cookie:");
+            who.push_str(n);
+            who.push('=');
+            who.push_str(val);
+            who.push('\n');
+        }
+        let visitor = !who.is_empty();
+        said.push_str(&who);
+        let mac = crate::crypto::hmac_sha256(crate::session::signing_key(), said.as_bytes());
+        (mac[..16].iter().map(|b| format!("{:02x}", b)).collect(), visitor)
+    }
+
+    /// The page's `page_head` calls, in its head (src/head.rs): out of the way of a request that
+    /// made none (FEEDBACK84.md, Q-1320; branch feedback82-85).
+    #[cold]
+    #[inline(never)]
+    fn page_head_into(&mut self, req: &HttpRequest, resp: &mut HttpResponse) {
+        if let Some(head) = self.page_head.take() {
+            if is_html(resp) && !as_written(resp) && req.method != "HEAD" {
+                crate::head::apply(&mut resp.body, &head);
+                self.head_sent = Some(head);
+            }
+        }
+    }
+
     pub fn handle(&mut self, req: &HttpRequest) -> HttpResponse {
         // A mounted program answers everything under its prefix, seeing the
         // path without it.
@@ -920,6 +1022,11 @@ impl Interp {
         }
         self.rendered_island = false;
         self.scroll_island = false;
+        // One said outside a request (at load, in a job) is no page's.
+        if self.page_head.is_some() || self.head_sent.is_some() {
+            self.page_head = None;
+            self.head_sent = None;
+        }
         // Q-1272: an error shown in this request's page is said once.
         self.err_shown = false;
         self.island_names.clear();
@@ -951,7 +1058,9 @@ impl Interp {
         // Quillo's worker keeping a program's offline pages as it installs asks for them so, under
         // --no-prefetch too: a GET that would write is refused, not run (FEEDBACK67.md, B.2, second
         // review; branch pwa).
-        let prefetch = (is_prefetch(req) || self.read_only || (self.site.offline.is_some() && precache(req))).then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        // A move in place's own fetch too, whatever --no-prefetch says: what it would change is
+        // refused, and the load that follows is the one run that counts (third review of slice H).
+        let prefetch = (is_prefetch(req) || self.read_only || (self.site.offline.is_some() && precache(req)) || (self.site.in_place && is_move(req))).then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         self.prefetching = prefetch.clone();
         let changed = (req.method != "GET" && req.method != "HEAD").then(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
         self.changed = changed.clone();
@@ -969,6 +1078,12 @@ impl Interp {
         // program without one pays (FEEDBACK67.md, B.1 and its review; branch pwa).
         if self.site.pwa.is_some() {
             crate::pwa::after_route(self, req, path, &mut resp);
+        }
+        // What the page's `page_head` calls said, in its head: one look, all a page without them
+        // pays (src/head.rs; FEEDBACK84.md, Q-1320, Q-1321; branch feedback82-85).
+        // Taken each request, so none is left for the next; `head_depth` comes back to 0 by itself.
+        if self.page_head.is_some() {
+            self.page_head_into(req, &mut resp);
         }
         // Before anything that can wait: another request on the thread would find it
         // (FEEDBACK55.md, Q-883; branch feedback55).
@@ -1110,7 +1225,13 @@ impl Interp {
         if marked.register && html && req.method != "HEAD" {
             if let Some(o) = self.site.offline.clone() {
                 let at = rfind_tag(&resp.body, b"</body>").unwrap_or(resp.body.len());
-                insert_at(&mut resp.body, at, o.register.as_bytes());
+                // Quillo's own, said so on a page that moves in place, whose moves leave it as it ran
+                // (fourth review of slice H).
+                if self.site.in_place {
+                    insert_at(&mut resp.body, at, format!("<script data-quillo>{}</script>", o.register_js).as_bytes());
+                } else {
+                    insert_at(&mut resp.body, at, o.register.as_bytes());
+                }
                 if refused.scripts {
                     own.push(o.register_js.clone());
                     if marked.private {
@@ -1122,7 +1243,10 @@ impl Interp {
         if html && req.method != "HEAD" && PREFETCH.load(std::sync::atomic::Ordering::Relaxed) {
             let has = rfind_tag;
             if let Some(at) = has(&resp.body, b"</body>") {
-                if self.rendered_island || tags.follow {
+                // Moves in place: the runtime asks for a link's page ahead itself, as it moves to it
+                // (`W.inPlace`; FEEDBACK84.md, Q-1330; branch feedback82-85).
+                if self.site.in_place {
+                } else if self.rendered_island || tags.follow {
                     if !script_with(&resp.body, &PREFETCH_JS.as_bytes()[..40]) {
                         if refused.scripts {
                             // Chrome's speculation rules, written for each link, pass no policy
@@ -1152,7 +1276,7 @@ impl Interp {
                     // Made by a script of Quillo's, hashed: a policy with `'strict-dynamic'` takes
                     // what it makes, and refuses a `<script src>` in the page (found in review).
                     let load = format!("(d=>{{const s=d.createElement(\"script\");s.src=\"{}/_quillo/media.js\";s.async=false;d.head.appendChild(s)}})(document)", self.base);
-                    insert_at(&mut resp.body, at, format!("<script>{}</script>", load).as_bytes());
+                    insert_at(&mut resp.body, at, format!("<script{}>{}</script>", if self.site.in_place { " data-quillo" } else { "" }, load).as_bytes());
                     own.push(load);
                 } else {
                     insert_at(&mut resp.body, at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).as_bytes());
@@ -1163,12 +1287,18 @@ impl Interp {
         // the whole program's bundle.
         let mut bundle_styles: Vec<String> = Vec::new();
         let mut hints = String::new();
-        if html && req.method != "HEAD" && std::mem::take(&mut self.rendered_island) {
+        // A program whose moves are in place: every page, with the program's whole bundle, which
+        // can take up any page's components, loaded once the page is idle (FEEDBACK84.md, Q-1323;
+        // branch feedback82-85).
+        let in_place = html && req.method != "HEAD" && self.site.in_place;
+        if html && req.method != "HEAD" && (std::mem::take(&mut self.rendered_island) | in_place) {
             let has = rfind_tag;
             let mut tags = String::new();
             // The page's bundle first: what its code reads decides what the page carries.
             let whole = script_tag_for(&resp.body, b"/_quillo/quillo.js");
-            let page_ref = if whole {
+            let page_ref = if in_place && !whole {
+                Some(None)
+            } else if whole {
                 None
             } else {
                 let names = std::mem::take(&mut self.island_names);
@@ -1206,7 +1336,8 @@ impl Interp {
                 // element and `&quot;` a quote that ends the string; `<` and `&` are the
                 // same characters to JavaScript wherever it is read (coverage of 0.8.7, Q-1116;
                 // branch coverage-087).
-                tags.push_str(&format!("<script>{}.g={}</script>", crate::client::HANDOFF_JS, text.replace('<', "\\u003c").replace('&', "\\u0026")));
+                // Quillo's own, said so on a page that moves in place (third review of slice H).
+                tags.push_str(&format!("<script{}>{}.g={}</script>", if in_place { " data-quillo" } else { "" }, crate::client::HANDOFF_JS, text.replace('<', "\\u003c").replace('&', "\\u0026")));
             }
             // Components translate in the browser too: the page carries its
             // locale's text, read when the (deferred) bundle runs.
@@ -1249,7 +1380,19 @@ impl Interp {
                         s
                     }
                 };
-                tags.push_str(&format!("<script>{}</script>", island_loader(&srcs, std::mem::take(&mut self.scroll_island))));
+                // A page a GET made, which a move may ask for again: one a form's POST made has no
+                // key, and its links load (review of slice H).
+                let key = (in_place && req.method == "GET").then(|| self.in_place_key(&srcs, req, &resp));
+                // A page whose key holds the visitor's: for this visitor's browser alone, as a
+                // session's page is; a program's own `cache-control` stands, told the cookie matters.
+                if let Some((_, true)) = &key {
+                    if resp.header("cache-control").is_none() {
+                        resp.headers.push(("cache-control".into(), "private".into()));
+                    } else if !resp.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("vary") && v.to_ascii_lowercase().contains("cookie")) {
+                        resp.headers.push(("vary".into(), "Cookie".into()));
+                    }
+                }
+                tags.push_str(&format!("<script{}>{}</script>", if in_place { " data-quillo" } else { "" }, island_loader(&srcs, std::mem::take(&mut self.scroll_island), in_place.then(|| key.as_ref().map_or("", |k| k.0.as_str())))));
             } else {
                 bundle_styles = self.styles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ids();
                 if let Some((i18n, l)) = &i18n {
@@ -1472,6 +1615,15 @@ impl Interp {
             // What Quillo's worker keeps: a read past the session (FEEDBACK67.md, B.2, review;
             // branch pwa).
             self.visitor_other |= r.reads_visitor || (reads && self.site.offline.is_some() && self.middleware_beyond(&r));
+            // A route that says it writes (`route writes GET ...`) is refused a run that changes
+            // nothing before it runs, rather than at its first write: the same answer whichever way
+            // it would have gone (third review of slice H).
+            if let (true, Some(flag)) = (r.writes, &self.prefetching) {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.current_request = None;
+                self.pending_request = None;
+                return plain(503, "");
+            }
             let file = std::mem::replace(&mut self.cur_file, r.file.clone());
             // `route ... with db`: its body runs as a `with` function's, narrowed, never widened
             // (branch feedback40-43).
@@ -3971,6 +4123,42 @@ fn precache(req: &HttpRequest) -> bool {
     req.method == "GET" && req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-quillo-prefetch") && v == "1")
 }
 
+/// Whether a `Set-Cookie` attribute ends the cookie: `Max-Age` 0 or less, or an `Expires` (an
+/// IMF-fixdate, as browsers and Quillo write it) that has gone by.
+fn cookie_ended(attr: &str) -> bool {
+    let (k, v) = attr.split_once('=').unwrap_or((attr, ""));
+    let (k, v) = (k.trim(), v.trim());
+    if k.eq_ignore_ascii_case("max-age") {
+        return v.parse::<i64>().is_ok_and(|n| n <= 0);
+    }
+    if !k.eq_ignore_ascii_case("expires") {
+        return false;
+    }
+    // `Thu, 01 Jan 1970 00:00:00 GMT`
+    let f: Vec<&str> = v.split([' ', ':']).filter(|p| !p.is_empty()).collect();
+    let month = |m: &str| ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].iter().position(|x| m.eq_ignore_ascii_case(x));
+    let (Some(d), Some(m), Some(y)) = (f.get(1).and_then(|d| d.parse::<i64>().ok()), f.get(2).and_then(|m| month(m)), f.get(3).and_then(|y| y.parse::<i64>().ok())) else {
+        return false;
+    };
+    let secs = |i: usize| f.get(i).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0);
+    // Days from 1970-01-01 to y-m-d (Howard Hinnant's days_from_civil).
+    let (y2, m2) = if m < 2 { (y - 1, m as i64 + 10) } else { (y, m as i64 - 2) };
+    let era = y2.div_euclid(400);
+    let yoe = y2 - era * 400;
+    let doy = (153 * m2 + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let at = (era * 146097 + doe - 719468) * 86400 + secs(4) * 3600 + secs(5) * 60 + secs(6);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+    at <= now
+}
+
+/// A move in place asking for its page (`x-quillo-move: 1`, src/client/runtime.js `ipFetch`): run
+/// as a prefetch is, changing nothing, but no guess: never shed as one when the server is busy, and
+/// never kept by the browser (third review of slice H; FEEDBACK84.md, Q-1323; branch feedback82-85).
+pub fn is_move(req: &HttpRequest) -> bool {
+    req.method == "GET" && req.headers.iter().any(|(k, v)| k.eq_ignore_ascii_case("x-quillo-move") && v == "1")
+}
+
 pub fn is_prefetch(req: &HttpRequest) -> bool {
     req.method == "GET"
         && PREFETCH.load(std::sync::atomic::Ordering::Relaxed)
@@ -5006,8 +5194,14 @@ fn script_texts(tags: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(tags);
     let mut out = Vec::new();
     let mut rest = &*text;
-    while let Some(i) = rest.find("<script>") {
-        let after = &rest[i + 8..];
+    // `<script data-quillo>` too, as a page that moves in place marks them (third review of slice H).
+    while let Some(i) = rest.find("<script") {
+        let open = ["<script>", "<script data-quillo>"].into_iter().find(|o| rest[i..].starts_with(o));
+        let Some(open) = open else {
+            rest = &rest[i + 7..];
+            continue;
+        };
+        let after = &rest[i + open.len()..];
         let Some(end) = after.find("</script>") else { break };
         out.push(after[..end].to_string());
         rest = &after[end + 9..];
@@ -6589,7 +6783,7 @@ fn ready_response(it: &mut Interp, req: &HttpRequest) -> HttpResponse {
     r
 }
 
-fn island_loader(srcs: &[String], scroll: bool) -> String {
+fn island_loader(srcs: &[String], scroll: bool, in_place: Option<&str>) -> String {
     let src = serde_json::to_string(srcs).unwrap_or_default().replace("</", "<\\/");
     // A page with a component that listens to scrolls (`data-sc`): a scroll in it, which does not
     // bubble and may come with no pointer, touch, focus or key (a script or a link moving the box),
@@ -6630,17 +6824,49 @@ fn island_loader(srcs: &[String], scroll: bool) -> String {
             // for a click or a form waits too; a press, a double click or a menu
             // goes on as the browser does it.
             "for(const v of[\"pointerdown\",\"mousedown\",\"pointerup\",\"mouseup\",\"click\",\"auxclick\",\"dblclick\",\"contextmenu\",\"submit\"])d.addEventListener(v,(e)=>{{if(w.booted||!isl(e))return;const i={{}};for(const k of K)if(k in e)i[k]=e[k];q.push({{t:v,el:e.target,i,p:typeof PointerEvent!==\"undefined\"&&e instanceof PointerEvent}});if(v===\"click\"||v===\"submit\"){{e.preventDefault();e.stopPropagation()}}load()}},true);",
-            "const idle=()=>{{if(d.querySelector(\"quillo-island[data-e],quillo-island[data-l],[data-qi][data-e],[data-qi][data-l],body>quillo-island\"))(window.requestIdleCallback||setTimeout)(load)}};",
+            "const idle=()=>{{if({}d.querySelector(\"quillo-island[data-e],quillo-island[data-l],[data-qi][data-e],[data-qi][data-l],body>quillo-island\"))(window.requestIdleCallback||setTimeout)(load)}};",
             "{}d.readyState===\"loading\"?d.addEventListener(\"DOMContentLoaded\",idle):idle()}})()"
         ),
         src,
-        scroll
+        // Moves in place: the bundle on every page, for its links, which it asks for ahead where
+        // pages are (FEEDBACK84.md, Q-1323, Q-1330; branch feedback82-85).
+        // Its key, which a page moved to must have too (see `in_place_key`).
+        if in_place.is_some() { "1||" } else { "" },
+        match in_place {
+            None => std::borrow::Cow::Borrowed(scroll),
+            Some(key) => std::borrow::Cow::Owned(format!(
+                "{}{}{}",
+                if key.is_empty() { String::new() } else { format!("w.ik=\"{}\";", key) },
+                if PREFETCH.load(std::sync::atomic::Ordering::Relaxed) { "w.pf=1;" } else { "" },
+                scroll
+            )),
+        }
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A `Set-Cookie` that ends its cookie, for a page's key (third review of slice H).
+    #[test]
+    fn a_cookies_end_is_told() {
+        for (a, ended) in [
+            ("Max-Age=0", true),
+            ("max-age=-1", true),
+            ("Max-Age=1", false),
+            ("Max-Age=x", false),
+            ("Expires=Thu, 01 Jan 1970 00:00:00 GMT", true),
+            ("expires=Wed, 29 Feb 2024 23:59:59 GMT", true),
+            ("Expires=Fri, 01 Jan 2100 00:00:00 GMT", false),
+            ("Expires=soon", false),
+            ("Expires=", false),
+            ("Path=/", false),
+            ("", false),
+        ] {
+            assert_eq!(cookie_ended(a), ended, "{}", a);
+        }
+    }
 
     // The log's names looked up by length are the list's, every one, in any case, and no other;
     // each word that counts anywhere is one of them, as a one-word name is looked up alone

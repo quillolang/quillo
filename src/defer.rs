@@ -84,7 +84,17 @@ pub(crate) fn split(body: Vec<u8>, jobs: Vec<Deferred>) -> Page {
 pub(crate) fn resolve(it: &mut crate::interp::Interp, d: &Deferred, page: (bool, bool)) -> String {
     let (plain_islands, one_swap) = page;
     // Under the route's `with`, as the rest of the page was (branch feedback40-43).
-    match it.under_route(|it| it.render_deferred(d)) {
+    let r = it.under_route(|it| it.render_deferred(d));
+    // A part sent after the page's head has gone out: what its `page_head` says otherwise than the
+    // head went out with reaches the head in the browser alone, as its component runs there; said
+    // once in the log (FEEDBACK84.md, Q-1320,
+    // review of slice H; branch feedback82-85).
+    if let Some(late) = it.page_head.take() {
+        if late.differs(it.head_sent.as_deref()) {
+            late_head(&d.tag);
+        }
+    }
+    match r {
         Ok(html) => {
             let mut made = if one_swap { part_one_swap(d.id, &html) } else { part(d.id, &html) };
             // A part rendered where the page's place is lost (its own raw markup lost it, or the
@@ -108,6 +118,14 @@ pub(crate) fn resolve(it: &mut crate::interp::Interp, d: &Deferred, page: (bool,
         }
         Err(_) => String::new(),
     }
+}
+
+#[cold]
+fn late_head(tag: &str) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        eprintln!("quillo: <{}> waits (defer), so its page_head reaches the page's head in the browser only, once it comes: a crawler that runs no script sees the head without it", tag);
+    });
 }
 
 /// The page whole: the first part, every waiting component's part, the rest.

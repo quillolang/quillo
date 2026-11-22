@@ -1432,6 +1432,10 @@ const NOT_SWEPT: &[(&str, &str)] = &[
     ("ask", "the page's dialog"),
     ("notify", "the page's toast"),
     ("navigate", "the page's address"),
+    // FEEDBACK84.md, Q-1320, Q-1328 (branch feedback82-85): new builtins; `page_head`'s values are
+    // written as the head's text and attributes, escaped, `page_url`'s are the page's address.
+    ("page_head", "the page's head"),
+    ("page_url", "the page's address"),
     ("url", "the page's address"),
     ("local_path", "the page's address"),
     ("cursor_index", "a field's caret"),

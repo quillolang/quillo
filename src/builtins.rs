@@ -86,6 +86,7 @@ pub fn install(env: &Env) {
         ("accept_calls", accept_calls),
         ("__callers", callers),
         ("allow_cross_site", allow_cross_site),
+        ("moves_in_place", moves_in_place),
         ("site_headers", site_headers),
         ("__site", crate::sites::declare),
         ("save_upload", save_upload),
@@ -144,6 +145,8 @@ pub fn install(env: &Env) {
         ("sql_param", sql_param),
         ("url", url),
         ("navigate", navigate),
+        ("page_head", page_head),
+        ("page_url", page_url),
         ("waiting", waiting),
         ("__answer", answer_with),
         ("publish", publish),
@@ -2366,6 +2369,20 @@ fn allow_cross_site(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::Nil)
 }
 
+/// `moves_in_place()`, at the top of a program: from then on every same-site link, and
+/// `navigate`, moves to its route's page in place: the page asked for, what differs swapped in, the
+/// head the new page's, a component on both pages (the same, with the same props) and the page's
+/// states kept; a full load where that is not safe (src/client/runtime.js, `W.inPlace`;
+/// FEEDBACK84.md, Q-1323, Q-1327; decided (user, 2026-11-22): an opt-in switch at the top; branch
+/// feedback82-85).
+fn moves_in_place(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    if !args.is_empty() {
+        return fail(line, "`moves_in_place()` takes nothing");
+    }
+    Arc::make_mut(&mut it.site).in_place = true;
+    Ok(Value::Nil)
+}
+
 /// `site_headers({ "content-security-policy": "..." })`, or `site_headers("/admin", {...})` for
 /// the answers under a path: headers sent with every answer that does not set them itself. A
 /// null value takes away one Quillo sends by itself, `"x-frame-options": null` (FEEDBACK31.md,
@@ -4300,7 +4317,95 @@ fn navigate(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if let Some(scheme) = crate::interp::script_scheme(&s_arg(&args, 0, "navigate", line)?) {
         return fail(line, format!("`navigate` is not given a {} URL", scheme));
     }
+    // `{ replace, scroll }`, both true or false, as the browser checks them (FEEDBACK84.md,
+    // Q-1326; branch feedback82-85).
+    match args.get(1) {
+        None | Some(Value::Nil) => {}
+        Some(Value::Map(m)) => {
+            for (k, v) in m.iter() {
+                if !matches!(&**k, "replace" | "scroll") {
+                    return fail(line, format!("`navigate` has no option `{}`: it takes replace and scroll", &**k));
+                }
+                if !matches!(v, Value::Bool(_) | Value::Nil) {
+                    return fail(line, format!("`navigate`'s `{}` is true or false, got {}", &**k, v.repr()));
+                }
+            }
+        }
+        Some(other) => return fail(line, format!("`navigate`'s options are a map, `{{ replace: true, scroll: false }}`, got {}", other.repr())),
+    }
     Ok(Value::Nil)
+}
+
+/// `page_head({ title, description, image, canonical })`: what goes in the head of the page being
+/// made, its tags written there once it is (src/head.rs), the innermost call winning each key; an
+/// `image` or `canonical` that is a path is made the page's whole address (`page_url`). Null says
+/// nothing. Outside a page it does nothing (FEEDBACK84.md, Q-1320, Q-1321; FEEDBACK81.md, Q-1275;
+/// branch feedback82-85; decided (user, 2026-11-22): a builtin, Nuxt's way).
+fn page_head(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let Some(Value::Map(m)) = args.first() else {
+        return fail(line, "`page_head` takes a map: page_head({ title: \"Home\", description: \"...\" })");
+    };
+    let mut said: Vec<(usize, String)> = Vec::with_capacity(m.len());
+    for (k, v) in m.iter() {
+        let Some(i) = crate::head::KEYS.iter().position(|n| *n == &**k) else {
+            return fail(line, format!("`page_head` has no key `{}`: it takes title, description, image and canonical", &**k));
+        };
+        let text = match v {
+            Value::Nil => continue,
+            Value::Str(s) | Value::Css(s) => s.to_string(),
+            Value::Int(_) | Value::Float(_) => v.display().to_string(),
+            other => return fail(line, format!("`page_head`: `{}` is text or null, got {}", &**k, other.repr())),
+        };
+        let text = if i >= 2 { whole_address(it, &text, "page_head", line)? } else { text };
+        said.push((i, text));
+    }
+    let (depth, comps) = (it.head_depth, it.islands_open());
+    let head = it.page_head.get_or_insert_with(Default::default);
+    for (i, t) in said {
+        head.say(i, depth, comps, t);
+    }
+    head.called();
+    Ok(Value::Nil)
+}
+
+/// `page_url()`: the page's public address, `https://shop.example/shop/posts/3`: the scheme the
+/// request came over (a `--trust-proxy` proxy's `X-Forwarded-Proto`, else `http`), its host, the
+/// program's prefix (`--base`, a mount) and its path, without the query. `page_url("/img/card.png")`:
+/// that path's (FEEDBACK84.md, Q-1328; branch feedback82-85).
+fn page_url(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let path = match args.first() {
+        None | Some(Value::Nil) => {
+            let p = match it.request_value() {
+                Some(Value::Map(m)) => m.get("path").map(|p| p.display().to_string()).unwrap_or_else(|| "/".into()),
+                _ => "/".into(),
+            };
+            p
+        }
+        Some(_) => s_arg(&args, 0, "page_url", line)?.to_string(),
+    };
+    Ok(Value::str(whole_address(it, &path, "page_url", line)?))
+}
+
+/// `path` as a whole address of this program's, for `page_url` and `page_head`: one already whole
+/// (`http://`, `https://`) as it is; a path from `/` with the scheme, host and prefix before it.
+fn whole_address(it: &mut Interp, path: &str, f: &str, line: u32) -> Result<String, Ctrl> {
+    let lower = path.get(..8).unwrap_or(path).to_ascii_lowercase();
+    if lower.starts_with("https://") || lower.starts_with("http://") {
+        return Ok(path.to_string());
+    }
+    if !path.starts_with('/') || path.starts_with("//") {
+        return fail(line, format!("`{}` takes a path that starts with / or a whole http(s) address, got {:?}", f, path));
+    }
+    let https = crate::session::came_over_https(it);
+    // Under --watch, the first name --allowed-hosts gives, rather than what the visitor sent
+    // (review of slice H).
+    let named = crate::server::ALLOWED_HOSTS.get().and_then(|all| all.iter().find(|h| !h.starts_with('.')).cloned());
+    let host = named.or_else(|| match it.request_value() {
+        Some(Value::Map(m)) => m.get("host").map(|h| h.display().to_string()).filter(|h| !h.is_empty()),
+        _ => None,
+    })
+    .unwrap_or_else(|| "localhost".into());
+    Ok(format!("{}://{}{}{}", if https { "https" } else { "http" }, host, it.base, path))
 }
 
 /// What a `routes` group's middleware gave, before a route's body: a response

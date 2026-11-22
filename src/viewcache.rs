@@ -216,7 +216,7 @@ const PURE: &[&str] = &[
 
 const READS: &[&str] = &[
     // Who asks, and for whom.
-    "session", "cookie", "url", "navigate", "tenant", "with_tenant", "with_locale", "live", "__answer", "mcp_tokens",
+    "session", "cookie", "url", "page_url", "navigate", "tenant", "with_tenant", "with_locale", "live", "__answer", "mcp_tokens",
     // A tool's user's answer, which changes nothing: a tool that asks and reads only reads
     // (FEEDBACK56.md, Part E; branch feedback56). `about` was `ask` with three arguments (the
     // user's decision 2026-11-09).
@@ -236,8 +236,8 @@ const ACTS: &[&str] = &[
     "exit", "stdin", "read_line", "notify", "random", "random_int", "uuid", "crypto.token", "crypto.hash_password", "write_file", "delete_file", "save_upload",
     "image.convert", "run_script", "publish", "redirect", "respond", "stream", "events", "listen", "set_cookie", "delete_cookie", "set_session", "end_session", "idempotent",
     "mcp_token", "revoke_mcp_token", "http.post", "http.put", "http.patch", "http.delete", "http.request", "http.stream", "db.exec", "db.exec_many", "db.migrate", "db.open", "db.atomic", "new_tenant",
-    "__service", "__service_later", "__site_call", "__site", "__built", "__callers", "schedule", "translations", "locale_from", "tenant_from", "allow_cross_site", "site_headers",
-    "accept_calls", "style_with", "ready", "channel.on", "channel.send", "channel.broadcast", "channel.open", "receive", "media.rtp", "media.close", "media.on", "udp.listen",
+    "__service", "__service_later", "__site_call", "__site", "__built", "__callers", "schedule", "translations", "locale_from", "tenant_from", "allow_cross_site", "moves_in_place", "site_headers",
+    "page_head", "accept_calls", "style_with", "ready", "channel.on", "channel.send", "channel.broadcast", "channel.open", "receive", "media.rtp", "media.close", "media.on", "udp.listen",
     "udp.send", "udp.reply",
     // The browser's, and a message sent; a sealed user is for this session and time
     // (FEEDBACK67.md, B.3; branch pwa).

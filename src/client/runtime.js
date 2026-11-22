@@ -3234,6 +3234,89 @@ const cssOne = (v) => cssValue(display(v)).replace(/&/g, "\\26 ");
 // Trusted CSS as it is (FEEDBACK79.md, Q-1250, the user's decision; branch feedback72-81).
 B.__css_value = meta((v) => (v instanceof Css ? v : v instanceof Err ? new Err(cssOne(v.error), v.own) : typeof v === "string" || Array.isArray(v) || isMap(v) || v instanceof Html ? cssOne(v) : v), "__css_value", null);
 B.sql = meta((s) => S(s, "sql"), "sql", null);
+// `page_head({ title, description, image, canonical })` in a component: the document's head
+// follows it, as it follows the state the call reads; a component run again says it again, and one
+// gone takes what it said away, the head going back to what an outer one said or the page came
+// with. The innermost wins a key, as on the server (src/head.rs): each component one deeper, one
+// that takes `children` (a layout) one less; then the one with more components around it; then the
+// later (FEEDBACK84.md, Q-1320; FEEDBACK81.md, Q-1275; branch feedback82-85).
+const HEAD_KEYS = ["title", "description", "image", "canonical"];
+const HEAD_TAGS = { title: [["title"], ["meta", "property", "og:title"]], description: [["meta", "name", "description"], ["meta", "property", "og:description"]], image: [["meta", "property", "og:image"]], canonical: [["link", "rel", "canonical"], ["meta", "property", "og:url"]] };
+const Head = { said: [], seq: 0, base: null, by: new WeakMap() };
+B.page_head = meta((m) => {
+  if (!isMap(m)) fail("`page_head` takes a map: page_head({ title: \"Home\", description: \"...\" })");
+  const v = {};
+  for (const k of Object.keys(m)) {
+    if (!HEAD_KEYS.includes(k)) fail(`\`page_head\` has no key \`${k}\`: it takes title, description, image and canonical`);
+    if (isNil(m[k])) continue;
+    if (typeof m[k] !== "string" && !(m[k] instanceof Css) && !isNumber(m[k])) fail(`\`page_head\`: \`${k}\` is text or null, got ${typeName(m[k])}`);
+    v[k] = k === "image" || k === "canonical" ? wholeAddress(display(m[k]), "page_head") : display(m[k]);
+  }
+  let d = 0, n = 0;
+  for (let s = Owner; s; s = s.up) if (s instanceof Inst && s.comp === s) { n++; d += (s.def.$p || []).includes("children") ? -1 : 1; }
+  // Said as a component the server rendered is taken up, the head has it already, as the server
+  // chose among all the page's calls, its views' too: it counts once what it says changes. Else an
+  // outer component's default title, taken up, took the place of the one a view had set.
+  const was = Owner && Head.by.get(Owner), same = was && HEAD_KEYS.every((k) => was.v[k] === v[k]);
+  const e = { v, d, n, seq: ++Head.seq, server: Resuming > 0 || !!(same && was.server) };
+  // A key whose head the server wrote from another call (one inside this component, say, which
+  // the browser has not taken up) this one lost there, and goes on losing while the page is the
+  // same: an outer layout's title said again did not give way to its page's (review of slice H).
+  e.lost = Resuming > 0 ? headLost(v) : was ? was.lost : null;
+  if (Owner) Head.by.set(Owner, e);
+  Head.said.push(e);
+  onCleanup(() => { const i = Head.said.indexOf(e); if (i >= 0) { Head.said.splice(i, 1); headShow(); } });
+  headShow();
+  return null;
+}, "page_head", null);
+// Components being taken up from the server's HTML (see `resume`).
+let Resuming = 0;
+// The keys of `v` the head shows otherwise than `v` says, as the server wrote it.
+function headLost(v) {
+  const out = new Set();
+  if (typeof document === "undefined" || !document.head) return out;
+  for (const k of Object.keys(v)) {
+    const t = HEAD_TAGS[k][0], el = headTag(t);
+    const now = t.length === 1 ? (el ? document.title : null) : el ? el.getAttribute(headAttr(t)) : null;
+    if (now !== v[k]) out.add(k);
+  }
+  return out;
+}
+// The tag of `t` (`["meta", "property", "og:title"]`) in the head, or none.
+const headTag = (t) => (t.length === 1 ? document.querySelector("head > title") : document.head.querySelector(`${t[0]}[${t[1]}="${t[2]}"]`));
+const headAttr = (t) => (t[0] === "link" ? "href" : "content");
+function headShow() {
+  if (typeof document === "undefined" || !document.head) return;
+  // What the page came with, for a key no call says any more.
+  if (!Head.base) {
+    Head.base = {};
+    for (const k of HEAD_KEYS) for (const t of HEAD_TAGS[k]) { const el = headTag(t); Head.base[t.join(" ")] = t.length === 1 ? (el ? document.title : null) : el ? el.getAttribute(headAttr(t)) : null; }
+  }
+  const win = {};
+  // Every call takes part, those the server wrote too, which are only not written again: an outer
+  // layout's title said again does not take the place of an inner page's (review of slice H).
+  for (const e of Head.said) for (const k of Object.keys(e.v)) {
+    if (e.lost && e.lost.has(k)) continue;
+    const w = win[k];
+    if (!w || e.d > w.d || (e.d === w.d && (e.n > w.n || (e.n === w.n && e.seq > w.seq)))) win[k] = e;
+  }
+  for (const k of HEAD_KEYS) for (const t of HEAD_TAGS[k]) {
+    const v = win[k] && !win[k].server ? win[k].v[k] : Head.base[t.join(" ")];
+    if (t.length === 1) { if (v !== null && document.title !== v) document.title = v; continue; }
+    let el = headTag(t);
+    if (v === null) { if (el) el.remove(); continue; }
+    if (!el) { el = document.createElement(t[0]); el.setAttribute(t[1], t[2]); document.head.appendChild(el); }
+    if (el.getAttribute(headAttr(t)) !== v) el.setAttribute(headAttr(t), v);
+  }
+}
+// `page_url()`: the page's whole address, without its query; `page_url("/img/a.png")`, a path's
+// of this program's (FEEDBACK84.md, Q-1328; branch feedback82-85).
+B.page_url = meta((p) => (isNil(p) ? location.origin + location.pathname : wholeAddress(S(p, "page_url"), "page_url")), "page_url", null);
+function wholeAddress(p, f) {
+  if (/^https?:\/\//i.test(p)) return p;
+  if (p[0] !== "/" || p[1] === "/") fail(`\`${f}\` takes a path that starts with / or a whole http(s) address, got ${repr(p)}`);
+  return location.origin + withBase(p);
+}
 // A run the page moved under does not move it again: once the person went to another page (a link,
 // Back or Forward, a link or a form the browser follows itself) or a run that began after it moved
 // the page, its `navigate` does nothing. A save that ended after the person had left took them on
@@ -3241,14 +3324,14 @@ B.sql = meta((s) => S(s, "sql"), "sql", null);
 // does not stop it, and its own moves are its own; a change of the hash alone keeps the page, and
 // code that does not wait is a run that begins as it moves (FEEDBACK61.md, Q-902; branch
 // feedback61).
-B.navigate = meta((to) => {
+B.navigate = meta((to, opts) => {
   to = S(to, "navigate");
   let r = Run;
   if (r !== null) while (r.up) r = r.up;
   const at = r !== null ? r.nav : ++Nav.runs;
   if (Nav.last > at) return null;
   Nav.by = at;
-  try { navigate(to); } finally { Nav.by = 0; }
+  try { navigate(to, opts); } finally { Nav.by = 0; }
   return null;
 }, "navigate", null);
 // The person leaving the page by a link or a form that the browser follows itself, which takes a
@@ -6234,6 +6317,9 @@ function livePatched(old, p) {
 }
 
 async function rpc(name, args, idem) {
+  // What a page asked for ahead is from before this call, which may have changed it (see
+  // `ipAhead`; third review of slice H).
+  QW.called = (QW.called || 0) + 1;
   return (await (idem ? rpcOnce(name, args) : rpcRaw(name, args, false))).value;
 }
 
@@ -7857,7 +7943,7 @@ function setClass(el, v, svg) {
 // feedback61): `page`, the address's path and query; `runs`, the runs begun, which numbers them;
 // `last`, the number of the latest of those that moved the page, or one past all those begun
 // when the person moved it; `by`, the run moving it now.
-const Nav = { at: new Sig(""), on: false, page: "", runs: 0, last: 0, by: 0 };
+const Nav = { at: new Sig(""), on: false, page: "", runs: 0, last: 0, by: 0, moves: 0, back: 0 };
 
 // What reads url() follows it.
 function navChanged() {
@@ -7896,13 +7982,14 @@ function leaving(e) {
 // the wait is all data. So what is kept is that page's components' state: taken as a page
 // being resumed takes it, it needs no new way to ask for data and shows no `null` first
 // (FEEDBACK22.md, Q-180; branch feedback22-fixes).
-const Ahead = { to: "", states: null, at: 0, turn: 0 };
+const Ahead = { to: "", states: null, at: 0, turn: 0, wait: null };
 // As long as a browser may keep a prefetch of ours.
 const AHEAD_KEPT = 30000;
 
 function aheadDrop() {
   Ahead.to = "";
   Ahead.states = null;
+  Ahead.wait = null;
   Ahead.turn++;
 }
 
@@ -7927,14 +8014,17 @@ function fetchAhead(e) {
   aheadDrop();
   Ahead.to = to;
   const turn = Ahead.turn;
-  fetch(to, { credentials: "same-origin", headers: { "x-quillo-prefetch": "1" } })
+  // While it is on its way, a click waits for it rather than asking again (FEEDBACK84.md, Q-1330;
+  // branch feedback82-85).
+  Ahead.wait = fetch(to, { credentials: "same-origin", headers: { "x-quillo-prefetch": "1" } })
     .then((r) => (r.ok ? r.text() : null))
     .then((html) => {
       if (html === null || turn !== Ahead.turn) return;
       Ahead.states = new DOMParser().parseFromString(html, "text/html");
       Ahead.at = Date.now();
     })
-    .catch(() => {});
+    .catch(() => {})
+    .finally(() => { if (turn === Ahead.turn) Ahead.wait = null; });
 }
 
 // The state for the components a page brings. Not for one already on this page: it lives on
@@ -7961,14 +8051,24 @@ function navStart() {
   Nav.page = location.pathname + location.search;
   // Links in components are followed here: not prefetched as pages.
   QW.nav = true;
-  window.addEventListener("popstate", navChanged);
+  // Back and Forward give the page's scroll back once it has what it had (FEEDBACK84.md, Q-1324;
+  // branch feedback82-85): each entry keeps its own, as it scrolls.
+  navScrollKeep();
+  window.addEventListener("popstate", () => {
+    if (QW.ip) return;
+    const was = Nav.page.split("?")[0], at = navScrollAt();
+    Nav.moves++;
+    navChanged();
+    navScrollBack(at);
+  });
   window.addEventListener("hashchange", navChanged);
   let pointed = 0;
   const o = { capture: true, passive: true };
   document.addEventListener("pointerover", (e) => { clearTimeout(pointed); pointed = setTimeout(() => fetchAhead(e), 65); }, o);
   for (const v of ["pointerdown", "touchstart", "focusin"]) document.addEventListener(v, fetchAhead, o);
   document.addEventListener("click", (e) => {
-    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+    // Moves in place follow every link themselves (see `W.inPlace`).
+    if (QW.ip || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     const u = followed(e.target.closest && e.target.closest("a[href]"));
     if (!u) return;
     const path = u.pathname.slice(BASE.length) || "/";
@@ -7976,15 +8076,35 @@ function navStart() {
     // its popstate (or hashchange) updates url().
     if (u.hash && u.pathname === location.pathname && u.search === location.search) return;
     e.preventDefault();
-    navigate(path + u.search + u.hash);
+    navigate(path + u.search + u.hash, null, true);
   });
 }
 
-function navigate(to) {
+// `navigate(path, { replace, scroll })`: `replace` takes the place of the address's history
+// entry rather than adding one, `scroll: false` leaves the page where it is (FEEDBACK84.md,
+// Q-1326; branch feedback82-85).
+function navOptions(o) {
+  if (isNil(o)) return {};
+  if (!isMap(o)) fail(`\`navigate\`'s options are a map, \`{ replace: true, scroll: false }\`, got ${typeName(o)}`);
+  for (const k of Object.keys(o)) {
+    if (k !== "replace" && k !== "scroll") fail(`\`navigate\` has no option \`${k}\`: it takes replace and scroll`);
+    if (!isNil(o[k]) && typeof o[k] !== "boolean") fail(`\`navigate\`'s \`${k}\` is true or false, got ${typeName(o[k])}`);
+  }
+  return { replace: o.replace === true, scroll: o.scroll !== false };
+}
+
+function navigate(to, opts, link) {
   // A javascript: URL runs as the page when nothing follows url(): `navigate(next)` after a
   // sign-in was XSS (FEEDBACK51.md, Q-645; branch feedback51-fixes).
   if (scriptURL(to)) fail(`\`navigate\` is not given a ${scriptScheme(to)} URL`);
+  const o = navOptions(opts);
   const full = withBase(to);
+  // Moves in place: the route's page, as a link's (see `W.inPlace`).
+  if (QW.ip && QW.ipGo) {
+    if (Nav.by) Nav.last = Math.max(Nav.last, Nav.by);
+    QW.ipGo(new URL(full, location.href), o);
+    return null;
+  }
   // Nothing on the page follows url(): load the page there.
   if (!Nav.on) {
     // A run's move, for one begun before it (see `B.navigate`; FEEDBACK61.md, Q-902; branch
@@ -8001,15 +8121,312 @@ function navigate(to) {
     navChanged();
     return null;
   }
-  if (full !== location.pathname + location.search + location.hash) history.pushState(null, "", full);
-  window.scrollTo(0, 0);
-  // For the render this sets off, which runs as a microtask queued before this one's.
-  const kept = aheadFor(u);
-  if (kept) hydrating = kept;
-  navChanged();
-  if (kept) queueMicrotask(() => { if (hydrating === kept) hydrating = null; });
-  if (u.hash) toHash();
+  const path = location.pathname;
+  navScrollSave();
+  if (full !== location.pathname + location.search + location.hash) {
+    if (o.replace) history.replaceState(null, "", full);
+    else history.pushState(null, "", full);
+  }
+  if (o.scroll !== false) window.scrollTo(0, 0);
+  const moves = ++Nav.moves, by = Nav.by;
+  const go = () => {
+    // Another move came while this one waited.
+    if (moves !== Nav.moves) return;
+    // For the render this sets off, which runs as a microtask queued before this one's.
+    const kept = aheadFor(u);
+    if (kept) hydrating = kept;
+    Nav.by = by;
+    try { navChanged(); } finally { Nav.by = 0; }
+    if (kept) queueMicrotask(() => { if (hydrating === kept) hydrating = null; });
+    if (u.hash) toHash();
+    // Only a link moves the focus here: a `navigate` from code keeps it where it is, as 0.8.10 did.
+    if (link && u.pathname !== path) moved();
+  };
+  // The page asked for ahead is on its way: waited for, which is the earlier request, rather than
+  // the page asking its server fns as well (FEEDBACK84.md, Q-1330; branch feedback82-85).
+  if (Ahead.wait && Ahead.to === u.pathname + u.search) {
+    const t = setTimeout(go, AHEAD_WAIT);
+    Ahead.wait.then(() => { clearTimeout(t); go(); });
+    return null;
+  }
+  go();
   return null;
+}
+
+// How long a move waits for the page asked for ahead before it goes without it.
+const AHEAD_WAIT = 3000;
+
+// The scroll of each history entry, kept in its state as the page scrolls, and given back on Back
+// and Forward once the page is as long as it was, or the person scrolls (FEEDBACK84.md, Q-1324;
+// branch feedback82-85).
+function navScrollSave() {
+  try { history.replaceState(Object.assign({}, isMap(history.state) ? history.state : null, { qs: [scrollX, scrollY] }), ""); } catch (_) {}
+}
+function navScrollKeep() {
+  if (Nav.kept) return;
+  Nav.kept = true;
+  let t = 0;
+  window.addEventListener("scroll", () => { if (!Nav.back) { clearTimeout(t); t = setTimeout(() => { if (!Nav.back) navScrollSave(); }, 120); } }, { passive: true });
+}
+// The scroll the entry gone back or forward to had, read as it is come to: the browser's own try
+// at it scrolls the page that is still there, which would be kept in its place.
+function navScrollAt() {
+  const st = history.state, at = st && Array.isArray(st.qs) ? st.qs : null;
+  if (at) Nav.back = -1;
+  return at;
+}
+function navScrollBack(at) {
+  if (!at) return;
+  const href = location.href, until = Date.now() + 2000;
+  let n = Nav.back = Math.max(Nav.back, 0) + 1;
+  // The person's own scroll, or a key, ends it; its listeners go as it ends.
+  const evs = ["wheel", "touchstart", "keydown"];
+  const stop = () => {
+    if (Nav.back === n) Nav.back = 0;
+    n = -1;
+    for (const v of evs) window.removeEventListener(v, stop);
+  };
+  for (const v of evs) window.addEventListener(v, stop, { passive: true });
+  const look = () => {
+    if (n < 0) return;
+    if (n !== Nav.back || location.href !== href) { stop(); return; }
+    window.scrollTo(at[0], at[1]);
+    if (Math.abs(scrollY - at[1]) < 2 && Math.abs(scrollX - at[0]) < 2 || Date.now() > until) { stop(); return; }
+    requestAnimationFrame(look);
+  };
+  requestAnimationFrame(look);
+}
+
+// After a move in place, as a page load does for nothing: the focus at the page's `<main>` or its
+// first heading, and its title said in a live region Quillo keeps (FEEDBACK84.md, Q-1325; branch
+// feedback82-85). For a link in a program that follows url(); for a link, Back, Forward and a
+// `navigate` that adds an entry where moves are in place; never while a field has the focus (review
+// of slice H).
+let Said = null;
+function moved() {
+  requestAnimationFrame(() => {
+    // Never away from a field the person is typing in.
+    const a = document.activeElement;
+    if (a && (a.isContentEditable || /^(input|textarea|select)$/.test(a.localName))) return;
+    const to = document.querySelector("main") || document.querySelector("h1");
+    if (to) {
+      if (!to.hasAttribute("tabindex") && to.tabIndex < 0) to.setAttribute("tabindex", "-1");
+      to.focus({ preventScroll: true });
+    } else if (document.activeElement && document.activeElement !== document.body && document.activeElement.blur) document.activeElement.blur();
+    if (!Said || !Said.isConnected) {
+      Said = Said || document.createElement("div");
+      Said.setAttribute("aria-live", "polite");
+      Said.setAttribute("aria-atomic", "true");
+      Said.setAttribute("data-quillo-said", "");
+      Object.assign(Said.style, { position: "absolute", width: "1px", height: "1px", margin: "-1px", padding: "0", overflow: "hidden", clipPath: "inset(50%)", whiteSpace: "nowrap", border: "0" });
+      document.body.appendChild(Said);
+    }
+    Said.textContent = "";
+    setTimeout(() => { Said.textContent = document.title; }, 50);
+  });
+}
+
+// ---- moves in place (FEEDBACK84.md, Q-1323, Q-1327; branch feedback82-85) ----------------------
+//
+// `moves_in_place()` at the top of a program (decided (user, 2026-11-22): an opt-in switch): every
+// same-site link, and `navigate`, asks for its route's page and changes this one to it in place.
+// The head becomes the new page's (its title, meta tags, canonical link, style sheets); the body
+// the new page's, but for each component on both pages, the same component with the same props at
+// the same place among those of its name, which is kept as it is, states and all; the others start
+// from the state the server wrote. The page's states (`state x = v` at the top) keep their values.
+// A full load instead where in place is not safe: an answer that is no HTML page, another site's
+// or another program's address, a page whose head has other scripts of the program's own, a
+// script of the program's in its body, a part still to come (`defer`), or anything failing on the
+// way. A link with `target`, `download` or `data-reload`, or a modifier key, is the browser's.
+const IP = { on: false, ahead: null, turn: 0, shown: "", ik: "" };
+
+// Where a link goes, if it is one moved to in place.
+function ipLink(a) {
+  if (!a || typeof a.href !== "string" || (a.target && a.target !== "_self") || a.hasAttribute("download") || a.hasAttribute("data-reload")) return null;
+  const u = new URL(a.href, location.href);
+  if (u.origin !== location.origin || !/^https?:$/.test(u.protocol)) return null;
+  if (BASE && u.pathname !== BASE && !u.pathname.startsWith(BASE + "/")) return null;
+  return (u.pathname.slice(BASE.length) || "/").startsWith("/_quillo/") ? null : u;
+}
+// A file's address (`/report.pdf`), loaded as it is rather than asked for as a page.
+const ipFile = (u) => /\.[A-Za-z0-9]{1,8}$/.test(u.pathname) && !/\.html?$/i.test(u.pathname);
+
+function ipClick(e) {
+  if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+  const u = ipLink(e.target.closest && e.target.closest("a[href], area[href]"));
+  if (!u || ipFile(u)) return;
+  // A spot on this page: the browser goes there.
+  if (u.hash && u.pathname + u.search === IP.shown) return;
+  e.preventDefault();
+  // The person moved the page (see `leaving`, `B.navigate`; FEEDBACK61.md, Q-902).
+  Nav.last = ++Nav.runs;
+  ipGo(u, {});
+}
+
+// A link pointed at, pressed or focused: its page asked for ahead, as a prefetch (which changes
+// nothing on the server), kept for the click for as long as a prefetch is.
+function ipAhead(e) {
+  const a = e.target.closest && e.target.closest("a[href]");
+  const u = a && !a.closest("[data-no-prefetch]") ? ipLink(a) : null;
+  const c = navigator.connection;
+  if (!u || !QW.pf || ipFile(u) || (c && (c.saveData || /2g/.test(c.effectiveType || "")))) return;
+  const to = u.pathname + u.search;
+  if (to === IP.shown || (IP.ahead && IP.ahead.to === to && Date.now() - IP.ahead.at < AHEAD_KEPT)) return;
+  IP.ahead = { to, at: Date.now(), called: QW.called || 0, page: ipFetch(to, true) };
+}
+
+// The page at `to`: its final address, its status, and its HTML, or null for an answer that is no
+// HTML page; null when it could not be asked for.
+// Asked for as a prefetch is, whether ahead or for the move itself: the route runs changing
+// nothing, and one that would change something (a sign-out, a flash read, a cart's `?add=`) is
+// refused, so the load that follows is its only run that counts; an answer that is no page is not
+// read on. A move never runs a GET's effects twice (review of slice H).
+function ipFetch(to, ahead) {
+  const stop = new AbortController();
+  // A guess as the link is pointed at is a prefetch, kept by the browser for the click; the move's
+  // own fetch has a header of its own, read-only whatever --no-prefetch says, and is never kept,
+  // so it is the page as it is now (third review of slice H).
+  const how = ahead ? { headers: { "x-quillo-prefetch": "1" } } : { headers: { "x-quillo-move": "1" }, cache: "no-store" };
+  return fetch(to, Object.assign({ credentials: "same-origin", signal: stop.signal }, how))
+    .then(async (r) => {
+      const page = r.ok || r.status === 404 ? /^\s*text\/html/i.test(r.headers.get("content-type") || "") : false;
+      if (!page) stop.abort();
+      return { url: r.url, status: r.status, ahead, html: page ? await r.text() : null };
+    })
+    .catch(() => null);
+}
+
+function ipPop() {
+  // Any move under way gives way to this one.
+  IP.turn++;
+  // Only an entry this runtime made (or the browser's own for a spot on one of its pages); any other
+  // is the program's own `history`, left to it (review of slice H).
+  const st = history.state;
+  if (st !== null && !(isMap(st) && st.qip)) return;
+  // The same page, another spot on it.
+  if (location.pathname + location.search === IP.shown) { navChanged(); return; }
+  ipGo(new URL(location.href), { pop: true, at: navScrollAt() });
+}
+
+async function ipGo(u, o) {
+  const turn = ++IP.turn, to = u.pathname + u.search;
+  Nav.moves++;
+  if (!o.pop && u.hash && to === IP.shown) {
+    if (u.hash !== location.hash) location.hash = u.hash;
+    else toHash();
+    navChanged();
+    return;
+  }
+  if (ipFile(u)) { location.assign(u.href); return; }
+  // Taken from the request made as the link was pointed at, waited for while it is on its way
+  // (FEEDBACK84.md, Q-1330); asked for as a move when that one was refused or is too old.
+  const a = IP.ahead;
+  IP.ahead = null;
+  // Not one asked for before a server fn ran since, which may have changed the page.
+  let got = a && a.to === to && Date.now() - a.at < AHEAD_KEPT && a.called === (QW.called || 0) ? await a.page : null;
+  if (turn !== IP.turn) return;
+  if (!got) got = await ipFetch(to, false);
+  if (turn !== IP.turn) return;
+  const end = got && got.html !== null ? new URL(got.url || u.href, location.href) : null;
+  if (end) end.hash = u.hash;
+  const doc = end && ipLink({ href: end.href, hasAttribute: () => false }) ? new DOMParser().parseFromString(got.html, "text/html") : null;
+  const plan = doc && ipPlan(doc);
+  if (!plan) {
+    // An entry gone back to is one this runtime made, for a GET: loaded in its place.
+    if (o.pop) location.replace(location.href);
+    else location.assign((end || u).href);
+    return;
+  }
+  const path = IP.shown.split("?")[0], href = end.pathname + end.search + end.hash;
+  if (!o.pop) {
+    navScrollSave();
+    if (o.replace || href === location.pathname + location.search + location.hash) history.replaceState({ qip: 1 }, "", href);
+    else history.pushState({ qip: 1 }, "", href);
+  }
+  await plan.ready;
+  if (turn !== IP.turn) { plan.drop(); return; }
+  plan.swap();
+  IP.shown = end.pathname + end.search;
+  Nav.by = o.by || 0;
+  try { navChanged(); } finally { Nav.by = 0; }
+  if (o.pop) navScrollBack(o.at);
+  else if (end.hash) toHash();
+  else if (o.scroll !== false) window.scrollTo(0, 0);
+  // Not for a `navigate` that replaces the entry, as a search box's on each key does.
+  if (end.pathname !== path && !o.replace) moved();
+}
+
+// Quillo's own scripts of a page (its loader, the page's states, prefetching, --watch's), which
+// a move does not run again; and a script that is code, not data (JSON-LD, a template).
+// Marked so by the server (`data-quillo`), not told by what they say: a script of the program's
+// that names Quillo's key is the program's (third review of slice H).
+const ipOwn = (n) => n.hasAttribute("data-quillo") || n.textContent.startsWith("/*quillo-dev*/") || (n.getAttribute("src") || "").startsWith(BASE + "/_quillo/") || n.type === "speculationrules";
+const ipCode = (n) => /^(|module|(text|application)\/(x-)?(java|ecma)script)$/.test((n.getAttribute("type") || "").trim().toLowerCase());
+const ipOuter = (root) => [...root.querySelectorAll(ISLANDS)].filter((i) => !(i.parentElement && i.parentElement.closest(ISLANDS)));
+
+// What changes this page to `doc`, or null where it cannot be done in place: `ready` once the new
+// page's style sheets have come (or 3 s), then `swap`.
+function ipPlan(doc) {
+  if (!doc.head || !doc.body || doc.querySelector("[data-qd]")) return null;
+  // The same program's page, of the same version, with the same policies, for the same visitor:
+  // another program's (a mount's), a new version's, one that may not be framed or has another
+  // policy, or one after a sign-in or a sign-out, is loaded (review of slice H).
+  const key = [...doc.querySelectorAll("script[data-quillo]:not([src])")].filter((x) => x.textContent.startsWith("(()=>{const d=document,W=window,k=Symbol.for(\"quillo\")")).map((x) => (/\bw\.ik="([0-9a-f]+)"/.exec(x.textContent) || [])[1]).find(Boolean);
+  if (!IP.ik || key !== IP.ik) return null;
+  // The scripts each page's head was written with are in the key, not the live head's, where a
+  // library the loader adds, or an analytics script, has its own.
+  for (const x of doc.body.querySelectorAll("script")) if (!ipOwn(x) && ipCode(x)) return null;
+  // The head's other elements, by what they are: those of the new page's that this one lacks
+  // come, those it no longer has go. The new style sheets come first, and are waited for.
+  const tags = (d) => [...d.head.children].filter((n) => n.localName !== "script" && n.localName !== "title");
+  const was = tags(document), now = tags(doc);
+  const wasK = new Set(was.map((n) => n.outerHTML)), nowK = new Set(now.map((n) => n.outerHTML));
+  const added = now.filter((n) => !wasK.has(n.outerHTML)).map((n) => document.importNode(n, true));
+  const sheets = added.filter((n) => n.localName === "link" && /\bstylesheet\b/i.test(n.rel));
+  const ready = Promise.all(sheets.map((l) => new Promise((ok) => {
+    const t = setTimeout(ok, 3000);
+    l.addEventListener("load", () => { clearTimeout(t); ok(); });
+    l.addEventListener("error", () => { clearTimeout(t); ok(); });
+    document.head.appendChild(l);
+  })));
+  const swap = () => {
+    for (const n of was) if (!nowK.has(n.outerHTML)) n.remove();
+    for (const n of added) if (!n.isConnected) document.head.appendChild(n);
+    document.title = doc.title;
+    // What `page_head` said in the browser, again over the new page's head, which the server
+    // wrote for this page: what a kept component says that it does not show is what it lost there.
+    Head.base = null;
+    for (const e of Head.said) e.lost = headLost(e.v);
+    if (Head.said.length) headShow();
+    // The components on both pages, kept: each the n-th of its name, with the same props.
+    const olds = {}, nth = {}, kept = new Set();
+    const old = ipOuter(document.body);
+    for (const el of old) (olds[el.dataset.c] = olds[el.dataset.c] || []).push(el);
+    const body = document.importNode(doc.body, true);
+    for (const x of [...body.querySelectorAll("script")]) if (ipOwn(x)) x.remove();
+    for (const n of ipOuter(body)) {
+      const c = n.dataset.c, i = nth[c] = (nth[c] || 0) + 1, o = olds[c] && olds[c][i - 1];
+      if (o && o.__qi && !o.__qi.dead && o.getAttribute("data-p") === n.getAttribute("data-p")) { n.replaceWith(o); kept.add(o); }
+    }
+    for (const el of old) if (!kept.has(el) && el.__qi) dispose(el.__qi);
+    removing++;
+    try {
+      // The new page's own on <html> (lang, dir, a theme) and <body>.
+      for (const [from, to] of [[doc.documentElement, document.documentElement], [body, document.body]]) {
+        for (const a of [...to.attributes]) if (!from.hasAttribute(a.name)) to.removeAttribute(a.name);
+        for (const a of [...from.attributes]) if (to.getAttribute(a.name) !== a.value) to.setAttribute(a.name, a.value);
+      }
+      document.body.replaceChildren(...body.childNodes);
+    } finally {
+      removing--;
+    }
+    // The new page's own components, taken up as a page's are (see `boot`).
+    const byItself = (i) => i.hasAttribute("data-e") || i.hasAttribute("data-l");
+    for (const i of ipOuter(document.body)) if (!kept.has(i) && (byItself(i) || i.parentElement === document.body || [...i.querySelectorAll(ISLANDS)].some(byItself))) resume(i);
+  };
+  // A move another took the place of: its style sheets go again.
+  const drop = () => { for (const l of sheets) l.remove(); };
+  return { ready, swap, drop };
 }
 
 // Goes to the element the address's #hash names, as the browser does for
@@ -9813,10 +10230,12 @@ function resume(el) {
   hydrating = queue();
   let inst = new Inst(def, props, state, liveInfo);
   inst.el = el;
-  if (DEV) { el.__qi = inst; el.__qp = props; }
+  if (DEV || QW.ip) { el.__qi = inst; el.__qp = props; }
   let ok = true;
   try {
-    run(inst, el, true);
+    // What `page_head` says as it is taken up is what the server wrote (see `B.page_head`).
+    Resuming++;
+    try { run(inst, el, true); } finally { Resuming--; }
     QW.resumed = (QW.resumed || 0) + 1;
   } catch (e) {
     // Made again from what a reload kept, which the server's HTML is not: as it should be.
@@ -9848,7 +10267,7 @@ function resume(el) {
     run(inst, el, false, svg);
     const r = asOwnRoot(el, inst, svg);
     if (r !== el) { el.replaceWith(r); el = r; }
-    if (DEV) { el.__qi = inst; el.__qp = props; }
+    if (DEV || QW.ip) { el.__qi = inst; el.__qp = props; }
   }
   hydrating = null;
   if (TOOLS) toolsMade(inst);
@@ -10146,6 +10565,29 @@ W.component = (name, params, render) => {
   render.$comp = true;
   C[name] = render;
   return render;
+};
+// Moves in place start here, for a program that says `moves_in_place()` (see `IP`; FEEDBACK84.md,
+// Q-1323; branch feedback82-85).
+W.inPlace = () => {
+  if (IP.on || typeof window === "undefined") return;
+  IP.on = true;
+  QW.ip = true;
+  QW.nav = true;
+  // A run's own move stays its own as it comes (see `B.navigate`; FEEDBACK61.md, Q-902).
+  QW.ipGo = (u, o) => { ipGo(u, Object.assign({ by: Nav.by }, o)); };
+  IP.shown = Nav.page = location.pathname + location.search;
+  // What the page this is shares with one it moves to (`in_place_key` in src/server.rs). A page
+  // with none (a form's POST made it) moves nothing: its links load, and Back is the browser's.
+  IP.ik = QW.ik || "";
+  if (!IP.ik) return;
+  try { history.replaceState(Object.assign({}, isMap(history.state) ? history.state : null, { qip: 1 }), ""); } catch (_) {}
+  navScrollKeep();
+  window.addEventListener("popstate", ipPop);
+  let pointed = 0;
+  const o = { capture: true, passive: true };
+  document.addEventListener("pointerover", (e) => { clearTimeout(pointed); pointed = setTimeout(() => ipAhead(e), 65); }, o);
+  for (const v of ["pointerdown", "touchstart", "focusin"]) document.addEventListener(v, ipAhead, o);
+  document.addEventListener("click", ipClick);
 };
 // A function's form for `<Name .../>`: its code once, with props as getters.
 W.view = (f, view) => { f.$view = view; return f; };
