@@ -306,10 +306,41 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
     // a file takes whole, through any number of files; a file taken both ways is taken, whatever
     // the order the files were read in (FEEDBACK83.md, Q-1301, found in review; branch
     // feedback82-85). The main file is the program's own.
+    // So is a mounted program's or a service's main file to the files of its own program: one of
+    // them taking a name of it (`import main.qwe use own` in sub/part.qwe) made it a taken file,
+    // and its routes, the mounted program's own, were not served until a `routes` line confirmed
+    // them. Taken by a file another program reaches by `use` (the main program's, a kit's, its own
+    // mount's), its code runs there, at that program's paths, and it is held as before
+    // (FEEDBACK83.md, Q-1301, found by the coverage tests; branch feedback82-85).
+    let roots: HashSet<PathBuf> = read.values().flat_map(|r| r.takes.iter().filter(|(_, _, used)| !*used).map(|(k, _, _)| k.clone())).chain([main_key.clone()]).collect();
+    let members: std::cell::OnceCell<HashMap<PathBuf, HashSet<PathBuf>>> = std::cell::OnceCell::new();
+    let own_program = |taker: &PathBuf, t: &PathBuf| -> bool {
+        if !roots.contains(t) {
+            return false;
+        }
+        // Each file's programs: the main files it is reached from by `use`, worked out only for a
+        // program's main file taken by name, which few programs have.
+        let m = members.get_or_init(|| {
+            let mut m: HashMap<PathBuf, HashSet<PathBuf>> = HashMap::new();
+            for root in &roots {
+                let mut todo = vec![root.clone()];
+                while let Some(k) = todo.pop() {
+                    if !m.entry(k.clone()).or_default().insert(root.clone()) {
+                        continue;
+                    }
+                    if let Some(r) = read.get(&k) {
+                        todo.extend(r.takes.iter().filter(|(_, _, used)| *used).map(|(f, _, _)| f.clone()));
+                    }
+                }
+            }
+            m
+        });
+        m.get(taker).is_some_and(|programs| programs.iter().all(|p| p == t))
+    };
     let mut taken: HashMap<PathBuf, Vec<String>> = HashMap::new();
-    for r in read.values() {
+    for (rk, r) in &read {
         for (k, names, _) in &r.takes {
-            if let Some(n) = names.as_ref().filter(|_| *k != main_key) {
+            if let Some(n) = names.as_ref().filter(|_| *k != main_key && !own_program(rk, k)) {
                 taken.entry(k.clone()).or_default().extend(n.iter().cloned());
             }
         }
@@ -321,7 +352,7 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
                 continue;
             }
             for (t, names, used) in &r.takes {
-                if *used && names.is_none() && *t != main_key && !taken.contains_key(t) && read.contains_key(t) {
+                if *used && names.is_none() && *t != main_key && !taken.contains_key(t) && read.contains_key(t) && !own_program(k, t) {
                     more.push((t.clone(), format!("what {} takes", r.name)));
                 }
             }
@@ -342,10 +373,21 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
             match s {
                 // A taken file's `service mcp` line offers its service's tools: ways in, as its own
                 // tools are (Q-1301, found in review of the coverage fixes).
-                Stmt::Service(name, _, path, _, line, true) if b.taken && !is_address(path) => {
-                    let prefix = format!("{}.", name);
-                    routes.extend(b.service_tools.iter().filter(|(d, _, _)| d.starts_with(&prefix)).map(|(d, _, _)| (format!("fn mcp {}", d), *line)));
+                // And a taken file's `mount /x` and `service /x` serve another program at /x: ways
+                // in too, listed by the path they serve. A kit taken for `Badge` mounted a program
+                // at /x under a quillo.confirmed that confirmed nothing of it (FEEDBACK83.md,
+                // Q-1301, found by the coverage tests; branch feedback82-85). A service with no
+                // path is only called, by the program's own code, and adds none.
+                Stmt::Service(name, prefix, path, _, line, mcp) if b.taken => {
+                    if *mcp && !is_address(path) {
+                        let named = format!("{}.", name);
+                        routes.extend(b.service_tools.iter().filter(|(d, _, _)| d.starts_with(&named)).map(|(d, _, _)| (format!("fn mcp {}", d), *line)));
+                    }
+                    if let Some(p) = prefix {
+                        routes.push((format!("service {}", p), *line));
+                    }
                 }
+                Stmt::Mount(prefix, _, line) if b.taken => routes.push((format!("mount {}", prefix), *line)),
                 Stmt::Use(path, _, line, _) if is_script(path) && is_address(path) => add(&mut b.scripts, path.clone(), *line),
                 Stmt::Route(rd) if b.taken => routes.push((rd.shown(), rd.line)),
                 // A taken file's `server fn` is called from the browser, and its `fn mcp` by an AI
@@ -401,6 +443,10 @@ fn entry_name(d: &FnDef) -> String {
 fn scan_taken(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>>>) -> Scan {
     let dir = dir_of(main);
     let base = crate::modules::source_dir(main);
+    // The main file is the program's own here too: `import main.qwe use site`, which `quillo fix`
+    // writes, had check say "main.qwe is taken for site, and also adds GET /" (FEEDBACK83.md,
+    // Q-1301, found by the coverage tests; branch feedback82-85).
+    let main_key = crate::modules::key(main);
     let mut out = Scan::default();
     let mut taken: HashMap<PathBuf, Vec<String>> = HashMap::new();
     for (file, stmts) in parsed {
@@ -418,7 +464,10 @@ fn scan_taken(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>>>)
                     }
                 }
             } else if let Some(names) = names {
-                taken.entry(crate::modules::key(&full)).or_default().extend(names.iter().map(|(n, _)| n.clone()));
+                let key = crate::modules::key(&full);
+                if key != main_key {
+                    taken.entry(key).or_default().extend(names.iter().map(|(n, _)| n.clone()));
+                }
             }
         }
     }
@@ -430,6 +479,9 @@ fn scan_taken(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>>>)
         for s in stmts.iter() {
             match s {
                 Stmt::Route(r) => routes.push((r.shown(), r.line)),
+                // Its `mount /x` and `service /x`, as `scan_from` lists them (Q-1301).
+                Stmt::Mount(p, _, line) => routes.push((format!("mount {}", p), *line)),
+                Stmt::Service(_, Some(p), _, _, line, _) => routes.push((format!("service {}", p), *line)),
                 Stmt::Fn(d) if (d.server || d.mcp) && !names.contains(&d.name) => routes.push((entry_name(d), d.line)),
                 Stmt::Let(_, e, line) | Stmt::Expr(e @ Expr::Call(_, _, line)) if reaches_out(e) => at_start.push(*line),
                 _ => {}
@@ -1810,6 +1862,37 @@ pub fn listing(scan: &Scan, missing: &[Missing]) -> String {
     s
 }
 
+/// What the program at `main` reaches that the `quillo.confirmed` beside it does not confirm; none
+/// where no such file holds it, or it cannot be read (`quillo check` says why). For `quillo fix`,
+/// before it writes imports (`fix_note`).
+pub fn left_unconfirmed(main: &Path) -> Option<Vec<Missing>> {
+    let conf = read(&dir_of(main).join(FILE)).ok()??;
+    Some(missing(&scan(main), &conf))
+}
+
+/// What `quillo fix` says once the imports it wrote under a `quillo.confirmed` make the program
+/// reach what that file does not confirm and did not before (`before`, `left_unconfirmed`): a
+/// file the imports take for some of its names is a taken file now, whose routes are held to the
+/// list. Said as the listing has it, with what to run (FEEDBACK83.md, Q-1300, the user's decision
+/// of 2026-11-24; branch feedback82-85).
+pub fn fix_note(main: &Path, before: &[Missing]) -> Option<String> {
+    let conf = read(&dir_of(main).join(FILE)).ok()??;
+    let found = scan(main);
+    let new: Vec<Missing> = missing(&found, &conf).into_iter().filter(|m| !before.iter().any(|b| (b.file.as_str(), b.kind, b.item.as_str()) == (m.file.as_str(), m.kind, m.item.as_str()))).collect();
+    if new.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}: with these imports, {}: run `quillo confirm` to confirm {} (until then `quillo check` stops on {}, and a run refuses {}):{}",
+        FILE,
+        summary(&new),
+        if new.len() == 1 { "it" } else { "them" },
+        if new.len() == 1 { "it" } else { "them" },
+        if new.len() == 1 { "it" } else { "each" },
+        listing(&found, &new).trim_end()
+    ))
+}
+
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{} {}", n, if n == 1 { one } else { many })
 }
@@ -2230,7 +2313,10 @@ pub fn pinned(qwer: &Path) -> bool {
 
 /// Whether the route `shown` (`GET /x`) that the code of `cur_file` declares is served: a file
 /// taken for some of its names serves only the routes confirmed for it (FEEDBACK83.md, Q-1301; branch
-/// feedback82-85). The main file's, and a mounted program's, are the program's own.
+/// feedback82-85). The main file's, and a mounted program's, are the program's own. Its `mount /x`
+/// and `service /x` lines are asked about the same way, as they are listed (`scan_from`), as the
+/// program runs each line: a mount not confirmed is not loaded, a service not confirmed is not
+/// served at its path (found by the coverage tests).
 pub fn route_ok(cur_file: Option<&str>, shown: &str) -> bool {
     let Some(h) = HOLD.get() else { return true };
     let i = h.id(cur_file);
@@ -2243,7 +2329,15 @@ pub fn route_ok(cur_file: Option<&str>, shown: &str) -> bool {
     if !h.routes_held.contains(&i) || h.blocks[i as usize].routes.contains_key(shown) || h.named.contains(&(i, shown.to_string())) {
         return true;
     }
-    let what = if shown.starts_with("server fn ") || shown.starts_with("fn mcp ") { format!("{} is not offered", shown) } else { format!("the route {} is not served", shown) };
+    let what = if shown.starts_with("server fn ") || shown.starts_with("fn mcp ") {
+        format!("{} is not offered", shown)
+    } else if shown.starts_with("mount ") {
+        format!("{} is not mounted", shown)
+    } else if let Some(p) = shown.strip_prefix("service ") {
+        format!("{} is not served at {} (its calls are made as before)", shown, p)
+    } else {
+        format!("the route {} is not served", shown)
+    };
     h.say(format!("{}: {}: it is not confirmed for this file (`quillo confirm` lists it)", if i == 0 { "a taken file" } else { h.name_of(i) }, what));
     false
 }

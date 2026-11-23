@@ -2085,3 +2085,242 @@ impl Diag {
         quillo::check::Diagnostic { file: self.file.clone(), line: self.line, severity: quillo::check::Severity::Error, message: self.message.clone() }.to_string()
     }
 }
+
+// ---- quillo fix under a hold, a mounted program's own main file, a taken file's doors (fix slice G)
+
+/// The listing's line for an item, as `quillo fix` says it (`confirm::listing`).
+fn fix_line(word: &str, item: &str, lines: &str) -> String {
+    format!("    {:<13} {:<40} {}\n", word, item, lines)
+}
+
+/// `quillo fix` under a quillo.confirmed writes the imports its errors ask for, as it writes them
+/// for the warnings without one: it stopped on the first, so a held program could not be fixed.
+/// It says each import, and where an import makes a file a taken one (`lib/b.qwe`, taken whole by
+/// the main file, now taken for `helper` too), what that leaves unconfirmed and that `quillo
+/// confirm` confirms it; after it, `quillo check` is clean, a second fix has nothing to do, and the
+/// page answers. A name of the main file alone, in a file in other letters, leaves nothing to
+/// confirm. Another error stops it as before, with nothing written, its file's name escaped as
+/// `quillo check` shows it, and so does a name in a program this one mounts, which a fix of that
+/// program writes. With no quillo.confirmed the import of a name of the main file is no word at
+/// check, where "main.qwe is taken for site" was said (src/modules.rs fix, src/confirm.rs fix_note
+/// and scan_taken; FEEDBACK83.md Q-1300, found by the coverage tests, the user's decision of
+/// 2026-11-24; branch feedback82-85).
+#[test]
+fn quillo_fix_writes_the_imports_a_quillo_confirmed_makes_errors() {
+    let d = dir("g1-fix-held");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nuse lib/b.qwe\nlet site = \"Shop\"\nroute GET / = <html><body><Badge/></body></html>\n");
+    let kit = "component Badge() {\n  return <b>{site} {helper()}</b>\n}\n";
+    write(&d, "kit/k.qwe", kit);
+    write(&d, "lib/b.qwe", "fn helper() {\n  return \"helped\"\n}\nroute GET /b = \"b\"\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("./kit/k.qwe:2: error: `helper` comes from lib/b.qwe") && out.ends_with("quillo: 2 errors\n"), "{}", out);
+    let (code, out) = quillo(&d, &["fix", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert_eq!(
+        out,
+        format!(
+            "./kit/k.qwe: import lib/b.qwe use helper\n./kit/k.qwe: import main.qwe use site\nquillo.confirmed: with these imports, 1 thing in 1 file is not confirmed: run `quillo confirm` to confirm it (until then `quillo check` stops on it, and a run refuses it):\n  lib/b.qwe\n{}",
+            fix_line("adds a route", "GET /b", "line 4")
+        )
+    );
+    assert_eq!(read(&d.join("kit/k.qwe")), format!("import lib/b.qwe use helper\nimport main.qwe use site\n\n{}", kit));
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("lib/b.qwe:4: error: adds a route GET /b: not confirmed for this file") && !out.contains("does not take"), "{}", out);
+    assert_eq!(quillo(&d, &["confirm", "--yes"]).0, Some(0));
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert_eq!(quillo(&d, &["fix", "main.qwe"]), (Some(0), "main.qwe: nothing to fix\n".to_string()));
+    let (g, port, log) = serve(&d, &[]);
+    assert!(send(port, "GET", "/", &[], "").body.contains("<b>Shop helped</b>"), "{}", read(&log));
+    assert_eq!(send(port, "GET", "/b", &[], "").body, "b");
+    drop(g);
+    // A name of the main file alone, in a file in other letters: nothing more to confirm.
+    write(&d, "main.qwe", "import kit/ünï.qwe use Badge\nlet site = \"Shop\"\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/ünï.qwe", "component Badge() {\n  return <b>{site}</b>\n}\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    assert_eq!(quillo(&d, &["fix", "main.qwe"]), (Some(0), "./kit/ünï.qwe: import main.qwe use site\n".to_string()));
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    // Another error stops it, nothing written, the file's name as a terminal shows it.
+    write(&d, "main.qwe", "import \"kit/x\\u{1b}[2Ky.qwe\" use Badge\nlet site = \"Shop\"\nroute GET / = <html><body><Badge/></body></html>\n");
+    let bad = "component Badge() {\n  return <b>{site} {nope()}</b>\n}\n";
+    write(&d, "kit/x\u{1b}[2Ky.qwe", bad);
+    let (code, out) = quillo(&d, &["fix", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.starts_with("quillo: ./kit/x\\u{1b}[2Ky.qwe:2: unknown name `nope`") && !out.contains('\u{1b}'), "{:?}", out);
+    assert_eq!(read(&d.join("kit/x\u{1b}[2Ky.qwe")), bad);
+    write(&d, "kit/x\u{1b}[2Ky.qwe", "component Badge() {\n  return <b>{site}</b>\n}\n");
+    assert_eq!(quillo(&d, &["fix", "main.qwe"]), (Some(0), "./kit/x\\u{1b}[2Ky.qwe: import main.qwe use site\n".to_string()));
+    // A name in a mounted program: that program's fix writes it, then this one has nothing to do.
+    write(&d, "main.qwe", "mount /sub = \"sub/main.qwe\"\nroute GET / = \"home\"\n");
+    write(&d, "sub/main.qwe", "use part.qwe\nlet own = \"own\"\nroute GET / = part()\n");
+    write(&d, "sub/part.qwe", "fn part() {\n  return own + \" part\"\n}\n");
+    let (code, out) = quillo(&d, &["fix", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.starts_with("quillo: ./sub/part.qwe:2: `own` comes from main.qwe") && out.ends_with("(`quillo fix` writes it) (that file is of a program this one mounts or calls as a service: `quillo fix` that program, and this one again)\n"), "{}", out);
+    assert_eq!(quillo(&d, &["fix", "sub/main.qwe"]), (Some(0), "sub/part.qwe: import main.qwe use own\n".to_string()));
+    assert_eq!(quillo(&d, &["fix", "main.qwe"]), (Some(0), "main.qwe: nothing to fix\n".to_string()));
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    // No quillo.confirmed: the warning's import is written as before, and is no word at check.
+    std::fs::remove_file(d.join("quillo.confirmed")).unwrap();
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nlet site = \"Shop\"\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/k.qwe", "component Badge() {\n  return <b>{site}</b>\n}\n");
+    assert_eq!(quillo(&d, &["fix", "main.qwe"]), (Some(0), "./kit/k.qwe: import main.qwe use site\n".to_string()));
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!((code, out.contains("warning")), (Some(0), false), "{}", out);
+}
+
+/// A mounted program's main file, and a service's, taken by name by a file of its own program
+/// (`import main.qwe use own` in sub/part.qwe) is the program's own, as the main file is: it was
+/// held as a taken file, so `quillo check` asked for a `routes` line and the mounted program's
+/// pages were 404 under a quillo.confirmed that named only main.qwe. Now check is clean, `quillo
+/// confirm` lists nothing, and its pages answer, checked and with `--no-check`. A mounted file that
+/// the main program also takes by name is held as before: its code runs in the main program too,
+/// at its paths (src/confirm.rs scan_from; FEEDBACK83.md Q-1301, found by the coverage tests;
+/// branch feedback82-85).
+#[test]
+fn a_mounted_programs_main_file_taken_by_its_own_file_is_its_programs_own() {
+    let d = dir("g2-mounted-main");
+    write(&d, "main.qwe", "mount /sub = \"sub/main.qwe\"\nservice /svc = \"svc/s.qwe\"\nroute GET / = \"home\"\n");
+    write(&d, "sub/main.qwe", "import part.qwe use part\nlet own = \"own\"\nroute GET / = part()\n");
+    write(&d, "sub/part.qwe", "import main.qwe use own\nfn part() {\n  return own + \" part\"\n}\n");
+    write(&d, "svc/s.qwe", "import lib.qwe use word\nlet base = \"svc\"\nroute GET / = word()\n");
+    write(&d, "svc/lib.qwe", "import s.qwe use base\nfn word() {\n  return base + \" word\"\n}\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(!out.contains("taken for") && !out.contains("adds a route"), "{}", out);
+    assert_eq!(quillo(&d, &["confirm", "--list"]), (Some(0), String::new()));
+    for opts in [&[][..], &["--no-check"][..]] {
+        let (g, port, log) = serve(&d, opts);
+        assert_eq!(send(port, "GET", "/sub/", &[], "").body, "own part", "{:?}: {}", opts, read(&log));
+        assert_eq!(send(port, "GET", "/svc/", &[], "").body, "svc word", "{:?}: {}", opts, read(&log));
+        assert!(!read(&log).contains("is not served"), "{:?}: {}", opts, read(&log));
+        drop(g);
+    }
+    // Mounted, and taken by name by the main program too: held, here and where it is mounted.
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nmount /k = \"kit/k.qwe\"\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/k.qwe", "route GET /secret = \"secret\"\ncomponent Badge() {\n  return <b>b</b>\n}\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("kit/k.qwe:1: error: adds a route GET /secret: not confirmed for this file"), "{}", out);
+    let (g, port, _) = serve(&d, &["--no-check"]);
+    assert_eq!((send(port, "GET", "/secret", &[], "").status, send(port, "GET", "/k/secret", &[], "").status), (404, 404));
+    drop(g);
+}
+
+/// A taken file's `mount /x` and `service /x` lines serve another program at /x: ways in, which
+/// the hold did not cover, so a kit taken for `Badge`, under a quillo.confirmed that confirmed
+/// nothing of it, mounted a program at /x and replaced the main file's /admin with its own. Each is
+/// listed by the path it serves (`mount /x`, `service /y`, and `service /m` beside `service mcp
+/// /m`'s tools; a service with no path, only called, adds none), `quillo check` says each not
+/// confirmed, and a run mounts none and serves no service at its path, said, while the services'
+/// calls are made as before; confirmed, each is served. With no quillo.confirmed, as before, and
+/// check's note names them (src/confirm.rs scan_from, scan_taken and route_ok, src/interp.rs
+/// run_decl; FEEDBACK83.md Q-1301, found by the coverage tests; branch feedback82-85).
+#[test]
+fn a_taken_files_mount_and_service_lines_are_held_to_the_list() {
+    let d = dir("g3-taken-doors");
+    write(&d, "main.qwe", "mount /admin = \"admin.qwe\"\nimport kit/k.qwe use Badge, calls\nroute GET / = <html><body><Badge/></body></html>\nroute GET /calls = calls()\n");
+    write(&d, "admin.qwe", "route GET / = \"admin\"\n");
+    write(&d, "kit/k.qwe", "mount /x = \"kit/evil.qwe\"\nmount /admin = \"kit/evil.qwe\"\nservice /y = \"kit/svc.qwe\" { timeout: \"2s\" }\nservice named = \"kit/named.qwe\"\nservice mcp /m = \"kit/m.qwe\"\ncomponent Badge() {\n  return <b>b</b>\n}\nfn calls() {\n  return str(svc.f()) + \" \" + str(named.g())\n}\n");
+    write(&d, "kit/evil.qwe", "route GET / = \"evil mount\"\n");
+    write(&d, "kit/svc.qwe", "route GET / = \"evil service\"\nserver fn f() -> int {\n  return 1\n}\n");
+    write(&d, "kit/named.qwe", "server fn g() -> int {\n  return 2\n}\n");
+    write(&d, "kit/m.qwe", "/// A tool.\nfn mcp hello() -> str = \"hello\"\nroute GET / = \"mcp service page\"\n");
+    let pages = |port: u16| ["/x/", "/y/", "/m/", "/admin/", "/calls"].map(|p| send(port, "GET", p, &[], "").body);
+    // No quillo.confirmed: served as before; check's note names the lines.
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("kit/k.qwe:1: warning: kit/k.qwe is taken for Badge, calls, and also adds mount /x, mount /admin, service /y, service /m"), "{}", out);
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(pages(port), ["evil mount", "evil service", "mcp service page", "evil mount", "1 2"]);
+    drop(g);
+    let (code, out) = quillo(&d, &["confirm", "--list"]);
+    assert_eq!(code, Some(0), "{}", out);
+    let listed = [("fn mcp m.hello", "5"), ("mount /admin", "2"), ("mount /x", "1"), ("service /m", "5"), ("service /y", "3")].map(|(r, l)| list_line("adds a route", r, l)).concat();
+    assert!(out.starts_with(&format!("kit/k.qwe\n{}", listed)) && !out.contains("named"), "{}", out);
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    for (line, route) in [(1, "mount /x"), (2, "mount /admin"), (3, "service /y"), (5, "service /m")] {
+        assert!(out.contains(&format!("kit/k.qwe:{}: error: adds a route {}: not confirmed for this file", line, route)), "{}", out);
+    }
+    for opts in [&[][..], &["--no-check"][..]] {
+        let (g, port, log) = serve(&d, opts);
+        let got = pages(port);
+        assert_eq!(got[3..], ["admin", "1 2"], "{:?}: {}", opts, read(&log));
+        assert!(got[..3].iter().all(|b| b == "not found\n"), "{:?}: {:?}", opts, got);
+        assert!(log_has(&log, "quillo: kit/k.qwe: mount /x is not mounted: it is not confirmed for this file", 30), "{}", read(&log));
+        assert!(log_has(&log, "quillo: kit/k.qwe: service /y is not served at /y (its calls are made as before): it is not confirmed", 30), "{}", read(&log));
+        drop(g);
+    }
+    // Confirmed: each is the developer's, and served.
+    assert_eq!(quillo(&d, &["confirm", "--yes"]).0, Some(0));
+    assert!(read(&d.join("quillo.confirmed")).contains("routes = [\"fn mcp m.hello\", \"mount /admin\", \"mount /x\", \"service /m\", \"service /y\"]"));
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(pages(port), ["evil mount", "evil service", "mcp service page", "evil mount", "1 2"]);
+    drop(g);
+}
+
+/// The ways round a taken file's held mount: a `mount` in a `routes` group, in an `if` and in a
+/// function (refused at check, and by the run with `--no-check`), a mount or a service whose file is
+/// a variable or a text worked out (refused as written); the kit taken twice, by name and whole,
+/// is held the same; saved under `--watch` to add a mount, the new version mounts nothing until
+/// it is confirmed (src/confirm.rs route_ok, src/interp.rs run_decl; FEEDBACK83.md Q-1301, found
+/// by the coverage tests; branch feedback82-85).
+#[test]
+fn a_taken_files_mount_is_held_whichever_way_it_is_written() {
+    let d = dir("g3-doors-round");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/evil.qwe", "route GET / = \"evil\"\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let badge = "component Badge() {\n  return <b>b</b>\n}\n";
+    for (kit, said) in [
+        ("routes /p {\n  mount /x = \"kit/evil.qwe\"\n}\n", "a `routes` group holds `route` and `routes`, found `mount`"),
+        ("if true {\n  mount /x = \"kit/evil.qwe\"\n}\n", "`mount` must be at the top level"),
+        ("fn m() {\n  mount /x = \"kit/evil.qwe\"\n}\nm()\n", "`mount` must be at the top level"),
+        ("let f = \"kit/evil.qwe\"\nmount /x = f\n", "`mount` expects a file"),
+        ("let f = \"kit/evil.qwe\"\nservice /x = \"{f}\"\n", "is not one (name the file so)"),
+    ] {
+        write(&d, "kit/k.qwe", &format!("{}{}", kit, badge));
+        let (code, out) = quillo(&d, &["check", "main.qwe"]);
+        assert_eq!(code, Some(1), "{}: {}", kit, out);
+        assert!(out.contains(said), "{}: {}", kit, out);
+        let (code, out) = quillo_env(&d, &["run", "--no-check", "main.qwe", "--port", "0"], 30, &[]);
+        assert_ne!(code, Some(0), "{}: {}", kit, out);
+        assert!(out.contains(said) && !out.contains("listening"), "{}: {}", kit, out);
+    }
+    // Taken twice, by name and whole.
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nuse kit/k.qwe\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/k.qwe", &format!("mount /x = \"kit/evil.qwe\"\n{}", badge));
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("kit/k.qwe:1: error: adds a route mount /x: not confirmed for this file"), "{}", out);
+    let (g, port, _) = serve(&d, &["--no-check"]);
+    assert_eq!(send(port, "GET", "/x/", &[], "").status, 404);
+    drop(g);
+    // In a file the kit takes whole: that file is taken too.
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/k.qwe", &format!("use kit/more.qwe\n{}", badge));
+    write(&d, "kit/more.qwe", "service /x = \"kit/evil.qwe\"\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("kit/more.qwe:1: error: adds a route service /x: not confirmed for this file"), "{}", out);
+    let (g, port, log) = serve(&d, &["--no-check"]);
+    assert_eq!(send(port, "GET", "/x/", &[], "").status, 404, "{}", read(&log));
+    drop(g);
+    // Added under --watch.
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/k.qwe", badge);
+    let (g, port, log) = serve(&d, &["--watch", "--no-check"]);
+    assert!(send(port, "GET", "/", &[], "").body.contains("<b>b</b>"));
+    write(&d, "kit/k.qwe", &format!("{}mount /x = \"kit/evil.qwe\"\n", badge));
+    assert!(log_has(&log, "quillo: kit/k.qwe: mount /x is not mounted: it is not confirmed for this file", 30), "{}", read(&log));
+    assert_eq!(send(port, "GET", "/x/", &[], "").status, 404, "{}", read(&log));
+    drop(g);
+}

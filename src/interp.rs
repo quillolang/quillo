@@ -4060,7 +4060,12 @@ impl Interp {
                     Some(e) => Some(self.eval(e, env)?),
                     None => None,
                 };
-                crate::service::declare(self, name, prefix.as_deref(), file, options.as_ref(), *line)?;
+                // A taken file's `service /x`, served at /x only where it was confirmed; its calls
+                // are made as a service's with no path are (FEEDBACK83.md, Q-1301, found by the
+                // coverage tests; branch feedback82-85).
+                let served = |p: &String| !crate::confirm::held() || crate::confirm::route_ok(self.cur_file.as_deref(), &format!("service {}", p));
+                let prefix = prefix.as_ref().filter(|p| served(p));
+                crate::service::declare(self, name, prefix.map(String::as_str), file, options.as_ref(), *line)?;
                 // Its tools' calls are signed both ways (FEEDBACK56.md, Part F, security review).
                 if let Some(how) = mcp.then(|| crate::service::unsigned_auth(name)).flatten() {
                     return fail(*line, &crate::service::tools_unsigned(name, how));
@@ -4070,6 +4075,11 @@ impl Interp {
             Stmt::Mount(prefix, file, line) => {
                 if !Arc::ptr_eq(env, &self.globals) {
                     return fail(*line, "`mount` must be at the top level");
+                }
+                // A taken file's mount, loaded only where it was confirmed (FEEDBACK83.md, Q-1301,
+                // found by the coverage tests; branch feedback82-85).
+                if crate::confirm::held() && !crate::confirm::route_ok(self.cur_file.as_deref(), &format!("mount {}", prefix)) {
+                    return Ok(Value::Nil);
                 }
                 let full = self.src_dir().join(file);
                 let dir = full.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| self.base_dir.to_path_buf());

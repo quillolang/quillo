@@ -1926,10 +1926,13 @@ fn before_the_program(file: &str, o: &RunOptions) -> Result<(), i32> {
         Some(f) => (std::path::PathBuf::from(f), true),
         None => (Path::new(file).parent().unwrap_or(Path::new(".")).join(".env"), false),
     };
-    // The names the app's `.env` gave, believed in a service its app started alone: anywhere else
+    // The names the app's `.env` gave, believed only where the process was given `--as-service`
+    // and its environment had QUILLO_STOP_WITH_APP (`stop_with_app`), as `--split` starts a
+    // service: that is what is checked, not who started it, and it is enough, as believing it
+    // gives that starter nothing it could not set itself (`dotenv::take_marker`). Anywhere else
     // `QUILLO_ENV_FROM_FILE` dropped the provider's QUILLO_POLICY_PATH and let `.env` beat what
-    // the environment set (FEEDBACK82.md, Q-1281 and Q-1280, found by the coverage tests; branch
-    // feedback82-85).
+    // the environment set (FEEDBACK82.md, Q-1281 and Q-1280, found by the coverage tests; said as
+    // what is checked since the review of bf40063; branch feedback82-85).
     quillo::dotenv::take_marker(o.as_service && WITH_APP.load(std::sync::atomic::Ordering::SeqCst));
     if let Err(e) = quillo::dotenv::load_into_process(&env_file.0, env_file.1) {
         eprintln!("quillo: {}", e);

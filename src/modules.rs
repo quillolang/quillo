@@ -627,7 +627,7 @@ fn script_line(all: &[Respell], file: &str, line: u32) -> Result<String, String>
     if let Some(r) = all.iter().find(|r| r.file == file && r.line == line) {
         return Ok(r.written());
     }
-    let text = crate::error::read_source(file).map_err(|e| format!("cannot read {}: {}", file, e))?;
+    let text = crate::error::read_source(file).map_err(|e| format!("cannot read {}: {}", crate::confirm::escaped(file), e))?;
     let mut lines = text.lines().skip(line as usize - 1);
     let first = lines.next().unwrap_or("").trim();
     Ok(match lines.next().map(str::trim).filter(|n| n.starts_with("use ") && !first.contains(" use ")) {
@@ -640,13 +640,36 @@ fn script_line(all: &[Respell], file: &str, line: u32) -> Result<String, String>
 /// take, and turns a `use` written as 0.6 did around. Says what it did, a line each.
 pub fn fix(main: &Path) -> Result<Vec<String>, String> {
     let a = crate::check::check_file_opts(main, Default::default(), crate::check::Options::plain());
-    if let Some(d) = a.diagnostics.iter().find(|d| d.severity == Severity::Error) {
-        return Err(format!("{}:{}: {}", d.file, d.line, d.message));
+    // Under a `quillo.confirmed` a name a file uses and does not take is an error, not the warning
+    // it is elsewhere (`Analysis::untaken`), and writing its import is what this is for: it stopped
+    // on it, so a held program could not be fixed. Each such error whose import this writes is
+    // passed over; one in a program this one mounts or calls as a service, whose imports a fix of
+    // that program writes, stops it as any other error does, said so (FEEDBACK83.md, Q-1300, the
+    // user's decision of 2026-11-24; branch feedback82-85).
+    let untaken = |d: &crate::check::Diagnostic| a.untaken.iter().any(|u| (&u.file, u.line, &u.message) == (&d.file, d.line, &d.message));
+    let written = |d: &crate::check::Diagnostic| {
+        a.imports.iter().any(|i| {
+            i.file == d.file
+                && match i.script {
+                    Some(_) => d.message.starts_with(&format!("`{}` is a browser library", i.name)),
+                    None => d.message.contains(&format!("add `import {} use {}`", i.from, i.name)),
+                }
+        })
+    };
+    if let Some(d) = a.diagnostics.iter().find(|d| d.severity == Severity::Error && !(untaken(d) && written(d))) {
+        let elsewhere = if untaken(d) { " (that file is of a program this one mounts or calls as a service: `quillo fix` that program, and this one again)" } else { "" };
+        // The file's name and the message as a terminal shows them, as `quillo check` shows them
+        // (Diagnostic's Display): a file named `kit/x\u{1b}[2Ky.qwe` was printed as it was
+        // (FEEDBACK83.md, Q-1300 D.2, found by the review of 2a1d3f7; branch feedback82-85).
+        return Err(format!("{}:{}: {}{}", crate::confirm::escaped(&d.file), d.line, shown_lines(&d.message), elsewhere));
     }
+    // What the held program reached unconfirmed before: the imports may make a file a taken one,
+    // whose routes are then held, which is said after (`confirm::fix_note`).
+    let before = if a.untaken.is_empty() { None } else { crate::confirm::left_unconfirmed(main) };
     let mut files: BTreeMap<String, String> = BTreeMap::new();
     let mut said = Vec::new();
     // A file as it stands: as this has left it, or as it is.
-    let read = |files: &BTreeMap<String, String>, f: &str| files.get(f).cloned().map_or_else(|| crate::error::read_source(f).map_err(|e| format!("cannot read {}: {}", f, e)), Ok);
+    let read = |files: &BTreeMap<String, String>, f: &str| files.get(f).cloned().map_or_else(|| crate::error::read_source(f).map_err(|e| format!("cannot read {}: {}", crate::confirm::escaped(f), e)), Ok);
     let mut respell = a.respell.clone();
     respell.sort_by(|x, y| (&x.file, x.line).cmp(&(&y.file, y.line)));
     respell.dedup_by(|x, y| (&x.file, x.line) == (&y.file, y.line));
@@ -655,7 +678,8 @@ pub fn fix(main: &Path) -> Result<Vec<String>, String> {
         let text = read(&files, &r.file)?;
         files.insert(r.file.clone(), respelled(&text, r));
     }
-    said.extend(respell.iter().map(|r| format!("{}:{}: {}", r.file, r.line, r.written().replace("\n   ", ""))));
+    // Each line as a terminal shows it, as the error above (Q-1300 D.2).
+    said.extend(respell.iter().map(|r| crate::confirm::escaped(&format!("{}:{}: {}", r.file, r.line, r.written().replace("\n   ", ""))).into_owned()));
     // By file, then by what it comes from.
     let mut wanted: BTreeMap<&str, BTreeMap<String, Vec<&str>>> = BTreeMap::new();
     for i in &a.imports {
@@ -676,14 +700,22 @@ pub fn fix(main: &Path) -> Result<Vec<String>, String> {
                 from
             };
             text = with_use(&text, &line);
-            said.push(format!("{}: {}", f, line.replace("\n   ", "")));
+            said.push(crate::confirm::escaped(&format!("{}: {}", f, line.replace("\n   ", ""))).into_owned());
         }
         files.insert(f.to_string(), text);
     }
     for (f, text) in files {
-        std::fs::write(&f, text).map_err(|e| format!("cannot write {}: {}", f, e))?;
+        std::fs::write(&f, text).map_err(|e| format!("cannot write {}: {}", crate::confirm::escaped(&f), e))?;
+    }
+    if let Some(note) = before.and_then(|b| crate::confirm::fix_note(main, &b)) {
+        said.push(note);
     }
     Ok(said)
+}
+
+/// `s` with each line `confirm::escaped`, its line breaks kept, as a diagnostic is shown.
+fn shown_lines(s: &str) -> String {
+    s.split('\n').map(|l| crate::confirm::escaped(l)).collect::<Vec<_>>().join("\n")
 }
 
 /// `text` with a line added below the `use`s and `import`s at its start, or, with none,
