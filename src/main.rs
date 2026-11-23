@@ -876,6 +876,11 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
     if tools.is_empty() {
         eprintln!("quillo: {} has no tools: a function is one when it is declared `fn mcp name(...)`", file);
     }
+    // A taken file's tool, offered only where it was confirmed, as `quillo run`'s door offers it
+    // (`mcp::open_door`): the door on stdio listed and ran one confirmed for nothing, on its own
+    // and beside the routes (FEEDBACK83.md, Q-1301, found by the coverage tests; branch
+    // feedback82-85).
+    let tools: Vec<quillo::mcp::Tool> = tools.into_iter().filter(|t| quillo::confirm::tool_ok(&t.name)).collect();
     let base = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     if serve {
@@ -931,16 +936,20 @@ fn serve_beside(path: &Path, stem: String, tools: Vec<quillo::mcp::Tool>, mut o:
     };
     stop_on_signal_with(None, None);
     let workers = o.workers;
+    let shown = path.display().to_string();
     // The server ends once a stop has drained it; the process with it, once the door has answered
     // the call in progress.
     std::thread::Builder::new()
         .name("quillo-serve".into())
         .stack_size(quillo::server::WORKER_STACK)
         .spawn(move || {
+            // What failed is said, as `quillo run` says it: "Too many open files" alone named
+            // neither the server nor the program (FEEDBACK85.md, Q-1347, found by the coverage
+            // tests; branch feedback82-85).
             let code = match quillo::server::serve_bound(app, listener, workers) {
                 Ok(()) => 0,
                 Err(e) => {
-                    eprintln!("quillo: {}", e);
+                    eprintln!("quillo: cannot start the server for {}: {}", shown, e);
                     1
                 }
             };
@@ -957,6 +966,9 @@ fn serve_beside(path: &Path, stem: String, tools: Vec<quillo::mcp::Tool>, mut o:
     if let Some(b) = quillo::policy::get().max_body {
         door.most = door.most.min(b);
     }
+    // Its calls take the routes' lock, which the server's start gives up (FEEDBACK85.md, Q-1347,
+    // found by the coverage tests; branch feedback82-85).
+    door.beside = true;
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let code = quillo::mcp::serve_stdio(&door, &mut interp, &mut input, &mut *out);
@@ -1761,12 +1773,23 @@ fn policy_run(o: &mut RunOptions, flags: &[String]) -> Result<(), i32> {
     if let Some(n) = p.run_ceiling("instances") {
         o.instances = o.instances.min(n as usize);
     }
+    // Where the policy's ceiling is the one in force, a connection it closes names its file
+    // (FEEDBACK82.md, Q-1280, found by the coverage tests; branch feedback82-85).
     if let Some(n) = p.run_ceiling("max_connections") {
         let now = quillo::httpd::MAX_CONNECTIONS.load(SeqCst);
-        quillo::httpd::MAX_CONNECTIONS.store(if now == 0 { n as usize } else { now.min(n as usize) }, SeqCst);
+        if now == 0 || (n as usize) < now {
+            quillo::httpd::MAX_CONNECTIONS.store(n as usize, SeqCst);
+            if let Some(f) = p.origin_of("run.max_connections") {
+                quillo::httpd::connections_limited_by(false, f);
+            }
+        }
     }
     if let Some(n) = p.run_ceiling("connections_per_client") {
-        quillo::httpd::CONNECTIONS_PER_CLIENT.fetch_min(n as usize, SeqCst);
+        if quillo::httpd::CONNECTIONS_PER_CLIENT.fetch_min(n as usize, SeqCst) > n as usize {
+            if let Some(f) = p.origin_of("run.connections_per_client") {
+                quillo::httpd::connections_limited_by(true, f);
+            }
+        }
     }
     if let Some(n) = p.run_ceiling("live_per_client") {
         quillo::server::LIVE_PER_CLIENT.fetch_min(n as usize, std::sync::atomic::Ordering::Relaxed);
@@ -1898,6 +1921,11 @@ fn before_the_program(file: &str, o: &RunOptions) -> Result<(), i32> {
         Some(f) => (std::path::PathBuf::from(f), true),
         None => (Path::new(file).parent().unwrap_or(Path::new(".")).join(".env"), false),
     };
+    // The names the app's `.env` gave, believed in a service its app started alone: anywhere else
+    // `QUILLO_ENV_FROM_FILE` dropped the provider's QUILLO_POLICY_PATH and let `.env` beat what
+    // the environment set (FEEDBACK82.md, Q-1281 and Q-1280, found by the coverage tests; branch
+    // feedback82-85).
+    quillo::dotenv::take_marker(o.as_service && WITH_APP.load(std::sync::atomic::Ordering::SeqCst));
     if let Err(e) = quillo::dotenv::load_into_process(&env_file.0, env_file.1) {
         eprintln!("quillo: {}", e);
         return Err(2);

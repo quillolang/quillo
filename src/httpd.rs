@@ -2418,11 +2418,33 @@ impl Drop for Place {
     }
 }
 
+/// The policy file `MAX_CONNECTIONS` and `CONNECTIONS_PER_CLIENT` came from, when its ceiling, not
+/// the option, is the one in force: a connection closed under a policy's limit was said to be
+/// "the most --max-connections allows", which the program was not given (FEEDBACK82.md, Q-1280,
+/// found by the coverage tests; branch feedback82-85).
+static MAX_CONNECTIONS_FROM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static PER_CLIENT_FROM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The connection limit is the policy `file`'s: `per_client` for `connections_per_client`, else
+/// `max_connections`.
+pub fn connections_limited_by(per_client: bool, file: &std::path::Path) {
+    let from = if per_client { &PER_CLIENT_FROM } else { &MAX_CONNECTIONS_FROM };
+    let _ = from.set(file.display().to_string());
+}
+
+/// "the most `option` allows", or the policy's file that set the limit, as `over_compute` says it.
+fn most_allowed(option: &str, key: &str, from: &std::sync::OnceLock<String>) -> String {
+    match from.get() {
+        Some(f) => format!("the most the policy {} allows (run.{})", f, key),
+        None => format!("the most {} allows", option),
+    }
+}
+
 /// A place for a connection from `peer`, if the limits leave one.
 fn place_for(peer: &SocketAddr) -> Option<Place> {
     let most = MAX_CONNECTIONS.load(SeqCst);
     if most > 0 && crate::metrics::CONNECTIONS.load(SeqCst) as usize >= most {
-        refused_connection(&format!("{} connections are open, the most --max-connections allows", most));
+        refused_connection(&format!("{} connections are open, {}", most, most_allowed("--max-connections", "max_connections", &MAX_CONNECTIONS_FROM)));
         return None;
     }
     let ip = match peer.ip() {
@@ -2438,7 +2460,7 @@ fn place_for(peer: &SocketAddr) -> Option<Place> {
     if *n >= CONNECTIONS_PER_CLIENT.load(SeqCst) {
         let n = *n;
         drop(all);
-        refused_connection(&format!("{} holds {} connections, the most --connections-per-client allows: behind a proxy, name it with --trust-proxy", key, n));
+        refused_connection(&format!("{} holds {} connections, {}: behind a proxy, name it with --trust-proxy", key, n, most_allowed("--connections-per-client", "connections_per_client", &PER_CLIENT_FROM)));
         return None;
     }
     *n += 1;

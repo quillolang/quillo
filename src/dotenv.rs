@@ -19,17 +19,49 @@ use std::sync::{Mutex, OnceLock};
 /// this one.
 const FROM_FILE_VAR: &str = "QUILLO_ENV_FROM_FILE";
 
+/// The names a file set in this process, and those its app's file set, as `take_marker` takes them
+/// from the app. None is taken from the environment unasked: `QUILLO_ENV_FROM_FILE` was believed in
+/// any process, so a start whose environment named `QUILLO_POLICY_PATH` there ran without the
+/// provider's layer it names, and a `.env` replaced what the host's `[env] set` forces
+/// (FEEDBACK82.md, Q-1281 and Q-1280, found by the coverage tests; branch feedback82-85).
 fn from_file() -> &'static Mutex<HashSet<String>> {
     static KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    KEYS.get_or_init(|| {
-        let inherited = std::env::var(FROM_FILE_VAR).unwrap_or_default();
-        Mutex::new(inherited.split(',').filter(|k| !k.is_empty()).map(str::to_string).collect())
-    })
+    KEYS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Whether `name` came from a `.env` file rather than the environment.
+/// The names the app's `.env` gave, passed on in `QUILLO_ENV_FROM_FILE`, believed only in a service
+/// its app started (`from_app`: `--as-service`, started by `--split`), which is what the variable is
+/// for: there the service's own `.env` comes before them. Elsewhere it is no one's word but whoever
+/// set the environment's, and is taken out, so that it reaches no process started from this one.
+/// Never a name that chooses the policy, which no `.env` sets (`load_into_process`), whoever passes
+/// it on (FEEDBACK82.md, Q-1281, found by the coverage tests; branch feedback82-85). Called once, at
+/// startup, before the program's `.env` is read.
+pub fn take_marker(from_app: bool) {
+    let inherited = std::env::var(FROM_FILE_VAR).unwrap_or_default();
+    let mut keys = from_file().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if from_app {
+        keys.extend(inherited.split(',').filter(|k| !k.is_empty() && !chooses_policy(k)).map(str::to_string));
+    }
+    if keys.is_empty() {
+        std::env::remove_var(FROM_FILE_VAR);
+    } else {
+        let mut list: Vec<&str> = keys.iter().map(String::as_str).collect();
+        list.sort();
+        std::env::set_var(FROM_FILE_VAR, list.join(","));
+    }
+}
+
+/// Whether `name` chooses the policy (`QUILLO_POLICY_PATH` and the like), however it is written.
+fn chooses_policy(name: &str) -> bool {
+    name.to_ascii_uppercase().starts_with("QUILLO_POLICY")
+}
+
+/// Whether `name` came from a `.env` file rather than the environment. Never one the policy's
+/// `[env] set` forces, which is the host's whatever a file or the marker says (FEEDBACK82.md,
+/// Q-1280, found by the coverage tests; branch feedback82-85). The policy is set before any of
+/// this is asked, and `policy::get` only reads it.
 pub(crate) fn set_by_file(name: &str) -> bool {
-    from_file().lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(name)
+    !crate::policy::get().forces_env(name) && from_file().lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(name)
 }
 
 /// Reads `path` into the process's environment, leaving the variables the
@@ -42,9 +74,16 @@ pub fn load_into_process(path: &Path, required: bool) -> Result<(), String> {
     for (n, why) in skipped {
         eprintln!("quillo: {}:{}: {}, skipped", path.display(), n, why);
     }
-    let host = crate::policy::get().has_host_layer();
+    let policy = crate::policy::get();
+    let host = policy.has_host_layer();
     for (k, v) in pairs {
         if std::env::var_os(&k).is_some() && !keys.contains(&k) {
+            continue;
+        }
+        // What the host's `[env] set` forces is not replaced, whatever the names a file set say:
+        // with `QUILLO_ENV_FROM_FILE=APP_ENV` passed in, `.env`'s `APP_ENV=dev` beat the host's
+        // "production" (FEEDBACK82.md, Q-1280, found by the coverage tests; branch feedback82-85).
+        if policy.forces_env(&k) {
             continue;
         }
         // A name that steers Quillo or the processes it starts (`--split`'s services, cargo,
@@ -62,7 +101,7 @@ pub fn load_into_process(path: &Path, required: bool) -> Result<(), String> {
                     path.display()
                 ));
             }
-            if k.to_ascii_uppercase().starts_with("QUILLO_POLICY") {
+            if chooses_policy(&k) {
                 eprintln!("quillo: {} sets {}, which only whoever starts Quillo may set: not read", path.display(), k);
                 continue;
             }
@@ -126,8 +165,13 @@ pub fn read(path: &Path) -> Result<HashMap<String, String>, String> {
 }
 
 /// `env(name)` for a program whose own file holds `own`: the environment's
-/// value, unless a file gave it and `own` has one.
+/// value, unless a file gave it and `own` has one. What the host's `[env] set` forces is its value
+/// whatever a service's own `.env` says (FEEDBACK82.md, Q-1280, found by the coverage tests; branch
+/// feedback82-85).
 pub fn var(own: &HashMap<String, String>, name: &str) -> Option<String> {
+    if let Some(v) = crate::policy::get().forced_env(name) {
+        return Some(v.to_string());
+    }
     let real = std::env::var(name).ok().filter(|_| name != FROM_FILE_VAR);
     match (real, own.get(name)) {
         (Some(v), Some(mine)) => Some(if set_by_file(name) { mine.clone() } else { v }),

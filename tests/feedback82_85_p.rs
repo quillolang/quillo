@@ -738,10 +738,12 @@ fn a_dotenv_never_names_the_policy() {
     let (code, out) = quillo(&d, &["run", "main.qwe"], &[]);
     assert_eq!(code, Some(0), "{}", out);
     assert!(out.contains(".env sets QUILLO_POLICY_PATH, which only whoever starts Quillo may set: not read") && out.contains("unset\nt\n"), "{}", out);
-    // A process told a file gave it (as a --split service is) does not read it as a layer.
+    // A process whose environment says a file gave it reads it all the same: no .env sets it, and
+    // the variable that says so is anyone's to set, which dropped the provider's layer
+    // (FEEDBACK82.md, Q-1281, found by the coverage tests; branch feedback82-85).
     let (code, out) = quillo(&d, &["run", "main.qwe"], &[(policy::PATH_VAR, "/nowhere/x.toml"), ("QUILLO_ENV_FROM_FILE", "QUILLO_POLICY_PATH")]);
-    assert_eq!(code, Some(0), "{}", out);
-    assert!(out.contains("QUILLO_POLICY_PATH came from a .env file, which may not name the policy: not read"), "{}", out);
+    assert_eq!(code, Some(2), "{}", out);
+    assert!(out.contains("QUILLO_POLICY_PATH names the policy /nowhere/x.toml, which is not there") && !out.contains("came from a .env file"), "{}", out);
 }
 
 #[test]

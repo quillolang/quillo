@@ -339,17 +339,12 @@ pub fn load(main: &Path, extra: &[PathBuf]) -> Result<Policy, String> {
 
 /// `load`, saying whether what stopped it was a layer asked for and not there.
 pub fn load_layers(main: &Path, extra: &[PathBuf]) -> Result<Policy, LoadError> {
-    // A `QUILLO_POLICY_PATH` a `.env` gave (a `--split` service knows the names its app's file
-    // gave) is no layer: the host's is set where the process starts (FEEDBACK82.md, Q-1281, found
-    // in review; branch feedback82-85).
-    let var = std::env::var_os(PATH_VAR).filter(|_| {
-        let from_file = crate::dotenv::set_by_file(PATH_VAR);
-        if from_file {
-            eprintln!("quillo: {} came from a .env file, which may not name the policy: not read", PATH_VAR);
-        }
-        !from_file
-    });
-    load_from(&anchor()?, main, extra, var)
+    // Always the environment's: the policy is read before the program's `.env`, which never sets
+    // it (`dotenv::load_into_process`), nor is it ever taken from the names an app's file gave.
+    // It was left out when `QUILLO_ENV_FROM_FILE` named it, which anyone starting Quillo could
+    // set, and the program ran without the provider's layer (FEEDBACK82.md, Q-1281, found by the
+    // coverage tests; branch feedback82-85).
+    load_from(&anchor()?, main, extra, std::env::var_os(PATH_VAR))
 }
 
 /// The layers from `anchor`, `path_var` (`QUILLO_POLICY_PATH`'s value), `extra` and the program's
@@ -380,7 +375,11 @@ pub fn load_from(anchor: &Path, main: &Path, extra: &[PathBuf], path_var: Option
             let mut names: Vec<PathBuf> = std::fs::read_dir(&dropins)
                 .map_err(|e| format!("cannot read the policies in {}: {}", dropins.display(), e))?
                 .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|f| f.extension().is_some_and(|x| x == "toml"))
+                // `.TOML` too: a provider's layer written in capitals was skipped without a word,
+                // and the program ran without its limits. A layer is never left out unsaid
+                // (`there`), and Quillo takes `.QWE` as `.qwe` (FEEDBACK82.md, Q-1281, found by
+                // the coverage tests; branch feedback82-85).
+                .filter(|f| f.extension().is_some_and(|x| x.eq_ignore_ascii_case("toml")))
                 .collect();
             names.sort();
             for f in names {
@@ -1026,7 +1025,11 @@ impl Policy {
     /// feedback82-85).
     fn force_env(&mut self, name: &str, value: &str, file: &Path, kind: Kind) -> Result<(), String> {
         if !matches!(kind, Kind::Host | Kind::Included | Kind::Dropin | Kind::PathVar) {
-            return Err(format!("`env.set` is the host's to say (its file, what it includes, policy.d, {}), not {}'s", PATH_VAR, kind.said()));
+            // Named as a layer of its kind is: `said()` is "the program's" already, which read
+            // "not the program's's" (FEEDBACK82.md, Q-1280, found by the coverage tests; branch
+            // feedback82-85).
+            let whose = if kind == Kind::Program { "the program's own (quillo.policy)" } else { "a --policy file's" };
+            return Err(format!("`env.set` is the host's to say (its file, what it includes, policy.d, {}), not {}", PATH_VAR, whose));
         }
         let upper = name.to_ascii_uppercase();
         if upper.starts_with("QUILLO_POLICY") || upper.starts_with("LD_") || upper.starts_with("DYLD_") {
@@ -1313,6 +1316,18 @@ impl Policy {
             out.extend(said.into_iter().map(|l| format!("  {}", l)));
         }
         out.join("\n")
+    }
+
+    /// The value `[env] set` forces for `name`, if it forces one: by the name as the system reads
+    /// it, on Windows whatever its case, where `app_env` is `APP_ENV` (FEEDBACK82.md, Q-1280, found
+    /// by the coverage tests; branch feedback82-85).
+    pub fn forced_env(&self, name: &str) -> Option<&str> {
+        self.env_set.iter().find(|(k, _)| if cfg!(windows) { k.eq_ignore_ascii_case(name) } else { k == name }).map(|(_, v)| v.as_str())
+    }
+
+    /// Whether `[env] set` forces `name`: no `.env` replaces it.
+    pub fn forces_env(&self, name: &str) -> bool {
+        self.forced_env(name).is_some()
     }
 
     /// `[env] set`'s values, put in the environment before the program's `.env` is read, which

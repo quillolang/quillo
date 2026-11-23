@@ -923,7 +923,6 @@ fn a_taken_files_tool_is_offered_only_once_confirmed() {
 /// holds back (`confirm::tool_ok` is asked only by `mcp::open_door`). What it should do: list
 /// `own` alone, and refuse `leak` (coverage of feedback82-85; branch feedback82-85).
 #[test]
-#[ignore = "bug: the stdio MCP door is not held to quillo.confirmed's tools"]
 fn the_stdio_door_offers_no_unconfirmed_tool() {
     let d = dir("stdio-tool");
     write(&d, "main.qwe", "import kit/t.qwe use Badge\n/// Own tool.\nfn mcp own() -> str = \"own\"\nroute GET / = <html><body><Badge/></body></html>\n");

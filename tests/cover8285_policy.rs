@@ -461,7 +461,9 @@ fn what_one_client_may_hold_is_the_policys_least() {
         let mut got = Vec::new();
         let _ = fourth.read_to_end(&mut got);
         assert!(!String::from_utf8_lossy(&got).contains("home"), "{}", String::from_utf8_lossy(&got));
-        wait_for(&d.join("c.log"), &format!("{} holds 3 connections, the most --connections-per-client allows", ip), 30);
+        // The policy's 3 is the one in force, and named (FEEDBACK82.md, Q-1280, found by the
+        // coverage tests: it said "the most --connections-per-client allows").
+        wait_for(&d.join("c.log"), &format!("{} holds 3 connections, the most the policy p.toml allows (run.connections_per_client)", ip), 30);
         drop(held);
     }
     // Loopback is not held to it.
@@ -724,7 +726,9 @@ fn mcp_serve_whose_server_cannot_start_says_why() {
         let code = wait_exit(&mut g.0, 60);
         let text = read(&d.join(&log));
         assert!(!text.contains("panicked"), "ulimit -n {}: {}", n, text);
-        if code == Some(1) && text.contains("quillo: Too many open files") {
+        // What failed is named (FEEDBACK85.md, Q-1347, found by the coverage tests: the line was
+        // "quillo: Too many open files (os error 24)" alone).
+        if code == Some(1) && text.contains("quillo: cannot start the server for m.qwe: Too many open files") {
             failed.push(n);
         }
     }
@@ -866,4 +870,321 @@ fn quillo_app_is_held_before_its_window() {
     assert_eq!(code, Some(2), "{}", out);
     assert!(out.contains("quillo.confirmed: line 2: `hosts` is not something quillo.confirmed says"), "{}", out);
     assert!(!d.join(".quillo").exists(), "nothing made for a start that stops");
+}
+
+// ---- Bugs the coverage tests found, fixed (slice Y) ---------------------------------------------
+
+/// A start whose environment says `QUILLO_ENV_FROM_FILE=QUILLO_POLICY_PATH`, with no `.env`, still
+/// reads the provider's layer `QUILLO_POLICY_PATH` names: its `[effects]` refuses `env`, and
+/// `quillo policy` lists it. Every spelling of the name in the marker, lower case, among others,
+/// with empty entries; and in a service its app started, where the marker is believed (src/dotenv.rs
+/// take_marker, src/policy.rs load_layers, FEEDBACK82.md Q-1281, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn a_marker_in_the_environment_drops_no_layer_of_the_providers() {
+    let d = Tmp::new("forged-marker");
+    write(&d, "host/p.toml", "[effects]\nallow = [\"db\"]\n");
+    write(&d, "main.qwe", "print(env(\"APP_X\") ?? \"none\")\n");
+    let host = d.join("host/p.toml").display().to_string();
+    let refused = format!("main.qwe:1: error: `env` needs the env effect, which {} does not allow", host);
+    for marker in ["QUILLO_POLICY_PATH", "quillo_policy_path", "Quillo_Policy_Path", "APP_X,QUILLO_POLICY_PATH", ",QUILLO_POLICY_PATH,", "QUILLO_POLICY_PATH,QUILLO_POLICY", ""] {
+        let (code, out) = quillo(&d, &["run", "main.qwe"], &[(policy::PATH_VAR, &host), ("QUILLO_ENV_FROM_FILE", marker)]);
+        assert_eq!(code, Some(1), "{:?}: {}", marker, out);
+        assert!(out.contains(&refused) && !out.contains("came from a .env file"), "{:?}: {}", marker, out);
+        let (code, out) = quillo(&d, &["policy", "main.qwe"], &[(policy::PATH_VAR, &host), ("QUILLO_ENV_FROM_FILE", marker)]);
+        assert_eq!(code, Some(0), "{:?}: {}", marker, out);
+        assert!(out.contains(&format!("{} (QUILLO_POLICY_PATH)", host)) && out.contains("effects.allow = db"), "{:?}: {}", marker, out);
+    }
+    // A service its app started believes the marker, and still never takes the policy's name from it.
+    let mut g = start(&d, &["run", "main.qwe", "--as-service", "--port", "0"], &[(policy::PATH_VAR, &host), ("QUILLO_ENV_FROM_FILE", "QUILLO_POLICY_PATH"), ("QUILLO_STOP_WITH_APP", "1")], "s.log");
+    assert_eq!(wait_exit(&mut g.0, 60), Some(1), "{}", read(&d.join("s.log")));
+    assert!(read(&d.join("s.log")).contains(&refused), "{}", read(&d.join("s.log")));
+}
+
+/// The marker is no one's word outside a service its app started: a value the environment set is
+/// not replaced by `.env` because the marker names it, there or in the processes started from it
+/// (`--with`'s command does not see it). In a service its app started it is believed: the app's
+/// file's value gives way to the service's own (src/dotenv.rs take_marker, FEEDBACK82.md Q-1281,
+/// found by the coverage tests; branch feedback82-85).
+#[test]
+fn the_marker_is_believed_only_in_a_service_its_app_started() {
+    let d = Tmp::new("marker-trust");
+    write(&d, "main.qwe", "print(env(\"REAL_X\") ?? \"none\")\n");
+    write(&d, ".env", "REAL_X=from the file\n");
+    let real = [("REAL_X", "real"), ("QUILLO_ENV_FROM_FILE", "REAL_X")];
+    let (code, out) = quillo(&d, &["run", "main.qwe"], &real);
+    assert_eq!((code, out.as_str()), (Some(0), "real\n"));
+    // With `--as-service` alone (no app started it) or the app's variable alone: not believed.
+    let (code, out) = quillo(&d, &["run", "main.qwe", "--as-service"], &real);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(!out.contains("from the file"), "{}", out);
+    // Started by its app (stdin the app's pipe, held open until the line is out): believed.
+    let mut g = start(&d, &["run", "main.qwe", "--as-service", "--port", "0"], &[("REAL_X", "the app's file's"), ("QUILLO_ENV_FROM_FILE", "REAL_X"), ("QUILLO_STOP_WITH_APP", "1")], "t.log");
+    wait_for(&d.join("t.log.out"), "from the file\n", 60);
+    drop(g.0.stdin.take());
+    assert!(wait_exit(&mut g.0, 60).is_some());
+    // Not passed on: the command `--with` starts sees no marker.
+    write(&d, "srv.qwe", "route GET / = \"home\"\n");
+    let mut g = start(&d, &["run", "srv.qwe", "--port", "0", "--with", "sh -c 'echo marker=[$QUILLO_ENV_FROM_FILE] > marker.txt'"], &real, "w.log");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !read(&d.join("marker.txt")).contains('\n') {
+        assert!(Instant::now() < deadline, "{}", read(&d.join("w.log")));
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(read(&d.join("marker.txt")), "marker=[]\n");
+    sigterm(&g.0);
+    assert!(wait_exit(&mut g.0, 60).is_some());
+}
+
+/// What the host's `[env] set` forces, no `.env` replaces, whatever the marker says: the program's
+/// `.env` (with the marker and without), a service's own `.env` in one process, and under `--split`,
+/// where the app's file's other names still give way to the service's own; the marker's entries no
+/// `.env` gave do not reach the service either. A name written in other case is another variable on
+/// Unix, read from `.env` (src/dotenv.rs load_into_process, var and set_by_file, FEEDBACK82.md
+/// Q-1280, found by the coverage tests; branch feedback82-85).
+#[test]
+fn a_name_the_hosts_env_set_forces_is_never_a_dotenvs() {
+    let d = Tmp::new("env-set-forced");
+    write(&d, "host/p.toml", "[env]\nset = { APP_ENV = \"production\" }\n");
+    write(&d, ".env", "APP_ENV=dev\nOTHER=x\napp_env=lower\n");
+    write(&d, "p.qwe", "print(env(\"APP_ENV\") ?? \"none\")\nprint(env(\"OTHER\") ?? \"none\")\nprint(env(\"app_env\") ?? \"none\")\n");
+    let host = d.join("host/p.toml").display().to_string();
+    let want = if cfg!(windows) { "production\nx\nproduction\n" } else { "production\nx\nlower\n" };
+    for marker in ["", "APP_ENV", "APP_ENV,OTHER", "app_env,APP_ENV"] {
+        let (code, out) = quillo(&d, &["run", "p.qwe"], &[(policy::PATH_VAR, &host), ("QUILLO_ENV_FROM_FILE", marker)]);
+        assert_eq!(code, Some(0), "{:?}: {}", marker, out);
+        assert!(out.ends_with(want), "{:?}: {}", marker, out);
+    }
+    // A service its app started, which believes the marker: the forced name is still the host's.
+    let mut g = start(&d, &["run", "p.qwe", "--as-service", "--port", "0"], &[(policy::PATH_VAR, &host), ("QUILLO_ENV_FROM_FILE", "APP_ENV"), ("QUILLO_STOP_WITH_APP", "1")], "a.log");
+    wait_for(&d.join("a.log.out"), want, 60);
+    drop(g.0.stdin.take());
+    assert!(wait_exit(&mut g.0, 60).is_some());
+    // A service's own .env, in one process and apart.
+    write(&d, "svc/.env", "APP_ENV=svcdev\nOTHER=svc\nREAL_X=svcfile\n");
+    write(&d, "svc/s.qwe", "server fn e() -> str = env(\"APP_ENV\") ?? \"none\"\nserver fn o() -> str = env(\"OTHER\") ?? \"none\"\nserver fn r() -> str = env(\"REAL_X\") ?? \"none\"\n");
+    write(&d, "main.qwe", "service s = \"svc/s.qwe\"\nroute GET /e = s.e()\nroute GET /o = s.o()\nroute GET /r = s.r()\n");
+    let vars = [(policy::PATH_VAR, host.as_str()), ("QUILLO_ENV_FROM_FILE", "APP_ENV,REAL_X"), ("REAL_X", "real"), ("QUILLO_SERVICE_SECRET", "another secret for the tests, 32 bytes or more")];
+    for split in [false, true] {
+        let mut args = vec!["run", "main.qwe", "--port", "0"];
+        if split {
+            args.push("--split");
+        }
+        let log = format!("split-{}.log", split);
+        let mut g = start(&d, &args, &vars, &log);
+        let port = port_in_log(&mut g.0, &d.join(&log), Duration::from_secs(60));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let body = |p: &str| send(port, "GET", p, &[], "").body;
+        while send(port, "GET", "/e", &[], "").status != 200 {
+            assert!(Instant::now() < deadline, "{}", read(&d.join(&log)));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!((body("/e"), body("/o"), body("/r")), ("production".to_string(), "svc".to_string(), "real".to_string()), "split {}: {}", split, read(&d.join(&log)));
+        sigterm(&g.0);
+        assert!(wait_exit(&mut g.0, 60).is_some());
+    }
+}
+
+/// `quillo mcp --serve`: after a tool that waits (`sleep` of 0, 1 and 20 ms, `http.get`, two waits
+/// in `parallel`), the routes still answer; one answers while a tool sleeps; and stdin closing ends
+/// the process (exit 0) once the call in progress is answered (src/mcp.rs serve_stdio, src/main.rs
+/// serve_beside, FEEDBACK85.md Q-1347, found by the coverage tests; branch feedback82-85).
+#[test]
+fn mcp_serve_routes_answer_after_a_tool_that_waits() {
+    let d = Tmp::new("mcp-lock");
+    write(
+        &d,
+        "m.qwe",
+        &format!(
+            "{}/// Fetches a page.\nfn mcp fetch(url: str) -> str with http {{\n  return http.get(url, {{}}, {{ public_only: false }}).body\n}}\n/// Two waits at once.\nfn mcp both() -> str with time {{\n  let r = parallel(() => {{ sleep(5)\n return \"a\" }}, () => {{ sleep(5)\n return \"b\" }})\n  return r[0] + r[1]\n}}\n",
+            SLOW
+        ),
+    );
+    let pong = files_server(vec![("/pong", b"pong".to_vec())]);
+    let mut g = start(&d, &["mcp", "m.qwe", "--serve", "--port", "0"], &[], "l.log");
+    let port = port_in_log(&mut g.0, &d.join("l.log"), Duration::from_secs(60));
+    let mut stdin = g.0.stdin.take().unwrap();
+    assert_eq!(send(port, "GET", "/", &[], "").body, "home");
+    let calls = [
+        (r#""name":"slow","arguments":{"ms":0}"#.to_string(), "done after 0".to_string()),
+        (r#""name":"slow","arguments":{"ms":1}"#.to_string(), "done after 1".to_string()),
+        (r#""name":"slow","arguments":{"ms":20}"#.to_string(), "done after 20".to_string()),
+        (format!(r#""name":"fetch","arguments":{{"url":"http://127.0.0.1:{}/pong"}}"#, pong), "pong".to_string()),
+        (r#""name":"both","arguments":{}"#.to_string(), "ab".to_string()),
+    ];
+    for (i, (call, want)) in calls.iter().enumerate() {
+        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":{},"method":"tools/call","params":{{{},{}}}}}"#, i + 1, call, META).unwrap();
+        stdin.flush().unwrap();
+        let text = wait_for(&d.join("l.log.out"), &format!(r#""id":{},"#, i + 1), 60);
+        assert!(text.lines().last().unwrap().contains(&format!(r#""structuredContent":{{"result":"{}"}}"#, want)), "{}", text);
+        assert_eq!(send(port, "GET", "/", &[], "").body, "home", "after {}: {}", call, read(&d.join("l.log")));
+    }
+    // A route answers while a tool sleeps: the lock is given up for the wait.
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{{"name":"slow","arguments":{{"ms":10000}},{}}}}}"#, META).unwrap();
+    stdin.flush().unwrap();
+    wait_for(&d.join("l.log"), "started 10000", 60);
+    assert_eq!(send(port, "GET", "/", &[], "").body, "home");
+    assert!(!read(&d.join("l.log.out")).contains(r#""id":9,"#), "answered before the route");
+    // stdin closed: the call is answered, then the process ends.
+    drop(stdin);
+    assert_eq!(wait_exit(&mut g.0, 60), Some(0), "{}", read(&d.join("l.log")));
+    assert!(read(&d.join("l.log.out")).contains("done after 10000"), "{}", read(&d.join("l.log.out")));
+}
+
+/// The stdio door of `quillo mcp --serve` offers no tool of a taken file that was not confirmed, as
+/// the door alone does not: the main file's own is listed, the taken file's neither listed nor run;
+/// a program that declares none still says it has none, and one whose only tool is held back does
+/// not (src/main.rs mcp, FEEDBACK83.md Q-1301, found by the coverage tests; branch feedback82-85).
+#[test]
+fn mcp_serve_offers_no_unconfirmed_tool_on_stdio() {
+    let d = Tmp::new("mcp-unconfirmed");
+    write(&d, "main.qwe", "import kit/t.qwe use Badge\n/// Own tool.\nfn mcp own() -> str = \"own\"\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/t.qwe", "component Badge() = <b>badge</b>\n/// Leaks.\nfn mcp leak() -> str with env = env(\"SECRET_X\") ?? \"\"\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n[\"kit/t.qwe\"]\n");
+    let list = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{{{}}}}}"#, META);
+    let call = format!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"leak","arguments":{{}},{}}}}}"#, META);
+    let mut g = start(&d, &["mcp", "main.qwe", "--serve", "--port", "0"], &[("SECRET_X", "s3cr3t")], "u.log");
+    let port = port_in_log(&mut g.0, &d.join("u.log"), Duration::from_secs(60));
+    let mut stdin = g.0.stdin.take().unwrap();
+    writeln!(stdin, "{}\n{}", list, call).unwrap();
+    drop(stdin);
+    assert_eq!(wait_exit(&mut g.0, 60), Some(0), "{}", read(&d.join("u.log")));
+    let out = read(&d.join("u.log.out"));
+    assert!(out.contains(r#""name":"own""#) && !out.contains(r#""name":"leak""#) && !out.contains("s3cr3t"), "{}", out);
+    assert!(out.lines().nth(1).is_some_and(|l| l.contains(r#""id":2,"#) && l.contains("error")), "{}", out);
+    assert!(!read(&d.join("u.log")).contains("has no tools"), "{}", read(&d.join("u.log")));
+    let _ = port;
+    // Its only tool held back: listed as none, without "has no tools", which is for a program that
+    // declares none.
+    write(&d, "only.qwe", "import kit/t.qwe use Badge\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "quillo.confirmed", "[\"only.qwe\"]\n[\"kit/t.qwe\"]\n");
+    let mut g = start(&d, &["mcp", "only.qwe"], &[("SECRET_X", "s3cr3t")], "o.log");
+    let mut stdin = g.0.stdin.take().unwrap();
+    writeln!(stdin, "{}\n{}", list, call).unwrap();
+    drop(stdin);
+    assert_eq!(wait_exit(&mut g.0, 60), Some(0), "{}", read(&d.join("o.log")));
+    let out = read(&d.join("o.log.out"));
+    assert!(out.contains(r#""tools":[]"#) && !out.contains("s3cr3t"), "{}", out);
+    assert!(!read(&d.join("o.log")).contains("has no tools"), "{}", read(&d.join("o.log")));
+    write(&d, "none.qwe", "route GET / = \"home\"\n");
+    write(&d, "quillo.confirmed", "[\"none.qwe\"]\n");
+    let (code, out) = quillo(&d, &["mcp", "none.qwe"], &[]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("none.qwe has no tools"), "{}", out);
+}
+
+/// A developer's layer saying `[env] set` is refused in words that read: "not the program's own
+/// (quillo.policy)" and "not a --policy file's", never "'s's" (src/policy.rs force_env, FEEDBACK82.md
+/// Q-1280, found by the coverage tests; branch feedback82-85).
+#[test]
+fn env_set_in_a_developers_layer_is_refused_in_words_that_read() {
+    for (kind, whose) in [(Kind::Program, "not the program's own (quillo.policy)"), (Kind::Named, "not a --policy file's")] {
+        let e = policy::Policy::default().add_layer(Path::new("dev.toml"), "[env]\nset = { APP_ENV = \"dev\" }\n", kind).unwrap_err();
+        assert!(e.contains("`env.set` is the host's to say") && e.ends_with(whose), "{:?}: {}", kind, e);
+        assert!(!e.contains("'s's") && !e.contains("--policy's"), "{}", e);
+    }
+}
+
+/// policy.d's layers are its `.toml` files whatever the case of the extension (`.TOML`, `.Toml`),
+/// read in name order with the others, unicode names too; a file of another kind (`.toml.bak`,
+/// `.tomlx`, one named `toml`) is not a layer (src/policy.rs load_from, FEEDBACK82.md Q-1281, found
+/// by the coverage tests; branch feedback82-85).
+#[test]
+fn a_dropin_in_capitals_is_read() {
+    let d = Tmp::new("dropin-case");
+    let a = d.canonicalize().unwrap();
+    let host = a.join("host/policy.toml");
+    let main = a.join("app/main.qwe");
+    write(&a, "host/policy.toml", "[limits]\nworkers = 8\n");
+    write(&a, "host/policy.d/10.TOML", "[limits]\nworkers = 3\n");
+    let p = policy::load_from(&host, &main, &[], None).unwrap();
+    assert_eq!(p.workers, Some(3));
+    assert_eq!(p.kinds, vec![Kind::Host, Kind::Dropin]);
+    write(&a, "host/policy.d/20.Toml", "[limits]\nmax_body = \"1KB\"\n");
+    write(&a, "host/policy.d/30-é.toml", "[http]\nprivate = false\n");
+    write(&a, "host/policy.d/40.toml.bak", "[limits]\nworkers = 1\n");
+    write(&a, "host/policy.d/50.tomlx", "[limits]\nworkers = 1\n");
+    write(&a, "host/policy.d/toml", "[limits]\nworkers = 1\n");
+    let p = policy::load_from(&host, &main, &[], None).unwrap();
+    let names: Vec<String> = p.files.iter().map(|f| f.file_name().unwrap().to_string_lossy().into_owned()).collect();
+    assert_eq!(names, vec!["policy.toml", "10.TOML", "20.Toml", "30-é.toml"]);
+    assert_eq!((p.workers, p.max_body, p.private), (Some(3), Some(1024), false));
+}
+
+/// A connection closed under the policy's `max_connections` names the policy's file; under an
+/// option as small, or smaller, the option, as before: two held open and the third closed under the
+/// policy's 2 alone and with `--max-connections 2`; one and the second with `--max-connections 1`.
+/// From this machine's address on its network, `--connections-per-client 2` under the policy's 3 is
+/// the option's (src/httpd.rs place_for, src/main.rs policy_run, FEEDBACK82.md Q-1280, found by the
+/// coverage tests; branch feedback82-85).
+#[test]
+fn a_connection_the_policy_closes_names_its_file() {
+    let d = Tmp::new("max-conn");
+    write(&d, "main.qwe", HOME);
+    write(&d, "p.toml", "[run]\nmax_connections = 2\n");
+    write(&d, "c.toml", "[run]\nconnections_per_client = 3\n");
+    // Held open once answered (kept alive), so counted before the next comes, however slow the
+    // machine: not after a fixed wait. One closed as it comes is tried again: a connection that
+    // looked for the port may not be given back yet.
+    let hold = |port: u16, ip: &str| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let mut s = TcpStream::connect((ip, port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
+            let _ = s.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+            let mut got = Vec::new();
+            let mut buf = [0u8; 512];
+            while !got.ends_with(b"home") {
+                match s.read(&mut buf) {
+                    Ok(n) if n > 0 => got.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+            if got.ends_with(b"home") {
+                return s;
+            }
+            assert!(Instant::now() < deadline, "never answered: {}", String::from_utf8_lossy(&got));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let refused = |port: u16, ip: &str| {
+        let mut one_more = TcpStream::connect((ip, port)).unwrap();
+        one_more.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let _ = one_more.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let mut got = Vec::new();
+        let _ = one_more.read_to_end(&mut got);
+        !String::from_utf8_lossy(&got).contains("home")
+    };
+    for (i, (extra, held, said)) in [
+        (&[][..], 2, "2 connections are open, the most the policy p.toml allows (run.max_connections)"),
+        (&["--max-connections", "2"][..], 2, "2 connections are open, the most --max-connections allows"),
+        (&["--max-connections", "1"][..], 1, "1 connections are open, the most --max-connections allows"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let log = format!("m{}.log", i);
+        let mut args = vec!["run", "main.qwe", "--port", "0", "--policy", "p.toml"];
+        args.extend_from_slice(extra);
+        let mut g = start(&d, &args, &[], &log);
+        let port = port_in_log(&mut g.0, &d.join(&log), Duration::from_secs(60));
+        let open: Vec<TcpStream> = (0..held).map(|_| hold(port, "127.0.0.1")).collect();
+        assert!(refused(port, "127.0.0.1"), "{:?}", extra);
+        let text = wait_for(&d.join(&log), said, 30);
+        assert_eq!(text.contains("p.toml allows"), extra.is_empty(), "{:?}: {}", extra, text);
+        drop(open);
+        sigterm(&g.0);
+        assert!(wait_exit(&mut g.0, 60).is_some());
+    }
+    if let Some(ip) = own_address() {
+        let mut g = start(&d, &["run", "main.qwe", "--port", "0", "--host", "0.0.0.0", "--policy", "c.toml", "--connections-per-client", "2"], &[], "c.log");
+        let port = port_in_log(&mut g.0, &d.join("c.log"), Duration::from_secs(60));
+        let held: Vec<TcpStream> = (0..2).map(|_| hold(port, &ip)).collect();
+        assert!(refused(port, &ip));
+        let text = wait_for(&d.join("c.log"), &format!("{} holds 2 connections, the most --connections-per-client allows", ip), 30);
+        assert!(!text.contains("c.toml allows"), "{}", text);
+        drop(held);
+        sigterm(&g.0);
+        assert!(wait_exit(&mut g.0, 60).is_some());
+    }
 }

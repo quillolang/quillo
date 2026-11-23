@@ -408,6 +408,10 @@ pub struct Door {
     /// (`own_block`), after Quillo's lines in `instructions` (FEEDBACK56.md, Part D, question 2;
     /// branch feedback56).
     pub own: Option<String>,
+    /// The door on stdio beside a server of the same program (`quillo mcp --serve`), its
+    /// interpreter sharing the routes' lock: it takes the lock to answer a message, as a request
+    /// does, and gives it back to wait for the next (`serve_stdio`).
+    pub beside: bool,
 }
 
 /// An error answered in place of a result.
@@ -537,7 +541,7 @@ fn text_of(tool: &str, v: &Value) -> Result<String, J> {
 
 impl Door {
     pub fn new(name: impl Into<String>, tools: Vec<Tool>) -> Door {
-        Door { tools, name: name.into(), most: MOST, over_http: false, own: None }
+        Door { tools, name: name.into(), most: MOST, over_http: false, own: None, beside: false }
     }
 
     /// The door of the program whose main file is `path`, as `quillo mcp` (stdio), `quillo run`
@@ -2488,6 +2492,14 @@ pub fn serve_stdio(door: &Door, it: &mut Interp, input: &mut dyn std::io::BufRea
                 return 1;
             }
         };
+        // Beside the routes, the call runs under the lock their requests run under. It ran without
+        // taking it: the routes ran beside the call, and a tool that waited (`sleep`, `http.get`)
+        // gave back the lock it did not hold and took it on waking for good, so that every request
+        // after it waited for ever, and so did a stop (FEEDBACK85.md, Q-1347, found by the
+        // coverage tests; branch feedback82-85). Taken before the call's time is counted.
+        if door.beside {
+            it.shared.gil.acquire();
+        }
         if let Some(w) = &watch {
             w.begin();
         }
@@ -2509,6 +2521,9 @@ pub fn serve_stdio(door: &Door, it: &mut Interp, input: &mut dyn std::io::BufRea
         };
         if let Some(w) = &watch {
             w.end();
+        }
+        if door.beside {
+            it.shared.gil.release();
         }
         if let Some(a) = answer {
             let mut text = a.to_string().into_bytes();
