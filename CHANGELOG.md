@@ -53,11 +53,23 @@ and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2
   main file's routes got through, its frame and CORS headers changed. A new key `site`,
   listed as `site-wide`, holds a taken file's `allow_cross_site`, `site_headers`,
   `tenant_from`, `moves_in_place`, `accept_calls`, `style_with`, `channel`, `media`, `ready`,
-  `locale_from` and `translations`, and its `db.open` and `db.system`, which replaced every
-  file's database: not applied unless confirmed. `pragma lock_proxy_file` is refused under a
+  `locale_from` and `translations`, its `db.open` and `db.system`, which replaced every
+  file's database, and `db.migrate()` on it: not applied unless confirmed. `pragma
+  lock_proxy_file` is refused under a
   hold; a migration's files are read, and its statements held, as the calling file's;
   `quillo fix`, `check` and `confirm` say what an import hands a file of another's reach
   (`kit/k.qwe takes main.qwe's reader (read_file, as main.qwe reaches it)`).
+- **A taken file sets nothing for the visitor unless confirmed** (Q-1301, found in review): a
+  kit's view called `set_session({ user: { role: "admin" } })` and every visitor became an
+  admin. A new key `session`, listed as `visitor's`, holds a taken file's `set_session`,
+  `end_session`, `set_cookie NAME`, `delete_cookie NAME`, `mcp_token` and
+  `revoke_mcp_token`, and the headers of its `reply`, which ended the main file's request
+  with any cookie, CORS or `location`: unconfirmed, its status and body go out without them.
+- **Push and Quillo's own tables are held** (Q-1300, found in review): a taken file wrote its
+  own endpoint into `_quillo_push`, and `notification.send` carried the users table there.
+  `notification.send` asks the hold for each push service's host, for the file that sends
+  (`quillo confirm` lists the browsers' push hosts for it), and under a hold a taken file's
+  SQL never touches Quillo's own `_quillo_*` tables, however it names them.
 - **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
   of 2026-11-24): a name another file defines, used without taking it, is an error in
   `quillo check`, and the start refuses it with `--no-check` too, as the value under it

@@ -934,14 +934,15 @@ Each file has a block, named by its path from the main file's folder, and these 
 
 | Key | What the file reaches |
 |---|---|
-| `http` | the hosts its `http.*` and `site` calls, its UDP sends and its databases (as their drivers read the address) reach; `*.stripe.com`, written by hand, covers the subdomains, and `quillo confirm` keeps it |
+| `http` | the hosts its `http.*` and `site` calls, its UDP sends, its databases (as their drivers read the address) and its `notification.send` pushes reach (for a file that calls it, `quillo confirm` lists the browsers' push hosts: `fcm.googleapis.com`, `updates.push.services.mozilla.com`, `web.push.apple.com`, `*.notify.windows.com`); `*.stripe.com`, written by hand, covers the subdomains, and `quillo confirm` keeps it |
 | `files` | the paths its file builtins read (`read_file`, `file`, `files`, `image.info`, and the folders of `db.migrate` and `translations`); a folder ends with `/` and covers what is in it |
 | `writes` | the paths it writes or deletes (`write_file`, `delete_file`, `save_upload`, `image.convert`'s, an `http.*` call's `save:`, a SQLite database's file and the files its SQL attaches); a path confirmed in `files` only is read, never written, and one under `writes` is read too, with no `files` entry |
 | `listens` | the UDP ports it listens on at an address others reach (`udp 514`); this machine's own loopback needs none |
 | `scripts` | the scripts its pages load (`client "https://..."`), each with the `sha384-...` integrity hash `quillo confirm` fetched it for |
 | `loads`, `calls` | the hosts its markup loads from (`src`), and its pages call (`js("fetch", "https://...")`) |
 | `routes` | for a file taken for some of its names (`import lib/x.qwe use f`), the routes, `server fn`s and tools (`fn mcp`) it adds beyond the names taken, and its `mount` and `service` lines (`mount /admin`, `service /jobs`, and a `service mcp` line's tools as `fn mcp billing.total`) |
-| `site` | for a file taken for some of its names, its calls that set something for the whole site, listed as `site-wide`: `allow_cross_site /`, `site_headers /`, `tenant_from`, `moves_in_place`, `accept_calls`, `style_with`, `channel`, `media`, `ready`, `locale_from`, `translations`, and `db.open` and `db.system`, which set every file's database; however written (in a function, piped, in an `if`), and as `name *` where the path or name is worked out as the program runs |
+| `site` | for a file taken for some of its names, its calls that set something for the whole site, listed as `site-wide`: `allow_cross_site /`, `site_headers /`, `tenant_from`, `moves_in_place`, `accept_calls`, `style_with`, `channel`, `media`, `ready`, `locale_from`, `translations`, `db.open` and `db.system`, which set every file's database, and `db.migrate()` on it (a connection's own `c.migrate()` is not); however written (in a function, piped, in an `if`), and as `name *` where the path or name is worked out as the program runs |
+| `session` | for a file taken for some of its names, what it sets for the visitor, listed as `visitor's`: `set_session`, `end_session`, `set_cookie NAME`, `delete_cookie NAME`, `mcp_token`, `revoke_mcp_token`, and `reply`, whose headers it sends only when confirmed |
 | `sha256`, `effects` | for a Rust file: its SHA-256, and what its `//! effects:` line said; Quillo cannot hold Rust to a list, only to the file |
 
 What is held, once the file is there (`quillo run`, `quillo mcp`, `quillo app`, `quillo
@@ -984,6 +985,17 @@ build`, and a `--split` service, by its app's `quillo.confirmed`):
   is an error value: ``db: db.open sets every file's database, and is not confirmed for
   kit/k.qwe (quillo confirm)``. The main file's calls, a file it takes whole and a mounted
   program's are the program's own.
+- What such a file sets for the visitor (`session`) is held too: unconfirmed, `set_session`,
+  `end_session`, `set_cookie` and `delete_cookie` are not applied, said once (a kit's view
+  could make every visitor an admin, or sign everyone out), and `mcp_token` and
+  `revoke_mcp_token` give an error value. Its `reply` still ends the request with its status
+  and body, so a guard's `reply 401` stops it, but without its headers (a cookie, CORS for
+  another site, a `location`): `quillo: kit/k.qwe: a reply's headers are not sent (its status
+  and body are): it is not confirmed for this file`.
+- `notification.send` is held as an `http` call, each push service's host for the file that
+  sends. A taken file's SQL never touches Quillo's own tables (`_quillo_push`, jobs, tokens),
+  however it names them: ``db: Quillo's own tables (_quillo_...) are refused for kit/k.qwe's SQL
+  where a quillo.confirmed holds the run ...``.
 - Each file uses only the names it takes. A name another file defines, used without taking
   it, is an error in `quillo check`, and the start refuses it, checked or not: the value
   under it carries what that file was confirmed for (main's `let reader = read_file`, used
@@ -1077,10 +1089,28 @@ reported, by the report-only policy; a database's address in upper case
 (`POSTGRES://...`) or as a `conninfo` string is listed as a path, and refused when reached;
 under [`--split`](#options-of-quillo-run), a taken file's `service` line that is not
 confirmed still starts its service, on this machine's loopback only, and says it is served
-under its path, which is then not served; a taken file's component can set a response's
-headers or cookies on the main file's requests; `notification.send` reaches push services
-without asking the hold; and without a `quillo.confirmed`, `translations(dir)` reads its
-folder through links wherever they lead (`db.migrate`'s is judged as `read_file`'s).
+under its path, which is then not served; a taken component's `page_head` sets the page's
+head as any call does (a canonical link to another site); and without a `quillo.confirmed`,
+`translations(dir)` reads its folder through links wherever they lead (`db.migrate`'s is
+judged as `read_file`'s).
+
+Three things a list per file does not cover, by design for now. A taken file shares the
+program's data and secrets: the hold is about what it reaches outside, and what it changes
+for the site and the visitor.
+
+- **The program's open database is every file's.** A taken file's `db.query` and `db.exec`
+  on the database the program opened are not held per file: a file confirmed for nothing
+  can read and write the program's tables through `db`. What is held is opening one
+  (`db.open`, `db.system`, a tenant's file), its migrations (`db.migrate()`), the files SQL
+  attaches, and Quillo's own `_quillo_*` tables, which a taken file's SQL never touches.
+- **A function is its own file's.** A `fn` another file declares, taken by name (`import
+  main.qwe use secret`), runs with that file's reach, a site-wide call inside it included:
+  a kit confirmed for nothing that takes main's `secret()`, which reads `.env`, reads it.
+  The import notes name only values that hold a builtin (`let reader = read_file`), not
+  declared functions, so read what a taken file imports from the program's own.
+- **The environment is every file's.** `env()` is not held per file for `.qwe` code: a
+  taken file reads the program's environment, `QUILLO_SECRET` included, as it shares the
+  program's open database.
 
 ## Quillo on a shared server (cPanel)
 

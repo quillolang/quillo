@@ -385,5 +385,6 @@ db.transaction(() => {
   (`attach`, `vacuum into`) must be under the file's `writes`, counted from the folder the
   process runs in; `attach ?` is refused. The folders of `db.migrate` and `translations` are
   `files` entries. A file taken for some of its names may not set what is site-wide
-  (`allow_cross_site`, `site_headers`, `db.open`, ...) unless `quillo confirm` confirmed it:
-  keep those calls in `main.qwe`.
+  (`allow_cross_site`, `site_headers`, `db.open`, ...) or the visitor's (`set_session`,
+  `set_cookie`, a `reply`'s headers) unless `quillo confirm` confirmed it, nor touch the
+  `_quillo_*` tables: keep those calls in `main.qwe`.
