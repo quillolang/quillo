@@ -548,10 +548,24 @@ fn name_arg(args: &[Value], f: &str, line: u32) -> Result<String, Ctrl> {
     }
 }
 
+/// Whether the code of `it` may set `item` of the visitor's (`set_session`, `set_cookie theme`):
+/// in the main file's requests, a file taken for some of its names sets only what was confirmed
+/// for it, said once where it is not, as what it sets for the whole site is held
+/// (`builtins::site_wide`). A kit's component taken for `Badge` called `set_session({ user: { role:
+/// "admin" } })`, and every visitor of the page was the main file's admin, `session().user` being
+/// the program's word for who someone is (FEEDBACK83.md, Q-1301, found by the review of bc460fd;
+/// branch feedback82-85). One look at the hold where none is.
+fn visitors(it: &Interp, item: impl FnOnce() -> String) -> bool {
+    crate::builtins::site_wide(it, item)
+}
+
 /// `set_cookie(name, value, { max_age, path, domain, http_only, secure,
 /// same_site })`: sent with the response, whatever the route returns.
 fn set_cookie(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = name_arg(&args, "set_cookie", line)?;
+    if !visitors(it, || format!("set_cookie {}", name)) {
+        return Ok(Value::Nil);
+    }
     let value = match args.get(1) {
         Some(Value::Str(s) | Value::Css(s)) => s.to_string(),
         Some(Value::Nil) | None => String::new(),
@@ -566,6 +580,9 @@ fn set_cookie(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// `delete_cookie(name, { path, domain })`: the path and domain it was set with.
 fn delete_cookie(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let name = name_arg(&args, "delete_cookie", line)?;
+    if !visitors(it, || format!("delete_cookie {}", name)) {
+        return Ok(Value::Nil);
+    }
     let o = opts(&args, 1, "delete_cookie", line)?;
     let l = cookie_line(it, &name, "", Some(0), o.as_ref(), "delete_cookie", line)?;
     queue(it, l);
@@ -695,9 +712,13 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         // Trusted CSS in it kept as the text it is: read back from the cookie it is text, and so
         // it is for the rest of this request (FEEDBACK79.md, Q-1250; branch feedback72-81).
         Some(v @ Value::Map(_)) => Value::plain_deep(v).unwrap_or_else(|| v.clone()),
-        Some(Value::Nil) => return end_session(it, Vec::new(), line),
+        Some(Value::Nil) if !visitors(it, || "set_session".into()) => return Ok(Value::Nil),
+        Some(Value::Nil) => return ended(it, line),
         other => return fail(line, format!("`set_session` expects a map, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
+    if !visitors(it, || "set_session".into()) {
+        return Ok(Value::Nil);
+    }
     let o = opts(&args, 1, "set_session", line)?;
     let given = o.as_ref().and_then(|m| m.get("max_age")).filter(|v| !matches!(v, Value::Nil));
     let age = match given {
@@ -793,6 +814,14 @@ fn set_session(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// the one it has now each with its own: its id alone is no one's, as it stays from no user to a
 /// user (FEEDBACK56.md, Q-859, second review; branch feedback56).
 fn end_session(it: &mut Interp, _: Vec<Value>, line: u32) -> R {
+    if !visitors(it, || "end_session".into()) {
+        return Ok(Value::Nil);
+    }
+    ended(it, line)
+}
+
+/// The session ended, its tokens and devices' notifications with it (`end_session`).
+fn ended(it: &mut Interp, line: u32) -> R {
     let user_in = |d: &Value| match d {
         Value::Map(m) => m.get("user").filter(|u| !matches!(u, Value::Nil)).cloned(),
         _ => None,

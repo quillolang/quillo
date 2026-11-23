@@ -2572,7 +2572,7 @@ fn db_migrate_reads_only_a_folder_its_file_may_read() {
     write(&app, "main.qwe", "import kit/k.qwe use Badge, m\ndb.open(\"data/app.db\")\nroute GET /m = m()\n");
     write(&app, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nfn m() {\n  return str(db.migrate(\"kit/m\"))\n}\n");
     write(&app, "kit/m/001_a.sql", "attach database 'data/kit.db' as o;\ncreate table o.t (x int);\n");
-    write(&app, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\nfiles = [\"migrations/\", \"mïg/\"]\n\n[\"kit/k.qwe\"]\nfiles = [\"kit/m/\"]\n");
+    write(&app, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\nfiles = [\"migrations/\", \"mïg/\"]\n\n[\"kit/k.qwe\"]\nfiles = [\"kit/m/\"]\nsite = [\"db.migrate\"]\n");
     let (g, port, log) = serve(&app, &["--no-check"]);
     assert_eq!(send(port, "GET", "/m", &[], "").status, 500);
     assert!(log_has(&log, "db.migrate: migration 001_a.sql failed: ", 30) && log_has(&log, "kit.db is not confirmed for kit/k.qwe (quillo confirm)", 30), "{}", read(&log));
@@ -2770,5 +2770,181 @@ fn a_taken_file_sets_the_programs_database_only_where_confirmed() {
     let (g, port, log) = serve(&d, &[]);
     assert_eq!(send(port, "GET", "/", &[], "").body, "false kits", "{}", read(&log));
     assert!(d.join("data/sys.db").exists());
+    drop(g);
+}
+
+/// A taken file's code, run in the main file's requests (a component's render), wrote the visitor's
+/// session and cookies: a kit taken for `Badge`, confirmed for nothing, called `set_session({ user:
+/// { role: "admin" } })` in its view, and after one visit to `/` the main file's /admin took the
+/// visitor for its admin. Each call is listed under the visitor's (`set_session`, `set_cookie
+/// theme` by the cookie's name, `end_session`, `delete_cookie`, `mcp_token`, `revoke_mcp_token`),
+/// `quillo check` says each, and a run does not apply it, said; `mcp_token` gives an error value.
+/// Confirmed, each is applied; the main file's own calls are the program's, held or not
+/// (src/session.rs visitors, src/mcp.rs, src/confirm.rs SITE_CALLS; FEEDBACK83.md Q-1301, found by
+/// the coverage tests; branch feedback82-85).
+#[test]
+fn a_taken_files_code_sets_the_visitors_session_only_where_confirmed() {
+    let d = dir("k8-session");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, out, token\nroute GET / = <html><body><Badge/></body></html>\nroute GET /admin = session().user?.role == \"admin\" ? \"ADMIN PANEL for \" + str(session().user.name) : \"denied\"\nroute GET /in {\n  set_session({ user: { name: \"ann\", role: \"member\" } })\n  return \"in\"\n}\nroute GET /out = out()\nroute GET /token = token()\n");
+    write(&d, "kit/k.qwe", "view Badge() {\n  set_session({ user: { name: \"anyone\", role: \"admin\" } })\n  set_cookie(\"theme\", \"dark\")\n  return <b>b</b>\n}\nfn out() {\n  end_session()\n  delete_cookie(\"theme\")\n  return \"out\"\n}\nfn token() {\n  let t = mcp_token()\n  return is_err(t) ? \"refused\" : \"a token\"\n}\n");
+    let items = [("delete_cookie theme", "8"), ("end_session", "7"), ("mcp_token", "12"), ("set_cookie theme", "3"), ("set_session", "2")];
+    let (code, out) = quillo(&d, &["confirm", "--list"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.starts_with(&format!("kit/k.qwe\n{}", items.map(|(i, l)| list_line("visitor's", i, l)).concat())), "{}", out);
+    // A visit to the page, then the admin page, with the cookies the answers set.
+    let visit = |port: u16, first: &str| {
+        let a = send(port, "GET", first, &[], "");
+        let cookies: Vec<String> = a.headers.iter().filter(|(k, _)| k == "set-cookie").map(|(_, v)| v.split(';').next().unwrap_or("").to_string()).collect();
+        let jar = cookies.join("; ");
+        (send(port, "GET", "/admin", &[("cookie", &jar)], "").body, cookies.iter().any(|c| c.starts_with("theme=")))
+    };
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(visit(port, "/"), ("ADMIN PANEL for anyone".to_string(), true), "as before, with no quillo.confirmed");
+    drop(g);
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    for (i, l) in items {
+        assert!(out.contains(&format!("kit/k.qwe:{}: error: visitor's {}: not confirmed for this file", l, i)), "{}: {}", i, out);
+    }
+    assert!(out.contains("kit/k.qwe:2: warning: kit/k.qwe is taken for Badge, out, token, and also sets the visitor's set_session, set_cookie theme, end_session, delete_cookie theme, mcp_token"), "{}", out);
+    let (g, port, log) = serve(&d, &["--no-check"]);
+    assert_eq!(visit(port, "/"), ("denied".to_string(), false), "{}", read(&log));
+    // The main file's own sign-in is the program's.
+    let a = send(port, "GET", "/in", &[], "");
+    let jar = a.headers.iter().filter(|(k, _)| k == "set-cookie").map(|(_, v)| v.split(';').next().unwrap_or("").to_string()).collect::<Vec<_>>().join("; ");
+    assert!(jar.contains("quillo_session="), "{:?}", a.headers);
+    assert_eq!(send(port, "GET", "/admin", &[("cookie", &jar)], "").body, "denied");
+    let o = send(port, "GET", "/out", &[("cookie", &jar)], "");
+    assert!(!o.headers.iter().any(|(k, _)| k == "set-cookie"), "the kit's end_session ended it: {:?}", o.headers);
+    assert_eq!(send(port, "GET", "/token", &[("cookie", &jar)], "").body, "refused");
+    for i in ["set_session", "set_cookie theme", "end_session", "delete_cookie theme", "mcp_token"] {
+        assert!(log_has(&log, &format!("quillo: kit/k.qwe: {} is not applied: it is not confirmed for this file", i), 30), "{}: {}", i, read(&log));
+    }
+    drop(g);
+    // Confirmed: the developer's, and applied.
+    assert_eq!(quillo(&d, &["confirm", "--yes"]).0, Some(0));
+    assert!(read(&d.join("quillo.confirmed")).contains("session = [\"delete_cookie theme\", \"end_session\", \"mcp_token\", \"set_cookie theme\", \"set_session\"]"), "{}", read(&d.join("quillo.confirmed")));
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(visit(port, "/"), ("ADMIN PANEL for anyone".to_string(), true));
+    drop(g);
+}
+
+/// Quillo's own tables are Quillo's: under a quillo.confirmed a taken file's SQL that names one
+/// (`_quillo_push`, in any letters, read or written, by `db.exec`, `db.query`, `db.exec_many`, a
+/// rename into one, a trigger writing one, its migration's file) is refused, and so is SQLite's
+/// `writable_schema`, under which a name worked out in the SQL renames a table into one; the main
+/// file's SQL and Quillo's own statements for a taken file's call (`idempotent`) write them as
+/// before. And `notification.send` is held to the hosts its file was confirmed for, as `http.*`
+/// is: a kit confirmed for nothing put its endpoint and keys in `_quillo_push` and a send to a
+/// user went to its host with the users' password hashes. The scan lists the browsers' push
+/// services for a file that sends (src/db.rs own_tables_refused and authorize, src/push.rs
+/// deliver, src/confirm.rs PUSH_HOSTS; FEEDBACK83.md Q-1300, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn quillos_own_tables_and_a_sends_hosts_are_held() {
+    let d = dir("k9-own-tables");
+    let (port, seen) = other_server();
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    {
+        // Quillo's own tables are in the program's database, which it opens (`db.open`).
+        let c = rusqlite::Connection::open(d.join("data/app.db")).unwrap();
+        c.execute_batch("create table _quillo_push (endpoint varchar(1000) primary key, p256dh text not null, auth text not null, who text not null, session text not null, origin text not null, place text not null, created bigint not null, succeeded bigint not null)").unwrap();
+        c.execute(
+            "insert into _quillo_push values (?1, 'BF5JjJmHYcp-lHVMIDyVSu7Q4fzLCDsfNqASRtVyiv5i8aoIztqkMiDtok0G5oXrmrnwzD1uoXEWEeXDg1_Yzpg', 'swC8VcTjKc8fIaxz_rdm_Q', '\"ann\"', 'id s', 'http://shop.example', '[\"\",null]', 1, 0)",
+            [format!("http://127.0.0.1:{}/push/1", port)],
+        )
+        .unwrap();
+    }
+    write(&d, "kit/m/001_a.sql", "insert into _QUILLO_JOBS (name, at) values ('x', 1);\n");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal, kit_send\ndb.open(\"data/app.db\")\ndb.exec(\"create table if not exists users (name text, hash text)\")\nprint(\"main own: \" + str(is_err(db.exec(\"create table if not exists _quillo_mine (x int)\"))))\nprint(steal())\nprint(\"main send: \" + str(notification.send(\"ann\", { title: \"t\" })))\nprint(\"kit send: \" + str(kit_send()))\n");
+    write(
+        &d,
+        "kit/k.qwe",
+        "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  let said = (r) => is_err(r) ? \"refused\" : \"ran\"\n  let out = []\n  for sql in [\"create table if not exists _quillo_push (x int)\", \"insert into _QUILLO_MINE values (1)\", \"select * from \\\"_quillo_mine\\\"\", \"create table if not exists k (x int)\", \"alter table k rename to _quillo_k\", \"create trigger t after insert on users begin insert into _quillo_mine values (2); end\", \"pragma writable_schema = 1\", \"insert into users values ('kit', 'ok')\"] {\n    out = push(out, said(db.exec(sql)))\n  }\n  out = push(out, said(db.query(\"select x from [_quillo_mine]\")))\n  out = push(out, said(db.exec_many(\"insert into _quillo_mine values (?)\", [[3]])))\n  out = push(out, said(db.migrate(\"kit/m\")))\n  return \"kit sql: \" + join(out, \" \")\n}\nfn kit_send() {\n  return notification.send(\"ann\", { title: \"k\" })\n}\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\nhttp = [\"127.0.0.1\"]\n\n[\"kit/k.qwe\"]\nfiles = [\"kit/m/\"]\nsite = [\"db.migrate\"]\n");
+    let (code, out) = quillo_env(&d, &["run", "--no-check", "main.qwe"], 60, &[("QUILLO_PUSH_LOCAL", "1")]);
+    assert_ne!(code, Some(0), "the kit's migration stops the start: {}", out);
+    assert!(out.contains("db.migrate: kit/m/001_a.sql: Quillo's own tables (_quillo_...) are refused for kit/k.qwe's SQL"), "{}", out);
+    write(&d, "kit/m/001_a.sql", "create table kits (x int);\n");
+    let (code, out) = quillo_env(&d, &["run", "--no-check", "main.qwe"], 60, &[("QUILLO_PUSH_LOCAL", "1")]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("main own: false\n"), "{}", out);
+    assert!(out.contains("kit sql: refused refused refused ran refused refused refused ran refused refused ran\n"), "{}", out);
+    assert!(out.contains("main send: { sent: 1, gone: 0 }\n") && out.contains("kit send: { sent: 0, gone: 0 }\n"), "{}", out);
+    assert!(out.contains("quillo: notification.send: 127.0.0.1: 127.0.0.1 is not confirmed for kit/k.qwe (quillo confirm)"), "{}", out);
+    assert_eq!(seen.load(Ordering::SeqCst), 1, "the kit's send reached the host");
+    let c = rusqlite::Connection::open(d.join("data/app.db")).unwrap();
+    let names: Vec<String> = c.prepare("select name from sqlite_master where type in ('table', 'trigger') order by name").unwrap().query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+    assert_eq!(names, ["_quillo_migrations", "_quillo_mine", "_quillo_push", "k", "kits", "users"]);
+    // The scan lists the browsers' push services for a file that sends.
+    let (code, out) = quillo(&d, &["confirm", "--list"]);
+    assert_eq!(code, Some(0), "{}", out);
+    for h in ["*.notify.windows.com", "fcm.googleapis.com", "updates.push.services.mozilla.com", "web.push.apple.com"] {
+        assert!(out.contains(&list_line("reaches", h, "16")) && out.contains(&list_line("reaches", h, "6")), "{}: {}", h, out);
+    }
+}
+
+/// A taken file's `db.migrate()` on the program's database sets the migrations every database the
+/// program opens later is brought up to (each tenant's): listed as `site-wide db.migrate`, refused
+/// until confirmed; on a connection of its own (`c.migrate`) it sets nothing for the program, and is
+/// held as a read of its folder alone (src/db.rs migrate; FEEDBACK83.md Q-1301, found by the
+/// coverage tests; branch feedback82-85).
+#[test]
+fn a_taken_files_db_migrate_sets_the_programs_migrations_only_where_confirmed() {
+    let d = dir("k10-migrate-site");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    write(&d, "kit/m/001_a.sql", "create table kits (x int);\n");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, own, all\ndb.open(\"data/app.db\")\nprint(\"own: \" + str(own()))\nprint(\"all: \" + str(all()))\n");
+    write(&d, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nfn own() {\n  let c = db.connect(\"data/kit.db\")\n  return c.migrate(\"kit/m\")\n}\nfn all() {\n  return db.migrate(\"kit/m\")\n}\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nfiles = [\"kit/m/\"]\nwrites = [\"data/kit.db\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("kit/k.qwe:9: error: site-wide db.migrate: not confirmed for this file") && !out.contains("kit/k.qwe:6: error"), "{}", out);
+    let (code, out) = quillo(&d, &["run", "--no-check", "main.qwe"]);
+    assert_ne!(code, Some(0), "{}", out);
+    assert!(out.contains("own: [\"001_a.sql\"]") && out.contains("kit/k.qwe:9: db.migrate: the migrations of every database the program opens are set by it, and it is not confirmed for kit/k.qwe (quillo confirm)"), "{}", out);
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nfiles = [\"kit/m/\"]\nwrites = [\"data/kit.db\"]\nsite = [\"db.migrate\"]\n");
+    let (code, out) = quillo(&d, &["run", "--no-check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("own: []") && out.contains("all: [\"001_a.sql\"]"), "{}", out);
+}
+
+/// A taken file's `reply` ends the main file's request with its answer: a kit's component took the
+/// main file's page over with a cookie's line and CORS for another site. Under a quillo.confirmed
+/// its headers are sent only where `reply` was confirmed for it (`visitor's reply`); its status and
+/// body are as they were, and a reply of a text, with no headers, is no item; a guard's redirect
+/// keeps its status. The main file's own replies are the program's (src/interp.rs eval_reply,
+/// src/confirm.rs site_calls; FEEDBACK83.md Q-1301, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn a_taken_files_reply_sends_headers_only_where_confirmed() {
+    let d = dir("k11-reply");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, guard\nroute GET / = <html><body><Badge/></body></html>\nroute GET /private {\n  guard()\n  return \"private\"\n}\nroute GET /own {\n  reply 200 respond(200, \"own\", { \"x-own\": \"1\" })\n}\n");
+    write(&d, "kit/k.qwe", "view Badge() {\n  reply 200 respond(200, \"taken over\", { \"set-cookie\": \"theme=dark; Path=/\", \"access-control-allow-origin\": \"https://evil.example\" })\n}\nfn guard() {\n  if session().user == null {\n    reply 303 redirect(\"/login\")\n  }\n  reply 403 \"no\"\n}\n");
+    let page = |port: u16| {
+        let a = send(port, "GET", "/", &[], "");
+        let p = send(port, "GET", "/private", &[], "");
+        (a.status, a.body.clone(), a.header("set-cookie").map(str::to_string), a.header("access-control-allow-origin").map(str::to_string), p.status, p.header("location").map(str::to_string), send(port, "GET", "/own", &[], "").header("x-own").map(str::to_string))
+    };
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(page(port), (200, "taken over".to_string(), Some("theme=dark; Path=/".to_string()), Some("https://evil.example".to_string()), 303, Some("/login".to_string()), Some("1".to_string())));
+    drop(g);
+    let (code, out) = quillo(&d, &["confirm", "--list"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.starts_with(&format!("kit/k.qwe\n{}", list_line("visitor's", "reply", "2, 6"))), "{}", out);
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("kit/k.qwe:2: error: visitor's reply: not confirmed for this file") && !out.contains("main.qwe:8: error"), "{}", out);
+    let (g, port, log) = serve(&d, &["--no-check"]);
+    assert_eq!(page(port), (200, "taken over".to_string(), None, None, 303, None, Some("1".to_string())), "{}", read(&log));
+    assert!(log_has(&log, "quillo: kit/k.qwe: a reply's headers are not sent (its status and body are): it is not confirmed for this file", 30), "{}", read(&log));
+    drop(g);
+    assert_eq!(quillo(&d, &["confirm", "--yes"]).0, Some(0));
+    assert!(read(&d.join("quillo.confirmed")).contains("session = [\"reply\"]"), "{}", read(&d.join("quillo.confirmed")));
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(page(port), (200, "taken over".to_string(), Some("theme=dark; Path=/".to_string()), Some("https://evil.example".to_string()), 303, Some("/login".to_string()), Some("1".to_string())));
     drop(g);
 }

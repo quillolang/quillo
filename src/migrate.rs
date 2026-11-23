@@ -71,7 +71,13 @@ pub fn run(db: &Backend, dir: &Path) -> Result<Vec<String>, String> {
     match db {
         Backend::Sqlite(m) => {
             let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            c.execute_batch(TABLE).map_err(|e| e.to_string())?;
+            // Quillo's own table, written as its own where a taken file's statements may not write
+            // one (db.rs `OwnSql`; FEEDBACK83.md, Q-1300, found by the review of bc460fd; branch
+            // feedback82-85).
+            {
+                let _own = crate::db::OwnSql::enter();
+                c.execute_batch(TABLE).map_err(|e| e.to_string())?;
+            }
             let mut applied = Vec::new();
             for (name, text) in &todo {
                 // SQLite takes `pragma foreign_keys` only outside a transaction, and each file
@@ -147,7 +153,10 @@ fn sqlite_one(c: &rusqlite::Connection, name: &str, text: &str, says: &SqliteSay
     };
     let done = c
         .execute_batch(text)
-        .and_then(|_| c.execute("insert into _quillo_migrations (name, sha256, applied_at) values (?1, ?2, datetime('now'))", [name, &hash]))
+        .and_then(|_| {
+            let _own = crate::db::OwnSql::enter();
+            c.execute("insert into _quillo_migrations (name, sha256, applied_at) values (?1, ?2, datetime('now'))", [name, &hash])
+        })
         .map_err(|e| e.to_string())
         .and_then(|_| if off { foreign_key_check(c, name, &before) } else { Ok(()) });
     match done {

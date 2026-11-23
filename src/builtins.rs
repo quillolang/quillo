@@ -2410,7 +2410,7 @@ fn read_upload(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
 /// Q-1301, found by the review of 4bc1ac9; branch feedback82-85). One look at the hold where none
 /// is; asked after the arguments are judged, so a wrong one is said as before.
 pub(crate) fn site_wide(it: &Interp, item: impl FnOnce() -> String) -> bool {
-    !crate::confirm::held() || crate::confirm::site_ok(it.cur_file.as_deref(), &item())
+    !crate::confirm::held() || !crate::confirm::held_taken_at(&it.cur_file) || crate::confirm::site_ok(it.cur_file.as_deref(), &item())
 }
 
 /// `allow_cross_site("/payments/return")`, at the top of a program: routes
@@ -4584,6 +4584,10 @@ fn answer_with(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         _ => false,
     };
     match given {
+        // Its headers, where it is a taken file's code that answers, as its `reply`'s are held
+        // (`confirm::reply_headers_ok`; FEEDBACK83.md, Q-1301, found by the review of bc460fd; branch
+        // feedback82-85). A group's own answer is its file's.
+        Value::Response(r) if !r.headers.is_empty() && !crate::confirm::reply_headers_ok(&it.cur_file) => Err(Ctrl::Reply(Arc::new(Response { headers: Vec::new(), ..(*r).clone() }))),
         Value::Response(r) => Err(Ctrl::Reply(r)),
         _ if itself => Ok(Value::Nil),
         Value::Nil => Err(Ctrl::Reply(Arc::new(crate::server::no_match(line)))),

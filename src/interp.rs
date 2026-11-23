@@ -5566,6 +5566,15 @@ impl Interp {
             }
             b => Response { status: code, headers: Vec::new(), body: Body::Value(b) },
         };
+        // A taken file's reply ends the main file's request: its status and body as they are, its
+        // headers (a cookie's line, CORS, a redirect's `location`) only where `reply` was confirmed
+        // for it. A kit's component set a cookie and `access-control-allow-origin` for another site
+        // on the main file's page (FEEDBACK83.md, Q-1301, found by the review of bc460fd; branch
+        // feedback82-85). One look at the hold where none is, and none for a reply with no headers.
+        let mut resp = resp;
+        if !resp.headers.is_empty() && !crate::confirm::reply_headers_ok(&self.cur_file) {
+            resp.headers.clear();
+        }
         Err(Ctrl::Reply(Arc::new(resp)))
     }
 

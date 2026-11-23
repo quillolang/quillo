@@ -719,6 +719,8 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
             return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rc), Some("the database's statements could not be held".into())));
         }
     }
+    // Quillo's own statements (its first page is made by a table of its own, `wal`).
+    let _own = OwnSql::enter();
     c.execute_batch("pragma foreign_keys = on")?;
     wal(&c)?;
     // The statements a program makes, compiled once each (see `rows`).
@@ -740,14 +742,62 @@ struct Statements {
     file: Option<Arc<str>>,
     base: Option<Arc<Path>>,
     refused: Option<String>,
+    /// The code is a file taken for some of its names (`confirm::held_taken`): its statements may
+    /// not touch Quillo's own tables (`own_table_named`, `authorize`).
+    taken: bool,
 }
 
 thread_local! {
-    static STATEMENTS_OF: std::cell::RefCell<Statements> = const { std::cell::RefCell::new(Statements { file: None, base: None, refused: None }) };
+    static STATEMENTS_OF: std::cell::RefCell<Statements> = const { std::cell::RefCell::new(Statements { file: None, base: None, refused: None, taken: false }) };
     /// Where the file and folder `STATEMENTS_OF` holds are, which it keeps alive: a call of the
     /// same code as the last is told by these alone, with nothing to drop (a refusal is taken by
     /// the error it gives, `db_err`).
     static STATEMENTS_AT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+thread_local! {
+    /// How deep this thread is in a statement of Quillo's own (`own_sql`): its tables are its own to
+    /// write, whichever file's call made it (a taken file's `idempotent()`, a sign-in's push unbind).
+    static OWN_SQL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// While it lives, the statements this thread runs are Quillo's own (`OWN_SQL`), however it ends.
+pub(crate) struct OwnSql;
+
+impl OwnSql {
+    pub(crate) fn enter() -> OwnSql {
+        OWN_SQL.with(|c| c.set(c.get() + 1));
+        OwnSql
+    }
+}
+
+impl Drop for OwnSql {
+    fn drop(&mut self) {
+        OWN_SQL.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+}
+
+/// Whether a statement's text names one of Quillo's own tables (`_quillo_push`, `_quillo_jobs`, ...),
+/// in any letters: under a quillo.confirmed a taken file's SQL may not, as what it would write
+/// there is Quillo's word (a push subscription, a job's run, an idempotent answer). A kit confirmed
+/// for nothing made `_quillo_push`, put its own endpoint and keys in it under a user's name, and the
+/// main file's `notification.send` to that user sent the kit the users' password hashes, encrypted
+/// to it (FEEDBACK83.md, Q-1300, found by the review of bc460fd; branch feedback82-85). Read as
+/// text, a rename into one (`alter table x rename to _quillo_push`) and a trigger writing one are
+/// refused too, which SQLite's authorizer does not show (`authorize` holds the names it sees).
+fn own_table_named(sql: &str) -> bool {
+    sql.as_bytes().windows(8).any(|w| w.eq_ignore_ascii_case(b"_quillo_"))
+}
+
+/// Why the SQL `sql` that the code of `it` runs may not run, if it may not: a taken file's naming
+/// Quillo's own tables, where a quillo.confirmed holds the run (`own_table_named`). After
+/// `backend_on`, which notes the code (`statements_of`); one look at the hold where none is.
+fn own_tables_refused(it: &Interp, sql: &str) -> Option<String> {
+    if !crate::confirm::held() || !STATEMENTS_OF.with(|s| s.borrow().taken) || !own_table_named(sql) {
+        return None;
+    }
+    let file = crate::confirm::held_name(it.cur_file.as_deref());
+    Some(format!("Quillo's own tables (_quillo_...) are refused for {}'s SQL where a quillo.confirmed holds the run: they hold what Quillo does (push subscriptions, jobs, tokens), and this statement names one", file))
 }
 
 /// Notes `it`'s code as the code whose statements run now (`STATEMENTS_OF`), where a run is held:
@@ -774,6 +824,7 @@ fn statements_of(it: &Interp) {
                 s.base = Some(it.base_dir.clone());
             }
             s.refused = None;
+            s.taken = crate::confirm::held_taken(it.cur_file.as_deref());
         });
     }
 }
@@ -792,6 +843,24 @@ fn statements_of(it: &Interp) {
 unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int, a1: *const std::ffi::c_char, a2: *const std::ffi::c_char, _: *const std::ffi::c_char, _: *const std::ffi::c_char) -> std::ffi::c_int {
     use rusqlite::ffi;
     let text = |p: *const std::ffi::c_char| (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) });
+    // A write to one of Quillo's own tables by a taken file's statement, as SQLite names the table,
+    // a view's or a trigger's too (`own_table_named`, which reads the text); Quillo's own
+    // statements (`OWN_SQL`) write them.
+    let own_name = |p: *const std::ffi::c_char| text(p).is_some_and(|t| t.to_bytes().len() >= 8 && t.to_bytes()[..8].eq_ignore_ascii_case(b"_quillo_"));
+    let writes = match action {
+        ffi::SQLITE_INSERT | ffi::SQLITE_UPDATE | ffi::SQLITE_DELETE | ffi::SQLITE_CREATE_TABLE | ffi::SQLITE_CREATE_TEMP_TABLE | ffi::SQLITE_DROP_TABLE | ffi::SQLITE_DROP_TEMP_TABLE | ffi::SQLITE_CREATE_VIEW | ffi::SQLITE_CREATE_TEMP_VIEW => own_name(a1),
+        ffi::SQLITE_CREATE_INDEX | ffi::SQLITE_CREATE_TEMP_INDEX | ffi::SQLITE_DROP_INDEX | ffi::SQLITE_DROP_TEMP_INDEX | ffi::SQLITE_CREATE_TRIGGER | ffi::SQLITE_CREATE_TEMP_TRIGGER | ffi::SQLITE_DROP_TRIGGER | ffi::SQLITE_DROP_TEMP_TRIGGER => own_name(a1) || own_name(a2),
+        ffi::SQLITE_ALTER_TABLE => own_name(a2),
+        _ => false,
+    };
+    if writes && OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_OF.with(|s| s.try_borrow().map_or(true, |s| s.taken)) {
+        STATEMENTS_OF.with(|s| {
+            if let Ok(mut s) = s.try_borrow_mut() {
+                s.refused = Some("Quillo's own tables (_quillo_...) are not written by a taken file's SQL where a quillo.confirmed holds the run".into());
+            }
+        });
+        return ffi::SQLITE_DENY;
+    }
     match action {
         ffi::SQLITE_ATTACH => {}
         ffi::SQLITE_FUNCTION => return if text(a2).is_some_and(|f| f.to_bytes().eq_ignore_ascii_case(b"load_extension")) { ffi::SQLITE_DENY } else { ffi::SQLITE_OK },
@@ -808,6 +877,9 @@ unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int
             let why = match text(a2) {
                 Some(_) if named(b"temp_store_directory") || named(b"data_store_directory") => "the folder of SQLite's temporary files is not moved where a quillo.confirmed holds the run",
                 Some(_) if named(b"lock_proxy_file") => "SQLite's lock_proxy_file names a file to make and lock, which is not done where a quillo.confirmed holds the run",
+                // The schema written as text, under which any table can be renamed into one of
+                // Quillo's own with a name worked out in the SQL (found by the review of bc460fd).
+                Some(_) if named(b"writable_schema") && OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_OF.with(|s| s.try_borrow().map_or(true, |s| s.taken)) => "SQLite's writable_schema is not turned on by a taken file's SQL where a quillo.confirmed holds the run",
                 _ => return ffi::SQLITE_OK,
             };
             STATEMENTS_OF.with(|s| {
@@ -2520,7 +2592,18 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             if let Err(why) = crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &p, false) {
                 return fail(line, format!("db.migrate: {}", why));
             }
+            // A taken file's migration names none of Quillo's own tables, as its `db.exec` may not
+            // (`own_table_named`; found by the review of bc460fd).
+            if crate::confirm::held() && crate::confirm::held_taken(it.cur_file.as_deref()) && std::fs::read_to_string(e.path()).is_ok_and(|t| own_table_named(&t)) {
+                return fail(line, format!("db.migrate: {}: Quillo's own tables (_quillo_...) are refused for {}'s SQL where a quillo.confirmed holds the run", p, crate::confirm::held_name(it.cur_file.as_deref())));
+            }
         }
+    }
+    // The migrations every database the program opens later is brought up to (a tenant's): a
+    // taken file's `db.migrate()`, only where it was confirmed, as what it sets for the whole
+    // program is (FEEDBACK83.md, Q-1301, found by the review of bc460fd; branch feedback82-85).
+    if on.is_none() && !crate::builtins::site_wide(it, || "db.migrate".into()) {
+        return fail(line, format!("db.migrate: the migrations of every database the program opens are set by it, and it is not confirmed for {} (quillo confirm)", crate::confirm::held_name(it.cur_file.as_deref())));
     }
     if on.is_none() {
         std::sync::Arc::make_mut(&mut it.site).migrations = Some(full.clone());
@@ -2562,6 +2645,7 @@ fn migrate_as<T>(code: (Option<Arc<str>>, Arc<Path>), run: impl FnOnce() -> Resu
     let was = STATEMENTS_OF.with(|s| {
         let mut s = s.borrow_mut();
         let was = (s.file.take(), s.base.take());
+        s.taken = crate::confirm::held_taken(code.0.as_deref());
         (s.file, s.base, s.refused) = (code.0, Some(code.1), None);
         was
     });
@@ -2674,6 +2758,11 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
             return Ok(db_err(e));
         }
     };
+    // Quillo's own statement writes its own tables; a taken file's names none (`own_table_named`).
+    let _own = own.then(OwnSql::enter);
+    if let Some(e) = (!own).then(|| own_tables_refused(it, &sql)).flatten() {
+        return Ok(db_err(e));
+    }
     // Read as this database reads it, once for each text (FEEDBACK55.md, Q-746; branch
     // feedback55).
     let scan = crate::sql::scan(b.dialect(), &sql);
@@ -2952,6 +3041,9 @@ fn exec_many(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
+    if let Some(e) = own_tables_refused(it, &sql) {
+        return Ok(db_err(e));
+    }
     let server = !matches!(&*b, Backend::Sqlite(_));
     // Its rows are all or none, in a transaction of its own (FEEDBACK55.md, Q-728).
     if b.is_mysql() {
@@ -3623,6 +3715,10 @@ fn query_as(it: &mut Interp, args: Vec<Value>, line: u32, limit: Option<usize>, 
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
+    let _own = own.then(OwnSql::enter);
+    if let Some(e) = (!own).then(|| own_tables_refused(it, &sql)).flatten() {
+        return Ok(db_err(e));
+    }
     let scan = crate::sql::scan(b.dialect(), &sql);
     if scan.is_empty() {
         return Ok(db_err(NO_STATEMENT));
@@ -4140,6 +4236,7 @@ fn apart(it: &mut Interp, b: &Arc<Backend>, sql: String, params: Vec<Value>) -> 
     match &**b {
         Backend::Sqlite(m) => {
             let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _own = OwnSql::enter();
             if sql.trim_start().to_ascii_lowercase().starts_with("select") {
                 rows(&c, &sql, &params, None)
             } else {

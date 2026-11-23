@@ -3196,6 +3196,11 @@ fn at_the_door(it: &mut Interp) -> bool {
 fn mcp_token(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
     use crate::interp::fail;
     let o = options_of(args.first(), "mcp_token", &["user", "max_age"], line)?;
+    // A token that stands for the visitor at the door: a taken file's, only where it was confirmed
+    // (FEEDBACK83.md, Q-1301, found by the review of bc460fd; branch feedback82-85).
+    if !crate::builtins::site_wide(it, || "mcp_token".into()) {
+        return Ok(Value::err(Value::str(format!("mcp_token is not confirmed for {} (quillo confirm)", crate::confirm::held_name(it.cur_file.as_deref())))));
+    }
     if !it.answering || it.request_value().is_none() {
         return fail(line, "`mcp_token` is made while a request is answered, where someone is signed in: the token stands for that session");
     }
@@ -3286,6 +3291,9 @@ fn revoke_mcp_token(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Valu
         other => return crate::interp::fail(line, format!("`revoke_mcp_token` takes a token's id, as `mcp_tokens()` gives it, got {}", other.map_or("nothing", |v| v.type_name()))),
     };
     let o = options_of(args.get(1), "revoke_mcp_token", &["user"], line)?;
+    if !crate::builtins::site_wide(it, || "revoke_mcp_token".into()) {
+        return Ok(Value::err(Value::str(format!("revoke_mcp_token is not confirmed for {} (quillo confirm)", crate::confirm::held_name(it.cur_file.as_deref())))));
+    }
     let Some(w) = whose(it, o) else { return Ok(Value::Bool(false)) };
     let place = crate::session::place(it);
     match take_away(it, &w, &place, Some(&id)) {

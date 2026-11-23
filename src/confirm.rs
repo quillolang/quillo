@@ -57,7 +57,7 @@ pub fn stops(version: &str) -> bool {
 
 /// What is listed of a `.qwe` file, each with the key it has in the file and the words a
 /// listing says it with.
-pub const KINDS: &[(&str, &str)] = &[("http", "reaches"), ("files", "reads"), ("writes", "writes"), ("listens", "listens on"), ("scripts", "page script"), ("loads", "page loads"), ("calls", "page calls"), ("routes", "adds a route"), ("site", "site-wide")];
+pub const KINDS: &[(&str, &str)] = &[("http", "reaches"), ("files", "reads"), ("writes", "writes"), ("listens", "listens on"), ("scripts", "page script"), ("loads", "page loads"), ("calls", "page calls"), ("routes", "adds a route"), ("site", "site-wide"), ("session", "visitor's")];
 
 /// Each item, with the lines it is written on (none for what was read from `quillo.confirmed`).
 pub type Items = BTreeMap<String, Vec<u32>>;
@@ -90,6 +90,12 @@ pub struct Block {
     /// credentialed CORS for another site, under a quillo.confirmed that confirmed nothing of it
     /// (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9; branch feedback82-85).
     pub site: Items,
+    /// What such a file sets of the visitor's, in the main file's requests: the session
+    /// (`set_session`, `end_session`), a cookie (`set_cookie theme`), an MCP token. A kit's
+    /// component taken for `Badge` called `set_session({ user: { role: "admin" } })` and every
+    /// visitor of the page was the main file's admin (FEEDBACK83.md, Q-1301, found by the review of
+    /// bc460fd; branch feedback82-85).
+    pub session: Items,
     /// A Rust file: its SHA-256, what its header says it does, and what a reading of it finds.
     pub rust: bool,
     pub sha256: Option<String>,
@@ -136,6 +142,7 @@ impl Block {
             "calls" => &self.calls,
             "routes" => &self.routes,
             "site" => &self.site,
+            "session" => &self.session,
             "env" => &self.env,
             "crates" => &self.crates,
             _ => &self.written,
@@ -153,6 +160,7 @@ impl Block {
             "calls" => &mut self.calls,
             "routes" => &mut self.routes,
             "site" => &mut self.site,
+            "session" => &mut self.session,
             "env" => &mut self.env,
             "crates" => &mut self.crates,
             _ => return None,
@@ -416,8 +424,10 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
         // file's, a file it takes whole and a mounted program's are the program's own, as their
         // routes are (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9; branch feedback82-85).
         let site = if b.taken { site_calls(&r.stmts) } else { Vec::new() };
-        for (item, line) in &site {
-            add(&mut b.site, item.clone(), *line);
+        for (kind, item, line) in &site {
+            if let Some(items) = b.items_mut(kind) {
+                add(items, item.clone(), *line);
+            }
         }
         for s in r.stmts.iter() {
             match s {
@@ -477,31 +487,48 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
     out
 }
 
-/// The builtins that set something for the whole program or site, by the name a call is written
-/// with: the word a taken file's call is listed by (`site_item`), and whether the path or name it
-/// is given first is part of what is confirmed (`allow_cross_site /pay`, `channel chat`). Each is
-/// held at its call (`site_ok`): `allow_cross_site` (a path's routes take other sites' form
-/// posts), `site_headers` (every answer's headers: CORS, framing, a CSP), `tenant_from` (whose
-/// database a request uses), `moves_in_place` (how every page moves), `accept_calls` (who may call
-/// the program's `server fn`s), `db.open` and `db.system` (every file's database, and where
-/// Quillo keeps its sessions), `translations` and `locale_from` (every page's words), `style_with`
-/// (a command run over all the program's CSS), `ready` (what the readiness answer says, a check of
-/// that name replaced), `channel.on` and `media.on` (what pages may send to the server)
-/// (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9; branch feedback82-85).
-pub const SITE_CALLS: &[(&str, &str, bool)] = &[
-    ("allow_cross_site", "allow_cross_site", true),
-    ("site_headers", "site_headers", true),
-    ("tenant_from", "tenant_from", false),
-    ("moves_in_place", "moves_in_place", false),
-    ("accept_calls", "accept_calls", false),
-    ("translations", "translations", false),
-    ("locale_from", "locale_from", false),
-    ("style_with", "style_with", false),
-    ("ready", "ready", true),
-    ("channel.on", "channel", true),
-    ("media.on", "media", true),
-    ("db.open", "db.open", false),
-    ("db.system", "db.system", false),
+/// The builtins that set something for the whole program or site, or the visitor's session, by
+/// the name a call is written with: the word a taken file's call is listed by (`site_item`), whether
+/// the path or name it is given first is part of what is confirmed (`allow_cross_site /pay`,
+/// `channel chat`), and the key it is listed under. Each is held at its call (`site_ok`):
+/// `allow_cross_site` (a path's routes take other sites' form posts), `site_headers` (every
+/// answer's headers: CORS, framing, a CSP), `tenant_from` (whose database a request uses),
+/// `moves_in_place` (how every page moves), `accept_calls` (who may call the program's `server
+/// fn`s), `db.open`, `db.system` and `db.migrate` (every file's database, where Quillo keeps its
+/// sessions, the migrations every tenant's is brought up to), `translations` and `locale_from`
+/// (every page's words), `style_with` (a command run over all the program's CSS), `ready` (what the
+/// readiness answer says, a check of that name replaced), `channel.on` and `media.on` (what pages
+/// may send to the server) (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9; branch
+/// feedback82-85). And, under `session`, what writes the visitor's session or cookies in the main
+/// file's requests: `set_session`, `end_session`, `set_cookie` and `delete_cookie` by the cookie's
+/// name, `mcp_token` and `revoke_mcp_token` (found by the review of bc460fd).
+pub const SITE_CALLS: &[(&str, &str, bool, &str)] = &[
+    ("allow_cross_site", "allow_cross_site", true, "site"),
+    ("site_headers", "site_headers", true, "site"),
+    ("tenant_from", "tenant_from", false, "site"),
+    ("moves_in_place", "moves_in_place", false, "site"),
+    ("accept_calls", "accept_calls", false, "site"),
+    ("translations", "translations", false, "site"),
+    ("locale_from", "locale_from", false, "site"),
+    ("style_with", "style_with", false, "site"),
+    ("ready", "ready", true, "site"),
+    ("channel.on", "channel", true, "site"),
+    ("media.on", "media", true, "site"),
+    ("db.open", "db.open", false, "site"),
+    ("db.system", "db.system", false, "site"),
+    ("db.migrate", "db.migrate", false, "site"),
+    ("set_session", "set_session", false, "session"),
+    ("end_session", "end_session", false, "session"),
+    ("set_cookie", "set_cookie", true, "session"),
+    ("delete_cookie", "delete_cookie", true, "session"),
+    ("mcp_token", "mcp_token", false, "session"),
+    ("revoke_mcp_token", "revoke_mcp_token", false, "session"),
+    // `reply` with an answer's headers (`reply 200 respond(...)`, a redirect's `location`): the
+    // headers of the main file's answer, a cookie's line and CORS among them. No call: listed from
+    // the expression (`site_calls`), held in `Interp::eval_reply`.
+    ("reply", "reply", false, "session"),
+    // What a group's middleware answers through, which code may call by its name (`__answer`).
+    ("__answer", "reply", false, "session"),
 ];
 
 /// Whether the builtin `name` sets something for the whole program (`SITE_CALLS`), or for another
@@ -509,7 +536,7 @@ pub const SITE_CALLS: &[(&str, &str, bool)] = &[
 /// names it when it is handed on as a value, as a builtin that reaches something is
 /// (`interp::carries_origin`).
 pub fn is_site_call(name: &str) -> bool {
-    name == "__callers" || SITE_CALLS.iter().any(|(n, _, _)| *n == name)
+    name == "__callers" || SITE_CALLS.iter().any(|(n, _, _, _)| *n == name)
 }
 
 /// `site_headers`' path as the builtin keeps it: no `/` at the end, `/` for every answer.
@@ -521,10 +548,10 @@ pub fn site_prefix(p: &str) -> String {
 /// How a call of the builtin `name` with `args` (as written) is listed, if it is one of
 /// `SITE_CALLS`: its word, and its path or name where that is written out, else `*` (any), which a
 /// developer confirms knowing that the file works it out.
-fn site_item(name: &str, args: &[&Expr]) -> Option<String> {
-    let (_, word, named) = SITE_CALLS.iter().find(|(n, _, _)| *n == name)?;
+fn site_item(name: &str, args: &[&Expr]) -> Option<(&'static str, String)> {
+    let (_, word, named, kind) = SITE_CALLS.iter().find(|(n, _, _, _)| *n == name)?;
     if !named {
-        return Some(word.to_string());
+        return Some((kind, word.to_string()));
     }
     let written = |e: Option<&&Expr>| e.and_then(|e| written_start(e)).filter(|(_, whole)| *whole).map(|(s, _)| s);
     let what = match (name, args.first()) {
@@ -533,12 +560,12 @@ fn site_item(name: &str, args: &[&Expr]) -> Option<String> {
         ("site_headers", _) => "*".to_string(),
         (_, first) => written(first).unwrap_or_else(|| "*".to_string()),
     };
-    Some(format!("{} {}", word, what))
+    Some((kind, format!("{} {}", word, what)))
 }
 
 /// Each call in `stmts` of a builtin that sets something for the whole program (`site_item`), with
 /// its line; a call given its first argument by a pipe is read with it, as `read_calls` reads one.
-fn site_calls(stmts: &[Stmt]) -> Vec<(String, u32)> {
+fn site_calls(stmts: &[Stmt]) -> Vec<(&'static str, String, u32)> {
     let mut out = Vec::new();
     let mut piped: HashSet<*const Expr> = HashSet::new();
     crate::check::each_expr_of(stmts, &mut |e| match e {
@@ -547,21 +574,32 @@ fn site_calls(stmts: &[Stmt]) -> Vec<(String, u32)> {
                 piped.insert(&**rhs as *const Expr);
                 let mut all: Vec<&Expr> = vec![&**lhs];
                 all.extend(args.iter());
-                if let Some(i) = site_item(&callee(c), &all) {
-                    out.push((i, *line));
+                if let Some((k, i)) = site_item(&callee(c), &all) {
+                    out.push((k, i, *line));
                 }
             }
         }
         Expr::Call(c, args, line) if !piped.contains(&(e as *const Expr)) => {
             let all: Vec<&Expr> = args.iter().collect();
-            if let Some(i) = site_item(&callee(c), &all) {
-                out.push((i, *line));
+            if let Some((k, i)) = site_item(&callee(c), &all) {
+                out.push((k, i, *line));
             }
         }
+        // A reply whose answer may carry headers: any but a text or markup written out. A kit's
+        // component ran `reply 200 respond(200, "...", { "set-cookie": ..., "access-control-allow-
+        // origin": ... })` in the main file's page (FEEDBACK83.md, Q-1301, found by the review of
+        // bc460fd; branch feedback82-85).
+        Expr::Reply(_, Some(body), line) if !matches!(&**body, Expr::Lit(_) | Expr::Template(_) | Expr::Html(..)) => out.push(("session", "reply".to_string(), *line)),
         _ => {}
     });
     out
 }
+
+/// The hosts of the browsers' push services, where their devices' endpoints are: Chrome's and the
+/// browsers built on it (FCM), Firefox's, Safari's, and Edge's (WNS, under subdomains). A file that
+/// calls `notification.send` is listed as reaching them, to be confirmed as any host is; a service
+/// of another kind is confirmed by hand.
+pub const PUSH_HOSTS: &[&str] = &["fcm.googleapis.com", "updates.push.services.mozilla.com", "web.push.apple.com", "*.notify.windows.com"];
 
 /// The modules whose builtins reach what a `quillo.confirmed` holds, as `interp::carries_origin`
 /// counts them: the others (`math`, `json`, `crypto`, ...) reach nothing it holds.
@@ -732,7 +770,7 @@ fn scan_taken(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>>>)
 
 /// What is said of a file taken for `names` that adds `routes`, sets something for the whole
 /// program (`site`) or reaches out at start.
-fn taken_note(name: &str, names: &[String], routes: &[(String, u32)], site: &[(String, u32)], at_start: &[u32]) -> Option<(u32, String)> {
+fn taken_note(name: &str, names: &[String], routes: &[(String, u32)], site: &[(&str, String, u32)], at_start: &[u32]) -> Option<(u32, String)> {
     if routes.is_empty() && site.is_empty() && at_start.is_empty() {
         return None;
     }
@@ -740,19 +778,21 @@ fn taken_note(name: &str, names: &[String], routes: &[(String, u32)], site: &[(S
     if !routes.is_empty() {
         also.push(format!("adds {}", routes.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>().join(", ")));
     }
-    if !site.is_empty() {
+    for (kind, says) in [("site", "sets for the whole site"), ("session", "sets the visitor's")] {
         let mut items: Vec<&str> = Vec::new();
-        for (i, _) in site {
+        for (_, i, _) in site.iter().filter(|(k, _, _)| *k == kind) {
             if !items.contains(&i.as_str()) {
                 items.push(i);
             }
         }
-        also.push(format!("sets for the whole site {}", items.join(", ")));
+        if !items.is_empty() {
+            also.push(format!("{} {}", says, items.join(", ")));
+        }
     }
     if !at_start.is_empty() {
         also.push(format!("reaches out as the program starts (line {})", at_start.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")));
     }
-    let line = routes.first().map(|r| r.1).into_iter().chain(site.iter().map(|s| s.1).min()).chain(at_start.first().copied()).min().unwrap_or(0);
+    let line = routes.first().map(|r| r.1).into_iter().chain(site.iter().map(|s| s.2).min()).chain(at_start.first().copied()).min().unwrap_or(0);
     let mut names = names.to_vec();
     names.dedup();
     Some((line, format!("{} is taken for {}, and also {}", name, names.join(", "), also.join(" and "))))
@@ -851,6 +891,14 @@ fn read_call(name: &str, args: &[&Expr], line: u32, b: &mut Block) {
         "__site" => {
             if let Some(h) = args.get(1).and_then(|e| host_written(e)) {
                 add(&mut b.http, h, line);
+            }
+        }
+        // The push services a send reaches: the browsers' (each device's endpoint is one of
+        // theirs), as a `notification.send` is held to its file's hosts (`push::deliver`;
+        // FEEDBACK83.md, Q-1300, found by the review of bc460fd; branch feedback82-85).
+        "notification.send" => {
+            for h in PUSH_HOSTS {
+                add(&mut b.http, h.to_string(), line);
             }
         }
         "udp.send" => {
@@ -1893,7 +1941,7 @@ pub fn parse(text: &str) -> Result<Confirmed, String> {
             k => {
                 let mut hashes: Vec<(String, String)> = Vec::new();
                 let Some(items) = b.items_mut(k) else {
-                    return Err(err(&format!("`{}` is not something quillo.confirmed says (it says http, files, writes, listens, scripts, loads, calls, routes, site, sha256, effects, env, crates)", k)));
+                    return Err(err(&format!("`{}` is not something quillo.confirmed says (it says http, files, writes, listens, scripts, loads, calls, routes, site, session, sha256, effects, env, crates)", k)));
                 };
                 let mut rest = value.strip_prefix('[').ok_or_else(|| err(&format!("`{}` is a list: [\"...\", ...]", k)))?.trim_start();
                 loop {
@@ -1940,7 +1988,7 @@ pub fn render(c: &Confirmed) -> String {
                 s.push_str(&format!("effects = {}\n", quote(e)));
             }
         }
-        for k in ["http", "files", "writes", "listens", "scripts", "loads", "calls", "routes", "site", "env", "crates"] {
+        for k in ["http", "files", "writes", "listens", "scripts", "loads", "calls", "routes", "site", "session", "env", "crates"] {
             let items = b.items(k);
             if items.is_empty() {
                 continue;
@@ -2046,7 +2094,7 @@ pub fn merged(scan: &Scan, conf: &Confirmed, chosen: &dyn Fn(&str) -> bool) -> C
         let mut b = found.clone();
         b.notes.clear();
         b.written.clear();
-        for k in ["http", "files", "writes", "listens", "scripts", "loads", "calls", "routes", "site", "env", "crates"] {
+        for k in ["http", "files", "writes", "listens", "scripts", "loads", "calls", "routes", "site", "session", "env", "crates"] {
             if let Some(items) = b.items_mut(k) {
                 items.values_mut().for_each(Vec::clear);
             }
@@ -2632,13 +2680,63 @@ pub fn site_ok(cur_file: Option<&str>, item: &str) -> bool {
         h.say(format!("{}: {} is not applied: its file was not read as the program started (restart it once it is confirmed)", file(), item));
         return false;
     }
-    let b = &h.blocks[i as usize];
-    let any = item.split_once(' ').map(|(w, _)| format!("{} *", w));
-    if !h.routes_held.contains(&i) || b.site.contains_key(item) || any.is_some_and(|a| b.site.contains_key(&a)) {
+    if !h.routes_held.contains(&i) {
         return true;
     }
-    h.say(format!("{}: {} is not applied: it is not confirmed for this file (`quillo confirm` lists it)", file(), item));
+    let word = item.split(' ').next().unwrap_or(item);
+    let kind = SITE_CALLS.iter().find(|(_, w, _, _)| *w == word).map_or("site", |(_, _, _, k)| *k);
+    let items = h.blocks[i as usize].items(kind);
+    if items.contains_key(item) || (word.len() < item.len() && items.contains_key(&format!("{} *", word))) {
+        return true;
+    }
+    // A reply is sent; what is held of it is its headers (`Interp::eval_reply`).
+    let what = if item == "reply" { "a reply's headers are not sent (its status and body are)".to_string() } else { format!("{} is not applied", item) };
+    h.say(format!("{}: {}: it is not confirmed for this file (`quillo confirm` lists it)", file(), what));
     false
+}
+
+/// Whether a reply the code of `cur_file` ends the request with sends its headers: a taken file's,
+/// only where `reply` was confirmed for it (`Interp::eval_reply`, `builtins::answer_with`, which a
+/// program's code may call too). One look at the hold where none is.
+pub fn reply_headers_ok(cur_file: &Option<std::sync::Arc<str>>) -> bool {
+    !held() || !held_taken_at(cur_file) || site_ok(cur_file.as_deref(), "reply")
+}
+
+/// `held_taken`, for the code of `cur_file` as the interpreter holds it, kept for the last file this
+/// thread asked about: a `set_session` in every request of the main file paid for looking its file
+/// up each time, 0.9% of a request (measured for the review of bc460fd). The file's text is kept
+/// with the answer, so no other file's is ever taken for it at the same address.
+pub fn held_taken_at(cur_file: &Option<std::sync::Arc<str>>) -> bool {
+    thread_local! {
+        static LAST: std::cell::RefCell<Option<(Option<std::sync::Arc<str>>, bool)>> = const { std::cell::RefCell::new(None) };
+    }
+    LAST.with(|l| {
+        let mut l = l.borrow_mut();
+        let same = |(f, _): &(Option<std::sync::Arc<str>>, bool)| match (f, cur_file) {
+            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        match l.as_ref().filter(|x| same(x)) {
+            Some((_, taken)) => *taken,
+            None => {
+                let taken = held_taken(cur_file.as_deref());
+                *l = Some((cur_file.clone(), taken));
+                taken
+            }
+        }
+    })
+}
+
+/// Whether the code of `cur_file` is held to what was confirmed for it of the site's and the
+/// visitor's (`site_ok`): a file taken for some of its names, or one no start read. False where
+/// nothing is held, and for the program's own files: what a call of theirs costs is this, with no
+/// text made for the item (`builtins::site_wide`; found by the review of bc460fd).
+pub fn held_taken(cur_file: Option<&str>) -> bool {
+    HOLD.get().is_some_and(|h| {
+        let i = h.id(cur_file);
+        i == 0 || h.routes_held.contains(&i)
+    })
 }
 
 /// The name `quillo.confirmed` has for the file of the code of `cur_file`, for a refusal's words.

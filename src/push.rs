@@ -804,9 +804,12 @@ fn send(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         (s, p)
     }).collect();
     let (ttl, urgency) = (msg.ttl, msg.urgency);
+    // Each endpoint held to the hosts the file whose code sends was confirmed for, as an `http.*`
+    // call is (`deliver`).
+    let held = crate::confirm::held_id(it.cur_file.as_deref());
     let outcomes: Vec<(String, Outcome)> = it.unlocked(move || {
         let deadline = std::time::Instant::now() + ALL_SENDS;
-        let done = in_parallel(&jobs, WORKERS, deadline, |(s, p), left| deliver(s, p, ttl, urgency, left), |(s, _)| Outcome::Failed(format!("{}: not sent: the {} s a send may take were up", host_of(&s.endpoint), ALL_SENDS.as_secs())));
+        let done = in_parallel(&jobs, WORKERS, deadline, |(s, p), left| deliver(s, p, ttl, urgency, left, held), |(s, _)| Outcome::Failed(format!("{}: not sent: the {} s a send may take were up", host_of(&s.endpoint), ALL_SENDS.as_secs())));
         jobs.iter().map(|(s, _)| s.endpoint.clone()).zip(done).collect()
     });
     let (mut sent, mut gone) = (0i64, 0i64);
@@ -923,7 +926,7 @@ enum Outcome {
 /// One message to one subscription within `left`: encrypted, signed, posted, its answer read to the
 /// end so that the connection is kept for the next (Q-960). What fails names the push service's
 /// host, never the endpoint, whose path is the subscription's secret.
-fn deliver(s: &Sub, payload: &str, ttl: u64, urgency: &str, left: std::time::Duration) -> Outcome {
+fn deliver(s: &Sub, payload: &str, ttl: u64, urgency: &str, left: std::time::Duration, held: u32) -> Outcome {
     let host = host_of(&s.endpoint);
     let shown = url::Url::parse(&s.endpoint).map(|u| u.to_string()).unwrap_or_default();
     let failed = |e: String| {
@@ -938,6 +941,16 @@ fn deliver(s: &Sub, payload: &str, ttl: u64, urgency: &str, left: std::time::Dur
         Err(e) => return failed(e),
     };
     if let Err(e) = crate::policy::get().http(&s.endpoint) {
+        return failed(e);
+    }
+    // And to the hosts the file whose code sends was confirmed for, where a quillo.confirmed holds
+    // the run (`confirm::http_ok`, as `http.*` is held; `held`, `confirm::held_id` of that code): an
+    // endpoint is the device's, but the row it is read from is a table any of the program's SQL
+    // could write, and a kit confirmed for nothing had a send reach its own host with the users'
+    // password hashes, encrypted to its keys (FEEDBACK83.md, Q-1300, found by the review of bc460fd;
+    // branch feedback82-85). A push service's host is confirmed as any host is (the scan lists the
+    // browsers' for a file that sends: `confirm::PUSH_HOSTS`).
+    if let Err(e) = crate::confirm::http_ok(held, &s.endpoint) {
         return failed(e);
     }
     let body = match encrypt(&s.p256dh, &s.auth, payload.as_bytes()) {
