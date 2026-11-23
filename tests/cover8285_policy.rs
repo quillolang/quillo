@@ -369,13 +369,22 @@ fn the_ceilings_and_the_log_a_provider_sets_are_held() {
     let port = port_in_log(&mut g.0, &d.join("l.log"), Duration::from_secs(60));
     // Two held open: the third is closed as it comes, and the log says why.
     let held: Vec<TcpStream> = (0..2).map(|_| TcpStream::connect(("127.0.0.1", port)).unwrap()).collect();
-    std::thread::sleep(Duration::from_millis(300));
-    let mut third = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    third.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let _ = third.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-    let mut got = Vec::new();
-    let _ = third.read_to_end(&mut got);
-    assert!(!String::from_utf8_lossy(&got).contains("home"), "{}", String::from_utf8_lossy(&got));
+    // Until the server has taken the two held ones, a third is still let in: asked again until
+    // it is closed as it comes. It waited a fixed 300 ms, which CI's build (about 100 times
+    // slower) did not always give the server (CI runs 45200557869, 45218613198, 45265030870).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut third = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        third.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let _ = third.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let mut got = Vec::new();
+        let _ = third.read_to_end(&mut got);
+        if !String::from_utf8_lossy(&got).contains("home") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "a third connection was still let in after 30 s");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     wait_for(&d.join("l.log"), "a connection is closed as it comes: 2 connections are open", 30);
     drop(held);
     // Once they are closed, a place again; and no request log.
