@@ -742,6 +742,12 @@ const RUST_CALLS: &[(&str, &str)] = &[
     (".symlink_metadata()", "fs"),
     (".canonicalize()", "fs"),
     ("read_dir(", "fs"),
+    // A file read as the plugin is built, into it: `include_str!("/etc/hosts")`, `include_bytes!`,
+    // and `include!`, whose code the reading never sees (FEEDBACK83.md, Q-1305, found by the
+    // coverage tests; branch feedback82-85).
+    ("include_str!", "fs"),
+    ("include_bytes!", "fs"),
+    ("include!", "fs"),
     ("TcpStream::", "net"),
     ("TcpListener::", "net"),
     ("UdpSocket::", "net"),
@@ -987,10 +993,201 @@ fn rust_code(src: &str) -> (String, Vec<(u32, usize, String)>) {
     (code, strings)
 }
 
+/// A byte of a Rust name: ASCII's, and any byte of a character past it (a name may be Unicode).
+fn rust_name_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c >= 0x80
+}
+
+/// `code` (`rust_code`'s) with each path written as one, `std :: fs :: read` as `std::fs::read`,
+/// and no space between a name (or a macro's `!`) and its `(`, `read (p)` as `read(p)`; a line
+/// break taken out is put back at the end of its line, so each call keeps its line.
+fn rust_joined(code: &str) -> String {
+    let b = code.as_bytes();
+    let space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r');
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut owed = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b':' && b.get(i + 1) == Some(&b':') {
+            while out.last().is_some_and(|l| space(*l)) {
+                owed += usize::from(out.pop() == Some(b'\n'));
+            }
+            out.extend_from_slice(b"::");
+            i += 2;
+            while i < b.len() && space(b[i]) {
+                owed += usize::from(b[i] == b'\n');
+                i += 1;
+            }
+            continue;
+        }
+        if space(c) {
+            let j = i + b[i..].iter().take_while(|x| space(**x)).count();
+            if b.get(j) == Some(&b'(') && out.last().is_some_and(|l| rust_name_byte(*l) || *l == b'!') {
+                owed += b[i..j].iter().filter(|x| **x == b'\n').count();
+                i = j;
+                continue;
+            }
+        }
+        if c == b'\n' {
+            out.extend(std::iter::repeat_n(b'\n', owed));
+            owed = 0;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out.extend(std::iter::repeat_n(b'\n', owed));
+    // Only ASCII spaces were taken out, and line breaks put in between characters.
+    String::from_utf8(out).unwrap_or_else(|_| code.to_string())
+}
+
+/// The names `use` declarations (and `extern crate x as y`) in `code` give: each name, the path
+/// it stands for, and whether it is another name for it (`as`); and where each declaration is.
+/// A name of the file's own (`crate::`, `self::`, `super::`) is read where it is written.
+fn rust_use_names(code: &str) -> (Vec<(String, String, bool)>, Vec<(usize, usize)>) {
+    let b = code.as_bytes();
+    let mut names = Vec::new();
+    let mut spans = Vec::new();
+    for kw in ["use", "extern crate"] {
+        let mut from = 0;
+        while let Some(at) = code[from..].find(kw).map(|a| a + from) {
+            from = at + kw.len();
+            let after = b.get(from).copied().unwrap_or(b';');
+            if (at > 0 && (rust_name_byte(b[at - 1]) || b[at - 1] == b':')) || !(matches!(after, b' ' | b'\t' | b'\n' | b'\r' | b'{') || (kw == "use" && after == b':')) {
+                continue;
+            }
+            let Some(end) = code[from..].find(';').map(|e| e + from) else { break };
+            spans.push((at, end));
+            let toks = rust_use_tokens(&code[from..end]);
+            let mut i = 0;
+            if kw == "use" {
+                rust_use_tree(&toks, &mut i, &[], &mut names);
+            } else if let [name, rest @ ..] = toks.as_slice() {
+                if let ["as", alias] = rest {
+                    names.push((alias.to_string(), name.to_string(), true));
+                }
+            }
+        }
+    }
+    names.retain(|(n, full, _)| n != "_" && *n != *full && !["crate", "self", "super"].iter().any(|s| full.split("::").next() == Some(*s)));
+    (names, spans)
+}
+
+fn rust_use_tokens(s: &str) -> Vec<&str> {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if rust_name_byte(c) {
+            let n = b[i..].iter().take_while(|x| rust_name_byte(**x)).count();
+            out.push(&s[i..i + n]);
+            i += n;
+        } else if c == b':' && b.get(i + 1) == Some(&b':') {
+            out.push("::");
+            i += 2;
+        } else {
+            if matches!(c, b'{' | b'}' | b',' | b'*') {
+                out.push(&s[i..i + 1]);
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// One tree of a `use` (`std::{fs as f, net::TcpStream}`) under `prefix`, its names into `out`.
+fn rust_use_tree(toks: &[&str], i: &mut usize, prefix: &[String], out: &mut Vec<(String, String, bool)>) {
+    let mut path = prefix.to_vec();
+    while let Some(t) = toks.get(*i).copied() {
+        match t {
+            "::" => *i += 1,
+            "*" | "}" | "," => {
+                *i += usize::from(t == "*");
+                return;
+            }
+            "{" => {
+                *i += 1;
+                while toks.get(*i).is_some_and(|t| *t != "}") {
+                    let at = *i;
+                    rust_use_tree(toks, i, &path, out);
+                    if toks.get(*i) == Some(&",") {
+                        *i += 1;
+                    } else if *i == at {
+                        *i += 1;
+                    }
+                }
+                *i += 1;
+                return;
+            }
+            name => {
+                *i += 1;
+                if toks.get(*i) == Some(&"::") {
+                    path.push(name.to_string());
+                    continue;
+                }
+                if name != "self" {
+                    path.push(name.to_string());
+                }
+                let Some(last) = path.last().cloned() else { return };
+                let (given, other) = match (toks.get(*i), toks.get(*i + 1)) {
+                    (Some(&"as"), Some(alias)) => {
+                        *i += 2;
+                        (alias.to_string(), true)
+                    }
+                    _ => (last, false),
+                };
+                out.push((given, path.join("::"), other));
+                return;
+            }
+        }
+    }
+}
+
+/// `code` as the reading looks through it: `rust_joined`, and each name a `use` gives another
+/// written as what it names, so `use std::fs as g; g::write(p)` is read as `std::fs::write(p)`
+/// and `use std::net::UdpSocket as U; U::bind(a)` as `std::net::UdpSocket::bind(a)`; a name
+/// taken as it is (`use std::fs::write;`) where it is called, `write(p)`. `deps`: the names a
+/// dependency line gives a crate (`h = { package = "reqwest" }`). Before, each of these spellings
+/// read as `effects: none` (FEEDBACK83.md, Q-1305, found by the coverage tests; branch
+/// feedback82-85).
+fn rust_spelled(code: &str, deps: &[(String, String)]) -> String {
+    let joined = rust_joined(code);
+    let (mut names, spans) = rust_use_names(&joined);
+    names.extend(deps.iter().map(|(n, p)| (n.clone(), p.clone(), true)));
+    if names.is_empty() {
+        return joined;
+    }
+    let b = joined.as_bytes();
+    let mut out = String::with_capacity(joined.len() + 64);
+    let (mut i, mut last) = (0, 0);
+    while i < b.len() {
+        if !rust_name_byte(b[i]) || b[i].is_ascii_digit() || (i > 0 && (rust_name_byte(b[i - 1]) || matches!(b[i - 1], b'.' | b':' | b'\''))) {
+            i += 1;
+            continue;
+        }
+        let end = i + b[i..].iter().take_while(|x| rust_name_byte(**x)).count();
+        let word = &joined[i..end];
+        let path = b.get(end) == Some(&b':') && b.get(end + 1) == Some(&b':');
+        let called = b.get(end) == Some(&b'(');
+        let mac = b.get(end) == Some(&b'!') && b.get(end + 1) != Some(&b'=');
+        let taken = names.iter().find(|(n, _, other)| n == word && (called || (*other && (path || mac))));
+        if let Some((_, full, _)) = taken.filter(|_| !spans.iter().any(|(s, e)| (*s..*e).contains(&i)) && !joined[..i].ends_with("fn ")) {
+            out.push_str(&joined[last..i]);
+            out.push_str(full);
+            last = end;
+        }
+        i = end;
+    }
+    out.push_str(&joined[last..]);
+    out
+}
+
 /// What a reading of a Rust file finds it does: the effects, each with the calls that mean it and
 /// their lines. A reading, not a proof: a crate can do what it does unseen.
 pub fn rust_effects(src: &str) -> (Effects, Vec<(&'static str, String, u32)>) {
     let (code, _) = rust_code(src);
+    let code = rust_spelled(&code, &[]);
     let starts_programs = code.contains("std::process") || code.contains("process::Command");
     effects_in(&code, starts_programs)
 }
@@ -1074,7 +1271,22 @@ fn scan_rust(bytes: &[u8]) -> Block {
         }
     }
     let (code, strings) = rust_code(&src);
-    let starts_programs = code.contains("std::process") || code.contains("process::Command");
+    // A crate taken under another name, `h = { package = "reqwest" }`: read as the crate it is, by
+    // its line and in the code (FEEDBACK83.md, Q-1305, found by the coverage tests; branch
+    // feedback82-85).
+    let crate_of = |name: &str, spec: &str| -> String {
+        let package = spec.split_once("package").and_then(|(_, r)| r.trim_start().strip_prefix('=')).and_then(|r| r.split('"').nth(1));
+        package.unwrap_or(name).to_string()
+    };
+    let renamed: Vec<(String, String)> = parsed
+        .deps
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(n, spec)| (n.trim().replace('-', "_"), crate_of(n.trim(), spec).replace('-', "_")))
+        .filter(|(n, c)| n != c && !n.is_empty())
+        .collect();
+    let spelled = rust_spelled(&code, &renamed);
+    let starts_programs = spelled.contains("std::process") || spelled.contains("process::Command");
     for (line, at, text) in &strings {
         let address = ["https://", "http://", "wss://", "ws://"].iter().find_map(|s| text.find(s).map(|i| format!("https://{}", &text[i + s.len()..])));
         if let Some(h) = address.and_then(|a| host_of(&a, true)) {
@@ -1088,9 +1300,12 @@ fn scan_rust(bytes: &[u8]) -> Block {
             add(&mut b.env, text.clone(), *line);
         }
     }
-    let (mut mask, mut calls) = effects_in(&code, starts_programs);
+    let (mut mask, mut calls) = effects_in(&spelled, starts_programs);
+    let code = spelled;
     for c in b.crates.keys() {
         let name = c.split(' ').next().unwrap_or("");
+        let package = parsed.deps.lines().filter_map(|l| l.split_once('=')).find(|(n, _)| n.trim() == name).map(|(n, spec)| crate_of(n.trim(), spec));
+        let name = package.as_deref().unwrap_or(name);
         for (_, effect) in RUST_CRATES.iter().filter(|(k, _)| *k == name) {
             mask |= effect_bit(effect);
             calls.push((*effect, format!("the crate {}", name), 0));
@@ -1099,7 +1314,8 @@ fn scan_rust(bytes: &[u8]) -> Block {
     // A crate's feature or call that does it (FEEDBACK83.md, Q-1305; branch feedback82-85).
     for l in parsed.deps.lines() {
         let Some((name, spec)) = l.split_once('=') else { continue };
-        let name = name.trim();
+        let name = crate_of(name.trim(), spec);
+        let name = name.as_str();
         for (_, uses, effect) in RUST_CRATE_USES.iter().filter(|(k, _, _)| *k == name) {
             let by = uses.iter().find(|u| match u.strip_prefix("feature:") {
                 Some(f) => spec.contains(&format!("\"{}\"", f)),
@@ -1140,12 +1356,52 @@ fn unquote(s: &str) -> Option<(String, &str)> {
             '\\' => match chars.next()?.1 {
                 'n' => out.push('\n'),
                 't' => out.push('\t'),
+                'r' => out.push('\r'),
+                // `\u{1b}`, as `quote` writes a control character (`unseen`).
+                'u' => match rest[i + 2..].strip_prefix('{').and_then(|r| r.split_once('}')).and_then(|(h, _)| u32::from_str_radix(h, 16).ok().and_then(char::from_u32).map(|c| (c, h.len()))) {
+                    Some((c, n)) => {
+                        out.push(c);
+                        for _ in 0..n + 2 {
+                            chars.next();
+                        }
+                    }
+                    None => out.push('u'),
+                },
                 c => out.push(c),
             },
             c => out.push(c),
         }
     }
     None
+}
+
+/// Whether a terminal does something with `c` other than show it: a control character (C0, DEL,
+/// C1: `\u{1b}[1A` moves up a line, `\u{9b}` is a CSI too), a line or paragraph separator, or one
+/// that turns the direction of the text around it.
+fn unseen(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// The program's text `s` as it is shown at a terminal: each character a terminal acts on
+/// (`unseen`) written as a Quillo text writes it (`\n`, `\r`, `\t`, else `\u{1b}`), the rest as it
+/// is. The listing a developer reads before answering `y`, and the hold's messages, printed a
+/// path's `\u{1b}[1A\u{1b}[2K` as it was: a taken file could erase the line that said what else
+/// it reaches (FEEDBACK83.md, Q-1300 D.2, found by the coverage tests; branch feedback82-85).
+pub fn escaped(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.chars().any(unseen) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if unseen(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// `line` up to a `#` that is not in a text.
@@ -1172,6 +1428,10 @@ fn quote(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            // Any other a terminal acts on, so the file shown (`cat`, a diff) is what it says
+            // (FEEDBACK83.md, Q-1300 D.2, found by the coverage tests; branch feedback82-85).
+            c if unseen(c) => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
             c => out.push(c),
         }
     }
@@ -1347,7 +1607,10 @@ pub fn missing(scan: &Scan, conf: &Confirmed) -> Vec<Missing> {
         }
         for (k, _) in KINDS {
             for (item, lines) in found.items(k) {
-                if !has(c.items(k), k, item) {
+                // A path confirmed under `writes` is read too, as the hold reads it at run time
+                // (`path_in`): `quillo check` and the start's count asked for a `files` entry too
+                // (FEEDBACK83.md, Q-1300, found by the coverage tests; branch feedback82-85).
+                if !has(c.items(k), k, item) && !(*k == "files" && has(&c.writes, "writes", item)) {
                     out.push(Missing { file: file.clone(), kind: k, item: item.clone(), lines: lines.clone() });
                 }
             }
@@ -1356,13 +1619,16 @@ pub fn missing(scan: &Scan, conf: &Confirmed) -> Vec<Missing> {
     out
 }
 
-/// How many confirmed items the files no longer have: they leave the list at the next `quillo
-/// confirm` (D.3).
-pub fn stale(scan: &Scan, conf: &Confirmed) -> usize {
+/// How many confirmed items the files `chosen` takes no longer have: they leave the list at the
+/// next `quillo confirm` (D.3). A block of a file no longer taken leaves whole, each of its items
+/// counted (its patterns too, and a Rust file's SHA-256 as one), where it was said as 1 item
+/// however many it had; a file not chosen keeps its block, and is not counted (FEEDBACK83.md,
+/// Q-1300 D.3, found by the coverage tests; branch feedback82-85).
+pub fn stale(scan: &Scan, conf: &Confirmed, chosen: &dyn Fn(&str) -> bool) -> usize {
     let mut n = 0;
-    for (file, c) in conf {
+    for (file, c) in conf.iter().filter(|(f, _)| chosen(f)) {
         let Some(found) = scan.files.get(file) else {
-            n += usize::from(!c.is_empty());
+            n += KINDS.iter().map(|(k, _)| c.items(k).len()).sum::<usize>() + usize::from(c.rust);
             continue;
         };
         for (k, _) in KINDS {
@@ -1417,7 +1683,9 @@ pub fn merged(scan: &Scan, conf: &Confirmed, chosen: &dyn Fn(&str) -> bool) -> C
     out
 }
 
-/// What is not confirmed, by file, as `quillo confirm` and a start list it (D.2).
+/// What is not confirmed, by file, as `quillo confirm` and a start list it (D.2); the program's
+/// texts in it `escaped`, as a terminal shows them (FEEDBACK83.md, Q-1300 D.2, found by the
+/// coverage tests; branch feedback82-85).
 pub fn listing(scan: &Scan, missing: &[Missing]) -> String {
     let mut s = String::new();
     let mut files: Vec<&str> = missing.iter().map(|m| m.file.as_str()).collect();
@@ -1425,7 +1693,7 @@ pub fn listing(scan: &Scan, missing: &[Missing]) -> String {
     for f in files {
         let found = scan.files.get(f);
         let rust = found.is_some_and(|b| b.rust);
-        s.push_str(&format!("\n  {}{}\n", f, if rust { "  (Rust: Quillo cannot hold it to a list, only to this file)" } else { "" }));
+        s.push_str(&format!("\n  {}{}\n", escaped(f), if rust { "  (Rust: Quillo cannot hold it to a list, only to this file)" } else { "" }));
         for m in missing.iter().filter(|m| m.file == f) {
             if m.kind == "sha256" {
                 s.push_str(&format!("    {:<13} sha256 {}\n", "file", m.item));
@@ -1437,7 +1705,7 @@ pub fn listing(scan: &Scan, missing: &[Missing]) -> String {
                 1 => format!("line {}", m.lines[0]),
                 _ => format!("lines {}", m.lines.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")),
             };
-            s.push_str(&format!("    {:<13} {:<40} {}\n", word, m.item, lines));
+            s.push_str(&format!("    {:<13} {:<40} {}\n", word, escaped(&m.item), lines));
         }
         if let Some(b) = found.filter(|b| b.rust) {
             s.push_str(&format!("    {:<13} effects: {}\n", "says", b.effects.as_deref().unwrap_or("nothing (every effect)")));
@@ -1446,10 +1714,10 @@ pub fn listing(scan: &Scan, missing: &[Missing]) -> String {
                 s.push_str(&format!("    {:<13} {}\n", "reads as", reads.join(", ")));
             }
             if !b.written.is_empty() {
-                s.push_str(&format!("    {:<13} {}\n", "written", b.written.keys().cloned().collect::<Vec<_>>().join(", ")));
+                s.push_str(&format!("    {:<13} {}\n", "written", escaped(&b.written.keys().cloned().collect::<Vec<_>>().join(", "))));
             }
             for (_, n) in &b.notes {
-                s.push_str(&format!("    {:<13} {}\n", "but", n.trim_start_matches("says ")));
+                s.push_str(&format!("    {:<13} {}\n", "but", escaped(n.trim_start_matches("says "))));
             }
         }
     }
@@ -1493,7 +1761,7 @@ struct Hold {
     refused_tools: HashSet<String>,
     known_tools: HashSet<String>,
     /// Each confirmed path where it really is, by the folder it was read from (`real_item`).
-    reals: RwLock<HashMap<(PathBuf, String), PathBuf>>,
+    reals: RwLock<HashMap<(PathBuf, String), Option<PathBuf>>>,
     page_policy: Option<String>,
 }
 
@@ -1619,10 +1887,11 @@ impl Hold {
         self.by_name.iter().find(|(_, v)| **v == i).map_or("this file", |(k, _)| k.as_str())
     }
 
-    /// Says `what` once in the log.
+    /// Says `what` once in the log, the program's texts in it `escaped` (FEEDBACK83.md, Q-1300,
+    /// found by the coverage tests; branch feedback82-85).
     fn say(&self, what: String) {
         if self.said.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(what.clone()) {
-            eprintln!("quillo: {}", what);
+            eprintln!("quillo: {}", escaped(&what));
         }
     }
 }
@@ -1721,24 +1990,40 @@ pub fn listen_ok(cur_file: Option<&str>, host: &str, port: u16) -> Result<(), St
     Err(format!("listening on {} is not confirmed for {} (quillo confirm)", item, file))
 }
 
-/// Where `p` (under `base`) really is: the nearest part of it that is there, its links followed,
-/// and the names after it, with `..` taken lexically.
-fn real_under(base: &Path, p: &str) -> PathBuf {
+/// Where `p` (under `base`) really is, as the system goes through it: the longest start of it
+/// that is there, resolved by the system (its links followed, and each `..` in it taken from
+/// where the link before it leads), then the names after it, a `..` among them taking away the
+/// name before it, which is not there (as `create_dir_all` makes it, a plain folder). None where
+/// a part of it is a link that leads nowhere: what is written through it is made wherever that
+/// is. Before, `..` was taken away from the text first: `data/media/../y.bin`, with `data/media`
+/// a link to `../../shared/media`, was judged as `data/y.bin` and written in `shared/`
+/// (FEEDBACK83.md, Q-1300, found by the coverage tests; branch feedback82-85). A path that is
+/// there costs one `canonicalize`, as before.
+fn real_under(base: &Path, p: &str) -> Option<PathBuf> {
     let full = if Path::new(p).is_absolute() { PathBuf::from(p) } else { base.join(p) };
-    let full = PathBuf::from(normal(&full.to_string_lossy()));
     let mut at = full.as_path();
-    let mut rest: Vec<std::ffi::OsString> = Vec::new();
+    let mut after: Vec<Component> = Vec::new();
     loop {
-        if let Ok(r) = at.canonicalize() {
-            return rest.iter().rev().fold(r, |r, n| r.join(n));
-        }
-        match (at.file_name(), at.parent()) {
-            (Some(n), Some(up)) => {
-                rest.push(n.to_os_string());
-                at = up;
+        if let Ok(mut r) = at.canonicalize() {
+            for c in after.iter().rev() {
+                match c {
+                    Component::ParentDir => {
+                        r.pop();
+                    }
+                    c => r.push(c.as_os_str()),
+                }
             }
-            _ => return full,
+            return Some(r);
         }
+        if std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return None;
+        }
+        match at.components().next_back()? {
+            c @ (Component::Normal(_) | Component::ParentDir) => after.push(c),
+            Component::CurDir => {}
+            _ => return None,
+        }
+        at = at.parent()?;
     }
 }
 
@@ -1754,7 +2039,7 @@ pub fn path_ok(cur_file: Option<&str>, base: &Path, p: &str, write: bool) -> Res
 
 /// A confirmed path where it really is, worked out once for each folder it is read from: a
 /// request held to it asks the system only for its own path (found measuring review 2).
-fn real_item(h: &Hold, base: &Path, c: &str) -> PathBuf {
+fn real_item(h: &Hold, base: &Path, c: &str) -> Option<PathBuf> {
     let key = (base.to_path_buf(), c.to_string());
     if let Some(r) = h.reals.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key) {
         return r.clone();
@@ -1766,17 +2051,19 @@ fn real_item(h: &Hold, base: &Path, c: &str) -> PathBuf {
 
 fn path_in(h: &Hold, i: u32, cur_file: Option<&str>, base: &Path, p: &str, write: bool) -> Result<(), String> {
     let b = &h.blocks[i as usize];
+    // A path through a link that leads nowhere is covered by nothing (`real_under`).
     let real = real_under(base, p);
     let covers = |items: &Items| {
-        items.keys().any(|c| {
-            let cr = real_item(h, base, c);
-            real == cr || (c.ends_with('/') && real.starts_with(&cr))
-        })
+        let Some(real) = &real else { return false };
+        items.keys().any(|c| real_item(h, base, c).is_some_and(|cr| *real == cr || (c.ends_with('/') && real.starts_with(&cr))))
     };
     if covers(&b.writes) || (!write && covers(&b.files)) {
         return Ok(());
     }
-    let shown = real.strip_prefix(&h.dir).map_or_else(|_| real.display().to_string(), slashed);
+    let shown = match &real {
+        Some(real) => real.strip_prefix(&h.dir).map_or_else(|_| real.display().to_string(), slashed),
+        None => p.to_string(),
+    };
     let file = if i == 0 { cur_file.map_or_else(|| h.main.clone(), |f| rel_name(&h.dir, Path::new(f))) } else { h.name_of(i).to_string() };
     let how = if write && covers(&b.files) { "confirmed to be read, not written" } else { "not confirmed" };
     h.say(format!("{}: the path {} was refused: it is {} for this file (`quillo confirm` lists it)", file, shown, how));
@@ -1841,10 +2128,11 @@ pub fn plugin_ok(qwer: &Path) -> Result<(), String> {
     let bytes = crate::error::read_file(qwer).map_err(|e| format!("{}: {}", qwer.display(), e))?;
     let have = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
     let want = h.by_name.get(&rel).and_then(|i| h.blocks[*i as usize].sha256.as_deref());
+    let shown = escaped(&rel);
     match want {
         Some(w) if w == have => Ok(()),
-        Some(_) => Err(format!("{} is not the file confirmed: its SHA-256 is {} now; Rust cannot be held to a list, so it does not load (`quillo confirm` shows it)", rel, have)),
-        None => Err(format!("{} is not confirmed (its SHA-256 is {}); Rust cannot be held to a list, so it does not load (`quillo confirm` asks about it)", rel, have)),
+        Some(_) => Err(format!("{} is not the file confirmed: its SHA-256 is {} now; Rust cannot be held to a list, so it does not load (`quillo confirm` shows it)", shown, have)),
+        None => Err(format!("{} is not confirmed (its SHA-256 is {}); Rust cannot be held to a list, so it does not load (`quillo confirm` asks about it)", shown, have)),
     }
 }
 
@@ -1918,6 +2206,13 @@ pub fn at_start_in(main: &Path, dir: &Path, ask: bool) -> Result<(), i32> {
         }
         return Ok(());
     };
+    // A link is read and trusted as the file is, and said once, with where it leads: what holds
+    // the program is then a file elsewhere, which a provider may want to know (FEEDBACK83.md,
+    // Q-1300, found by the coverage tests; branch feedback82-85). A checkout has a plain file.
+    if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+        let to = path.canonicalize().map_or_else(|_| "nowhere".to_string(), |r| r.display().to_string());
+        eprintln!("quillo: {} is a symbolic link, to {}: the program is held to what that file says", escaped(&path.display().to_string()), escaped(&to));
+    }
     // The program's own, served by no name and written by no builtin, as its policy is.
     crate::builtins::protect_named(&path, crate::builtins::OWN_POLICY);
     let found = scan_from(main, &dir, &HashMap::new(), true);
@@ -1975,9 +2270,10 @@ pub fn rust_confirmed(main: &Path, files: &[PathBuf]) -> Result<bool, String> {
 }
 
 fn plugin_message(conf: &Confirmed, m: &Missing, _full: &Path) -> String {
+    let file = escaped(&m.file);
     match conf.get(&m.file).and_then(|b| b.sha256.as_ref()) {
-        Some(_) => format!("{} is not the file confirmed: its SHA-256 is {} now; Rust cannot be held to a list, so it does not load (`quillo confirm` shows it)", m.file, m.item),
-        None => format!("{} is not confirmed (its SHA-256 is {}); Rust cannot be held to a list, so it does not load (`quillo confirm` asks about it)", m.file, m.item),
+        Some(_) => format!("{} is not the file confirmed: its SHA-256 is {} now; Rust cannot be held to a list, so it does not load (`quillo confirm` shows it)", file, m.item),
+        None => format!("{} is not confirmed (its SHA-256 is {}); Rust cannot be held to a list, so it does not load (`quillo confirm` asks about it)", file, m.item),
     }
 }
 
@@ -1986,8 +2282,29 @@ pub fn write(path: &Path, conf: &Confirmed) -> Result<(), String> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(format!("{} is a symbolic link: nothing written", path.display()));
     }
+    // Made new, never opened through what is at its name: `fs::write` followed a link left there
+    // and wrote the list wherever it led. One a run of this process's number left is taken away
+    // first, a link at that name is not, and nothing is written (FEEDBACK83.md, Q-1300, found by
+    // the coverage tests; branch feedback82-85).
     let tmp = path.with_file_name(format!(".{}.{}.part", FILE, std::process::id()));
-    std::fs::write(&tmp, render(conf)).map_err(|e| format!("{}: {}", tmp.display(), e))?;
+    match std::fs::symlink_metadata(&tmp) {
+        Ok(m) if m.file_type().is_symlink() => return Err(format!("{} is a symbolic link: nothing written", tmp.display())),
+        Ok(_) => {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        Err(_) => {}
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, render(conf).as_bytes()))
+        .map_err(|e| {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            format!("{}: {}", tmp.display(), e)
+        })?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("{}: {}", path.display(), e)
@@ -2012,7 +2329,7 @@ pub fn fetch_integrity(conf: &mut Confirmed) {
                     let h = <sha2::Sha384 as sha2::Digest>::digest(&bytes);
                     b.integrity.insert(u, format!("sha384-{}", crate::crypto_b64(&h)));
                 }
-                Err(e) => eprintln!("quillo: {} could not be fetched for its integrity hash ({}): confirmed without one", u, e),
+                Err(e) => eprintln!("quillo: {} could not be fetched for its integrity hash ({}): confirmed without one", escaped(&u), escaped(&e)),
             }
         }
     }
@@ -2042,7 +2359,9 @@ pub fn for_check(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>
     let found = scan_with(main, parsed, conf.is_some() || layer.is_some() || !p.hosts.is_empty());
     for (file, b) in &found.files {
         for (line, note) in &b.notes {
-            let message = if b.rust { format!("{} {}", file, note) } else { note.clone() };
+            // The program's texts `escaped`, as the listing has them (FEEDBACK83.md, Q-1300 D.2,
+            // found by the coverage tests; branch feedback82-85).
+            let message = if b.rust { format!("{} {}", escaped(file), escaped(note)) } else { escaped(note).into_owned() };
             out.push(Diagnostic { file: shown(file), line: *line, severity: Severity::Warning, message });
         }
         // A written address the policy refuses (FEEDBACK83.md, Q-1302; branch feedback82-85).
@@ -2062,7 +2381,7 @@ pub fn for_check(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>
                     plugin_message(conf, m, &dir.join(&m.file))
                 } else {
                     let word = KINDS.iter().find(|(k, _)| *k == m.kind).map_or(m.kind, |(_, w)| w);
-                    format!("{} {}: not confirmed for this file ({}; `quillo confirm` lists it)", word, m.item, FILE)
+                    format!("{} {}: not confirmed for this file ({}; `quillo confirm` lists it)", word, escaped(&m.item), FILE)
                 };
                 let line = m.lines.first().copied().unwrap_or(0);
                 out.push(Diagnostic { file: shown(&m.file), line, severity: Severity::Error, message });
@@ -2146,7 +2465,7 @@ pub fn main(args: &[String]) -> i32 {
     };
     let chosen = |f: &str| paths.is_empty() || paths.iter().any(|p| path_within(&normal(&format!("{}/", p.trim_end_matches('/'))), f) || normal(p) == f);
     let left: Vec<Missing> = missing(&found, &conf).into_iter().filter(|m| chosen(&m.file)).collect();
-    let stale_n = stale(&found, &conf);
+    let stale_n = stale(&found, &conf, &chosen);
     if left.is_empty() {
         if stale_n > 0 || !path.exists() {
             let next = merged(&found, &conf, &chosen);
@@ -2175,7 +2494,7 @@ pub fn main(args: &[String]) -> i32 {
                 let mut files: Vec<&str> = left.iter().map(|m| m.file.as_str()).collect();
                 files.dedup();
                 for f in files {
-                    print!("  {}? [y/n]: ", f);
+                    print!("  {}? [y/n]: ", escaped(f));
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                     if read_answer() == "y" {
                         take.insert(f.to_string());
@@ -2204,7 +2523,7 @@ pub fn main(args: &[String]) -> i32 {
     for (file, b) in next.iter().filter(|(f, _)| take.contains(*f)) {
         for host in b.http.keys() {
             if let Some(why) = p.refuses_host(host) {
-                println!("  note: {}: {} stays refused: {}", file, host, why);
+                println!("  note: {}: {} stays refused: {}", escaped(file), escaped(host), why);
             }
         }
     }
@@ -2218,31 +2537,31 @@ fn read_answer() -> String {
     a.trim().to_ascii_lowercase()
 }
 
-/// Everything each file reaches, for `--list`.
+/// Everything each file reaches, for `--list`, its texts `escaped` as `listing`'s are.
 fn whole_listing(found: &Scan) -> String {
     let mut s = String::new();
     for (file, b) in &found.files {
         if b.is_empty() && b.notes.is_empty() {
             continue;
         }
-        s.push_str(&format!("{}\n", file));
+        s.push_str(&format!("{}\n", escaped(file)));
         if b.rust {
             s.push_str(&format!("  {:<13} {}\n", "sha256", b.sha256.as_deref().unwrap_or("")));
             s.push_str(&format!("  {:<13} {}\n", "says effects", b.effects.as_deref().unwrap_or("nothing (every effect)")));
             s.push_str(&format!("  {:<13} {}\n", "reads as", if b.found_effects == 0 { "none".to_string() } else { effect_names(b.found_effects).join(", ") }));
             for k in ["written", "env", "crates"] {
                 if !b.items(k).is_empty() {
-                    s.push_str(&format!("  {:<13} {}\n", k, b.items(k).keys().cloned().collect::<Vec<_>>().join(", ")));
+                    s.push_str(&format!("  {:<13} {}\n", k, escaped(&b.items(k).keys().cloned().collect::<Vec<_>>().join(", "))));
                 }
             }
         }
         for (k, word) in KINDS {
             for (item, lines) in b.items(k) {
-                s.push_str(&format!("  {:<13} {:<40} {}\n", word, item, lines.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")));
+                s.push_str(&format!("  {:<13} {:<40} {}\n", word, escaped(item), lines.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")));
             }
         }
         for (_, n) in &b.notes {
-            s.push_str(&format!("  note: {}\n", n));
+            s.push_str(&format!("  note: {}\n", escaped(n)));
         }
     }
     s
@@ -2267,7 +2586,7 @@ fn effects_command(files: &[String]) -> i32 {
         let proposed = if b.found_effects == 0 { "none".to_string() } else { effect_names(b.found_effects).join(", ") };
         println!("{}: effects: {}", f, proposed);
         for (_, n) in &b.notes {
-            println!("  but it {}", n);
+            println!("  but it {}", escaped(n));
             code = code.max(1);
         }
     }

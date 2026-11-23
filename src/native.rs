@@ -1936,8 +1936,12 @@ const BUILD_ENV: &[&str] = &["PATH", "HOME", "USER", "CARGO_HOME", "RUSTUP_HOME"
 /// loaded, which keeps it mapped (FEEDBACK82.md, Q-1285, found in review; branch feedback82-85).
 static PRIVATE_DIRS: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
 
-/// The library at `lib` just loaded: its private folder goes. On Windows a loaded library cannot
-/// be removed, and its folder stays.
+/// The library at `lib` just loaded, or not to be: its private folder goes. Asked on each way out
+/// of a `use` after the build, not only once the library is open: a library refused for its
+/// effects lines, or one that did not open, left its folder (its source and the library) in the
+/// temporary folder, one more on each `--watch` reload (FEEDBACK83.md, Q-1305, found by the
+/// coverage tests; branch feedback82-85). On Windows a loaded library cannot be removed, and its
+/// folder stays.
 fn loaded(lib: &Path) {
     let mut dirs = PRIVATE_DIRS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(i) = dirs.iter().position(|(l, _)| l == lib) {
@@ -2282,12 +2286,18 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
     let built = it.unlocked(move || if confirmed { build_confirmed(&path, &program) } else { build_with(&path, here) });
     let (lib_path, parsed) = built.map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
     // Not loaded with a function's effects wider than its file's, as `quillo check` says
-    // (FEEDBACK85.md, Q-1344; branch feedback82-85).
+    // (FEEDBACK85.md, Q-1344; branch feedback82-85). Said once, at the plugin's own line, with the
+    // `use` that took it as where: it was `./hi.qwer:1: hi.qwer:4:`, the use's line given to the
+    // plugin's file (FEEDBACK83.md, Q-1305, found by the coverage tests; branch feedback82-85).
     if let Some((l, msg)) = parsed.errors.first() {
-        let file = qwer.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-        return Err(Ctrl::Error(Box::new(crate::error::QuilloError::new(format!("{}:{}: {}", file, l, msg), line))));
+        loaded(&lib_path);
+        let by = it.cur_file.as_deref().map_or_else(|| format!("line {}", line), |f| format!("{}:{}", Path::new(f).strip_prefix(&*it.base_dir).map_or_else(|_| f.to_string(), |r| r.display().to_string()), line));
+        return Err(Ctrl::Error(Box::new(crate::error::QuilloError::new(format!("{} (the `use` at {})", msg, by), *l).in_file(&qwer.display().to_string()))));
     }
-    let lib = open(&lib_path, parsed.exports.len()).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
+    let lib = open(&lib_path, parsed.exports.len()).map_err(|e| {
+        loaded(&lib_path);
+        Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line)))
+    })?;
     loaded(&lib_path);
     let file = qwer.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     // `import "x.qwer" use a, b as c`: each must be one of its functions (branch imports).

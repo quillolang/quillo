@@ -2214,6 +2214,154 @@ fn same_file(a: &Option<Arc<str>>, b: &Option<Arc<str>>) -> bool {
     }
 }
 
+// ---- a builtin taken as a value, held to the file that named it --------------------------------
+//
+// A builtin named where it is not called (`apply(read_file, p)`, `let get = http.get`, `items |
+// map(read_file)`, `http` handed on whole) is held, when it is called, to the file whose code named
+// it, as a lambda is held to the file it was written in (`enter_call`). The file builtins, `http.*`
+// and the rest read the hold by `cur_file` at their call, and that was the file of the code that
+// called the value: another file's helper's, so a file confirmed for nothing read `.env` through
+// a helper whose own file was confirmed for it (FEEDBACK83.md, Q-1300, found by the coverage
+// tests; branch feedback82-85). The value stays the builtin it is, by its name (`==`, `str`, JSON's
+// refusal, the browser's code), and no `Value` grows: its function is one of `NAMED_SLOTS`
+// stand-ins, each given once to a builtin and a file, which calls the builtin with `cur_file` that
+// file. Only while a `quillo.confirmed` holds the run (`confirm::held`), and only for a builtin that
+// may reach something (`carries_origin`); a builtin called by its name is called by the code that
+// names it, and is as it was (`eval_called`).
+
+/// How many builtins, each as one file names it, can be held to that file: a program names few
+/// that reach out as values. Past them a builtin so named is refused when it is called
+/// (`named_full`), never held to the file that calls it.
+const NAMED_SLOTS: usize = 1024;
+
+/// Each stand-in's builtin and the file that named it, given before the stand-in is.
+static NAMED: [OnceLock<(BuiltinFn, Option<Arc<str>>)>; NAMED_SLOTS] = [const { OnceLock::new() }; NAMED_SLOTS];
+
+/// The stand-ins given: by builtin and file, and each by its address, to know one.
+#[derive(Default)]
+struct StandIns {
+    by: std::collections::HashMap<(usize, Option<Arc<str>>), BuiltinFn>,
+    fns: HashSet<usize>,
+}
+
+static GIVEN: std::sync::LazyLock<std::sync::RwLock<StandIns>> = std::sync::LazyLock::new(Default::default);
+
+fn named_slot<const K: usize>(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+    it.call_named(K, args, line)
+}
+
+macro_rules! named_row {
+    ($hi:literal) => {
+        named_row!(@ $hi; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
+    };
+    (@ $hi:literal; $($lo:literal)*) => {
+        [$(named_slot::<{ $hi * 32 + $lo }> as BuiltinFn),*]
+    };
+}
+
+static NAMED_FNS: [[BuiltinFn; 32]; NAMED_SLOTS / 32] = [
+    named_row!(0), named_row!(1), named_row!(2), named_row!(3), named_row!(4), named_row!(5), named_row!(6), named_row!(7),
+    named_row!(8), named_row!(9), named_row!(10), named_row!(11), named_row!(12), named_row!(13), named_row!(14), named_row!(15),
+    named_row!(16), named_row!(17), named_row!(18), named_row!(19), named_row!(20), named_row!(21), named_row!(22), named_row!(23),
+    named_row!(24), named_row!(25), named_row!(26), named_row!(27), named_row!(28), named_row!(29), named_row!(30), named_row!(31),
+];
+
+/// A builtin named as a value past `NAMED_SLOTS`: refused, as a file builtin refuses a path, since
+/// no file can be said to hold it.
+fn named_full(_: &mut Interp, _: Vec<Value>, _: u32) -> Result<Value, Ctrl> {
+    Ok(Value::err(Value::str(format!("refused: more than {} builtins that reach out are taken as values in the program's files, and none holds this one (call it by its name)", NAMED_SLOTS))))
+}
+
+/// Whether a builtin, taken as a value, is held to the file that took it: one with an effect
+/// (`ast::builtin_effect`: the file builtins, `env` and the rest), and every module's but those of
+/// modules that reach nothing a `quillo.confirmed` holds (`math`, `stats`, `re` and `bit`, as a
+/// script has them, and `json`, `vec`, `date`, `money`, `crypto`), so that a module's builtin
+/// is held whatever its effect says. Not a Rust plugin's: it is called by its name
+/// (`native::call`), and held by its SHA-256.
+fn carries_origin(name: &str) -> bool {
+    if name.starts_with("native:") {
+        return false;
+    }
+    match name.split_once('.') {
+        Some((module, _)) => !matches!(module, "math" | "stats" | "re" | "bit" | "json" | "vec" | "date" | "money" | "crypto"),
+        None => crate::ast::builtin_effect(name) != 0,
+    }
+}
+
+/// Whether `v`, named as a value, is or holds a builtin that `named_here` holds to a file while a
+/// `quillo.confirmed` holds the run: asked in `eval`'s every name, so in a few instructions, and
+/// what never is (a record, `upper`) is not copied to be given back as it was. A map is a module
+/// (`http`, a map of builtins) only if its first value is a builtin, which a record's seldom is;
+/// a builtin's name is asked once (`carries_name`).
+#[inline(always)]
+fn carries_any(v: &Value) -> bool {
+    match v {
+        Value::Builtin(n, _) => crate::confirm::held() && carries_name(n),
+        Value::Map(m) => matches!(m.first(), Some((_, Value::Builtin(..)))) && crate::confirm::held() && module_carries(m),
+        _ => false,
+    }
+}
+
+/// Whether a map whose first value is a builtin is a module that holds one `named_here` holds.
+#[inline(never)]
+fn module_carries(m: &Map) -> bool {
+    is_module_map(m) && m.values().any(|x| matches!(x, Value::Builtin(n, _) if carries_name(n)))
+}
+
+/// What `carries_origin` said of each builtin's name, by where its text is and its length, which
+/// say what it is: an entry is the text's address, its length from bit 48, `NAME_KNOWN`, and
+/// `NAME_CARRIES`. Two names on one entry each ask again; a name whose address or length does
+/// not fit is asked each time.
+static NAMES_SEEN: [std::sync::atomic::AtomicU64; 256] = [const { std::sync::atomic::AtomicU64::new(0) }; 256];
+const NAME_KNOWN: u64 = 1 << 62;
+const NAME_CARRIES: u64 = 1 << 63;
+
+/// `carries_origin(n)`, asked once for each builtin's name rather than each time it is named.
+#[inline(always)]
+fn carries_name(n: &'static str) -> bool {
+    let key = n.as_ptr() as u64 | (n.len() as u64) << 48 | NAME_KNOWN;
+    let seen = &NAMES_SEEN[(key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize];
+    let e = seen.load(std::sync::atomic::Ordering::Relaxed);
+    if e & !NAME_CARRIES == key {
+        return e & NAME_CARRIES != 0;
+    }
+    name_carries_first(n, key, seen)
+}
+
+#[cold]
+#[inline(never)]
+fn name_carries_first(n: &'static str, key: u64, seen: &std::sync::atomic::AtomicU64) -> bool {
+    let carries = carries_origin(n);
+    if (n.as_ptr() as u64) >> 48 == 0 && (n.len() as u64) < 1 << 14 {
+        seen.store(key | if carries { NAME_CARRIES } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+    }
+    carries
+}
+
+/// `f`'s stand-in for `file`: the one given before, or a new one; `f` itself where it is one.
+fn named_fn(f: BuiltinFn, file: &Option<Arc<str>>) -> BuiltinFn {
+    let key = (f as usize, file.clone());
+    {
+        let given = GIVEN.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if given.fns.contains(&key.0) || key.0 == named_full as BuiltinFn as usize {
+            return f;
+        }
+        if let Some(g) = given.by.get(&key) {
+            return *g;
+        }
+    }
+    let mut given = GIVEN.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(g) = given.by.get(&key) {
+        return *g;
+    }
+    let k = given.by.len();
+    let Some(g) = NAMED_FNS.get(k / 32).map(|row| row[k % 32]) else { return named_full };
+    let _ = NAMED[k].set((f, file.clone()));
+    given.fns.insert(g as usize);
+    given.by.insert(key, g);
+    g
+}
+
 /// What a one-parameter function gives without being called, when calling it can do nothing
 /// else (no types, defaults or effects to check, and not a script's, which runs only while its
 /// script does: Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250).
@@ -4135,6 +4283,11 @@ impl Interp {
                 // 16 bytes larger, and a 3,000-deep walk ran out of stack on Linux (CI run
                 // 43733282629, feedback52_jit).
                 match lookup(env, *n) {
+                    // A builtin or a module named as a value where a `quillo.confirmed` holds the
+                    // run: held to this file when it is called, wherever that is (`named_here`;
+                    // FEEDBACK83.md, Q-1300, found by the coverage tests; branch feedback82-85). A
+                    // call by its name does not come here (`eval_called`).
+                    Some(ref v) if carries_any(v) => self.named_ident(v, n, *line),
                     Some(v) if !crate::value::is_page_state(&v) => Ok(v),
                     found => Err(name_missing(n, *line, found.is_some())),
                 }
@@ -4371,7 +4524,8 @@ impl Interp {
             }
             // `sql | analytics.one`: on that connection.
             Expr::Field(obj, name, l) => {
-                let recv = self.eval(obj, env)?;
+                // `x | read_file.curry` hands `read_file` on, to `curry` (`get_field`).
+                let recv = if let Expr::Ident(..) = &**obj { self.eval_receiver(obj, name, env)? } else { self.eval(obj, env)? };
                 let db_on = crate::db::conn_of(&recv, name);
                 let f = self.get_field(recv, name, env, *l)?;
                 self.db_on = db_on;
@@ -4380,7 +4534,7 @@ impl Interp {
                 self.call(&f, vec![v], line)
             }
             other => {
-                let f = self.eval(other, env)?;
+                let f = self.eval_called(other, env)?;
                 self.exact_div = pending;
                 self.piped_site(rhs);
                 self.call(&f, vec![v], line)
@@ -5346,7 +5500,8 @@ impl Interp {
             if !self.js_libs.is_empty() && lib_root(obj, env) {
                 return Ok(Value::Nil);
             }
-            let recv = self.eval(obj, env)?;
+            // A name by `eval_receiver`; anything else is a value already.
+            let recv = if let Expr::Ident(..) = &**obj { self.eval_receiver(obj, name, env)? } else { self.eval(obj, env)? };
             // `json.stringify(...)` where a variable named `json` hides the
             // module (FEEDBACK9.md, Q-069; branch feedback9-fixes).
             if let Expr::Ident(m, _) = &**obj {
@@ -5382,7 +5537,7 @@ impl Interp {
                 },
             }
         } else {
-            self.eval(callee, env)?
+            self.eval_called(callee, env)?
         };
         // `raw(t(key, vars))`: the translation's markup, but the values put
         // in it are text, escaped (see `i18n::t_html`).
@@ -5641,6 +5796,92 @@ impl Interp {
                 fail(line, format!("cannot call {}: it is not a function", other.type_name()))
             }
         }
+    }
+
+    /// A stand-in's call (`named_slot`): its builtin's, with `cur_file` the file that named it, as
+    /// a lambda's body runs in its own (`enter_call`; FEEDBACK83.md, Q-1300, found by the coverage
+    /// tests; branch feedback82-85).
+    #[inline(never)]
+    fn call_named(&mut self, k: usize, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+        let Some((f, file)) = NAMED.get(k).and_then(OnceLock::get) else { return named_full(self, args, line) };
+        let was = std::mem::replace(&mut self.cur_file, file.clone());
+        let r = f(self, args, line);
+        self.cur_file = was;
+        r
+    }
+
+    /// `v`, which the code of `cur_file` names as a value while a `quillo.confirmed` holds the run:
+    /// a builtin that may reach something, held to that file from now on, and a module's builtins
+    /// so (a map of builtins, as `http` is: what is taken of it is then held, by any way, `.get`,
+    /// `["get"]`, `values`, handed on whole); anything else as it is, and one held already to the
+    /// file it was named in (FEEDBACK83.md, Q-1300, found by the coverage tests; branch
+    /// feedback82-85).
+    #[cold]
+    #[inline(never)]
+    fn named_here(&self, v: Value) -> Value {
+        match v {
+            Value::Builtin(n, f) if carries_name(n) => Value::Builtin(n, named_fn(f, &self.cur_file)),
+            Value::Map(m) if is_module_map(&m) && m.values().any(|x| matches!(x, Value::Builtin(n, f) if carries_name(n) && named_fn(*f, &self.cur_file) as usize != *f as usize)) => {
+                let mut held = (*m).clone();
+                for x in held.values_mut() {
+                    if let Value::Builtin(n, f) = x {
+                        if carries_name(n) {
+                            *f = named_fn(*f, &self.cur_file);
+                        }
+                    }
+                }
+                Value::Map(Arc::new(held))
+            }
+            v => v,
+        }
+    }
+
+    /// A name's builtin or map, read as `eval` reads a name, taken as a value (`named_here`): given
+    /// where `eval` has it, whose every frame another value would make larger.
+    #[cold]
+    #[inline(never)]
+    fn named_ident(&self, v: &Value, n: &Sym, line: u32) -> Result<Value, Ctrl> {
+        if crate::value::is_page_state(v) {
+            return Err(name_missing(n, line, true));
+        }
+        Ok(self.named_here(v.clone()))
+    }
+
+    /// A call's callee or receiver, as `eval` works it out, but a builtin or module named there is
+    /// called by this code, here, and held to its file as it always was (`cur_file` at the
+    /// builtin's own call), not given an origin as one taken as a value is (`named_here`): every
+    /// call by a name takes this way, as it did (FEEDBACK83.md, Q-1300, found by the coverage
+    /// tests; branch feedback82-85).
+    #[inline(never)]
+    fn eval_called(&mut self, e: &Expr, env: &Env) -> Result<Value, Ctrl> {
+        self.called_value(e, env)
+    }
+
+    #[inline(always)]
+    fn called_value(&mut self, e: &Expr, env: &Env) -> Result<Value, Ctrl> {
+        let Expr::Ident(n, line) = e else { return self.eval(e, env) };
+        if self.reads.is_some() || !self.tracks.is_empty() {
+            self.note_global_read(env, n);
+        }
+        match lookup(env, *n) {
+            Some(v) if !crate::value::is_page_state(&v) => Ok(v),
+            found => Err(name_missing(n, *line, found.is_some())),
+        }
+    }
+
+    /// A method call's receiver that is a name, `recv` of `recv.name(...)`: as a callee is
+    /// (`eval_called`), unless the call hands it on, to the function `name`, as it does all but a
+    /// map holding `name`: then it is taken as a value, `read_file.apply(p)` as `apply(read_file,
+    /// p)` (`named_here`); any other receiver `eval` works out as a value. Here, out of
+    /// `eval_call`, whose frame every call has (FEEDBACK83.md, Q-1300, found by the coverage tests;
+    /// branch feedback82-85).
+    #[inline(never)]
+    fn eval_receiver(&mut self, obj: &Expr, name: &str, env: &Env) -> Result<Value, Ctrl> {
+        let v = self.called_value(obj, env)?;
+        if matches!(v, Value::Builtin(..) | Value::Map(_)) && crate::confirm::held() && !matches!(&v, Value::Map(m) if m.contains_key(name)) {
+            return Ok(self.named_here(v));
+        }
+        Ok(v)
     }
 
     /// `css(x)` by that name: css`...` as the parser writes it, the builtin's (`parser::css_tag_arg`),

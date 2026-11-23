@@ -3036,23 +3036,18 @@ fn real_path(p: &Path) -> Option<std::path::PathBuf> {
 
 /// `p` as it really is, if that is inside a folder `--allow-path` named. A file not made yet
 /// is where the nearest folder above it that is there really is, and what follows that is
-/// plain names: a `..` past it is refused.
+/// plain names: a `..` past it is refused. A link that leads nowhere is refused too, as
+/// `stays_in` refuses one in the program's folder (`real_path`): `write_file("../shared/dl")`,
+/// with `shared/dl` a link to `../outside/made.txt`, made that file outside every folder named
+/// (FEEDBACK29.md, Q-357's folders; found fixing FEEDBACK83.md Q-1300 for the coverage tests;
+/// branch feedback82-85).
 fn allowed_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {
     let dirs = ALLOWED_PATHS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
     if dirs.is_empty() {
         return None;
     }
     let full = if Path::new(p).is_absolute() { std::path::PathBuf::from(p) } else { it.base_dir.join(p) };
-    let mut at = full.as_path();
-    let mut rest = Vec::new();
-    let real = loop {
-        if let Ok(r) = at.canonicalize() {
-            break r;
-        }
-        rest.push(at.file_name()?);
-        at = at.parent()?;
-    };
-    let real = rest.iter().rev().fold(real, |r, name| r.join(name));
+    let real = real_path(&full)?;
     dirs.iter().any(|d| real.starts_with(d)).then_some(real)
 }
 

