@@ -137,6 +137,14 @@ fn check_src(name: &str, src: &str, more: &[(&str, &str)]) -> (bool, Vec<String>
     check_file(d.path(), "main.qwe")
 }
 
+/// `check_src`'s lines without the warning of a GET that writes and is not declared `route writes`
+/// (FEEDBACK70.md, Q-965, decided 2026-11-23: warned by `quillo check`). The tests that use it are
+/// about the warning of a GET that writes and reads who the visitor is, written before Q-965's.
+fn check_src_who(name: &str, src: &str, more: &[(&str, &str)]) -> (bool, Vec<String>) {
+    let (ok, lines) = check_src(name, src, more);
+    (ok, lines.into_iter().filter(|l| !l.contains("but is not declared `route writes`")).collect())
+}
+
 /// What `quillo check` says of a GET route that writes and reads who the visitor is.
 fn get_warned(line: usize, route: &str, writes: &str, reads: &str) -> String {
     format!(
@@ -273,7 +281,7 @@ fn a_get_routes_alternative_request_patterns_are_looked_through() {
         src.push_str(&route(path, pat));
     }
     src.push_str("route writes GET /meant { cookies: c } | { headers: h } {\n    db.exec(\"delete from notes\")\n    return \"x\"\n}\n");
-    assert_eq!(check_src("get-alt", &src, &[]), (true, want), "{}", src);
+    assert_eq!(check_src_who("get-alt", &src, &[]), (true, want), "{}", src);
 }
 
 /// A field of the request taken by `let { ... } = request` is named as `request.<field>`, one of
@@ -287,7 +295,7 @@ fn a_get_routes_field_of_the_request_and_an_early_return_are_read() {
         NOTES
     );
     assert_eq!(
-        check_src("get-field", &src, &[]),
+        check_src_who("get-field", &src, &[]),
         (
             true,
             vec![
@@ -334,7 +342,7 @@ route GET /d {{
 "#,
         NOTES
     );
-    let (ok, lines) = check_src("get-middleware", &src, &[]);
+    let (ok, lines) = check_src_who("get-middleware", &src, &[]);
     assert!(!ok);
     // The hand-written `__answer`'s error, whose words are not this test's (Q-1108 is open).
     assert_eq!(lines.len(), 3, "{:?}", lines);
