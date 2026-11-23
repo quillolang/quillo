@@ -253,9 +253,13 @@ route GET /attr {
     let (_g, port, log) = serve(d.path(), "main.qwe", &[]);
     let a = get(port, "/");
     assert_eq!(a.status, 200, "{}", read(&log));
+    // `<meta=" a='">`'s `a` opens a value with `'` that never ends: the browser drops it and all
+    // after it (parse5: the head ends at `<meta data-x name="keep">`, the body is empty), so the
+    // tags go before it, and the title after it, never read, stays (slice Z's fix: FEEDBACK84.md,
+    // Q-1320, found by the coverage tests; branch feedback82-85). They went after it, unseen.
     assert_eq!(
         a.body,
-        "<!doctype html><html><head><meta data-x name=\"keep\"><meta=\" a='\"><title>New</title><meta property=\"og:title\" content=\"New\"><meta name=\"description\" content=\"Said\"><meta property=\"og:description\" content=\"Said\"></head><body>b</body></html>"
+        "<!doctype html><html><head><meta data-x name=\"keep\"><title>New</title><meta property=\"og:title\" content=\"New\"><meta name=\"description\" content=\"Said\"><meta property=\"og:description\" content=\"Said\"><meta=\" a='\"><title>Old</title></head><body>b</body></html>"
     );
     let a = get(port, "/attr");
     assert_eq!(a.status, 200, "{}", read(&log));
@@ -737,7 +741,9 @@ fn a_plugin_function_wider_than_its_file_does_not_load() {
     assert!(out.contains("names fs, which the file's `//! effects: none` does not"), "{}", out);
     let (code, out) = quillo_env(d.path(), &["run", "main.qwe", "--no-check"], 600, &[("QUILLO_NATIVE_CACHE", &cache)]);
     assert_eq!(code, Some(1), "{}", out);
-    assert!(out.contains(": hi.qwer:4: `hi`'s `/// effects: fs` names fs, which the file's `//! effects: none` does not: a function's line narrows its file's, never widens it"), "{}", out);
+    // Said once, at the plugin's line, with the `use` it was taken by: it was `./hi.qwer:1:
+    // hi.qwer:4:` (found by the coverage tests; the expected text changed with that fix).
+    assert!(out.contains("./hi.qwer:4: `hi`'s `/// effects: fs` names fs, which the file's `//! effects: none` does not: a function's line narrows its file's, never widens it (the `use` at main.qwe:1)"), "{}", out);
     assert!(!out.contains("\nhi\n"), "{}", out);
     d.write("hi.qwer", "//! version: 1.0.0\n//! effects: fs, net\n/// effects: fs\n/// effects: net\npub fn hi() -> String { \"hi\".into() }\n");
     let (code, out) = quillo_env(d.path(), &["run", "main.qwe", "--no-check"], 600, &[("QUILLO_NATIVE_CACHE", &cache)]);
@@ -809,4 +815,243 @@ fn a_pinned_plugin_refused_at_its_load_is_built_again_at_a_reload() {
     assert!(read(&log).matches("building ./hi.qwer (held to its SHA-256: from its source, apart)").count() >= 2, "{}", read(&log));
     assert_eq!(get(port, "/").status, 500, "{}", read(&log));
     drop(g);
+}
+
+// ---- src/head.rs, src/fetch.rs, src/check.rs: what the coverage tests found (slice Z) -----------
+
+/// A head that says `pairs`, each at depth 0 in no component, in their order.
+fn said_head(pairs: &[(&str, &str)]) -> quillo::head::Head {
+    let mut h = quillo::head::Head::default();
+    for (k, v) in pairs {
+        h.say(quillo::head::KEYS.iter().position(|x| x == k).unwrap(), 0, 0, v.to_string());
+        h.called();
+    }
+    h
+}
+
+/// `page` with `h`'s tags in its head.
+fn with_head(page: &str, h: &quillo::head::Head) -> String {
+    let mut b = page.as_bytes().to_vec();
+    quillo::head::apply(&mut b, h);
+    String::from_utf8(b).unwrap()
+}
+
+/// What `page_head({ title: "T" })` writes.
+const TT: &str = "<title>T</title><meta property=\"og:title\" content=\"T\">";
+
+/// The repro: a page with no head and no body whose `<html>` tag's `lang` holds a `>` takes
+/// `page_head`'s tags after that tag, not inside it (which lost the title and showed `b">` as
+/// text); so does one after a comment that says `<html>` and `>`, and one whose doctype comes
+/// after a comment that says one (src/head.rs apply, marks, tag_close, FEEDBACK84.md Q-1320, found
+/// by the coverage tests; branch feedback82-85)
+#[test]
+fn page_heads_tags_go_after_an_html_tag_whose_value_holds_a_gt() {
+    let d = Dir::new("headgt");
+    d.write(
+        "main.qwe",
+        r#"route GET / {
+    page_head({ title: "T" })
+    return raw("<html lang=\"a>b\"><p>x</p></html>")
+}
+route GET /c {
+    page_head({ title: "T" })
+    return raw("<!-- <html> > --><html lang='a>b'><p>x</p></html>")
+}
+route GET /d {
+    page_head({ title: "T" })
+    return raw("<!-- <!doctype x> --><!doctype html><p>x</p>")
+}
+route GET /u {
+    page_head({ title: "Café · 東京" })
+    return raw("<html lang=\"日本>語\"><p>x</p></html>")
+}
+"#,
+    );
+    checked(d.path(), "main.qwe");
+    let (_g, port, log) = serve(d.path(), "main.qwe", &[]);
+    for (path, want) in [
+        ("/", format!("<html lang=\"a>b\">{TT}<p>x</p></html>")),
+        ("/c", format!("<!-- <html> > --><html lang='a>b'>{TT}<p>x</p></html>")),
+        ("/d", format!("<!-- <!doctype x> --><!doctype html>{TT}<p>x</p>")),
+        ("/u", "<html lang=\"日本>語\"><title>Café · 東京</title><meta property=\"og:title\" content=\"Café · 東京\"><p>x</p></html>".to_string()),
+    ] {
+        let a = get(port, path);
+        assert_eq!((a.status, a.body.as_str()), (200, want.as_str()), "{} {}", path, read(&log));
+    }
+}
+
+/// Each tag `page_head`'s tags go after ends where the browser ends it (checked against parse5, the
+/// HTML standard's tokenizer): a quote opens a value only after `=` (and spaces), single or
+/// double; an unquoted value, a value or a name that starts with `=`, a quote in a name, end at
+/// their first `>`; any case. A comment ends at its first `-->` or `--!>`, `<!-->` and `<!--->`
+/// whole, `<!---!>` not (one short); a doctype and a `<?...>` at their first `>`, quoted or not.
+/// What a comment or a script says is no tag. A tag, comment or doctype that never ends, or a
+/// page that is no document, is left as it is (src/head.rs apply, marks, token, comment_end,
+/// tag_close, FEEDBACK84.md Q-1320, found by the coverage tests; branch feedback82-85)
+#[test]
+fn the_tag_page_head_goes_after_ends_where_the_browser_ends_it() {
+    let h = said_head(&[("title", "T")]);
+    let after = |tag: &str, rest: &str| format!("{tag}{TT}{rest}");
+    for (page, want) in [
+        ("<html lang=\"a>b\"><p>x</p>", after("<html lang=\"a>b\">", "<p>x</p>")),
+        ("<html lang='a>b'><p>x</p>", after("<html lang='a>b'>", "<p>x</p>")),
+        ("<HTML LANG = \"a>b\" ><p>x</p>", after("<HTML LANG = \"a>b\" >", "<p>x</p>")),
+        ("<html\nlang=\n'a>b'><p>x</p>", after("<html\nlang=\n'a>b'>", "<p>x</p>")),
+        ("<html/ lang=\"a>b\"><p>x</p>", after("<html/ lang=\"a>b\">", "<p>x</p>")),
+        ("<html lang=a>b><p>x</p>", after("<html lang=a>", "b><p>x</p>")),
+        ("<html lang=a\"b>c\"><p>x</p>", after("<html lang=a\"b>", "c\"><p>x</p>")),
+        ("<html a==\">\"><p>x</p>", after("<html a==\">", "\"><p>x</p>")),
+        ("<html =\">\"><p>x</p>", after("<html =\">", "\"><p>x</p>")),
+        ("<html b'c><p>x</p>", after("<html b'c>", "<p>x</p>")),
+        ("<html a=\"\"><p>x</p>", after("<html a=\"\">", "<p>x</p>")),
+        ("<html a=><p>x</p>", after("<html a=>", "<p>x</p>")),
+        ("<!-- > --><html lang=\"x>y\"><p>x</p>", after("<!-- > --><html lang=\"x>y\">", "<p>x</p>")),
+        ("<!-- <html lang=\"no\"> --><html lang=\"yes\"><p>x</p>", after("<!-- <html lang=\"no\"> --><html lang=\"yes\">", "<p>x</p>")),
+        ("<!--><html lang=\"a>b\"><p>x</p>", after("<!--><html lang=\"a>b\">", "<p>x</p>")),
+        ("<!---><html lang=\"a>b\"><p>x</p>", after("<!---><html lang=\"a>b\">", "<p>x</p>")),
+        ("<!----><html lang=\"a>b\"><p>x</p>", after("<!----><html lang=\"a>b\">", "<p>x</p>")),
+        ("<!----!><html lang=\"a>b\"><p>x</p>", after("<!----!><html lang=\"a>b\">", "<p>x</p>")),
+        ("<!-- --!><html><p>x</p>", after("<!-- --!><html>", "<p>x</p>")),
+        ("<?xml version=\"1.0\"?><html lang=\"a>b\"><p>x</p>", after("<?xml version=\"1.0\"?><html lang=\"a>b\">", "<p>x</p>")),
+        ("<!doctype html><p>x</p>", after("<!doctype html>", "<p>x</p>")),
+        ("<!-- <!doctype x> --><!DOCTYPE html><p>x</p>", after("<!-- <!doctype x> --><!DOCTYPE html>", "<p>x</p>")),
+        ("<!doctype html \"a>b\"><p>x</p>", after("<!doctype html \"a>", "b\"><p>x</p>")),
+        ("<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\"><html lang=\"a>b\"><p>x</p>", after("<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\"><html lang=\"a>b\">", "<p>x</p>")),
+        // Left as they are: no end, or no document outside a comment or a script.
+        ("<html lang=\"a>b\"", "<html lang=\"a>b\"".to_string()),
+        ("<html lang=\"a><p>x</p>", "<html lang=\"a><p>x</p>".to_string()),
+        ("<!--!><html lang=\"a>b\"><p>x</p>", "<!--!><html lang=\"a>b\"><p>x</p>".to_string()),
+        ("<!---!><html><p>x</p>", "<!---!><html><p>x</p>".to_string()),
+        ("<!doctype html", "<!doctype html".to_string()),
+        ("<script>\"<html>\"</script><p>x</p>", "<script>\"<html>\"</script><p>x</p>".to_string()),
+        ("<p>1 < 2</p><", "<p>1 < 2</p><".to_string()),
+        ("</", "</".to_string()),
+        ("", String::new()),
+    ] {
+        assert_eq!(with_head(page, &h), want, "{:?}", page);
+    }
+}
+
+/// The head's own `<head ...>`, `</head ...>` and `<body ...>` are read as tags too: a `</head>`
+/// in a quoted value is none, an end tag's own attributes are passed over, a `<body>` whose value
+/// holds a `>` is where a page with no head ends it; a title's text runs to `</title>`, its name
+/// whole (`</titles>` is text). Where the head's rest is one tag, script or comment that never
+/// ends (the browser drops it, or takes it whole), the tags go before it, the head's own of the
+/// keys said before it taken away (src/head.rs marks, text_end, FEEDBACK84.md Q-1320, found by the
+/// coverage tests; branch feedback82-85)
+#[test]
+fn the_heads_own_tags_are_read_as_the_browser_reads_them() {
+    let h = said_head(&[("title", "T")]);
+    for (page, want) in [
+        ("<head data-x=\"</head>\"><title>Old</title></head><body>b</body>", format!("<head data-x=\"</head>\">{TT}</head><body>b</body>")),
+        ("<head><title>Old</title></head x=\">\"><body>b</body>", format!("<head>{TT}</head x=\">\"><body>b</body>")),
+        ("<html><body class=\"a>b\">x</body></html>", format!("<html>{TT}<body class=\"a>b\">x</body></html>")),
+        ("<html><BODY\tclass='a>b'>x</BODY></html>", format!("<html>{TT}<BODY\tclass='a>b'>x</BODY></html>")),
+        ("<html><head><title>a</titles>b</title></head><body>c</body>", format!("<html><head>{TT}</head><body>c</body>")),
+        ("<html><head><title data-x=\"</title>\">a</title ></head>", format!("<html><head>{TT}</head>")),
+        ("<head><title>Old</title><script>let a = \"</head>\"", format!("<head>{TT}<script>let a = \"</head>\"")),
+        ("<head><title>Old</title><!-- </head>", format!("<head>{TT}<!-- </head>")),
+        ("<head><title>Old</title><meta x='y></head><body>b</body>", format!("<head>{TT}<meta x='y></head><body>b</body>")),
+    ] {
+        assert_eq!(with_head(page, &h), want, "{:?}", page);
+    }
+    // Two keys: the description before the tag that never ends taken away, the title after it
+    // (which the browser never reads) left.
+    let h = said_head(&[("title", "T"), ("description", "D")]);
+    let page = "<html><head><meta name=\"description\" content=\"old\"><meta x='y><title>Old</title></head><body>b</body></html>";
+    assert_eq!(
+        with_head(page, &h),
+        format!("<html><head>{TT}<meta name=\"description\" content=\"D\"><meta property=\"og:description\" content=\"D\"><meta x='y><title>Old</title></head><body>b</body></html>")
+    );
+    // A custom element whose name starts with `meta` or `title` is neither.
+    let page = "<html><head><meta-x name=\"description\"></meta-x><title-bar>t</title-bar><title>Old</title></head><body>b</body></html>";
+    assert_eq!(
+        with_head(page, &h),
+        format!("<html><head><meta-x name=\"description\"></meta-x><title-bar>t</title-bar>{TT}<meta name=\"description\" content=\"D\"><meta property=\"og:description\" content=\"D\"></head><body>b</body></html>")
+    );
+}
+
+/// `save: null` and `max_bytes: null` are no options on `http.stream`, as `http.get` reads them:
+/// the stream runs. Written with a value (a text, an empty one, a template, a number) they stop
+/// the program, and `quillo check` now says so first; a value worked out is judged as it runs, a
+/// null passing (src/fetch.rs opts_of, src/check.rs, FEEDBACK85.md Q-1342, found by the coverage
+/// tests; branch feedback82-85)
+#[test]
+fn a_null_save_is_no_option_on_http_stream() {
+    let d = Dir::new("streamsave");
+    let u = format!("http://127.0.0.1:{}", stand_in());
+    d.write(
+        "s.qwe",
+        &format!(
+            "print(http.stream(\"{u}/ok\", (p) => print(p), {{ save: null }}).status)\nprint(http.stream(\"{u}/ok\", (p) => print(p), {{ max_bytes: null, save: null, public_only: false }}).status)\nprint(http.get(\"{u}/ok\", {{}}, {{ save: null }}).body)\nlet none = json.parse(\"null\")\nprint(http.stream(\"{u}/ok\", (p) => print(p), {{ save: none }}).status)\n"
+        ),
+    );
+    checked(d.path(), "s.qwe");
+    let (code, out) = quillo(d.path(), &["run", "s.qwe"]);
+    assert_eq!((code, out.as_str()), (Some(0), "hello\n200\nhello\n200\nhello\nhello\n200\n"));
+    for (opts, key) in [("{ save: \"a.bin\" }", "save"), ("{ save: \"\" }", "save"), ("{ save: `${n}.bin` }", "save"), ("{ max_bytes: 5 }", "max_bytes"), ("{ save: null, max_bytes: 0 }", "max_bytes"), ("{ save: \"caf\u{e9}.bin\" }", "save")] {
+        d.write("t.qwe", &format!("let n = \"a\"\nprint(http.stream(\"{u}/ok\", (p) => print(p), {opts}))\n"));
+        let (code, out) = quillo(d.path(), &["check", "t.qwe"]);
+        assert_eq!(code, Some(1), "{}: {}", opts, out);
+        assert!(out.contains(&format!("t.qwe:2: error: `http.stream`: `{}` is for the calls that read an answer whole", key)), "{}: {}", opts, out);
+        let (code, out) = quillo(d.path(), &["run", "t.qwe", "--no-check"]);
+        assert_eq!(code, Some(1), "{}: {}", opts, out);
+        assert!(out.contains(&format!("quillo: t.qwe:2: `http.stream`: `{}` is for the calls that read an answer whole", key)), "{}: {}", opts, out);
+        assert!(!out.contains("hello"), "{}: {}", opts, out);
+    }
+    // Worked out: check says nothing; the run stops on a text.
+    d.write("w.qwe", &format!("let f = json.parse(\"\\\"a.bin\\\"\")\nprint(http.stream(\"{u}/ok\", (p) => print(p), {{ save: f }}))\n"));
+    checked(d.path(), "w.qwe");
+    let (code, out) = quillo(d.path(), &["run", "w.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("quillo: w.qwe:2: `http.stream`: `save` is for the calls that read an answer whole"), "{}", out);
+    assert!(!d.path().join("a.bin").exists());
+}
+
+/// A path confirmed under `writes` is read as well, as the hold reads it as the program runs
+/// (`writes` is read and write, `files` read only: f98c76f, CHANGELOG's "files is read-only"):
+/// `quillo check` and the start's count ask no `files` entry for it; a path confirmed only in
+/// `files` is still not written (src/confirm.rs missing, FEEDBACK83.md Q-1300, found by the
+/// coverage tests; branch feedback82-85)
+#[test]
+fn a_path_confirmed_under_writes_is_read_without_a_files_entry() {
+    let d = Dir::new("writesread");
+    d.write("data/a.txt", "hi");
+    d.write("main.qwe", "print(read_file(\"data/a.txt\"))\nprint(image.convert(\"data/in.png\", \"data/out.png\"))\n");
+    d.write("quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n");
+    let (code, out) = quillo(d.path(), &["run", "main.qwe", "--no-check"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.starts_with("hi\n") && !out.contains("not confirmed"), "{}", out);
+    checked(d.path(), "main.qwe");
+    d.write("quillo.confirmed", "[\"main.qwe\"]\nfiles = [\"data/\"]\n");
+    let (code, out) = quillo(d.path(), &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("main.qwe:2: error: writes data/out.png: not confirmed for this file"), "{}", out);
+}
+
+/// `save` with `cache` on `http.get`, written so, is an error of `quillo check`, as it is when the
+/// program runs and as the changelog says: `cache: 1` and the longest, a day, are; `cache: 0`,
+/// none, and `save: null` or `save: ""` (said otherwise when it runs) are not this error (src/check.rs
+/// http_rules, FEEDBACK85.md Q-1342, found by the coverage tests; branch feedback82-85)
+#[test]
+fn save_with_cache_is_an_error_before_it_runs() {
+    let d = Dir::new("savecache");
+    let u = format!("http://127.0.0.1:{}", stand_in());
+    for opts in ["{ save: \"a.bin\", cache: 60 }", "{ cache: 1, save: \"a.bin\" }", "{ save: `${n}.bin`, cache: 86400 }", "{ save: \"\u{6771}.bin\", cache: 5 }"] {
+        d.write("t.qwe", &format!("let n = \"a\"\nprint(http.get(\"{u}/ok\", {{}}, {opts}))\n"));
+        let (code, out) = quillo(d.path(), &["check", "t.qwe"]);
+        assert_eq!(code, Some(1), "{}: {}", opts, out);
+        assert!(out.contains("t.qwe:2: error: `http.get`: `cache` keeps answers in memory and `save` writes one to its file: one or the other"), "{}: {}", opts, out);
+        let (code, out) = quillo(d.path(), &["run", "t.qwe", "--no-check"]);
+        assert_eq!(code, Some(1), "{}: {}", opts, out);
+        assert!(out.contains("quillo: t.qwe:2: `http.get`: `cache` keeps answers in memory and `save` writes one to its file: one or the other"), "{}: {}", opts, out);
+    }
+    d.write("s.qwe", &format!("print(http.get(\"{u}/ok\", {{}}, {{ save: \"a.bin\", cache: 0 }}).bytes)\nprint(http.get(\"{u}/ok\", {{}}, {{ save: null, cache: 60 }}).body)\n"));
+    checked(d.path(), "s.qwe");
+    let (code, out) = quillo(d.path(), &["run", "s.qwe"]);
+    assert_eq!((code, out.as_str()), (Some(0), "5\nhello\n"));
+    assert_eq!(read(&d.path().join("a.bin")), "hello");
+    d.write("e.qwe", &format!("print(http.get(\"{u}/ok\", {{}}, {{ save: \"\", cache: 60 }}))\n"));
+    let (_, out) = quillo(d.path(), &["check", "e.qwe"]);
+    assert!(!out.contains("one or the other"), "{}", out);
 }

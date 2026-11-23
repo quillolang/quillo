@@ -231,7 +231,7 @@ const STREAM_NAMES: &[&str] = &["method", "body", "headers"];
 const MAX_TIMEOUT_SECS: f64 = 300.0;
 
 /// The longest `cache`: a day.
-const MAX_CACHE_SECS: i64 = 86_400;
+pub(crate) const MAX_CACHE_SECS: i64 = 86_400;
 
 /// `saving`: set when the options say `save` or `max_bytes`, found by their names as the keys are
 /// looked over, so that a call without them looks nothing up for them (FEEDBACK85.md, Q-1342;
@@ -271,7 +271,10 @@ fn opts_of(v: Option<&Value>, fname: &str, line: u32, base: &std::path::Path, sa
     let stream = fname == "http.stream";
     *saving = m.keys().any(|k| matches!(k.as_ref(), "save" | "max_bytes"));
     if stream && *saving {
-        if let Some(k) = ["save", "max_bytes"].into_iter().find(|k| m.get(*k).is_some()) {
+        // A null is no option, as `http.get` reads `save: null` (FEEDBACK85.md, Q-1342, found by
+        // the coverage tests; branch feedback82-85): `http.stream(url, f, { save: null })` was
+        // stopped where `quillo check` said ok.
+        if let Some(k) = ["save", "max_bytes"].into_iter().find(|k| m.get(*k).is_some_and(|v| !matches!(v, Value::Nil))) {
             return fail(line, format!("`http.stream`: `{}` is for the calls that read an answer whole (http.get and the others): http.stream hands it over as it arrives", k));
         }
     }

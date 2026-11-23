@@ -69,23 +69,25 @@ impl Head {
         out
     }
 
-    /// Whether `tag` (one tag's text, `<meta ...>`) is one of a key this head says.
-    fn replaces(&self, name: &str, tag: &[u8]) -> bool {
+    /// Whether `tag` (one tag's text, `<meta ...>`, its name `name` as written) is one of a key
+    /// this head says.
+    fn replaces(&self, name: &[u8], tag: &[u8]) -> bool {
         let said = |k: &str| self.get(k).is_some();
-        match name {
-            "title" => said("title"),
-            "meta" => {
-                let n = attr_of(tag, b"name").or_else(|| attr_of(tag, b"property")).map(|v| v.to_ascii_lowercase());
-                match n.as_deref() {
-                    Some("og:title") => said("title"),
-                    Some("description" | "og:description") => said("description"),
-                    Some("og:image") => said("image"),
-                    Some("og:url") => said("canonical"),
-                    _ => false,
-                }
+        if name.eq_ignore_ascii_case(b"title") {
+            said("title")
+        } else if name.eq_ignore_ascii_case(b"meta") {
+            let n = attr_of(tag, b"name").or_else(|| attr_of(tag, b"property")).map(|v| v.to_ascii_lowercase());
+            match n.as_deref() {
+                Some("og:title") => said("title"),
+                Some("description" | "og:description") => said("description"),
+                Some("og:image") => said("image"),
+                Some("og:url") => said("canonical"),
+                _ => false,
             }
-            "link" => said("canonical") && attr_of(tag, b"rel").is_some_and(|r| r.split_ascii_whitespace().any(|w| w.eq_ignore_ascii_case("canonical"))),
-            _ => false,
+        } else if name.eq_ignore_ascii_case(b"link") {
+            said("canonical") && attr_of(tag, b"rel").is_some_and(|r| r.split_ascii_whitespace().any(|w| w.eq_ignore_ascii_case("canonical")))
+        } else {
+            false
         }
     }
 }
@@ -145,14 +147,6 @@ fn is_space(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
 }
 
-/// Where the tag named `name` (`</head`, `<body`) first starts, any case, its name whole.
-fn tag_at(body: &[u8], from: usize, name: &[u8]) -> Option<usize> {
-    let (&first, _) = name.split_first()?;
-    memchr::memchr_iter(first, &body[from..]).map(|i| from + i).find(|&i| {
-        body.len() - i > name.len() && body[i..i + name.len()].eq_ignore_ascii_case(name) && matches!(body[i + name.len()], b'>' | b'/' | b' ' | b'\t' | b'\n' | b'\r' | b'\x0c')
-    })
-}
-
 /// The page `body` with `head`'s tags in its head, in place of those it had of the same keys. A
 /// page that is no document (no `<head>`, `<body>`, `<html>` or doctype: a part of one, as an
 /// `hx-get` asks for) is left as it is.
@@ -161,103 +155,192 @@ pub fn apply(body: &mut Vec<u8>, head: &Head) {
     if tags.is_empty() {
         return;
     }
-    // Read as tags, past comments and scripts, whose text may say `</head>` (review of slice H).
-    let (head_end, body_at) = head_and_body(body);
-    // Where the new tags go: before `</head>`; else before `<body>`, which a head left out ends;
-    // else after `<html ...>` or the doctype.
-    let after = |at: usize, body: &[u8]| body[at..].iter().position(|&c| c == b'>').map(|e| at + e + 1);
-    let at = match (head_end, body_at) {
-        (Some(h), _) => Some(h),
-        (None, Some(b)) => Some(b),
-        (None, None) => tag_at(body, 0, b"<html").and_then(|h| after(h, body)).or_else(|| {
-            let d = body.windows(9).position(|w| w.eq_ignore_ascii_case(b"<!doctype"))?;
-            after(d, body)
-        }),
-    };
-    let Some(at) = at else { return };
-    // The head's own tags of the keys said, taken away: those before `at`, past any `<script>`,
-    // `<style>` or comment, whose text is not tags.
+    // Read once, as the browser reads it (`marks`): where the head ends, and the head's own tags
+    // of the keys said, to be taken away: a `<title>` with its text and end tag, a `<meta>` or
+    // `<link>` whole.
     let mut cuts: Vec<(usize, usize)> = Vec::new();
-    let mut i = 0;
-    while let Some(lt) = memchr::memchr(b'<', &body[i..at]).map(|p| i + p) {
-        let rest = &body[lt..at];
-        if rest.starts_with(b"<!--") {
-            i = find(body, lt + 4, at, b"-->").map_or(at, |e| e + 3);
-            continue;
+    let m = marks(body, |lt, name, close, end| {
+        if head.replaces(name, &body[lt..close]) {
+            cuts.push((lt, if name.eq_ignore_ascii_case(b"title") { end } else { close }));
         }
-        let name_len = rest[1..].iter().position(|&c| !c.is_ascii_alphanumeric()).map_or(rest.len() - 1, |n| n);
-        if name_len == 0 {
-            i = lt + 1;
-            continue;
-        }
-        let name = String::from_utf8_lossy(&rest[1..1 + name_len]).to_ascii_lowercase();
-        let close = match tag_close(body, lt, at) {
-            Some(c) => c,
-            None => break,
-        };
-        match name.as_str() {
-            "script" | "style" | "textarea" | "noscript" | "template" => {
-                let end = find_ci(body, close, at, format!("</{}", name).as_bytes()).and_then(|e| tag_close(body, e, at)).unwrap_or(at);
-                i = end;
-            }
-            "title" => {
-                let end = find_ci(body, close, at, b"</title").and_then(|e| tag_close(body, e, at)).unwrap_or(close);
-                if head.replaces("title", &body[lt..close]) {
-                    cuts.push((lt, end));
-                }
-                i = end;
-            }
-            n => {
-                if head.replaces(n, &body[lt..close]) {
-                    cuts.push((lt, close));
-                }
-                i = close;
-            }
-        }
-    }
-    let mut at = at;
+    });
+    // Where the new tags go: before `</head>`; else before `<body>`, which a head left out ends;
+    // else, after the head's start, where the rest of the page is one tag, comment or text that
+    // never ends (which the browser drops, or takes whole); else after `<html ...>` or the
+    // doctype, each just past its own `>`, never inside it (FEEDBACK84.md, Q-1320, found by the
+    // coverage tests; branch feedback82-85: `<html lang="a>b">` took the tags at its first `>`).
+    let Some(mut at) = m.head_end.or(m.body_at).or(m.open_in_head).or(m.html_end).or(m.doctype_end) else { return };
+    // Only those before it: a page with no head's end read on to its last tag.
     for &(from, to) in cuts.iter().rev() {
-        body.drain(from..to);
-        at -= to - from;
+        if to <= at {
+            body.drain(from..to);
+            at -= to - from;
+        }
     }
     body.splice(at..at, tags.bytes());
 }
 
-/// Where the page's own `</head>` and `<body>` tags start, read tag by tag: a comment, and the
-/// text of a `<script>`, `<style>`, `<textarea>`, `<title>`, `<noscript>` or `<template>`, are
-/// passed over whole.
-fn head_and_body(body: &[u8]) -> (Option<usize>, Option<usize>) {
-    let (mut head, mut i) = (None, 0);
-    let end = body.len();
+/// Where a page's own tags are, read as the browser's tokenizer reads them (the HTML standard's),
+/// up to the page's first `</head>` or `<body ...>` (FEEDBACK84.md, Q-1320, found by the coverage
+/// tests; branch feedback82-85).
+#[derive(Default)]
+struct Marks {
+    /// Where `</head>` starts.
+    head_end: Option<usize>,
+    /// Where `<body ...>` starts.
+    body_at: Option<usize>,
+    /// Just past the first `<html ...>`, and the first doctype.
+    html_end: Option<usize>,
+    doctype_end: Option<usize>,
+    /// Where, after `<head ...>`, a tag, comment or element's text starts that runs on to the
+    /// page's end: what the browser reads of the head ends there.
+    open_in_head: Option<usize>,
+}
+
+/// The elements whose text is no tags, up to their own end tag (`<title>`, `<textarea>`: text;
+/// `<script>`, `<style>` and the others: raw text; `<template>`'s, which the browser holds apart,
+/// passed over whole too).
+const TEXT_ONLY: [&[u8]; 10] = [b"script", b"style", b"title", b"textarea", b"noscript", b"template", b"iframe", b"noembed", b"noframes", b"xmp"];
+
+/// The page read thing by thing, as the browser reads it, up to its first `</head>` or `<body>`:
+/// a comment, a doctype and any other `<!...>`, `<?...>` or `</ ...>` passed over whole; a tag to
+/// the `>` that ends it, quotes and all; the text of the `TEXT_ONLY` elements to their end tag.
+/// `start` is told of each start tag before them, as (where it starts, its name as written, just
+/// past its `>`, just past its element: its end tag's `>` for a `TEXT_ONLY` one, else its own).
+fn marks(body: &[u8], mut start: impl FnMut(usize, &[u8], usize, usize)) -> Marks {
+    let mut m = Marks::default();
+    let mut in_head = false;
+    let mut i = 0;
     while let Some(lt) = memchr::memchr(b'<', &body[i..]).map(|p| i + p) {
-        let rest = &body[lt..];
-        if rest.starts_with(b"<!--") {
-            i = find(body, lt + 4, end, b"-->").map_or(end, |e| e + 3);
-            continue;
-        }
-        let close = rest.get(1) == Some(&b'/');
-        let from = lt + 1 + close as usize;
-        let n = body[from..].iter().position(|&c| !c.is_ascii_alphanumeric()).unwrap_or(end - from);
-        let name = body[from..from + n].to_ascii_lowercase();
-        if n == 0 {
-            i = lt + 1;
-            continue;
-        }
-        if close && name == b"head" && head.is_none() {
-            head = Some(lt);
-        }
-        if !close && name == b"body" {
-            return (head, Some(lt));
-        }
-        let Some(after) = tag_close(body, lt, end) else { return (head, None) };
-        i = after;
-        if !close && matches!(&name[..], b"script" | b"style" | b"textarea" | b"title" | b"noscript" | b"template") {
-            let mut closing = b"</".to_vec();
-            closing.extend_from_slice(&name);
-            i = find_ci(body, after, end, &closing).unwrap_or(end);
+        let Some((tok, next)) = token(body, lt) else {
+            // A tag that never ends: the browser drops it and all after it; a comment or doctype
+            // that never ends takes the rest.
+            if in_head {
+                m.open_in_head = Some(lt);
+            }
+            break;
+        };
+        i = next;
+        match tok {
+            Tok::Text => {}
+            Tok::Skip { doctype } => {
+                if doctype && m.doctype_end.is_none() {
+                    m.doctype_end = Some(next);
+                }
+            }
+            Tok::End(name) => {
+                if name.eq_ignore_ascii_case(b"head") {
+                    m.head_end = Some(lt);
+                    break;
+                }
+            }
+            Tok::Start(name) => {
+                if name.eq_ignore_ascii_case(b"body") {
+                    m.body_at = Some(lt);
+                    break;
+                }
+                if name.eq_ignore_ascii_case(b"html") && m.html_end.is_none() {
+                    m.html_end = Some(next);
+                }
+                in_head |= name.eq_ignore_ascii_case(b"head");
+                if name.eq_ignore_ascii_case(b"plaintext") {
+                    break;
+                }
+                let mut end = next;
+                if TEXT_ONLY.iter().any(|t| name.eq_ignore_ascii_case(t)) {
+                    // Its text runs to its end tag, or to the page's end.
+                    let Some(e) = text_end(body, next, name) else {
+                        if in_head {
+                            m.open_in_head = Some(lt);
+                        }
+                        break;
+                    };
+                    end = tag_close(body, e, body.len()).unwrap_or(body.len());
+                    i = e;
+                }
+                start(lt, name, next, end);
+            }
         }
     }
-    (head, None)
+    m
+}
+
+/// What a `<` in the page's text starts.
+enum Tok<'a> {
+    /// A `<` that starts nothing (`a < b`, `<3`): text.
+    Text,
+    /// A comment, a doctype, or another `<!...>`, `<?...>` or `</ ...>`, passed over whole.
+    Skip { doctype: bool },
+    /// A start tag, an end tag: its name as written.
+    Start(&'a [u8]),
+    End(&'a [u8]),
+}
+
+/// What starts at `lt` (a `<`), and just past it; None for a tag, comment or doctype that never
+/// ends.
+fn token(body: &[u8], lt: usize) -> Option<(Tok<'_>, usize)> {
+    let s = &body[lt..];
+    // A doctype, and a `<!x>`, `<?x>` or `</ x>` the browser reads as a comment, end at their
+    // first `>`, even one in quotes (`<!doctype html "a>b">` ends at `a>`), as the browser ends one.
+    let to_gt = || memchr::memchr(b'>', s).map(|p| lt + p + 1);
+    let name = |from: usize| &s[from..s[from..].iter().position(|&c| is_space(c) || c == b'/' || c == b'>').map_or(s.len(), |p| from + p)];
+    match s.get(1).copied() {
+        Some(b'!') if s[2..].starts_with(b"--") => Some((Tok::Skip { doctype: false }, comment_end(body, lt)?)),
+        Some(b'!') => Some((Tok::Skip { doctype: s.len() >= 9 && s[2..9].eq_ignore_ascii_case(b"doctype") }, to_gt()?)),
+        Some(b'?') => Some((Tok::Skip { doctype: false }, to_gt()?)),
+        Some(b'/') => match s.get(2).copied() {
+            Some(c) if c.is_ascii_alphabetic() => Some((Tok::End(name(2)), tag_close(body, lt, body.len())?)),
+            Some(b'>') => Some((Tok::Skip { doctype: false }, lt + 3)),
+            Some(_) => Some((Tok::Skip { doctype: false }, to_gt()?)),
+            None => Some((Tok::Text, lt + 1)),
+        },
+        Some(c) if c.is_ascii_alphabetic() => Some((Tok::Start(name(1)), tag_close(body, lt, body.len())?)),
+        _ => Some((Tok::Text, lt + 1)),
+    }
+}
+
+/// Just past the comment at `lt` (`<!--`), as the browser ends one: at its first `-->` or
+/// `--!>`, where `<!-->` and `<!--->` are whole; None where it never ends.
+fn comment_end(body: &[u8], lt: usize) -> Option<usize> {
+    let s = &body[lt..];
+    if s.get(4) == Some(&b'>') {
+        return Some(lt + 5);
+    }
+    if s.get(4..6) == Some(b"->") {
+        return Some(lt + 6);
+    }
+    let mut k = 4;
+    while let Some(p) = memchr::memchr(b'>', &s[k..]) {
+        let g = k + p;
+        if (g >= 6 && &s[g - 2..g] == b"--") || (g >= 7 && &s[g - 3..g] == b"--!") {
+            return Some(lt + g + 1);
+        }
+        k = g + 1;
+    }
+    None
+}
+
+/// Where the text of the element `name`, from `from`, ends: its end tag's `<`, `</name` whole
+/// and in any case (`</scripts>` is text in a script); None where it runs to the page's end.
+fn text_end(body: &[u8], from: usize, name: &[u8]) -> Option<usize> {
+    let mut i = from;
+    while let Some(lt) = memchr::memchr(b'<', &body[i..]).map(|p| i + p) {
+        let n = lt + 2;
+        if body.get(lt + 1) == Some(&b'/')
+            && body.get(n..n + name.len()).is_some_and(|w| w.eq_ignore_ascii_case(name))
+            && body.get(n + name.len()).is_some_and(|&c| is_space(c) || c == b'/' || c == b'>')
+        {
+            return Some(lt);
+        }
+        i = lt + 1;
+    }
+    None
+}
+
+/// Where the page's own `</head>` and `<body>` tags start (`marks`).
+fn head_and_body(body: &[u8]) -> (Option<usize>, Option<usize>) {
+    let m = marks(body, |_, _, _, _| {});
+    (m.head_end, m.body_at)
 }
 
 /// The `<script>` elements the page's head was written with, each whole, in their order, which a
@@ -277,30 +360,53 @@ pub fn head_scripts(body: &[u8]) -> Vec<String> {
     out
 }
 
-/// Just past the `>` that ends the tag at `lt`, quotes in it skipped.
+/// Just past the `>` that ends the tag at `lt` (a start or end tag), before `limit`: read by the
+/// tokenizer's states, so a quote opens a value only where a value starts, after an attribute's
+/// name and `=` (FEEDBACK84.md, Q-1320, found by the coverage tests; branch feedback82-85).
+/// `<a b="x>y">` ends at its last `>`; `<a b'c>`, `<a b=c"d>`, `<a ="x>` (a name that starts
+/// with `=`) and `<a b==">` (a value that does) at their first, as the browser ends them.
 fn tag_close(body: &[u8], lt: usize, limit: usize) -> Option<usize> {
-    // A quote opens a value only after `=` (and spaces): `<a b'c>` ends at its `>`.
-    let (mut q, mut eq) = (None, false);
-    for (k, &c) in body[lt..limit].iter().enumerate() {
-        match (q, c) {
-            (Some(x), _) if c == x => q = None,
-            (Some(_), _) => {}
-            (None, b'"' | b'\'') if eq => q = Some(c),
-            (None, b'>') => return Some(lt + k + 1),
-            (None, b'=') => {
-                eq = true;
-                continue;
-            }
-            (None, _) if is_space(c) => continue,
-            _ => {}
+    #[derive(Clone, Copy)]
+    enum S {
+        /// The tag's name; an unquoted value.
+        Name,
+        Unquoted,
+        /// Before an attribute's name (after a space, a `/`, a quoted value).
+        Before,
+        /// In an attribute's name, after it.
+        Attr,
+        After,
+        /// After its `=`.
+        Value,
+    }
+    let mut s = S::Name;
+    let mut k = lt + 1 + usize::from(body.get(lt + 1) == Some(&b'/'));
+    while k < limit {
+        let c = body[k];
+        if c == b'>' {
+            return Some(k + 1);
         }
-        eq = false;
+        let space = is_space(c);
+        s = match s {
+            S::Name | S::Unquoted if space => S::Before,
+            S::Name if c == b'/' => S::Before,
+            S::Name | S::Unquoted => s,
+            S::Before if space || c == b'/' => S::Before,
+            S::Before => S::Attr,
+            S::Attr | S::After if c == b'=' => S::Value,
+            S::Attr | S::After if c == b'/' => S::Before,
+            S::Attr | S::After if space => S::After,
+            S::Attr | S::After => S::Attr,
+            S::Value if space => S::Value,
+            S::Value if c == b'"' || c == b'\'' => {
+                k += 1 + memchr::memchr(c, &body[k + 1..limit])?;
+                S::Before
+            }
+            S::Value => S::Unquoted,
+        };
+        k += 1;
     }
     None
-}
-
-fn find(body: &[u8], from: usize, limit: usize, needle: &[u8]) -> Option<usize> {
-    body[from..limit].windows(needle.len()).position(|w| w == needle).map(|p| from + p)
 }
 
 fn find_ci(body: &[u8], from: usize, limit: usize, needle: &[u8]) -> Option<usize> {

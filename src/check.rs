@@ -9944,6 +9944,16 @@ impl Checker {
         } else if !BROWSER_MODULES.contains(&m) && full != "channel.open" {
             self.browser_forbidden(&format!("`{}`", full));
         }
+        // `save` or `max_bytes` written with a value on `http.stream`, which stops the program when
+        // it runs, is an error before it runs; a null is no option, there as here (FEEDBACK85.md,
+        // Q-1342, found by the coverage tests; branch feedback82-85).
+        if full == "http.stream" && !piped {
+            if let Some(Expr::Map(fields)) = args.get(2) {
+                if let Some((k, _)) = fields.iter().find(|(k, v)| matches!(k.as_str(), "save" | "max_bytes") && (matches!(v, Expr::Lit(l) if !matches!(l, Lit::Nil)) || matches!(v, Expr::Template(_)))) {
+                    self.error(format!("`http.stream`: `{}` is for the calls that read an answer whole (http.get and the others): http.stream hands it over as it arrives", k));
+                }
+            }
+        }
         if m == "db" && !piped {
             self.sql_params(&full, args);
         }
@@ -10151,6 +10161,14 @@ impl Checker {
                 if !crate::fetch::OPTION_NAMES.contains(&k.as_str()) {
                     self.error(format!("`http.{}`: unknown option `{}` (the options are {})", f, k, crate::fetch::OPTION_NAMES.join(", ")));
                 }
+            }
+            // `save` with `cache` on a GET, as written: one or the other, before the program runs
+            // as when it runs, and as the changelog says (FEEDBACK85.md, Q-1342, found by the
+            // coverage tests; branch feedback82-85).
+            let saves = fields.iter().any(|(k, v)| k == "save" && (matches!(v, Expr::Lit(Lit::Str(s)) if !s.is_empty()) || matches!(v, Expr::Template(_))));
+            let caches = fields.iter().any(|(k, v)| k == "cache" && matches!(v, Expr::Lit(Lit::Int(n)) if (1..=crate::fetch::MAX_CACHE_SECS).contains(n)));
+            if f == "get" && saves && caches {
+                self.error(format!("`http.{}`: `cache` keeps answers in memory and `save` writes one to its file: one or the other", f));
             }
         }
         if let Some(c) = self.in_component() {
