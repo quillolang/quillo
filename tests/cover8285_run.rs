@@ -963,11 +963,15 @@ fn the_heads_own_tags_are_read_as_the_browser_reads_them() {
         with_head(page, &h),
         format!("<html><head>{TT}<meta name=\"description\" content=\"D\"><meta property=\"og:description\" content=\"D\"><meta x='y><title>Old</title></head><body>b</body></html>")
     );
-    // A custom element whose name starts with `meta` or `title` is neither.
+    // A custom element whose name starts with `meta` or `title` is neither. Changed with the
+    // review of 1a4bb9b (FEEDBACK84.md, Q-1320; branch feedback82-85): no head holds a custom
+    // element, so the browser ends the head at `<meta-x>` (parse5: it and all after it are the
+    // body's); the tags go before it and the title after it, in the body, stays: nothing after the
+    // head's end is cut. The test asked the tags before `</head>` and that title taken away.
     let page = "<html><head><meta-x name=\"description\"></meta-x><title-bar>t</title-bar><title>Old</title></head><body>b</body></html>";
     assert_eq!(
         with_head(page, &h),
-        format!("<html><head><meta-x name=\"description\"></meta-x><title-bar>t</title-bar>{TT}<meta name=\"description\" content=\"D\"><meta property=\"og:description\" content=\"D\"></head><body>b</body></html>")
+        format!("<html><head>{TT}<meta name=\"description\" content=\"D\"><meta property=\"og:description\" content=\"D\"><meta-x name=\"description\"></meta-x><title-bar>t</title-bar><title>Old</title></head><body>b</body></html>")
     );
 }
 
@@ -1054,4 +1058,325 @@ fn save_with_cache_is_an_error_before_it_runs() {
     d.write("e.qwe", &format!("print(http.get(\"{u}/ok\", {{}}, {{ save: \"\", cache: 60 }}))\n"));
     let (_, out) = quillo(d.path(), &["check", "e.qwe"]);
     assert!(!out.contains("one or the other"), "{}", out);
+}
+
+// ---- src/head.rs: what the review of 1a4bb9b found (slice F2) --------------------------------------
+
+/// What `page_head({ title: "T", description: "D" })` writes.
+const TD: &str = "<title>T</title><meta property=\"og:title\" content=\"T\"><meta name=\"description\" content=\"D\"><meta property=\"og:description\" content=\"D\">";
+
+/// The repro: a script that says `<!--` and then `<script>` is double escaped, so its first
+/// `</script>` ends nothing but that and the second ends it, as the browser reads it (parse5): the
+/// tags no longer go inside its string, a title it says is no tag, and the head's title after it
+/// is replaced; one that says `-->` first is back to plain, one that says `<!--` and no `<script>`
+/// ends at its first (its title, after, the head's). Each checked with parse5 (src/head.rs
+/// script_end, FEEDBACK84.md Q-1320, found by the review of 1a4bb9b; branch feedback82-85)
+#[test]
+fn a_script_that_says_script_inside_a_comment_ends_where_the_browser_ends_it() {
+    let d = Dir::new("headesc");
+    d.write(
+        "main.qwe",
+        r#"route GET / {
+    page_head({ title: "T", description: "D" })
+    return raw("<head><script><!--\nvar s = \"<script></script></head>\";\n--></script><title>Old</title></head><body>b</body>")
+}
+route GET /w {
+    page_head({ title: "T", description: "D" })
+    return raw("<html><head><script><!--\ndocument.write(\"<script>x()</script><title>in js</title>\");\n--></script><title>Old</title></head><body>b</body></html>")
+}
+"#,
+    );
+    checked(d.path(), "main.qwe");
+    // Without the script a page with one is given to fetch the links ahead: the page as written.
+    let (_g, port, log) = serve(d.path(), "main.qwe", &["--no-prefetch"]);
+    let a = get(port, "/");
+    assert_eq!(
+        (a.status, a.body.as_str()),
+        (200, format!("<head><script><!--\nvar s = \"<script></script></head>\";\n--></script>{TD}</head><body>b</body>").as_str()),
+        "{}",
+        read(&log)
+    );
+    let a = get(port, "/w");
+    assert_eq!(
+        (a.status, a.body.as_str()),
+        (200, format!("<html><head><script><!--\ndocument.write(\"<script>x()</script><title>in js</title>\");\n--></script>{TD}</head><body>b</body></html>").as_str()),
+        "{}",
+        read(&log)
+    );
+    let h = said_head(&[("title", "T")]);
+    let page = |script: &str| format!("<html><head><script>{script}</script><title>Old</title></head><body>b</body></html>");
+    let kept = |script: &str| format!("<html><head><script>{script}</script>{TT}</head><body>b</body></html>");
+    for script in [
+        "<!--<script></script>-->",
+        // `-->` while double escaped is back to plain: the next `</script>` ends it.
+        "<!--<script>-->",
+        // `<scripts>` and `<script1>` start nothing: escaped, the next `</script>` ends it.
+        "<!--<scripts>",
+        "<!--<script1>",
+        // Any case, `/` or a line feed after the name, the end's attributes passed over.
+        "<!--<SCRIPT/></script x>-->",
+        "<!--<script\n></script\n>-->",
+        "<!--<script></script\t>-->",
+        // `<!-->` and `<!--->` end at once; `<!-` and `<!x` start nothing.
+        "<!-->x",
+        "<!--->x",
+        "a<!-b",
+        "<!x<script>",
+        // Dashes: `-->` and `--->` end the escape, a `<!--` after it starts one again.
+        "<!-- <script> -->",
+        "<!--<script>--><!--",
+        "<!--<script>-</script>--->",
+        "<!--<script></></x></script-->",
+        "<!--<script></scriptx></script>-->",
+        "<!--<script></script<-->",
+        "<!--<script>\"東京 · café</script>\"-->",
+        "",
+    ] {
+        assert_eq!(with_head(&page(script), &h), kept(script), "{:?}", script);
+    }
+    // Escaped with no `<script>`: its first `</script>` ends it, so what it says after is the
+    // page's, a title of the head's (replaced) and text (which ends the head: the tags go before it
+    // and the title after it, in the body, stays).
+    let page = "<html><head><script><!-- var a = \"</script><title>t</title>\"; --></script><title>Old</title></head><body>b</body></html>";
+    assert_eq!(with_head(page, &h), format!("<html><head><script><!-- var a = \"</script>{TT}\"; --></script><title>Old</title></head><body>b</body></html>"));
+    // One that runs to the page's end, escaped or double escaped: the tags before it.
+    for rest in ["<script><!--<script></script>", "<script><!--<script>", "<script><!--", "<script><!--<script></script>--"] {
+        assert_eq!(with_head(&format!("<head><title>Old</title>{rest}"), &h), format!("<head>{TT}{rest}"), "{:?}", rest);
+    }
+}
+
+/// The head ends where the browser's tree builder ends it (parse5): at an `<svg>` or `<math>`
+/// (their titles, a CDATA's too, are kept and the head's after them, now the body's, stay), at
+/// text that is not spaces (`&#32;`, `&#x20`, `&Tab;`, `&NewLine;` are spaces; `&#33;`, `&tab;`,
+/// `é` are not), at any element no head holds (a custom one), at `</body>`, `</html>` or
+/// `</br>`, not at `</div>`, `</>`, `</ x>` or a second `<head>` or `<html>`; the tags go before
+/// what ends it. A template's content is never cut, read as the browser reads it to the
+/// `</template>` that closes it: a template inside it, a script saying `</template>`, a `</head>`
+/// in it; in SVG a `<style>` holds tags and a CDATA text, at an integration point or after an
+/// element that breaks out of foreign content it is raw text again. After `</head>` a title or
+/// meta still goes in the head and is replaced, until anything else. Each checked with parse5
+/// (src/head.rs scan, walk, not_space, space_ref, FEEDBACK84.md Q-1320, found by the review of
+/// 1a4bb9b; branch feedback82-85)
+#[test]
+fn the_head_ends_where_the_browsers_tree_builder_ends_it() {
+    let h = said_head(&[("title", "T"), ("description", "D")]);
+    let doc = |head: &str| format!("<html><head>{head}</head><body>b</body></html>");
+    for (head, want) in [
+        // Foreign content ends the head.
+        ("<svg><title>Icon</title></svg><title>Old</title>", format!("{TD}<svg><title>Icon</title></svg><title>Old</title>")),
+        ("<svg><![CDATA[ > <title>cdata</title> ]]></svg><title>Old</title>", format!("{TD}<svg><![CDATA[ > <title>cdata</title> ]]></svg><title>Old</title>")),
+        ("<title>Old</title><math><mi><title>m</title></mi></math>", format!("{TD}<math><mi><title>m</title></mi></math>")),
+        // Text, a custom element, `</br>`, `</body>`, `</html>`.
+        ("<title>Old</title>Hello<meta name=\"description\" content=\"old\">", format!("{TD}Hello<meta name=\"description\" content=\"old\">")),
+        ("<meta name=\"description\" content=\"old\">é<title>Old</title>", format!("{TD}é<title>Old</title>")),
+        ("<title>Old</title>&#33;<title>x</title>", format!("{TD}&#33;<title>x</title>")),
+        ("<title>Old</title>&tab;<title>x</title>", format!("{TD}&tab;<title>x</title>")),
+        ("<title>Old</title>&#;<title>x</title>", format!("{TD}&#;<title>x</title>")),
+        ("<title>Old</title>&#99999999999999999999;<title>x</title>", format!("{TD}&#99999999999999999999;<title>x</title>")),
+        ("<title>Old</title>< title>x</title>", format!("{TD}< title>x</title>")),
+        ("<meta-x name=\"description\"></meta-x><title>Old</title>", format!("{TD}<meta-x name=\"description\"></meta-x><title>Old</title>")),
+        ("<title>Old</title></br><title>x</title>", format!("{TD}</br><title>x</title>")),
+        ("<title>Old</title></body><title>x</title>", format!("{TD}</body><title>x</title>")),
+        ("<title>Old</title></html><title>x</title>", format!("{TD}</html><title>x</title>")),
+        // Spaces, written as references too, and end tags the head passes over.
+        ("&#32;<title>Old</title>&#x20<meta name=\"description\" content=\"o\">", format!("&#32;&#x20{TD}")),
+        ("&Tab;&NewLine;&#0000032;&#X9;&#10;&#12;<title>Old</title>", format!("&Tab;&NewLine;&#0000032;&#X9;&#10;&#12;{TD}")),
+        ("</div></p></></ x></template><title>Old</title>", format!("</div></p></></ x></template>{TD}")),
+        ("<head><html lang=\"x\"><title>Old</title>", format!("<head><html lang=\"x\">{TD}")),
+        ("<base href=\"/\"><basefont><bgsound><noframes><title>nf</title></noframes><noscript><meta name=\"description\" content=\"ns\"></noscript><title>Old</title>", format!("<base href=\"/\"><basefont><bgsound><noframes><title>nf</title></noframes><noscript><meta name=\"description\" content=\"ns\"></noscript>{TD}")),
+        // Templates: never cut inside, read to the `</template>` that closes them.
+        ("<template><template></template><title>tpl</title></template><title>Old</title>", format!("<template><template></template><title>tpl</title></template>{TD}")),
+        ("<template><script>var t = \"</template>\";</script><meta name=\"description\" content=\"tpl\"></template><meta name=\"description\" content=\"old\">", format!("<template><script>var t = \"</template>\";</script><meta name=\"description\" content=\"tpl\"></template>{TD}")),
+        ("<template><div></head></div></template><title>Old</title>", format!("<template><div></head></div></template>{TD}")),
+        ("<template><svg><![CDATA[</template>]]></svg><title>tpl</title></template><title>Old</title>", format!("<template><svg><![CDATA[</template>]]></svg><title>tpl</title></template>{TD}")),
+        ("<template><svg><style></template><title>Old</title>", format!("<template><svg><style></template>{TD}")),
+        ("<template><svg><title></template><title>Old</title>", format!("<template><svg><title></template>{TD}")),
+        ("<template><svg><foreignObject><title></template></title></foreignObject></svg></template><title>Old</title>", format!("<template><svg><foreignObject><title></template></title></foreignObject></svg></template>{TD}")),
+        ("<template><svg><desc><style></template></style></desc></svg></template><title>Old</title>", format!("<template><svg><desc><style></template></style></desc></svg></template>{TD}")),
+        ("<template><math><mi><style></template></style></mi></math></template><title>Old</title>", format!("<template><math><mi><style></template></style></mi></math></template>{TD}")),
+        ("<template><math><mi><mglyph><style></template><title>Old</title>", format!("<template><math><mi><mglyph><style></template>{TD}")),
+        ("<template><math><annotation-xml encoding=\"Text/HTML\"><style></template></style></annotation-xml></math></template><title>Old</title>", format!("<template><math><annotation-xml encoding=\"Text/HTML\"><style></template></style></annotation-xml></math></template>{TD}")),
+        ("<template><math><annotation-xml encoding=\"application/xhtml+xml\"><style></template></style></annotation-xml></math></template><title>Old</title>", format!("<template><math><annotation-xml encoding=\"application/xhtml+xml\"><style></template></style></annotation-xml></math></template>{TD}")),
+        ("<template><math><annotation-xml><style></template><title>Old</title>", format!("<template><math><annotation-xml><style></template>{TD}")),
+        ("<template><math><annotation-xml><svg><title><style></template></style></title></svg></annotation-xml></math></template><title>Old</title>", format!("<template><math><annotation-xml><svg><title><style></template></style></title></svg></annotation-xml></math></template>{TD}")),
+        ("<template><svg><p><style></template></style></template><title>Old</title>", format!("<template><svg><p><style></template></style></template>{TD}")),
+        ("<template><svg><font color=red><style></template></style></template><title>Old</title>", format!("<template><svg><font color=red><style></template></style></template>{TD}")),
+        ("<template><svg><font><style></template><title>Old</title>", format!("<template><svg><font><style></template>{TD}")),
+        ("<template><svg></p><style></template></style></template><title>Old</title>", format!("<template><svg></p><style></template></style></template>{TD}")),
+        ("<template><div><svg><circle></div><title></template></title></template><title>Old</title>", format!("<template><div><svg><circle></div><title></template></title></template>{TD}")),
+        ("<template><svg><g></g><template></svg><style></template></style></template><title>Old</title>", format!("<template><svg><g></g><template></svg><style></template></style></template>{TD}")),
+        ("<template><svg/><title></template></title></template><title>Old</title>", format!("<template><svg/><title></template></title></template>{TD}")),
+        ("<template><SVG><circle/><style></template><title>Old</title>", format!("<template><SVG><circle/><style></template>{TD}")),
+        ("<template><textarea></template></textarea><plaintext></template><title>Old</title>", format!("{TD}<template><textarea></template></textarea><plaintext></template><title>Old</title>")),
+        // A second head, and what follows `</head>` the browser puts in the head.
+        ("<title>Old</title></head><head><title>Second</title>", format!("{TD}</head><head>")),
+        ("<title>Old</title></head>\n<!-- c --><!doctype x><html></head></x></template><meta name=\"description\" content=\"after\"><title>after</title>", format!("{TD}</head>\n<!-- c --><!doctype x><html></head></x></template>")),
+        ("<title>Old</title></head><noscript><title>ns</title></noscript>", format!("{TD}</head><noscript><title>ns</title></noscript>")),
+        ("<title>Old</title></head></html><title>after</title>", format!("{TD}</head></html><title>after</title>")),
+        ("<title>Old</title></head>x<title>after</title>", format!("{TD}</head>x<title>after</title>")),
+        ("</head><template><title>t</title></template><title>after</title> x <title>body</title>", format!("{TD}</head><template><title>t</title></template> x <title>body</title>")),
+    ] {
+        assert_eq!(with_head(&doc(head), &h), doc(&want), "{:?}", head);
+    }
+    // A template, a title or one after `</head>` that runs to the page's end: the tags before it,
+    // a title cut to there.
+    for (page, want) in [
+        ("<html><head><title>Old</title", format!("<html><head>{TD}")),
+        ("<html><head><title>Old</title ", format!("<html><head>{TD}")),
+        ("<html><head><title>Old</title a=\"", format!("<html><head>{TD}")),
+        ("<html><head></head><title>after", format!("<html><head>{TD}</head>")),
+        ("<html><head><title>Old</title><template><title>t", format!("<html><head>{TD}<template><title>t")),
+        ("<html><head><template><svg><![CDATA[", format!("<html><head>{TD}<template><svg><![CDATA[")),
+        ("<html><head><template><plaintext></template><title>Old</title>", format!("<html><head>{TD}<template><plaintext></template><title>Old</title>")),
+        ("<html><head><template><x a=\"", format!("<html><head>{TD}<template><x a=\"")),
+        ("<html><head><style>a</style", format!("<html><head>{TD}<style>a</style")),
+    ] {
+        assert_eq!(with_head(page, &h), want, "{:?}", page);
+    }
+}
+
+/// A head the page leaves out (no `<head>`) the browser starts at its first element: where that is
+/// one of a key said, the tags take its place, so the spaces, comment or doctype after it stay in
+/// the head (a doctype after a title is passed over there; first, it would make a quirks page a
+/// standard one); where it is another, the tags go where the head ends. A page that starts
+/// `<head>` with no `</head>`, `<body>`, `<html>` or doctype is a document; so is one with a
+/// `<frameset>`, and one with a `<body>` or `<html>` after its part's elements; a `<body>` in a
+/// template or a CDATA, a `<html>` in a script, makes none. The byte order mark stays first.
+/// Each checked with parse5 (src/head.rs apply, scan, walk, FEEDBACK84.md Q-1320, found by the
+/// review of 1a4bb9b; branch feedback82-85)
+#[test]
+fn a_head_left_out_or_never_ended_takes_the_tags_where_the_browser_has_it() {
+    let h = said_head(&[("title", "T"), ("description", "D")]);
+    for (page, want) in [
+        ("<title>Old</title><!doctype html><p>x</p>", format!("{TD}<!doctype html><p>x</p>")),
+        ("<meta name=\"description\" content=\"o\">&Tab;<!-- c --><head lang=\"x\"><link rel=\"icon\"><frame>", format!("{TD}&Tab;<!-- c --><head lang=\"x\"><link rel=\"icon\"><frame>")),
+        ("<!doctype html><title>Old</title>\n<p>x</p>", format!("<!doctype html>{TD}\n<p>x</p>")),
+        ("<!doctype html><script>s</script><title>Old</title><p>x</p>", format!("<!doctype html><script>s</script>{TD}<p>x</p>")),
+        ("<html><script>s</script>  <p>x</p>", format!("<html><script>s</script>  {TD}<p>x</p>")),
+        ("<title>Old</title></head><p>x</p>", format!("{TD}</head><p>x</p>")),
+        ("<title>Old</title><frameset><frame></frameset>", format!("{TD}<frameset><frame></frameset>")),
+        // `<head>` and nothing else that says a document.
+        ("<head><script>\"</head>\"</script></body></html>", format!("<head><script>\"</head>\"</script>{TD}</body></html>")),
+        ("<head>", format!("<head>{TD}")),
+        ("<HEAD class=\"a>b\"><title>Old</title>", format!("<HEAD class=\"a>b\">{TD}")),
+        ("<head><title>Old</title><meta name=\"description\" content=\"old\">", format!("<head>{TD}")),
+        ("<head>x", format!("<head>{TD}x")),
+        // What says a document after the part's elements.
+        ("<p>x</p><body>", format!("{TD}<p>x</p><body>")),
+        ("<p>x</p><!doctype html>", format!("{TD}<p>x</p><!doctype html>")),
+        ("<li>x</li><HTML>", format!("{TD}<li>x</li><HTML>")),
+        ("<li>x</li></head>", format!("{TD}<li>x</li></head>")),
+        ("<li><frameset>", format!("{TD}<li><frameset>")),
+        ("<svg><![CDATA[ > ]]></svg><body>", format!("{TD}<svg><![CDATA[ > ]]></svg><body>")),
+        // At an integration point a `<![CDATA[` is a comment, to its first `>`.
+        ("<svg><desc><![CDATA[ > ]]><body>", format!("{TD}<svg><desc><![CDATA[ > ]]><body>")),
+        ("<math><mi><![CDATA[ > ]]><body>", format!("{TD}<math><mi><![CDATA[ > ]]><body>")),
+        ("\u{feff}<head><title>Old</title></head>", format!("\u{feff}<head>{TD}</head>")),
+        ("\u{feff}<title>Old</title><body>", format!("\u{feff}{TD}<body>")),
+    ] {
+        assert_eq!(with_head(page, &h), want, "{:?}", page);
+    }
+    // No document: left as they are.
+    for page in [
+        "<template><body></template>",
+        "<template><template></template><head></template>",
+        "<li>x</li>",
+        "<svg><![CDATA[<html>]]></svg>",
+        "<svg><![CDATA[ > <html> ]]></svg>",
+        "<svg><![CDATA[ > <html>",
+        "<p><script>\"<html>\"</script></p>",
+        "<p><script>\"<html>\"",
+        "<p><title><body></title></p>",
+        "<p><plaintext><body>",
+        "<p><svg><title><style><body>",
+        "<title>Old</title><p>x</p>",
+        "<title>Old</title><!-- <body> -->",
+        "<p a=\"<body>",
+        "\u{feff}<title>Old</title>",
+        "",
+    ] {
+        assert_eq!(with_head(page, &h), page, "{:?}", page);
+    }
+}
+
+/// The time `apply` takes for a page, its best of three.
+fn apply_time(page: &str, h: &quillo::head::Head) -> Duration {
+    (0..3)
+        .map(|_| {
+            let mut b = page.as_bytes().to_vec();
+            let t = Instant::now();
+            quillo::head::apply(&mut b, h);
+            let e = t.elapsed();
+            assert!(b.len() < page.len());
+            e
+        })
+        .min()
+        .unwrap()
+}
+
+/// A head of many titles among tags it keeps is made again in one pass: each title taken away, the
+/// kept tags in their order and the tags once, before `</head>`; eight times the titles take about
+/// eight times as long, not sixty-four (each was a move of the page's rest: quadratic, a 5 MB page
+/// with 20,000 seconds 1.9 s). Measured against itself, so a slow machine is no failure
+/// (src/head.rs apply, FEEDBACK84.md Q-1320, found by the review of 1a4bb9b; branch feedback82-85)
+#[test]
+fn a_head_of_many_titles_is_made_again_in_one_pass() {
+    let h = said_head(&[("title", "T")]);
+    let meta = format!("<meta name=\"x\" content=\"{}\">", "k".repeat(80));
+    let page = |n: usize| format!("<!doctype html><html><head>{}</head><body>b</body></html>", format!("<title>t</title>{meta}").repeat(n));
+    let want = |n: usize| format!("<!doctype html><html><head>{}{TT}</head><body>b</body></html>", meta.repeat(n));
+    assert_eq!(with_head(&page(3), &h), want(3));
+    assert_eq!(with_head(&page(2000), &h), want(2000));
+    let (small, big) = (apply_time(&page(2000), &h), apply_time(&page(16000), &h));
+    assert!(big < small * 24, "2,000 titles {:?}, 16,000 {:?}", small, big);
+}
+
+/// The scripts the head is written with, as the browser has them in its head (parse5): a script
+/// double escaped whole, those after `</head>` that go in the head, not a template's nor one after
+/// the head's end; one that runs to the page's end to there; none of a page that is no document
+/// (src/head.rs head_scripts, FEEDBACK84.md Q-1320, found by the review of 1a4bb9b; branch
+/// feedback82-85)
+#[test]
+fn the_heads_scripts_are_those_the_browser_puts_in_it() {
+    let s = |page: &str| quillo::head::head_scripts(page.as_bytes());
+    assert_eq!(
+        s("<html><head><script><!--<script></script>--></script><template><script>t</script></template></head>\n<script src=\"/a.js\"></script><body><script>b</script></body></html>"),
+        ["<script><!--<script></script>--></script>", "<script src=\"/a.js\"></script>"]
+    );
+    assert_eq!(s("<html><head><script>a</script>x<script>b</script></head></html>"), ["<script>a</script>"]);
+    assert_eq!(s("<html><head><svg><script>a</script></svg></head></html>"), Vec::<String>::new());
+    assert_eq!(s("<!doctype html><script>a</script><p><script>b</script>"), ["<script>a</script>"]);
+    assert_eq!(s("<head><script>\"東京\"</script><script>let a = 1"), ["<script>\"東京\"</script>", "<script>let a = 1"]);
+    assert_eq!(s("<script>a</script><p>part</p>"), Vec::<String>::new());
+}
+
+/// A template's content where many list items, paragraphs and cells are left open, as the body
+/// ends them, still has its SVG followed (its `<style>` holds tags, so the `</template>` in it
+/// closes the template); and a part of many elements that never end, with as many end tags that
+/// close none, is read in one pass: eight times as many take about eight times as long (src/head.rs
+/// walk, ends_before, FEEDBACK84.md Q-1320, found by the review of 1a4bb9b; branch feedback82-85)
+#[test]
+fn elements_left_open_are_ended_as_the_body_ends_them_and_read_in_one_pass() {
+    let h = said_head(&[("title", "T")]);
+    for open in ["<ul><li>a".to_string() + &"<li>b".repeat(100) + "</ul>", "<p>a".repeat(100) + "<div>d</div>", "<dl>".to_string() + &"<dt>t<dd>d".repeat(60) + "</dl>", "<table>".to_string() + &"<tr><td>a<th>b".repeat(60) + "</table>", "<select><optgroup>".to_string() + &"<option>o".repeat(70) + "<optgroup><option>x</select>"] {
+        let page = format!("<html><head><template>{open}<svg><style></template><title>Old</title></head><body>b</body></html>");
+        assert_eq!(with_head(&page, &h), format!("<html><head><template>{open}<svg><style></template>{TT}</head><body>b</body></html>"), "{:?}", &open[..20]);
+    }
+    let part = |n: usize| format!("{}{}", "<span>".repeat(n), "</x>".repeat(n));
+    let time = |n: usize| {
+        let page = part(n);
+        (0..3)
+            .map(|_| {
+                let mut b = page.as_bytes().to_vec();
+                let t = Instant::now();
+                quillo::head::apply(&mut b, &h);
+                let e = t.elapsed();
+                assert_eq!(b, page.as_bytes());
+                e
+            })
+            .min()
+            .unwrap()
+    };
+    let (small, big) = (time(2000), time(16000));
+    assert!(big < small * 24, "2,000 elements {:?}, 16,000 {:?}", small, big);
 }
