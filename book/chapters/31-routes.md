@@ -2152,7 +2152,10 @@ view Header(user) = <header>
 - The folder holds one JSON object per locale, `<dir>/<locale>.json`, the locale named
   as `en`, `pt-BR` or `zh-Hant`. A file named with `_` (`fr_FR.json`, as other tools
   write them) is read as `fr-FR`; two files for one locale are an error. A byte-order mark
-  at a file's start, as Windows editors save one, is skipped.
+  at a file's start, as Windows editors save one, is skipped. Under a `quillo.confirmed`
+  *(since 0.8.11)* the folder is a `files` entry of the file that calls `translations`, and
+  in a file taken for some of its names the call is site-wide (see [What a program
+  reaches](#what-a-program-reaches)).
 - A request's locale is what `locale_from((request) => ...)` gives (a query parameter,
   a user's setting), else its `locale` cookie, else the best match in `Accept-Language`
   (`fr-CA` is served by `fr`, `pt` by `pt-BR`; `q` weights count, `Q=` too, `*` does not), else

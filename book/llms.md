@@ -363,6 +363,8 @@ db.transaction(() => {
 - A row is a map: `select a.id, b.id` leaves one `id`, so name columns apart with `as`.
 - `last_id` is the one inserted row's id, else `null` (always `null` on PostgreSQL: write
   `insert ... returning id` with `db.one`); `changes` is the rows matched, on every database.
+- `db.migrate(dir)` reads a folder inside the program's, as `read_file` does *(since
+  0.8.11)*: one outside (`../shared/migrations`, a link out) needs `--allow-path`.
 - `with db` on a function says it uses the database; a function with `with` may do only
   what it declares (`db`, `http`, `fs`, `env`, `time`, `random`, `net`, and `run` *(since
   0.8.11)*, which only a Rust file's `//! effects:` line names: starting another program). Routes and
@@ -381,4 +383,7 @@ db.transaction(() => {
   fail: tell the user to run `quillo confirm`, do not edit the file. Each file takes the
   names it uses (`quillo fix`, then `quillo confirm` if fix says so). A file SQL attaches
   (`attach`, `vacuum into`) must be under the file's `writes`, counted from the folder the
-  process runs in; `attach ?` is refused.
+  process runs in; `attach ?` is refused. The folders of `db.migrate` and `translations` are
+  `files` entries. A file taken for some of its names may not set what is site-wide
+  (`allow_cross_site`, `site_headers`, `db.open`, ...) unless `quillo confirm` confirmed it:
+  keep those calls in `main.qwe`.

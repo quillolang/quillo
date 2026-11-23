@@ -1248,6 +1248,14 @@ twice.
   `<template>` or a script is not the page's, and stays. A page with no `<head>` gets the tags
   where the browser makes its head, before the `<body>`; a part of a page (a route that gives
   an `<li>`) gets nothing.
+- A `<noscript>` in the head (a tracking pixel's) is read both ways: as text by a browser
+  with scripts, as tags by a crawler without them, which is what reads `og:` tags and the
+  description. So the tags go before the head's first `<noscript>`, and a title,
+  description or canonical link inside one is cut, leaving exactly one of each for either
+  reader; the rest of the noscript (its pixel, a style sheet) stays as written.
+- Not followed yet: inside a `<template>`, the reading follows 64 open elements without
+  the browser's implied end tags, so a `</template>` in a CDATA section after many unclosed
+  elements can end the template early.
 - In a deferred part (`state x = defer(...)`), it reaches the browser only, after the page
   is sent, and the log says so.
 - A component inside `<head>` is an error in `quillo check` (`a component cannot stand in

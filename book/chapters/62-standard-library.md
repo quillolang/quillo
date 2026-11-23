@@ -438,8 +438,9 @@ level off: `flatten(flatten(xs))` for two.
 
 ## Paths and links
 
-`read_file`, `write_file`, `delete_file`, `file`, `files`, `save_upload` and
-`check_program` take a path from the program's folder, and stay in it. A path with `..`
+`read_file`, `write_file`, `delete_file`, `file`, `files`, `save_upload`,
+`check_program` and `db.migrate` *(since 0.8.11)* take a path from the program's folder, and
+stay in it. A path with `..`
 or starting with `/` is refused, unless the program is started with [`--allow-path`](#options-of-quillo-run)
 naming the folder it leads to (`quillo run main.qwe --allow-path /srv/shared/uploads`). A
 path is judged where it really leads, with its links followed:
@@ -468,8 +469,11 @@ path is judged where it really leads, with its links followed:
 What is refused is what any refused path is: an error value from `read_file`,
 `write_file` and `delete_file`, which ends with the way out *(since 0.8.11)*
 (``read_file: path must stay inside the program's folder: ../secret.txt; `--allow-path ..` (on
-`quillo run` or `quillo mcp`) lets the program read it``), a 404 from `file` and `files` (the same whether the folder outside is
-there or not), and a runtime error from `save_upload`.
+`quillo run` or `quillo mcp`) lets the program read it``; through a link, the link and where
+it leads: ``data/s.txt; data is a link to /srv/outside, outside the program's folder;
+`--allow-path /srv/outside` ...``, or ``dl is a link that leads nowhere (to
+../outside/made.txt)``), a 404 from `file` and `files` (the same whether the folder outside is
+there or not), and a runtime error from `save_upload` and `db.migrate`.
 
 `files()` judges a link as `file()` does *(since 0.8.11: it refused every link out of the
 folder without a word, whatever `--allow-path` said)*: one that leads into a folder
@@ -1330,8 +1334,14 @@ waits, with a warning, until it has one *(since 0.8.6: it was recorded empty, an
 written in it later never ran)*. In a route, a file that fails stops the request with a 500:
 `db.migrate` gives the names it applied, never an error value to handle. The folder must exist: a missing one is an error that
 says why it may be gone from a clone (`there is no such folder (git keeps no empty
-folder: put the first migration in it, or a .gitkeep, which is not read)`). The table is `_quillo_migrations
-(name, sha256, applied_at)`. Call it right after `db.open`:
+folder: put the first migration in it, or a .gitkeep, which is not read)`). The folder, and
+each file in it, is judged as a `read_file` path is *(since 0.8.11: any folder was read)*:
+inside the program's folder, or one [`--allow-path`](#options-of-quillo-run) names, links
+followed (see [Paths and links](#paths-and-links)), so migrations kept outside the program
+(`db.migrate("../shared/migrations")`, or a link out) need `--allow-path ../shared`; else
+the start stops: ``db.migrate: the folder must stay inside the program's folder:
+../shared/migrations; `--allow-path ../shared` ... lets the program read it``. The table
+is `_quillo_migrations (name, sha256, applied_at)`. Call it right after `db.open`:
 
 ```quillo
 db.open(env("DATABASE_URL"))

@@ -48,6 +48,16 @@ and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2
   mcp`'s stdio door, alone or beside `--serve`, offers only confirmed tools; `quillo.confirmed`
   takes only the escapes `quillo confirm` writes (`\u{+2e}` confirmed `.env` unseen), its
   temporary file is never written through a link, and one that is a link is said at start.
+- **A taken file's calls for the whole site are held** (Q-1301, found in review): a kit taken
+  for `Badge` called `allow_cross_site("/")` and `site_headers`, and a cross-site `POST` to the
+  main file's routes got through, its frame and CORS headers changed. A new key `site`,
+  listed as `site-wide`, holds a taken file's `allow_cross_site`, `site_headers`,
+  `tenant_from`, `moves_in_place`, `accept_calls`, `style_with`, `channel`, `media`, `ready`,
+  `locale_from` and `translations`, and its `db.open` and `db.system`, which replaced every
+  file's database: not applied unless confirmed. `pragma lock_proxy_file` is refused under a
+  hold; a migration's files are read, and its statements held, as the calling file's;
+  `quillo fix`, `check` and `confirm` say what an import hands a file of another's reach
+  (`kit/k.qwe takes main.qwe's reader (read_file, as main.qwe reaches it)`).
 - **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
   of 2026-11-24): a name another file defines, used without taking it, is an error in
   `quillo check`, and the start refuses it with `--no-check` too, as the value under it
@@ -102,9 +112,15 @@ What a program may notice:
   `//! effects:` line.** There is an eighth, `run` (starting another program), so such a list
   no longer allows every effect, and a file that says nothing may do anything. Add `run` to the
   list, or an effects line to the file (FEEDBACK83.md, Q-1308).
+- **`db.migrate(dir)`'s folder is judged as a `read_file` path**, with or without a
+  `quillo.confirmed`: inside the program's folder or one `--allow-path` names, links followed,
+  and each `.sql` file in it too. It read and ran SQL from any folder, so migrations kept
+  outside the program (`db.migrate("../shared/migrations")`, or a link out of the folder) now
+  stop the start until it is given `--allow-path ../shared` (Q-1300, found in review).
 - **In `quillo.confirmed`, `files` is read-only**: a path written or deleted (`write_file`,
   `delete_file`, `save_upload`, `save:`, a SQLite file and what its SQL attaches) is confirmed
-  under `writes`, and is read too, with no `files` entry.
+  under `writes`, and is read too, with no `files` entry. The folders of `db.migrate` and
+  `translations` are `files` entries.
 - **New builtins `page_head`, `page_url` and `moves_in_place`**: a program's own function of
   that name still wins, with a warning, `` `page_url` hides the builtin `page_url` `` (rename
   it). quillolang.org's own `page_url` is one.
@@ -166,7 +182,9 @@ What a program may notice:
   winning, on the server and, following state, in the browser (FEEDBACK84.md, Q-1320, Q-1321;
   FEEDBACK81.md, Q-1275). The page is read as the browser reads it, checked against parse5:
   the tags go where it puts the head, before the text or element that ends it early, and an
-  `<svg>`'s, a `<template>`'s or a script's `<title>` stays.
+  `<svg>`'s, a `<template>`'s or a script's `<title>` stays. They go before the head's first
+  `<noscript>`, and its title, description or canonical is cut, so a crawler without scripts
+  reads exactly one of each.
 - **`page_url()` and `page_url(path)`**: the page's public address, with its scheme (https only
   through a trusted proxy), host and `--base` prefix (Q-1328).
 - **`moves_in_place()`**: same-site links and `navigate` move between the program's routes
@@ -190,7 +208,10 @@ What a program may notice:
 
 - **`read_file`, `write_file` and `delete_file`'s refusal of a path outside the folder** ends
   with the way out: ``; `--allow-path ..` (on `quillo run` or `quillo mcp`) lets the program
-  read it`` (Q-1341).
+  read it`` (Q-1341). Refused for a link, it names the link and where it leads, with the
+  folder to allow, or that it leads nowhere: it suggested the `--allow-path` already given.
+- **`quillo fix` into a closed pipe** (`quillo fix main.qwe | head -1`) exits 141 without a
+  word, as a script's `print` does: it panicked after writing its files.
 - **`files()` refused a folder reached through a link without a word**, whatever
   `--allow-path` said (Q-1340).
 - **The MCP door's refusal of a request without `_meta`** names both keys and what they hold,

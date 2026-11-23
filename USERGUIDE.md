@@ -3178,6 +3178,14 @@ twice.
   `<template>` or a script is not the page's, and stays. A page with no `<head>` gets the tags
   where the browser makes its head, before the `<body>`; a part of a page (a route that gives
   an `<li>`) gets nothing.
+- A `<noscript>` in the head (a tracking pixel's) is read both ways: as text by a browser
+  with scripts, as tags by a crawler without them, which is what reads `og:` tags and the
+  description. So the tags go before the head's first `<noscript>`, and a title,
+  description or canonical link inside one is cut, leaving exactly one of each for either
+  reader; the rest of the noscript (its pixel, a style sheet) stays as written.
+- Not followed yet: inside a `<template>`, the reading follows 64 open elements without
+  the browser's implied end tags, so a `</template>` in a CDATA section after many unclosed
+  elements can end the template early.
 - In a deferred part (`state x = defer(...)`), it reaches the browser only, after the page
   is sent, and the log says so.
 - A component inside `<head>` is an error in `quillo check` (`a component cannot stand in
@@ -6645,7 +6653,10 @@ view Header(user) = <header>
 - The folder holds one JSON object per locale, `<dir>/<locale>.json`, the locale named
   as `en`, `pt-BR` or `zh-Hant`. A file named with `_` (`fr_FR.json`, as other tools
   write them) is read as `fr-FR`; two files for one locale are an error. A byte-order mark
-  at a file's start, as Windows editors save one, is skipped.
+  at a file's start, as Windows editors save one, is skipped. Under a `quillo.confirmed`
+  *(since 0.8.11)* the folder is a `files` entry of the file that calls `translations`, and
+  in a file taken for some of its names the call is site-wide (see [What a program
+  reaches](#what-a-program-reaches)).
 - A request's locale is what `locale_from((request) => ...)` gives (a query parameter,
   a user's setting), else its `locale` cookie, else the best match in `Accept-Language`
   (`fr-CA` is served by `fr`, `pt` by `pt-BR`; `q` weights count, `Q=` too, `*` does not), else
@@ -8078,8 +8089,9 @@ level off: `flatten(flatten(xs))` for two.
 
 ### Paths and links
 
-`read_file`, `write_file`, `delete_file`, `file`, `files`, `save_upload` and
-`check_program` take a path from the program's folder, and stay in it. A path with `..`
+`read_file`, `write_file`, `delete_file`, `file`, `files`, `save_upload`,
+`check_program` and `db.migrate` *(since 0.8.11)* take a path from the program's folder, and
+stay in it. A path with `..`
 or starting with `/` is refused, unless the program is started with [`--allow-path`](#options-of-quillo-run)
 naming the folder it leads to (`quillo run main.qwe --allow-path /srv/shared/uploads`). A
 path is judged where it really leads, with its links followed:
@@ -8108,8 +8120,11 @@ path is judged where it really leads, with its links followed:
 What is refused is what any refused path is: an error value from `read_file`,
 `write_file` and `delete_file`, which ends with the way out *(since 0.8.11)*
 (``read_file: path must stay inside the program's folder: ../secret.txt; `--allow-path ..` (on
-`quillo run` or `quillo mcp`) lets the program read it``), a 404 from `file` and `files` (the same whether the folder outside is
-there or not), and a runtime error from `save_upload`.
+`quillo run` or `quillo mcp`) lets the program read it``; through a link, the link and where
+it leads: ``data/s.txt; data is a link to /srv/outside, outside the program's folder;
+`--allow-path /srv/outside` ...``, or ``dl is a link that leads nowhere (to
+../outside/made.txt)``), a 404 from `file` and `files` (the same whether the folder outside is
+there or not), and a runtime error from `save_upload` and `db.migrate`.
 
 `files()` judges a link as `file()` does *(since 0.8.11: it refused every link out of the
 folder without a word, whatever `--allow-path` said)*: one that leads into a folder
@@ -8970,8 +8985,14 @@ waits, with a warning, until it has one *(since 0.8.6: it was recorded empty, an
 written in it later never ran)*. In a route, a file that fails stops the request with a 500:
 `db.migrate` gives the names it applied, never an error value to handle. The folder must exist: a missing one is an error that
 says why it may be gone from a clone (`there is no such folder (git keeps no empty
-folder: put the first migration in it, or a .gitkeep, which is not read)`). The table is `_quillo_migrations
-(name, sha256, applied_at)`. Call it right after `db.open`:
+folder: put the first migration in it, or a .gitkeep, which is not read)`). The folder, and
+each file in it, is judged as a `read_file` path is *(since 0.8.11: any folder was read)*:
+inside the program's folder, or one [`--allow-path`](#options-of-quillo-run) names, links
+followed (see [Paths and links](#paths-and-links)), so migrations kept outside the program
+(`db.migrate("../shared/migrations")`, or a link out) need `--allow-path ../shared`; else
+the start stops: ``db.migrate: the folder must stay inside the program's folder:
+../shared/migrations; `--allow-path ../shared` ... lets the program read it``. The table
+is `_quillo_migrations (name, sha256, applied_at)`. Call it right after `db.open`:
 
 ```quillo
 db.open(env("DATABASE_URL"))
@@ -10780,12 +10801,13 @@ Each file has a block, named by its path from the main file's folder, and these 
 | Key | What the file reaches |
 |---|---|
 | `http` | the hosts its `http.*` and `site` calls, its UDP sends and its databases (as their drivers read the address) reach; `*.stripe.com`, written by hand, covers the subdomains, and `quillo confirm` keeps it |
-| `files` | the paths its file builtins read (`read_file`, `file`, `files`, `image.info`); a folder ends with `/` and covers what is in it |
+| `files` | the paths its file builtins read (`read_file`, `file`, `files`, `image.info`, and the folders of `db.migrate` and `translations`); a folder ends with `/` and covers what is in it |
 | `writes` | the paths it writes or deletes (`write_file`, `delete_file`, `save_upload`, `image.convert`'s, an `http.*` call's `save:`, a SQLite database's file and the files its SQL attaches); a path confirmed in `files` only is read, never written, and one under `writes` is read too, with no `files` entry |
 | `listens` | the UDP ports it listens on at an address others reach (`udp 514`); this machine's own loopback needs none |
 | `scripts` | the scripts its pages load (`client "https://..."`), each with the `sha384-...` integrity hash `quillo confirm` fetched it for |
 | `loads`, `calls` | the hosts its markup loads from (`src`), and its pages call (`js("fetch", "https://...")`) |
 | `routes` | for a file taken for some of its names (`import lib/x.qwe use f`), the routes, `server fn`s and tools (`fn mcp`) it adds beyond the names taken, and its `mount` and `service` lines (`mount /admin`, `service /jobs`, and a `service mcp` line's tools as `fn mcp billing.total`) |
+| `site` | for a file taken for some of its names, its calls that set something for the whole site, listed as `site-wide`: `allow_cross_site /`, `site_headers /`, `tenant_from`, `moves_in_place`, `accept_calls`, `style_with`, `channel`, `media`, `ready`, `locale_from`, `translations`, and `db.open` and `db.system`, which set every file's database; however written (in a function, piped, in an `if`), and as `name *` where the path or name is worked out as the program runs |
 | `sha256`, `effects` | for a Rust file: its SHA-256, and what its `//! effects:` line said; Quillo cannot hold Rust to a list, only to the file |
 
 What is held, once the file is there (`quillo run`, `quillo mcp`, `quillo app`, `quillo
@@ -10804,10 +10826,13 @@ build`, and a `--split` service, by its app's `quillo.confirmed`):
 - A file SQLite attaches, by `attach 'side.db' as s` or `vacuum into 'backups/b.db'`, is held
   as `db.open`'s file is, to the `writes` of the file whose code runs the statement; its path
   counts from the folder the process runs in, as SQLite opens it (see
-  [Database](#database)). A `file:` address, a name the SQL works out (`attach ? as x`) and
-  moving SQLite's temporary files (`pragma temp_store_directory`) are refused (``db: the
-  database file:data/u.db attached by its address is refused for main.qwe (quillo
-  confirm)``); `vacuum into ?`, given the path, is judged by it.
+  [Database](#database)). A `file:` address, a name the SQL works out (`attach ? as x`),
+  moving SQLite's temporary files (`pragma temp_store_directory`) and a lock file named
+  elsewhere (`pragma lock_proxy_file`) are refused (``db: the database file:data/u.db
+  attached by its address is refused for main.qwe (quillo confirm)``); `vacuum into ?`,
+  given the path, is judged by it. A migration's SQL files are read as the file that calls
+  `db.migrate` was confirmed to read, and its statements held as that file's, in a request
+  too.
 - A route, `server fn` or tool that a file taken for some of its names adds, and that was
   not confirmed, is not served (a 404; a tool is not offered, on `quillo mcp`'s stdio too),
   said at the start: `quillo: lib/geo.qwe: the route GET /x is not served: it is not
@@ -10818,11 +10843,22 @@ build`, and a `--split` service, by its app's `quillo.confirmed`):
   (`service /jobs is not served at /jobs (its calls are made as before)`). The main file's
   routes and a mounted program's are the program's own, and so is a `server fn` or tool the
   `use` names (`import lib/notes.qwe use load_notes`).
+- A site-wide call of such a file that was not confirmed is not applied, said once: `quillo:
+  kit/k.qwe: allow_cross_site / is not applied: it is not confirmed for this file`. A kit
+  taken for `Badge` could otherwise let other sites post to every route, or drop the
+  site's headers. Its `db.open` or `db.system`, which would replace every file's database,
+  is an error value: ``db: db.open sets every file's database, and is not confirmed for
+  kit/k.qwe (quillo confirm)``. The main file's calls, a file it takes whole and a mounted
+  program's are the program's own.
 - Each file uses only the names it takes. A name another file defines, used without taking
   it, is an error in `quillo check`, and the start refuses it, checked or not: the value
   under it carries what that file was confirmed for (main's `let reader = read_file`, used
-  by a kit confirmed for nothing, read `.env` as main). Taken by name, it still does, and the
-  `import` line shows it. A record made from another file's `type` must be taken too, and a
+  by a kit confirmed for nothing, read `.env` as main). Taken by name, it still does: the
+  import is the grant, and `quillo fix`, `quillo check` (a warning) and `quillo confirm` say
+  it (``kit/k.qwe takes main.qwe's reader (read_file, as main.qwe reaches it)``) for a
+  top-level `let` holding a builtin that reaches something, a site-wide builtin, a module or
+  a function value; a `fn` taken by name is plain reuse, not said. A record made from another
+  file's `type` must be taken too, and a
   page state holds no function. Without a `quillo.confirmed`, a name not taken stays a
   warning (see [Files of a program](#files-of-a-program)). `quillo fix main.qwe` writes the
   imports, and says what they leave to confirm, as an import can make a file one taken for
@@ -10907,7 +10943,10 @@ reported, by the report-only policy; a database's address in upper case
 (`POSTGRES://...`) or as a `conninfo` string is listed as a path, and refused when reached;
 under [`--split`](#options-of-quillo-run), a taken file's `service` line that is not
 confirmed still starts its service, on this machine's loopback only, and says it is served
-under its path, which is then not served.
+under its path, which is then not served; a taken file's component can set a response's
+headers or cookies on the main file's requests; `notification.send` reaches push services
+without asking the hold; and without a `quillo.confirmed`, `translations(dir)` reads its
+folder through links wherever they lead (`db.migrate`'s is judged as `read_file`'s).
 
 ### Quillo on a shared server (cPanel)
 
