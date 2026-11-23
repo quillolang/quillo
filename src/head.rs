@@ -167,7 +167,7 @@ pub fn apply(body: &mut Vec<u8>, head: &Head) {
     // the keys said, to be taken away: a `<title>` with its text and end tag, a `<meta>` or
     // `<link>` whole.
     let mut cuts: Vec<(usize, usize)> = Vec::new();
-    let Some((end, first)) = scan(body, |lt, name, close, end| {
+    let Some((end, first)) = scan(body, true, |lt, name, close, end| {
         if head.replaces(name, &body[lt..close]) {
             cuts.push((lt, if name.eq_ignore_ascii_case(b"title") { end } else { close }));
         }
@@ -218,21 +218,31 @@ pub fn apply(body: &mut Vec<u8>, head: &Head) {
 /// meta, link, script, style or template still goes in the head, up to anything else. A
 /// template's content is passed over whole, to the `</template>` that closes it (`walk`). The tags
 /// go before what ends the head, or before a tag, comment or element that runs on to the page's
-/// end (which the browser drops, or takes whole; a title that does is the head's, cut to the end);
-/// nothing after is cut. With it, where a head the page leaves out (no `<head>`) starts: at its
-/// first element, a title, meta, script, .... None for a page that is no document: no doctype, `<html>`, `<head>`, `<body>`, `<frameset>` or
-/// `</head>` in it, outside a template.
+/// end (which the browser drops, or takes whole; a title that does is the head's, cut to the end),
+/// or before the head's first `<noscript>`, where both readers have the head still open: a
+/// noscript is text to a browser with scripting on, but a crawler (a search engine's, a social
+/// card's) reads with it off, and there what it holds is tags, a pixel's `<img>` ends the head
+/// (FEEDBACK84.md, Q-1320, found by the review of a6988b4; branch feedback82-85). Nothing after
+/// what ends the head is cut. With it, where a head the page leaves out (no `<head>`) starts: at
+/// its first element, a title, meta, script, .... None for a page that is no document: no doctype,
+/// `<html>`, `<head>`, `<body>`, `<frameset>` or `</head>` in it, outside a template.
 ///
 /// No full parser: the head is read as the browser reads it, a template's content and the rest
 /// (for whether the page is a document) by `walk`, which follows foreign content by name, not the
 /// body's implied end tags, nor the older `<select>` rules (which drop a `<title>` or `<svg>` in a
-/// select); and the page is read as UTF-8, with no `<meta charset>` reread.
+/// select); and the page is read as UTF-8, with no `<meta charset>` reread. A known limit, not
+/// fixed (found by the review of a6988b4): `walk` follows 64 open elements, without the browser's
+/// implied end tags past the commonest or its adoption agency, so in a template many elements left
+/// open (a run of `<button>`s, which the browser ends one by the next, or of `<b>`s) before an
+/// `<svg>` leave the svg not followed, and a `<![CDATA[` in it that holds `</template>` closes the
+/// template there, early.
 ///
 /// `each` is told of each element of the head's own (not a template's), as (where it starts, its
 /// name as written, just past its start tag, just past its element: its end tag's `>`, its own
 /// for a meta, link or base, the `</template>`'s for a template, the page's end for one that runs
-/// to it).
-fn scan(body: &[u8], mut each: impl FnMut(usize, &[u8], usize, usize)) -> Option<(usize, Option<usize>)> {
+/// to it); and, with `noscripts`, of the titles, metas and links in a noscript of the head as
+/// scripting off reads them (`hidden`), none of them a script (`head_scripts` has no use for them).
+fn scan(body: &[u8], noscripts: bool, mut each: impl FnMut(usize, &[u8], usize, usize)) -> Option<(usize, Option<usize>)> {
     #[derive(PartialEq, Clone, Copy)]
     enum Mode {
         Before,
@@ -243,6 +253,7 @@ fn scan(body: &[u8], mut each: impl FnMut(usize, &[u8], usize, usize)) -> Option
     let mut doc = false;
     let mut head_end = None;
     let mut implied = None;
+    let mut noscript = None;
     // A byte order mark is the decoder's, no text.
     let mut i = if body.starts_with(b"\xEF\xBB\xBF") { 3 } else { 0 };
     let stop = loop {
@@ -286,9 +297,22 @@ fn scan(body: &[u8], mut each: impl FnMut(usize, &[u8], usize, usize)) -> Option
                     }
                     let end = match kind {
                         Kind::Void => Some(next),
+                        // A noscript's text is tags to a browser with scripting off: its titles,
+                        // metas and links are told (`hidden`), and the tags go before the first
+                        // (FEEDBACK84.md, Q-1320, found by the review of a6988b4; branch
+                        // feedback82-85: they went after it, where a crawler, which reads with
+                        // scripting off, has ended the head at a pixel's `<img>` in it).
+                        Kind::Text if name.eq_ignore_ascii_case(b"noscript") => {
+                            let to = text_end(body, next, name);
+                            noscript = noscript.or(Some(lt));
+                            if noscripts {
+                                hidden(body, next, to.unwrap_or(body.len()), &mut each);
+                            }
+                            to.and_then(|e| tag_close(body, e)).map(|(c, _)| c)
+                        }
                         Kind::Text => text_end(body, next, name).and_then(|e| tag_close(body, e)).map(|(c, _)| c),
                         Kind::Script => script_end(body, next).and_then(|e| tag_close(body, e)).map(|(c, _)| c),
-                        Kind::Template => walk(body, next, false),
+                        Kind::Template => walk(body, next, false, true),
                     };
                     // Its text runs to the page's end: the head's, to there.
                     let Some(end) = end else {
@@ -305,11 +329,159 @@ fn scan(body: &[u8], mut each: impl FnMut(usize, &[u8], usize, usize)) -> Option
         }
         i = next;
     };
-    if !doc && walk(body, stop, true).is_none() {
+    if !doc && walk(body, stop, true, true).is_none() {
         return None;
     }
-    Some((head_end.unwrap_or(stop), implied))
+    // The head's first noscript is before its `</head>` and what ends it.
+    Some((noscript.or(head_end).unwrap_or(stop), implied))
 }
+
+/// The titles, metas and links in a `<noscript>` of the head, its text from `from` to `to` (its
+/// `</noscript`, or the page's end), as a browser with scripting off reads them, told to `each` as
+/// `scan` tells the head's (FEEDBACK84.md, Q-1320, found by the review of a6988b4; branch
+/// feedback82-85). With scripting on the browser reads that text as text, no element, so taking
+/// one away changes nothing there; with it off they are the head's (a meta or link in the
+/// noscript, in the head; a title, script, template or base closes the noscript and is the
+/// head's, and what follows), and left, a crawler would read two titles, descriptions or
+/// canonicals, the noscript's first. Read as the tree builder reads it there, by its in-head
+/// noscript, in-head and after-head modes: spaces, comments, a style's and a noframes' text, a
+/// script, a template whole (`walk`, scripting off), `<head>`, `<html>` and the end tags those
+/// modes pass over are passed over; `</head>` once the noscript is closed is after the head, where
+/// a title, meta or link is still the head's. Anything else ends the head there (text, an `<img>`,
+/// an `<svg>`, `</br>`, once closed `</body>` or `</html>`, after `</head>` a `<noscript>`): what
+/// follows, the body's, is left. So is all from one that runs past `to` (`<title></noscript>`:
+/// with scripting on the noscript ends in its text, so it is not cut, and a crawler reads two); a
+/// title that runs to the page's end, in a noscript that does, is the head's to there. A title
+/// that closes the noscript is left where taking it away would have what follows read otherwise
+/// (`moves`).
+fn hidden(body: &[u8], from: usize, to: usize, each: &mut impl FnMut(usize, &[u8], usize, usize)) {
+    #[derive(PartialEq, Clone, Copy)]
+    enum M {
+        /// In the noscript; closed, in the head; after `</head>`.
+        Noscript,
+        Head,
+        After,
+    }
+    let mut m = M::Noscript;
+    let mut i = from;
+    loop {
+        let lt = memchr::memchr(b'<', &body[i..to]).map_or(to, |p| i + p);
+        if lt == to || not_space(body, i, lt).is_some() || !holds(body, lt, to) {
+            return;
+        }
+        let Some((tok, mut next)) = token(body, lt).filter(|&(_, n)| n <= to) else { return };
+        match tok {
+            Tok::Text => return,
+            Tok::Skip { .. } => {}
+            Tok::End(name) if name.eq_ignore_ascii_case(b"br") || (m != M::Noscript && is_one(name, &[b"body", b"html"])) => return,
+            Tok::End(name) if m == M::Head && name.eq_ignore_ascii_case(b"head") => m = M::After,
+            Tok::End(_) => {}
+            Tok::Start(name, _) if is_one(name, &[b"meta", b"link"]) => each(lt, name, next, next),
+            Tok::Start(name, _) if is_one(name, &[b"basefont", b"bgsound", b"head", b"html"]) => {}
+            // Another passed over in one, one more once it closed, the body's after `</head>`.
+            Tok::Start(name, _) if name.eq_ignore_ascii_case(b"noscript") => {
+                if m == M::After {
+                    return;
+                }
+                m = M::Noscript;
+            }
+            Tok::Start(name, _) => {
+                let title = name.eq_ignore_ascii_case(b"title");
+                let raw = is_one(name, &[b"style", b"noframes"]);
+                let end = if title || raw {
+                    text_end(body, next, name).and_then(|e| tag_close(body, e)).map(|(c, _)| c)
+                } else if name.eq_ignore_ascii_case(b"script") {
+                    script_end(body, next).and_then(|e| tag_close(body, e)).map(|(c, _)| c)
+                } else if name.eq_ignore_ascii_case(b"template") {
+                    walk(body, next, false, false)
+                } else {
+                    Some(next)
+                };
+                let Some(end) = end.filter(|&e| e <= to).or_else(|| (title && to == body.len()).then_some(to)) else { return };
+                if title && (m != M::Noscript || !moves(body, end, to)) {
+                    each(lt, name, next, end);
+                }
+                if m == M::Noscript && !raw {
+                    m = M::Head;
+                }
+                next = end;
+            }
+        }
+        i = next;
+    }
+}
+
+/// Whether the tag at `lt` (before `to`) is of an element a head holds, read by its name only, so
+/// an `<img>`'s, its long `src`, is not read on: any other ends the head. What is not a start tag
+/// is read on.
+fn holds(body: &[u8], lt: usize, to: usize) -> bool {
+    if !body.get(lt + 1).is_some_and(|c| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    let s = &body[lt + 1..to];
+    let name = s.iter().position(|&c| is_space(c) || c == b'/' || c == b'>').map_or(s, |p| &s[..p]);
+    is_one(name, &HEAD_HOLDS)
+}
+
+/// Whether taking away the title that closes a head's noscript, with scripting off, has what
+/// follows it in the noscript's text (`from` to `to`) read otherwise (`hidden`; FEEDBACK84.md,
+/// Q-1320, found by the review of a6988b4; branch feedback82-85). With the title the head goes on
+/// closed; without it in the noscript, which passes over `</head>`, `</body>`, `</html>` and
+/// `<noscript>`. The two readings meet again at what ends the head in both (text, an element no
+/// head holds, `</br>`), at a script, template, base or title it keeps that closes the noscript in
+/// turn, or at its `</noscript>` (or the page's end); not where one of those four comes first
+/// (`</body>` or `</html>` would end the head, `<noscript>` start one more), where something runs
+/// past `</noscript` (in the noscript, it holds that), or where `</head>` did (after the head
+/// with the title, in it without, past the noscript; a page's end is the end of both).
+fn moves(body: &[u8], from: usize, to: usize) -> bool {
+    let mut after = false;
+    let mut i = from;
+    loop {
+        let lt = memchr::memchr(b'<', &body[i..to]).map_or(to, |p| i + p);
+        if not_space(body, i, lt).is_some() {
+            return false;
+        }
+        if lt == to {
+            return after && to < body.len();
+        }
+        if !holds(body, lt, to) {
+            return false;
+        }
+        let Some((tok, next)) = token(body, lt) else { return false };
+        let end = match tok {
+            Tok::Text => return false,
+            Tok::End(name) if name.eq_ignore_ascii_case(b"br") => return false,
+            Tok::End(name) if is_one(name, &[b"body", b"html"]) => return true,
+            Tok::End(name) => {
+                after |= name.eq_ignore_ascii_case(b"head");
+                next
+            }
+            Tok::Start(name, _) if name.eq_ignore_ascii_case(b"noscript") => return true,
+            Tok::Start(name, _) if is_one(name, &[b"script", b"template", b"base"]) => return after,
+            Tok::Start(name, _) if is_one(name, &[b"title", b"style", b"noframes"]) => {
+                let title = name.eq_ignore_ascii_case(b"title");
+                match text_end(body, next, name).and_then(|e| tag_close(body, e)) {
+                    // One `hidden` takes away too.
+                    Some((e, _)) if e <= to => e,
+                    // A title it keeps closes the noscript.
+                    Some(_) if title => return after,
+                    None if title && to < body.len() => return after,
+                    Some(_) => return true,
+                    None => return false,
+                }
+            }
+            Tok::Skip { .. } | Tok::Start(..) => next,
+        };
+        if end > to {
+            return true;
+        }
+        i = end;
+    }
+}
+
+/// The elements a noscript of the head holds, as scripting off reads it (`hidden`), that leave the
+/// head open.
+const HEAD_HOLDS: [&[u8]; 13] = [b"meta", b"link", b"basefont", b"bgsound", b"head", b"html", b"noscript", b"title", b"style", b"noframes", b"script", b"template", b"base"];
 
 /// How the head's elements end: a meta, link or base with its tag; a title's, style's,
 /// noscript's and noframes' text at their end tag; a script's by its states; a template's
@@ -450,8 +622,10 @@ fn foreign<'a>(name: &'a [u8], tag: &[u8], svg: bool) -> Open<'a> {
 /// None where none is. Past `DEEP` open elements no more are followed (templates are), so a page
 /// of many that never end, and as many end tags that close none, is still read in one pass; the
 /// commonest elements left open, a list item, a paragraph, a cell, end as the body ends them
-/// (`ends_before`).
-fn walk(body: &[u8], from: usize, signal: bool) -> Option<usize> {
+/// (`ends_before`). A noscript's text is raw text with `scripting`, tags without it (a template in a
+/// head's noscript, as a crawler reads it: `hidden`; FEEDBACK84.md, Q-1320, found by the review
+/// of a6988b4; branch feedback82-85).
+fn walk(body: &[u8], from: usize, signal: bool, scripting: bool) -> Option<usize> {
     const DEEP: usize = 64;
     let mut open: Vec<Open> = if signal { Vec::new() } else { vec![Open::Template] };
     let mut templates = open.len();
@@ -505,7 +679,7 @@ fn walk(body: &[u8], from: usize, signal: bool) -> Option<usize> {
                     templates += 1;
                 } else if name.eq_ignore_ascii_case(b"script") {
                     i = tag_close(body, script_end(body, next)?)?.0;
-                } else if is_one(name, &RAW) {
+                } else if is_one(name, &RAW) && (scripting || !name.eq_ignore_ascii_case(b"noscript")) {
                     i = tag_close(body, text_end(body, next, name)?)?.0;
                 } else if name.eq_ignore_ascii_case(b"plaintext") {
                     return None;
@@ -777,7 +951,7 @@ fn script_end(body: &[u8], from: usize) -> Option<usize> {
 /// page that is no document.
 pub fn head_scripts(body: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
-    let doc = scan(body, |lt, name, _, end| {
+    let doc = scan(body, false, |lt, name, _, end| {
         if name.eq_ignore_ascii_case(b"script") {
             out.push(String::from_utf8_lossy(&body[lt..end]).into_owned());
         }

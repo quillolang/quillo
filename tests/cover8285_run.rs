@@ -1183,7 +1183,9 @@ fn the_head_ends_where_the_browsers_tree_builder_ends_it() {
         ("&Tab;&NewLine;&#0000032;&#X9;&#10;&#12;<title>Old</title>", format!("&Tab;&NewLine;&#0000032;&#X9;&#10;&#12;{TD}")),
         ("</div></p></></ x></template><title>Old</title>", format!("</div></p></></ x></template>{TD}")),
         ("<head><html lang=\"x\"><title>Old</title>", format!("<head><html lang=\"x\">{TD}")),
-        ("<base href=\"/\"><basefont><bgsound><noframes><title>nf</title></noframes><noscript><meta name=\"description\" content=\"ns\"></noscript><title>Old</title>", format!("<base href=\"/\"><basefont><bgsound><noframes><title>nf</title></noframes><noscript><meta name=\"description\" content=\"ns\"></noscript>{TD}")),
+        // The tags before a noscript, and its description, the head's with scripting off, taken away
+        // (FEEDBACK84.md, Q-1320, found by the review of a6988b4: it was kept, the tags after it).
+        ("<base href=\"/\"><basefont><bgsound><noframes><title>nf</title></noframes><noscript><meta name=\"description\" content=\"ns\"></noscript><title>Old</title>", format!("<base href=\"/\"><basefont><bgsound><noframes><title>nf</title></noframes>{TD}<noscript></noscript>")),
         // Templates: never cut inside, read to the `</template>` that closes them.
         ("<template><template></template><title>tpl</title></template><title>Old</title>", format!("<template><template></template><title>tpl</title></template>{TD}")),
         ("<template><script>var t = \"</template>\";</script><meta name=\"description\" content=\"tpl\"></template><meta name=\"description\" content=\"old\">", format!("<template><script>var t = \"</template>\";</script><meta name=\"description\" content=\"tpl\"></template>{TD}")),
@@ -1379,4 +1381,141 @@ fn elements_left_open_are_ended_as_the_body_ends_them_and_read_in_one_pass() {
     };
     let (small, big) = (time(2000), time(16000));
     assert!(big < small * 24, "2,000 elements {:?}, 16,000 {:?}", small, big);
+}
+
+// ---- src/head.rs: what the review of a6988b4 found (slice N) ---------------------------------------
+
+/// What `page_head({ title: "T", description: "D", canonical: "/c" })` writes.
+const TDC: &str = "<title>T</title><meta property=\"og:title\" content=\"T\"><meta name=\"description\" content=\"D\"><meta property=\"og:description\" content=\"D\"><link rel=\"canonical\" href=\"/c\"><meta property=\"og:url\" content=\"/c\">";
+
+/// The repro: a tracking pixel's `<noscript><img></noscript>` in the head, which a crawler (scripting
+/// off: a search engine's, a social card's) reads as an image that ends the head, so the tags,
+/// written before `</head>`, were the body's there; and the noscript's canonical, a second one to
+/// that crawler, first. Now the tags go before the head's first noscript and its canonical is
+/// taken away, so the head holds one title, description and canonical, the new ones, read with
+/// scripting on or off (parse5 both ways) (src/head.rs scan, hidden, FEEDBACK84.md Q-1320, found
+/// by the review of a6988b4; branch feedback82-85)
+#[test]
+fn a_heads_noscript_gets_the_tags_before_it_and_its_own_are_taken_away() {
+    let d = Dir::new("headnos");
+    d.write(
+        "main.qwe",
+        r#"route GET / {
+    page_head({ title: "T", description: "D", canonical: "https://example.com/c" })
+    return raw("<!doctype html><html><head><meta charset=\"utf-8\"><noscript><link rel=\"canonical\" href=\"/ns\"><img height=\"1\" width=\"1\" src=\"https://px.example/tr\"/></noscript><title>Old</title><meta name=\"description\" content=\"old\"><link rel=\"canonical\" href=\"/old\"></head><body>b</body></html>")
+}
+"#,
+    );
+    checked(d.path(), "main.qwe");
+    let (_g, port, log) = serve(d.path(), "main.qwe", &["--no-prefetch"]);
+    let a = get(port, "/");
+    assert_eq!(
+        (a.status, a.body.as_str()),
+        (200, format!("<!doctype html><html><head><meta charset=\"utf-8\">{}<noscript><img height=\"1\" width=\"1\" src=\"https://px.example/tr\"/></noscript></head><body>b</body></html>", TDC.replace("\"/c\"", "\"https://example.com/c\"")).as_str()),
+        "{}",
+        read(&log)
+    );
+}
+
+/// What a head's noscript holds, read as a browser with scripting off reads it, up to what ends the
+/// head there: its titles, descriptions, og: metas and canonicals are taken away (with scripting
+/// on they are its text, no element) and what else it holds is kept: a stylesheet, a style, a
+/// comment, a template, a script, a base, spaces; any case, with attributes, `/>`, unicode, empty.
+/// What follows an `<img>`, text, an `<svg>` or `</br>` in it (`</body>` once a title closed it, a
+/// `<noscript>` after `</head>`) is the body's with scripting off and is left; one whose element
+/// runs past the noscript's `</noscript` (as scripting on reads it) is left whole, as is a title
+/// that closes it where a `</head>`, `</body>` or `<noscript>` follows (read in the noscript, which
+/// passes over them, once it is taken away), not where a script closes it before them or the
+/// head ends after them either way. The tags go before the first noscript of the head, one left
+/// out too, not before one after `</head>` (the body's) or a template's. Each checked with parse5,
+/// scripting on and off (src/head.rs scan, hidden, holds, moves, FEEDBACK84.md Q-1320, found by
+/// the review of a6988b4; branch feedback82-85)
+#[test]
+fn what_a_heads_noscript_holds_is_read_as_scripting_off_reads_it() {
+    let h = said_head(&[("title", "T"), ("description", "D"), ("canonical", "/c")]);
+    let old = "<title>Old</title><meta name=\"description\" content=\"old\"><link rel=\"canonical\" href=\"/old\">";
+    let doc = |head: &str| format!("<!doctype html><html><head>{head}</head><body>b</body></html>");
+    for (head, want) in [
+        // The pixel, first, last; a stylesheet: the tags before the noscript.
+        (format!("<meta charset=\"utf-8\"><noscript><img height=\"1\" width=\"1\" src=\"https://px.example/tr\"/></noscript>{old}"), format!("<meta charset=\"utf-8\">{TDC}<noscript><img height=\"1\" width=\"1\" src=\"https://px.example/tr\"/></noscript>")),
+        (format!("{old}<noscript><img src=\"px\"></noscript>"), format!("{TDC}<noscript><img src=\"px\"></noscript>")),
+        (format!("<noscript><link rel=\"stylesheet\" href=\"a.css\"></noscript>{old}"), format!("{TDC}<noscript><link rel=\"stylesheet\" href=\"a.css\"></noscript>")),
+        (format!("<title>Old</title><noscript><iframe src=\"https://gtm.example/ns.html\" height=\"0\" width=\"0\"></iframe></noscript><meta name=\"description\" content=\"old\">"), format!("{TDC}<noscript><iframe src=\"https://gtm.example/ns.html\" height=\"0\" width=\"0\"></iframe></noscript>")),
+        // Its own of the keys said, taken away; what else it holds, kept.
+        (format!("<noscript><link rel=\"canonical\" href=\"/ns\"></noscript>{old}"), format!("{TDC}<noscript></noscript>")),
+        (format!("<noscript><title>ns</title></noscript>{old}"), format!("{TDC}<noscript></noscript>")),
+        (format!("<NOSCRIPT><META NAME=DESCRIPTION CONTENT=ns></NOSCRIPT >{old}"), format!("{TDC}<NOSCRIPT></NOSCRIPT >")),
+        (format!("<noscript class=\"a>b\"><meta name=\"description\" content=\"ns\"/></noscript>{old}"), format!("{TDC}<noscript class=\"a>b\"></noscript>")),
+        (format!("<noscript><link rel=\"stylesheet\" href=\"a.css\"><meta property=\"og:title\" content=\"ns\"><style>/* <title>s</title> */</style></noscript>{old}"), format!("{TDC}<noscript><link rel=\"stylesheet\" href=\"a.css\"><style>/* <title>s</title> */</style></noscript>")),
+        (format!("<noscript><!-- <title>c</title> --><meta name=\"description\" content=\"ns\"></noscript>{old}"), format!("{TDC}<noscript><!-- <title>c</title> --></noscript>")),
+        (format!("<noscript><template><title>t</title></template><script>document.write(\"<title>x</title>\")</script><title>ns</title></noscript>{old}"), format!("{TDC}<noscript><template><title>t</title></template><script>document.write(\"<title>x</title>\")</script></noscript>")),
+        (format!("<noscript><link rel=\"Canonical\" href=\"/ns\"><link rel=alternate href=/alt><meta property=\"og:url\" content=\"/ns\"></noscript>{old}"), format!("{TDC}<noscript><link rel=alternate href=/alt></noscript>")),
+        (format!("<noscript><link rel=\"canonical alternate\" href=\"/ns\"></noscript>{old}"), format!("{TDC}<noscript></noscript>")),
+        (format!("<noscript><meta name=\"description\" content=\"東京 · café\"></noscript>{}", old.replace("Old", "Ünï")), format!("{TDC}<noscript></noscript>")),
+        (format!("<noscript></noscript>{old}"), format!("{TDC}<noscript></noscript>")),
+        (format!("<noscript>\n  &#32;<title>ns</title>\n</noscript>{old}"), format!("{TDC}<noscript>\n  &#32;\n</noscript>")),
+        (format!("<noscript><base href=\"/b/\"><title>ns</title></noscript>{old}"), format!("{TDC}<noscript><base href=\"/b/\"></noscript>")),
+        (format!("<noscript><noscript><meta name=\"description\" content=\"ns\"></noscript></noscript>{old}"), format!("{TDC}<noscript><noscript></noscript></noscript>")),
+        (format!("<noscript><noframes><title>nf</title></noframes><meta name=\"description\" content=\"ns\"></noscript>{old}"), format!("{TDC}<noscript><noframes><title>nf</title></noframes></noscript>")),
+        (format!("<noscript></div><head><html lang=x><title>a</title><title>b</title></noscript>{old}"), format!("{TDC}<noscript></div><head><html lang=x></noscript>")),
+        // In the noscript `</head>`, `</body>` and `</html>` are passed over; once a title closed it,
+        // `</head>` is after the head, where a title or meta is still the head's.
+        (format!("<noscript></head></body></html><title>ns</title></noscript>{old}"), format!("{TDC}<noscript></head></body></html></noscript>")),
+        (format!("<noscript><title>ns</title><script>s()</script></head><meta name=\"description\" content=\"ns\"></noscript>{old}"), format!("{TDC}<noscript><script>s()</script></head></noscript>")),
+        // A title that closes it, then `</head>`, `</body>` or `<noscript>`, read in it once the
+        // title is taken away (it passes over them): left, so what follows is read as before.
+        (format!("<noscript><title>ns</title></head><meta name=\"description\" content=\"ns\"></noscript>{old}"), format!("{TDC}<noscript><title>ns</title></head></noscript>")),
+        (format!("<noscript><title>a</title></body><title>ns</title></noscript>{old}"), format!("{TDC}<noscript><title>a</title></body><title>ns</title></noscript>")),
+        (format!("<noscript><title>ns</title></head><noscript><title>b</title></noscript>{old}"), format!("{TDC}<noscript><title>ns</title></head><noscript><title>b</title></noscript>")),
+        (format!("<noscript><title>a</title><title>b</title><noscript><meta name=\"description\" content=\"ns\"></noscript>{old}"), format!("{TDC}<noscript><title>a</title><noscript></noscript>")),
+        (format!("<noscript><template><noscript></template><meta name=\"description\" content=\"ns\"></noscript>{old}"), format!("{TDC}<noscript><template><noscript></template></noscript>")),
+        (format!("<noscript><title>ns</title>x</noscript>{old}"), format!("{TDC}<noscript>x</noscript>")),
+        // Two noscripts: the tags before the first, the second's own taken away too.
+        (format!("<noscript><link rel=\"stylesheet\" href=\"a.css\"></noscript>{old}<noscript><meta name=\"description\" content=\"ns2\"></noscript>"), format!("{TDC}<noscript><link rel=\"stylesheet\" href=\"a.css\"></noscript><noscript></noscript>")),
+        // What ends the head with scripting off: what follows is the body's there, left.
+        (format!("<noscript><meta name=\"description\" content=\"ns\"><img src=px><meta name=\"description\" content=\"ns2\"></noscript>{old}"), format!("{TDC}<noscript><img src=px><meta name=\"description\" content=\"ns2\"></noscript>")),
+        (format!("<noscript>Turn on JavaScript<title>ns</title></noscript>{old}"), format!("{TDC}<noscript>Turn on JavaScript<title>ns</title></noscript>")),
+        (format!("<noscript><svg><title>s</title></svg><title>ns</title></noscript>{old}"), format!("{TDC}<noscript><svg><title>s</title></svg><title>ns</title></noscript>")),
+        (format!("<noscript></br><title>ns</title></noscript>{old}"), format!("{TDC}<noscript></br><title>ns</title></noscript>")),
+        // A style that holds `</noscript>`: scripting on ends the noscript there, so the description
+        // after it is the head's, and taken away as one.
+        (format!("<noscript><style></noscript></style><meta name=\"description\" content=\"ns\"></noscript>{old}"), format!("{TDC}<noscript><style></noscript></style></noscript>")),
+        (format!("<noscript><title>ns</title></noscript>"), format!("{TDC}<noscript></noscript>")),
+        // Not the head's: after `</head>`, in a template, in a script.
+        (format!("{old}</head><noscript><title>ns</title></noscript>"), format!("{TDC}</head><noscript><title>ns</title></noscript>")),
+        (format!("<template><noscript><title>t</title></noscript></template><script>var a = \"<noscript>\";</script>{old}"), format!("<template><noscript><title>t</title></noscript></template><script>var a = \"<noscript>\";</script>{TDC}")),
+    ] {
+        assert_eq!(with_head(&doc(&head), &h), doc(&want), "{:?}", head);
+    }
+    for (page, want) in [
+        // A head left out: the tags before its first noscript, or in place of its first element.
+        ("<!doctype html><noscript><img src=\"px\"></noscript><title>Old</title><p>x</p>", format!("<!doctype html>{TDC}<noscript><img src=\"px\"></noscript><p>x</p>")),
+        ("<!doctype html><title>Old</title><noscript><img src=\"px\"></noscript><p>x</p>", format!("<!doctype html>{TDC}<noscript><img src=\"px\"></noscript><p>x</p>")),
+        ("<!doctype html><noscript><title>ns</title></noscript><p>x</p>", format!("<!doctype html>{TDC}<noscript></noscript><p>x</p>")),
+        // A noscript that runs to the page's end: read to there.
+        ("<html><head><title>Old</title><noscript><meta name=\"description\" content=\"ns\">", format!("<html><head>{TDC}<noscript>")),
+        ("<html><head><title>Old</title><noscript><title>ns", format!("<html><head>{TDC}<noscript>")),
+        ("<html><head><title>Old</title><noscript><title>ns</title", format!("<html><head>{TDC}<noscript>")),
+        ("<head><noscript><img src=px></noscript>", format!("<head>{TDC}<noscript><img src=px></noscript>")),
+        ("<html><head><title>Old</title><noscript><", format!("<html><head>{TDC}<noscript><")),
+        ("<html><head><title>Old</title><noscript><img src=", format!("<html><head>{TDC}<noscript><img src=")),
+        ("<html><head><title>Old</title><noscript>", format!("<html><head>{TDC}<noscript>")),
+        // There a title, then `</head>` and an element no head holds: read alike with it or without.
+        ("<html><head><noscript><title>Old</title><meta name=\"description\" content=\"old\"></head><body>b</body></html>", format!("<html><head>{TDC}<noscript></head><body>b</body></html>")),
+    ] {
+        assert_eq!(with_head(page, &h), want, "{:?}", page);
+    }
+    // The limit and one past it: a title whose end tag is the noscript's last, cut; one whose end
+    // tag is after `</noscript>` (its text holds it with scripting off), left, as is a meta whose
+    // value says `</noscript>` (the text after it, `">`, ends the head with scripting on).
+    let d = said_head(&[("title", "T"), ("description", "D")]);
+    assert_eq!(with_head(&doc("<noscript><title>ns</title></noscript><title>Old</title>"), &d), doc(&format!("{TD}<noscript></noscript>")));
+    assert_eq!(with_head(&doc("<noscript><title></noscript></title><title>Old</title>"), &d), doc(&format!("{TD}<noscript><title></noscript></title>")));
+    assert_eq!(
+        with_head(&doc("<noscript><meta name=\"description\" content=\"</noscript>\"></noscript><title>Old</title>"), &d),
+        doc(&format!("{TD}<noscript><meta name=\"description\" content=\"</noscript>\"></noscript><title>Old</title>"))
+    );
+    // The scripts the head is written with: none of a noscript's (text, with scripting on).
+    let s = quillo::head::head_scripts(b"<html><head><noscript><script>ns()</script></noscript><script>a()</script></head></html>");
+    assert_eq!(s, ["<script>a()</script>"]);
 }
