@@ -1333,7 +1333,7 @@ fn a_pinned_plugin_refused_for_its_effects_lines_leaves_nothing_and_says_where()
 /// U+0080 to U+009F), the line and paragraph separators and the marks that turn the direction of
 /// text, and nothing either side of them (a space, `~`, U+00A0, U+202F, U+2065, U+206A, a joiner,
 /// `é`, CJK, an emoji); an empty text as it is. And quillo.confirmed written with them reads back
-/// the same, a `\u{...}` it cannot read taken as its letters (src/confirm.rs escaped, unseen,
+/// the same, a `\u{...}` it does not write an error (src/confirm.rs escaped, unseen,
 /// quote, unquote; FEEDBACK83.md Q-1300 D.2, found by the coverage tests; branch feedback82-85).
 #[test]
 fn what_a_terminal_acts_on_is_escaped_and_nothing_either_side() {
@@ -1374,9 +1374,13 @@ fn what_a_terminal_acts_on_is_escaped_and_nothing_either_side() {
     assert!(!text.contains(['\u{1b}', '\u{9b}', '\u{202e}', '\u{7f}', '\r', '\t']), "{:?}", text);
     let back = parse(&text).unwrap();
     assert!(back["kit/k\u{1b}.qwe"].files.contains_key(&item), "{:?}", back);
-    let hand = parse("[\"x\"]\nfiles = [\"a\\u{zz}\", \"b\\u{110000}\", \"c\\u{41}\", \"d\\u{10ffff}\", \"e\\u\"]\n").unwrap();
-    let files: Vec<&str> = hand["x"].files.keys().map(String::as_str).collect();
-    assert_eq!(files, vec!["au{zz}", "bu{110000}", "cA", "d\u{10ffff}", "eu"]);
+    // A `\u{...}` that `quote` does not write is an error naming its line, no longer taken as its
+    // letters or as a character a terminal shows (FEEDBACK83.md, Q-1300, as round 2 of the coverage
+    // fixes decided: `\u{+2e}` confirmed `.env` unseen; branch feedback82-85).
+    for (item, shown) in [("a\\u{zz}", "\\u{zz}"), ("b\\u{110000}", "\\u{110000}"), ("c\\u{41}", "\\u{41}"), ("d\\u{10ffff}", "\\u{10ffff}"), ("e\\u", "\\u")] {
+        let e = parse(&format!("[\"x\"]\nfiles = [\"{}\"]\n", item)).unwrap_err();
+        assert!(e.starts_with(&format!("line 2: `{}` is not written so", shown)), "{}: {}", item, e);
+    }
 }
 
 // ---- a builtin taken as a value, held to the file that named it (slice X2) --------------------
@@ -1496,20 +1500,22 @@ fn a_builtin_handed_on_by_a_file_with_an_empty_block_or_none_is_held_to_that_fil
     drop(g);
 }
 
-/// The stand-ins a builtin taken as a value is held by: 1,024. With 1,023 taken by as many files
-/// at the start, the 1,024th, a file's at a request, is held to that file; the 1,025th is refused
-/// whatever its file is confirmed for, the main file's too, never held to the helper's; the file
-/// that has one keeps it; a builtin called by its name needs none (src/interp.rs, FEEDBACK83.md
-/// Q-1300, found by the coverage tests; branch feedback82-85).
+/// The stand-ins a builtin taken as a value is held by: 4,096 (1,024 until the review of 2a1d3f7;
+/// FEEDBACK83.md Q-1300, branch feedback82-85). With 4,095 taken by 1,024 files at the start (four
+/// builtins each, the last file three), the 4,096th, a file's at a request, is held to that file;
+/// the 4,097th is refused whatever its file is confirmed for, the main file's too, never held to
+/// the helper's; the file that has one keeps it; a builtin called by its name needs none
+/// (src/interp.rs, FEEDBACK83.md Q-1300, found by the coverage tests; branch feedback82-85).
 #[test]
 fn past_the_stand_ins_a_builtin_taken_as_a_value_is_refused_not_held_to_the_helper() {
     let d = dir("x2-limit");
     let mut main = String::from("use lib/config.qwe\n");
-    for i in 1..=1023 {
-        write(&d, &format!("f/t{}.qwe", i), &format!("let t{} = read_file\n", i));
+    for i in 1..=1024 {
+        let taken = if i < 1024 { "read_file, write_file, delete_file, save_upload" } else { "read_file, write_file, delete_file" };
+        write(&d, &format!("f/t{}.qwe", i), &format!("let t{} = [{}]\n", i, taken));
         main.push_str(&format!("use f/t{}.qwe\n", i));
     }
-    main.push_str("import kit/a.qwe use steal_a\nimport kit/b.qwe use steal_b\nroute GET /a = steal_a().error ?? \"read\"\nroute GET /b = steal_b().error ?? \"read\"\nroute GET /mine = apply(read_file, \"data.txt\").error ?? \"read\"\nroute GET /direct = secret()\nroute GET /t = t7(\".env\").error ?? \"read\"\n");
+    main.push_str("import kit/a.qwe use steal_a\nimport kit/b.qwe use steal_b\nroute GET /a = steal_a().error ?? \"read\"\nroute GET /b = steal_b().error ?? \"read\"\nroute GET /mine = apply(read_file, \"data.txt\").error ?? \"read\"\nroute GET /direct = secret()\nroute GET /t = t7[0](\".env\").error ?? \"read\"\n");
     write(&d, "main.qwe", &main);
     write(&d, "lib/config.qwe", X2_LIB);
     write(&d, "kit/a.qwe", "use ../lib/config.qwe\nfn steal_a() = apply(read_file, \".env\")\n");
@@ -1518,7 +1524,7 @@ fn past_the_stand_ins_a_builtin_taken_as_a_value_is_refused_not_held_to_the_help
     write(&d, "data.txt", "D\n");
     write(&d, "quillo.confirmed", "[\"lib/config.qwe\"]\nfiles = [\".env\"]\n\n[\"main.qwe\"]\nfiles = [\"data.txt\"]\n");
     let (g, port, _) = serve(&d, &[]);
-    let full = "refused: more than 1024 builtins that reach out are taken as values in the program's files, and none holds this one (call it by its name)";
+    let full = "refused: more than 4096 builtins that reach out are taken as values in the program's files, and none holds this one (call it by its name)";
     assert_eq!(send(port, "GET", "/a", &[], "").body, "read_file: .env is not confirmed for kit/a.qwe (quillo confirm)");
     assert_eq!(send(port, "GET", "/b", &[], "").body, full);
     assert_eq!(send(port, "GET", "/mine", &[], "").body, full);
@@ -1526,4 +1532,556 @@ fn past_the_stand_ins_a_builtin_taken_as_a_value_is_refused_not_held_to_the_help
     assert_eq!(send(port, "GET", "/t", &[], "").body, "read_file: .env is not confirmed for f/t7.qwe (quillo confirm)");
     assert_eq!(send(port, "GET", "/direct", &[], "").body, "SECRET=1\n");
     drop(g);
+}
+
+// ---- round 2: reviews of the coverage fixes (slice F1) -----------------------------------------
+
+/// `quillo run main.qwe` in `d`, a program with no routes, which ends once it has loaded: what it
+/// printed and logged.
+fn f1_run(d: &Path) -> String {
+    let (code, out) = quillo(d, &["run", "main.qwe"]);
+    assert!(code.is_some(), "it did not end: {}", out);
+    out
+}
+
+/// Each path under `root`, from it, sorted: what a run made.
+fn f1_tree(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut todo = vec![root.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            out.push(p.strip_prefix(root).unwrap().to_string_lossy().into_owned());
+            if e.file_type().unwrap().is_dir() {
+                todo.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A `..` that follows a name that is not there is refused where a run is held, for a tenant's
+/// database: with `data/media` a link to `../../shared/media` and `data/` confirmed,
+/// `data/{tenant}/../media/{tenant}.db` makes nothing in `shared/` by `with_tenant`, nor an empty
+/// file by `new_tenant`, nor its tenant's folder; a link that leads nowhere reached so makes nothing
+/// outside; past a Unicode link too; with the tenant's folder there, where the path really leads
+/// is judged; `data/{tenant}/../{tenant}.db` is refused before its folder is there and opened in
+/// `data/` once it is; a plain tenant's database is made as before; `quillo confirm --list` shows
+/// the `..` as written, and a `./` or a leading `..` as before (src/confirm.rs real_under, listed;
+/// src/db.rs tenant_backend, claim_tenant; FEEDBACK83.md Q-1300, found by the coverage tests;
+/// branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_dotdot_past_a_name_not_there_is_refused_for_a_tenants_database() {
+    let root = dir("f1-dotdot");
+    let d = root.join("app");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("shared/media")).unwrap();
+    std::fs::create_dir_all(root.join("outside")).unwrap();
+    std::os::unix::fs::symlink("../../shared/media", d.join("data/media")).unwrap();
+    std::os::unix::fs::symlink("../../shared/media", d.join("data/médias")).unwrap();
+    std::os::unix::fs::symlink("../../outside/made.db", d.join("data/dl")).unwrap();
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nfiles = [\"data/\"]\nwrites = [\"data/\"]\n");
+    // with_tenant, the path written out.
+    write(&d, "main.qwe", "db.open(\"data/{tenant}/../media/{tenant}.db\")\nprint(str(with_tenant(\"beta\", () => db.exec(\"create table stolen (x text)\"))))\n");
+    let out = f1_run(&d);
+    assert!(out.contains("err(\"db: tenant beta: data/beta/../media/beta.db is not confirmed for main.qwe (quillo confirm)\")"), "{}", out);
+    assert!(out.contains("quillo: main.qwe: the path data/beta/../media/beta.db was refused"), "{}", out);
+    // new_tenant, the path worked out: no empty file made before the refusal.
+    write(&d, "main.qwe", "db.open(join([\"data\", \"{tenant}\", \"..\", \"media\", \"app.db\"], \"/\"))\nprint(str(new_tenant(\"acme\", () => 1)))\n");
+    let out = f1_run(&d);
+    assert!(out.contains("`new_tenant`: data/acme/../media/app.db is not confirmed for main.qwe (quillo confirm)"), "{}", out);
+    // A link that leads nowhere, reached past a name not there.
+    write(&d, "main.qwe", "let t = db.connect(join([\"data\", \"{tenant}\", \"..\", \"dl\"], \"/\"))\nprint(str(with_tenant(\"gamma\", () => t.exec(\"create table t (x int)\"))))\n");
+    let out = f1_run(&d);
+    assert!(out.contains("err(\"db: tenant gamma: data/gamma/../dl is not confirmed for main.qwe (quillo confirm)\")"), "{}", out);
+    // A plain tenant's is made; one `..` back into data/ waits for its folder; past a Unicode link.
+    write(
+        &d,
+        "main.qwe",
+        "let all = db.connect(\"data/{tenant}/app.db\")\nlet up = db.connect(\"data/{tenant}/../{tenant}.db\")\nlet uni = db.connect(\"data/{tenant}/../médias/{tenant}.db\")\nprint(\"plain: \" + str(with_tenant(\"eps\", () => all.exec(\"create table if not exists t (x int)\"))))\nprint(\"up: \" + str(with_tenant(\"delta\", () => up.exec(\"create table if not exists t (x int)\"))))\nprint(\"unicode: \" + str(with_tenant(\"zeta\", () => uni.exec(\"create table t (x int)\"))))\n",
+    );
+    let out = f1_run(&d);
+    assert!(out.contains("plain: { changes: 0, last_id: null }"), "{}", out);
+    assert!(out.contains("up: err(\"db: tenant delta: data/delta/../delta.db is not confirmed for main.qwe (quillo confirm)\")"), "{}", out);
+    assert!(out.contains("unicode: err(\"db: tenant zeta: data/zeta/../médias/zeta.db is not confirmed for main.qwe (quillo confirm)\")"), "{}", out);
+    assert_eq!(f1_tree(&root.join("shared")), vec!["media".to_string()]);
+    assert_eq!(f1_tree(&root.join("outside")), Vec::<String>::new());
+    assert_eq!(f1_tree(&d.join("data")), ["dl", "eps", "eps/app.db", "media", "médias"].map(String::from).to_vec());
+    // The folders there: each judged where it really is.
+    std::fs::create_dir_all(d.join("data/delta")).unwrap();
+    std::fs::create_dir_all(d.join("data/beta")).unwrap();
+    let out = f1_run(&d);
+    assert!(out.contains("up: { changes: 0, last_id: null }"), "{}", out);
+    assert!(d.join("data/delta.db").is_file());
+    write(&d, "main.qwe", "db.open(\"data/{tenant}/../media/{tenant}.db\")\nprint(str(with_tenant(\"beta\", () => db.exec(\"create table stolen (x text)\"))))\n");
+    let out = f1_run(&d);
+    assert!(out.contains("shared/media/beta.db is not confirmed for main.qwe (quillo confirm)"), "{}", out);
+    assert_eq!(f1_tree(&root.join("shared")), vec!["media".to_string()]);
+    // The listing: the `..` after a name as written; `./` and a leading `..` as before.
+    write(&d, "main.qwe", "db.open(\"data/{tenant}/../media/{tenant}.db\")\nlet r = read_file(\"data/./x.txt\") ?? \"\"\nlet s = read_file(\"data/a/../b.txt\") ?? \"\"\nlet u = read_file(\"../up.txt\") ?? \"\"\nlet w = write_file(\"data/n/../\" + r, s + u)\n");
+    std::fs::remove_file(d.join("quillo.confirmed")).unwrap();
+    let (code, out) = quillo(&d, &["confirm", "--list"]);
+    assert_eq!(code, Some(0), "{}", out);
+    for line in [list_line("reads", "../up.txt", "4"), list_line("reads", "data/a/../b.txt", "3"), list_line("reads", "data/x.txt", "2"), list_line("writes", "data/n/../", "5"), list_line("writes", "data/{tenant}/../media/{tenant}.db", "1")] {
+        assert!(out.contains(&line), "{:?}: {}", line, out);
+    }
+}
+
+/// SQLite's `ATTACH` and `VACUUM INTO` are held to the file whose code runs them, as `db.open`
+/// is: a file confirmed for nothing reads no other app's database, copies none out, makes no file
+/// outside, by an address (`file:`), a parameter or an expression either; `load_extension` stays
+/// off; the main file attaches and copies into the folder it may write, `:memory:` and a
+/// temporary database, but nothing through a link that leads out, nor outside; SQLite's folder for
+/// its temporary files is read but not moved; a path in SQL
+/// counts from the folder the process runs in, so a relative copy from elsewhere is refused and
+/// the guide's absolute one goes through; with no `quillo.confirmed`, as before (src/db.rs
+/// connect, authorize, statements_of, db_err; src/confirm.rs attach_ok; FEEDBACK83.md Q-1300,
+/// found by the coverage tests; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn sqlite_attach_and_vacuum_into_are_held_to_the_file_that_runs_them() {
+    let root = dir("f1-attach");
+    let d = root.join("app");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("outside")).unwrap();
+    std::os::unix::fs::symlink("../../outside", d.join("data/out")).unwrap();
+    // Nothing held: another app's database made, and attached, as before.
+    let maker = root.join("maker");
+    write(&maker, "main.qwe", "db.open(\"../outside/other.db\")\nlet _t = db.exec(\"create table secrets (v text)\")\nlet _r = db.exec(\"insert into secrets values ('s3cr3t')\")\nprint(\"attached: \" + str(db.exec(\"attach '../outside/free.db' as f\")))\nprint(\"ext: \" + str(db.query(\"select load_extension('x')\")))\n");
+    let out = f1_run(&maker);
+    assert!(out.contains("attached: { changes: 0, last_id: null }\next: err(\"db: not authorized\")"), "{}", out);
+    write(
+        &d,
+        "kit/k.qwe",
+        "component Badge() { <b>b</b> }\nfn steal() {\n    let a = db.exec(\"attach database '../outside/other.db' as o\")\n    let v = db.exec(\"vacuum main into '../outside/dump.db'\")\n    let p = db.exec(\"attach database '../outside/planted.qwe' as p\")\n    let u = db.exec(\"attach database 'file:../outside/uri.db?mode=rwc' as u\")\n    let w = db.exec(\"attach database ? as w\", \"../outside/param.db\")\n    let e = db.exec(\"attach database 'data/' || 'in.db' as i\")\n    let l = db.query(\"select load_extension('x')\")\n    let k = db.exec(\"attach database 'data/kit.db' as k\")\n    let td = db.exec(\"pragma temp_store_directory = '../outside'\")\n    return \"tmpdir: \" + str(td) + \"\\nattach: \" + str(a) + \"\\nvacuum: \" + str(v) + \"\\nplant: \" + str(p) + \"\\nuri: \" + str(u) + \"\\nparam: \" + str(w) + \"\\nexpr: \" + str(e) + \"\\next: \" + str(l) + \"\\nkit in data: \" + str(k)\n}\n",
+    );
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\ndb.open(\"data/app.db\")\nlet _a = db.exec(\"create table if not exists users (name text)\")\nlet _b = db.exec(\"insert into users values ('ann')\")\nprint(steal())\nprint(\"main attach: \" + str(db.exec(\"attach 'data/other.db' as o2\")))\nprint(\"main vacuum: \" + str(db.exec(\"vacuum into 'data/backup.db'\")))\nprint(\"main vacuum plain: \" + str(db.exec(\"vacuum\")))\nprint(\"memory: \" + str(db.exec(\"attach ':memory:' as m\")))\nprint(\"temp: \" + str(db.exec(\"attach '' as t\")))\nprint(\"link: \" + str(db.exec(\"attach 'data/out/linked.db' as l\")))\nprint(\"main outside: \" + str(db.exec(\"attach '../outside/other.db' as o3\")))\nprint(\"tmpdir read: \" + str(db.query(\"pragma temp_store_directory\")))\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n");
+    let out = f1_run(&d);
+    for (what, why) in [
+        ("attach", "outside/other.db is not confirmed for kit/k.qwe (quillo confirm)\")"),
+        ("vacuum", "outside/dump.db is not confirmed for kit/k.qwe (quillo confirm)\")"),
+        ("plant", "outside/planted.qwe is not confirmed for kit/k.qwe (quillo confirm)\")"),
+        ("uri", "db: the database file:../outside/uri.db?mode=rwc attached by its address is refused for kit/k.qwe (quillo confirm)\")"),
+        ("param", "db: a database attached by a name worked out in the SQL is refused for kit/k.qwe (quillo confirm)\")"),
+        ("expr", "db: a database attached by a name worked out in the SQL is refused for kit/k.qwe (quillo confirm)\")"),
+        ("ext", "db: not authorized to use function: load_extension"),
+        ("kit in data", "db: data/kit.db is not confirmed for kit/k.qwe (quillo confirm)\")"),
+        ("link", "outside/linked.db is not confirmed for main.qwe (quillo confirm)\")"),
+        ("main outside", "outside/other.db is not confirmed for main.qwe (quillo confirm)\")"),
+        ("tmpdir", "db: the folder of SQLite's temporary files is not moved where a quillo.confirmed holds the run\")"),
+    ] {
+        let line = out.lines().find(|l| l.starts_with(&format!("{}: ", what))).unwrap_or_else(|| panic!("{}: {}", what, out));
+        assert!(line.starts_with(&format!("{}: err(", what)) && line.contains(why), "{}", line);
+    }
+    for what in ["main attach", "main vacuum", "main vacuum plain", "memory", "temp"] {
+        assert!(out.contains(&format!("\n{}: {{ changes: 0, last_id: null }}\n", what)), "{}: {}", what, out);
+    }
+    assert!(!out.contains("s3cr3t"), "{}", out);
+    assert!(out.contains("\ntmpdir read: [") && !out.contains("tmpdir read: err"), "{}", out);
+    assert!(out.contains("quillo: kit/k.qwe: a database attached by a name worked out in the SQL was refused"), "{}", out);
+    assert_eq!(f1_tree(&root.join("outside")), ["free.db", "other.db"].map(String::from).to_vec());
+    assert!(d.join("data/backup.db").is_file() && d.join("data/other.db").is_file() && !d.join("data/kit.db").exists());
+    // Started from another folder: SQLite's relative path is that folder's.
+    let two = root.join("app2");
+    std::fs::create_dir_all(two.join("data")).unwrap();
+    write(&two, "main.qwe", "db.open(\"data/app.db\")\nlet _a = db.exec(\"create table if not exists t (x int)\")\nprint(\"relative: \" + str(db.exec(\"vacuum into 'data/copy.db'\")))\nprint(\"absolute: \" + str(db.exec(\"vacuum into ?\", db.one(\"pragma database_list\").file + \".bak\")))\n");
+    write(&two, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n");
+    let (code, out) = quillo(&root, &["run", "app2/main.qwe"]);
+    assert!(code.is_some(), "{}", out);
+    assert!(out.contains("relative: err(\"db: ") && out.contains("data/copy.db is not confirmed for main.qwe (quillo confirm)\")"), "{}", out);
+    assert!(out.contains("absolute: { changes: 0, last_id: null }"), "{}", out);
+    assert!(!root.join("data").exists() && two.join("data/app.db.bak").is_file());
+}
+
+/// The stdio door, `quillo mcp main.qwe`, given `lines` and ended after its answers: what it wrote.
+fn f1_stdio_door(d: &Path, lines: &[&str]) -> String {
+    let meta = r#""_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}"#;
+    let input: String = lines.iter().enumerate().map(|(i, l)| format!("{{\"jsonrpc\":\"2.0\",\"id\":{},{}{}}}}}\n", i + 1, l, meta)).collect();
+    let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["mcp", "main.qwe"])
+        .current_dir(d)
+        .env_remove("QUILLO_POLICY_PATH")
+        .env("QUILLO_SECRET", SECRET)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    support::stop_with_tests(&c);
+    c.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let mut so = c.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        let _ = so.read_to_string(&mut out);
+        out
+    });
+    let until = Instant::now() + Duration::from_secs(30);
+    while c.try_wait().unwrap().is_none() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = c.kill();
+    let _ = c.wait();
+    reader.join().unwrap()
+}
+
+/// The tools' names a `tools/list` answer of the stdio door gives.
+fn f1_names(out: &str) -> Vec<String> {
+    let first = out.lines().next().unwrap_or_default();
+    let v: serde_json::Value = serde_json::from_str(first).unwrap_or_else(|_| panic!("{}", out));
+    let mut names: Vec<String> = v["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
+    names.sort();
+    names
+}
+
+/// A mounted service's tools are offered, and run, once its program is confirmed, by the stdio
+/// door and by `quillo run`'s: a complete quillo.confirmed took `s.hello` away, looked up as the
+/// bare name `hello`. A taken file's `service mcp` line offers its service's tools only once that
+/// file's `fn mcp s.hello` is confirmed, and a tool of a file the service takes for some of its
+/// names only once that file's `fn mcp extra` is (src/confirm.rs scan_from's service_tools, hold,
+/// tool_ok; FEEDBACK83.md Q-1301, found by the coverage tests; branch feedback82-85).
+#[test]
+fn a_mounted_services_tools_are_offered_as_its_files_are_confirmed() {
+    let d = dir("f1-svctools");
+    write(&d, "main.qwe", "service mcp /s = \"svc/s.qwe\"\n/// Own tool.\nfn mcp own() -> str = \"own\"\nroute GET / = \"home\"\n");
+    write(&d, "svc/s.qwe", "/// A service tool.\nfn mcp hello() -> str = \"hello from service\"\nserver fn ping() -> str = \"pong\"\n");
+    let calls = [r#""method":"tools/list","params":{"#, r#""method":"tools/call","params":{"name":"s.hello","arguments":{},"#];
+    // Nothing held: offered, as before.
+    let out = f1_stdio_door(&d, &calls);
+    assert_eq!(f1_names(&out), ["own", "s.hello"].map(String::from).to_vec(), "{}", out);
+    assert_eq!(quillo(&d, &["confirm", "--yes"]).0, Some(0));
+    let out = f1_stdio_door(&d, &calls);
+    assert_eq!(f1_names(&out), ["own", "s.hello"].map(String::from).to_vec(), "{}", out);
+    assert!(out.contains("hello from service"), "{}", out);
+    let (g, port, log) = serve(&d, &["--watch"]);
+    let token = token_in(&log);
+    let mut tools = listed_tools(port, &token);
+    tools.sort();
+    assert_eq!(tools, ["own", "s.hello"].map(String::from).to_vec());
+    assert!(!read(&log).contains("is not offered"), "{}", read(&log));
+    drop(g);
+    // Mounted by a taken file, the service taking a file for one name.
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\n/// Own tool.\nfn mcp own() -> str = \"own\"\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/k.qwe", "service mcp /s = \"svc/s.qwe\"\ncomponent Badge() { <b>b</b> }\n");
+    write(&d, "svc/s.qwe", "import lib.qwe use helper\n/// A service tool.\nfn mcp hello() -> str = \"hello \" + helper()\n");
+    write(&d, "svc/lib.qwe", "fn helper() -> str = \"helped\"\n/// The lib's.\nfn mcp extra() -> str = \"extra\"\n");
+    let (code, out) = quillo(&d, &["confirm", "--list"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains(&format!("kit/k.qwe\n{}{}", list_line("adds a route", "fn mcp s.extra", "1"), list_line("adds a route", "fn mcp s.hello", "1"))), "{}", out);
+    assert!(out.contains(&format!("svc/lib.qwe\n{}", list_line("adds a route", "fn mcp extra", "3"))), "{}", out);
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    assert_eq!(f1_names(&f1_stdio_door(&d, &calls[..1])), vec!["own".to_string()]);
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n[\"kit/k.qwe\"]\nroutes = [\"fn mcp s.extra\", \"fn mcp s.hello\"]\n");
+    let out = f1_stdio_door(&d, &calls);
+    assert_eq!(f1_names(&out), ["own", "s.hello"].map(String::from).to_vec(), "{}", out);
+    assert!(out.contains("hello helped"), "{}", out);
+    assert_eq!(quillo(&d, &["confirm", "--yes"]).0, Some(0));
+    assert_eq!(f1_names(&f1_stdio_door(&d, &calls[..1])), ["own", "s.extra", "s.hello"].map(String::from).to_vec());
+}
+
+/// A `quillo.confirmed` text reads only what `quote` writes: a `\u{...}` with a sign, of a
+/// character a terminal shows (`.`), empty, of seven digits or of no character, another escape
+/// (`\.`), and a control character as it is, are errors naming their line; `\u{1b}` and
+/// `\u{1B}`, `\"`, `\\` and `é` as it is are read (src/confirm.rs unquote; FEEDBACK83.md Q-1300,
+/// found by the coverage tests; branch feedback82-85).
+#[test]
+fn a_confirmed_text_reads_only_the_escapes_quote_writes() {
+    let d = dir("f1-unquote");
+    write(&d, "main.qwe", "route GET / = read_file(\".env\") ?? \"refused\"\n");
+    write(&d, ".env", "SECRET=s3cr3t\n");
+    for (item, shown) in [
+        ("data/\\u{+2e}\\u{2e}/\\u{2e}env", "`\\u{+2e}` is not written so"),
+        ("\\u{2e}env", "`\\u{2e}` is not written so"),
+        ("x\\u{}", "`\\u{}` is not written so"),
+        ("x\\u{1b00000}", "`\\u{1b00000}` is not written so"),
+        ("x\\u{d800}", "`\\u{d800}` is not written so"),
+        ("x\\u{1b", "`\\u{1b` is not written so"),
+        ("data/\\.\\./\\.env", "`\\.` is not written so"),
+        ("x\u{1b}[1A", "a text writes a character a terminal acts on escaped, `\\u{1b}`, not as it is"),
+    ] {
+        write(&d, "quillo.confirmed", &format!("[\"main.qwe\"]\nhttp = [\"a.example\"]\nfiles = [\"{}\"]\n", item));
+        let (code, out) = quillo(&d, &["check", "main.qwe"]);
+        assert_eq!(code, Some(1), "{}: {}", item, out);
+        assert!(out.contains(&format!("quillo.confirmed: line 3: {}", shown)), "{}: {}", item, out);
+        let (code, out) = quillo(&d, &["run", "main.qwe", "--port", "0"]);
+        assert_ne!(code, None, "{}: {}", item, out);
+        assert!(!out.contains("s3cr3t") && out.contains("line 3"), "{}: {}", item, out);
+    }
+    // In a block's name and a Rust file's text too.
+    write(&d, "quillo.confirmed", "[\"main\\u{2e}qwe\"]\n");
+    assert!(quillo(&d, &["check", "main.qwe"]).1.contains("quillo.confirmed: line 1: `\\u{2e}` is not written so"));
+    write(&d, "quillo.confirmed", &format!("[\"p.qwer\"]\nsha256 = \"{}\\q\"\n", "a".repeat(64)));
+    assert!(quillo(&d, &["check", "main.qwe"]).1.contains("quillo.confirmed: line 2: `\\q` is not written so"));
+    // What quote writes, and a character as it is.
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nfiles = [\"x\\u{1b}\", \"y\\u{1B}\", \"a\\\"b\\\\c\", \"é.txt\", \".env\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+}
+
+/// A macro's name apart from its `!`, as Rust allows (`include_str !(...)`, over a line break, with
+/// `[...]` and `{...}`), is read as the macro: `effects: none` was said of a file that reads one;
+/// a `!=` and a `!` before a value stay as they were (src/confirm.rs rust_joined; FEEDBACK83.md
+/// Q-1305, found by the coverage tests; branch feedback82-85).
+#[test]
+fn a_macro_named_apart_from_its_bang_is_read() {
+    let d = dir("f1-macro");
+    let cases: &[(&str, &str)] = &[
+        ("pub fn a() -> &'static str { include_str !(\"/etc/hosts\") }\n", "include_str! (line 2)"),
+        ("pub fn a() -> usize { include_bytes\n    !(\"/etc/hosts\").len() }\n", "include_bytes! (line 2)"),
+        ("pub fn a() -> usize { include_bytes ! [\"/etc/hosts\"].len() }\n", "include_bytes! (line 2)"),
+        ("include \t! {\"/tmp/more.rs\"}\npub fn a() {}\n", "include! (line 2)"),
+        ("pub fn a() -> &'static str { std::include_str !(\"/etc/hosts\") }\n", "std::include_str! (line 2)"),
+    ];
+    for (i, (code, calls)) in cases.iter().enumerate() {
+        let name = format!("m{}.qwer", i);
+        write(&d, &name, &format!("//! effects: none\n{}", code));
+        let (exit, out) = quillo(&d, &["confirm", "--effects", &name]);
+        assert_eq!(exit, Some(1), "{}: {}", name, out);
+        assert!(out.starts_with(&format!("{}: effects: fs\n  but it says `effects: none`, and calls {}: a reading", name, calls)), "{}: {}", code, out);
+    }
+    write(&d, "none.qwer", "//! effects: none\npub fn a(x: u8, y: u8) -> bool { let include_str = x; include_str != y && !include_str_ok(y) }\nfn include_str_ok(y: u8) -> bool { y > 0 }\n");
+    assert_eq!(quillo(&d, &["confirm", "--effects", "none.qwer"]), (Some(0), "none.qwer: effects: none\n".to_string()));
+}
+
+// ---- a name used and not taken, under a quillo.confirmed (fix slice F3) ------------------------
+
+/// What `quillo check` and a start say of a taken file's use of a name it does not take.
+const NOT_TAKEN: &str = ", and under quillo.confirmed a file uses only the names it takes, as each file is held to what it was confirmed for: add `import main.qwe use ";
+
+/// The review's repro: the main file is confirmed for `.env` and 127.0.0.1 and holds `let reader =
+/// read_file`, a lambda over it and `let api = { get: http.get }`; a taken file confirmed for
+/// nothing uses the three without taking them, and read `.env` and connected. Under the
+/// quillo.confirmed each use is an error: `quillo check` says it, `quillo run` stops on it, and so
+/// does `quillo run --no-check`, before the program's first line runs, naming each. The other
+/// spellings are the same name: a method's (`".env".reader()`), a pipe's (`".env" | reader`), a
+/// component in markup (`<Leak/>`), a type made (`Cfg()`, whose defaults are its file's code). A
+/// file in other letters and an empty block are held alike; a quillo.confirmed that confirms
+/// nothing holds the program too. Taken (`import main.qwe use reader, ...`) they are the
+/// program's choice, and run; with no quillo.confirmed each use is the warning it was (src/check.rs
+/// taken and untaken_at_load, src/interp.rs load_file; FEEDBACK83.md Q-1300, found by the review of
+/// 2a1d3f7, decided by the user 2026-11-24; branch feedback82-85).
+#[test]
+fn a_name_another_file_defines_used_untaken_is_an_error_under_a_quillo_confirmed() {
+    let d = dir("f3-untaken");
+    let main = "import kit/k.qwe use Badge, steal, steal2, steal3\nlet reader = read_file\nlet reader2 = (p) => read_file(p)\nlet api = { get: http.get }\nprint(\"alias: \" + str(steal()))\nprint(\"lambda: \" + str(steal2()))\nprint(\"field: \" + str(steal3()))\n";
+    let kit = "view Badge() = <b>b</b>\nfn steal() {\n  return reader(\".env\") ?? \"refused\"\n}\nfn steal2() {\n  return reader2(\".env\") ?? \"refused\"\n}\nfn steal3() {\n  return api.get(\"http://127.0.0.1:9/x\").error ?? \"sent\"\n}\n";
+    write(&d, "main.qwe", main);
+    write(&d, "kit/k.qwe", kit);
+    write(&d, ".env", "SECRET=s3cr3t\n");
+    // Without a quillo.confirmed: warnings, and the program runs as it did.
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("./kit/k.qwe:3: warning: `reader` comes from main.qwe, which this file does not take: add `import main.qwe use reader` (`quillo fix` writes it)"), "{}", out);
+    let (code, out) = quillo(&d, &["run", "--no-check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("alias: SECRET=s3cr3t"), "{}", out);
+    // Under one: an error each, at check and at the start, checked or not.
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nfiles = [\".env\"]\nhttp = [\"127.0.0.1\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    for (line, name) in [(3, "reader"), (6, "reader2"), (9, "api")] {
+        assert!(out.contains(&format!("./kit/k.qwe:{}: error: `{}` comes from main.qwe, which this file does not take{}{}` (`quillo fix` writes it)", line, name, NOT_TAKEN, name)), "{}", out);
+    }
+    assert!(out.ends_with("quillo: 3 errors\n"), "{}", out);
+    let (code, out) = quillo(&d, &["run", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(!out.contains("SECRET") && !out.contains("alias:"), "{}", out);
+    let (code, out) = quillo(&d, &["run", "--no-check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.starts_with("quillo: a quillo.confirmed holds the program, and 1 of its files uses a name another file defines without taking it, so that it would reach what that file was confirmed for: the program is not started\n  ./kit/k.qwe:3: error: `reader` comes from main.qwe"), "{}", out);
+    assert_eq!(out.matches("\n  ./kit/k.qwe:").count(), 3, "{}", out);
+    assert!(!out.contains("SECRET") && !out.contains("alias:"), "{}", out);
+    // An empty quillo.confirmed holds the program as well; a kit with an empty block is held as one
+    // with none.
+    for conf in ["", "[\"kit/k.qwe\"]\n"] {
+        write(&d, "quillo.confirmed", conf);
+        let (code, out) = quillo(&d, &["run", "--no-check", "main.qwe"]);
+        assert_eq!(code, Some(1), "{:?}: {}", conf, out);
+        assert!(out.contains("the program is not started") && !out.contains("SECRET"), "{:?}: {}", conf, out);
+    }
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nfiles = [\".env\"]\nhttp = [\"127.0.0.1\"]\n");
+    // The other spellings, in a file in other letters: two files, each said.
+    let main2 = "import kit/ünï.qwe use m1, m2, m3, m4\nfn reader(p) {\n  return read_file(p)\n}\ncomponent Leak() {\n  return <b>{read_file(\".env\") ?? \"\"}</b>\n}\ntype Cfg = { v: str = read_file(\".env\") ?? \"none\" }\nprint(m1() + m2() + m3() + m4())\n";
+    let kit2 = "fn m1() {\n  return \".env\".reader() ?? \"\"\n}\nfn m2() {\n  return (\".env\" | reader) ?? \"\"\n}\nfn m3() {\n  return str(<Leak/>)\n}\nfn m4() {\n  return Cfg().v\n}\n";
+    write(&d, "main.qwe", main2);
+    write(&d, "kit/ünï.qwe", kit2);
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    for (line, name) in [(2, "reader"), (8, "Leak"), (11, "Cfg")] {
+        assert!(out.contains(&format!("./kit/ünï.qwe:{}: error: `{}` comes from main.qwe, which this file does not take{}{}`", line, name, NOT_TAKEN, name)), "{}", out);
+    }
+    let (code, out) = quillo(&d, &["run", "--no-check", "main.qwe"]);
+    assert_eq!((code, out.contains("the program is not started"), out.contains("SECRET")), (Some(1), true, false), "{}", out);
+    // The pipe's spelling alone is said too (a name is said once a file).
+    write(&d, "kit/ünï.qwe", &kit2.replace("\".env\".reader()", "\"\""));
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("./kit/ünï.qwe:5: error: `reader` comes from main.qwe"), "{}", out);
+    // Taken, each is the program's own choice: no word, and it runs.
+    write(&d, "main.qwe", main);
+    write(&d, "kit/k.qwe", &format!("import main.qwe use reader, reader2, api\n{}", kit));
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(!out.contains("does not take"), "{}", out);
+    let (code, out) = quillo(&d, &["run", "--no-check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("alias: SECRET=s3cr3t") && out.contains("lambda: SECRET=s3cr3t"), "{}", out);
+}
+
+/// What a program does by its own ways is as it was under a quillo.confirmed: the main file uses
+/// its own names; a component, a function and a server fn taken by name, a file taken whole; the
+/// builtins; a type named in a parameter's annotation (no value is made); a page's state read by a
+/// taken file's component; a service, called from a taken file; a mounted program and the file it
+/// takes. `quillo check` passes, and the pages answer, checked and with
+/// `--no-check` (src/check.rs taken; FEEDBACK83.md Q-1300, decided by the user 2026-11-24; branch
+/// feedback82-85).
+#[test]
+fn the_programs_own_ways_stay_as_they_were_under_a_quillo_confirmed() {
+    let d = dir("f3-own-ways");
+    write(&d, "main.qwe", "import kit/k.qwe use Card, label, hello, priced\nuse lib/whole.qwe\nservice billing = \"svc/billing.qwe\"\nmount /sub = \"sub/main.qwe\"\ntype Item = { name: str }\nstate cart = [\"tea\"]\nlet site = \"Shop\"\nfn title() {\n  return site + \" \" + upper(label(Item({ name: \"x\" }))) + \" \" + priced()\n}\nroute GET / = <html><body><h1>{title()}</h1><Card/><p>{whole()}</p></body></html>\n");
+    write(&d, "kit/k.qwe", "fn label(i: Item) -> str {\n  return i.name\n}\nfn priced() -> str {\n  return str(billing.price())\n}\ncomponent Card() {\n  return <p>{len(cart)} {upper(cart[0])}</p>\n}\nserver fn hello() -> str {\n  return \"hi\"\n}\n");
+    write(&d, "lib/whole.qwe", "fn whole() {\n  return \"whole\"\n}\n");
+    write(&d, "svc/billing.qwe", "server fn price() -> int {\n  return 7\n}\n");
+    write(&d, "sub/main.qwe", "import part.qwe use part, own\nroute GET / = part()\n");
+    write(&d, "sub/part.qwe", "let own = \"own\"\nfn part() {\n  return own + \" part\"\n}\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(!out.contains("does not take") && !out.contains("error"), "{}", out);
+    for opts in [&[][..], &["--no-check"][..]] {
+        let (g, port, log) = serve(&d, opts);
+        let page = send(port, "GET", "/", &[], "").body;
+        assert!(page.contains("<h1>Shop X 7</h1>") && page.contains("<p>1 TEA</p>") && page.contains("<p>whole</p>"), "{:?}: {}\n{}", opts, page, read(&log));
+        assert_eq!(send(port, "GET", "/sub/", &[], "").body, "own part", "{:?}", opts);
+        drop(g);
+    }
+}
+
+/// A page's state is read by every file without taking it, so under a quillo.confirmed it holds no
+/// function: the main file's `state reader = read_file`, called by a taken file's component, read
+/// `.env` as the main file. `quillo check` says it where the state is a function; `--no-check`, the
+/// page starts with the state null, said in the log, and the component's read is refused; a
+/// function in a list is refused the same at the start, and one set later at its line. A page
+/// state of data, even one read from a file, is the page's as before; with no quillo.confirmed a
+/// function is kept as it was (src/interp.rs page_start and exec_assign, src/check.rs; FEEDBACK83.md
+/// Q-1300, found fixing the review of 2a1d3f7; branch feedback82-85).
+#[test]
+fn a_page_state_holds_no_function_under_a_quillo_confirmed() {
+    let d = dir("f3-page-state");
+    write(&d, "main.qwe", "import kit/k.qwe use Page\nstate sreader = read_file\nstate list = [read_file]\nstate token = read_file(\".env\") ?? \"none\"\nroute GET / = <html><body><Page/></body></html>\nroute GET /set = <html><body><Setter/></body></html>\ncomponent Setter() {\n  sreader = upper\n  return <p>set</p>\n}\n");
+    write(&d, "kit/k.qwe", "component Page() {\n  let a = sreader(\".env\") ?? \"refused\"\n  let b = list == null ? \"refused\" : (list[0](\".env\") ?? \"refused\")\n  return <div><p>call: {a}</p><p>list: {b}</p><p>value: {token}</p></div>\n}\n");
+    write(&d, ".env", "SECRET=s3cr3t\n");
+    // No quillo.confirmed: as it was.
+    let (g, port, _) = serve(&d, &["--no-check"]);
+    let page = send(port, "GET", "/", &[], "").body;
+    assert!(page.contains("<p>call: SECRET=s3cr3t\n</p>"), "{}", page);
+    drop(g);
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nfiles = [\".env\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("main.qwe:2: error: `sreader` is the page's state, and under quillo.confirmed a page's state holds no function"), "{}", out);
+    let (g, port, log) = serve(&d, &["--no-check"]);
+    let page = send(port, "GET", "/", &[], "").body;
+    assert!(page.contains("<p>call: refused</p>") && page.contains("<p>list: refused</p>") && page.contains("<p>value: SECRET=s3cr3t\n</p>"), "{}", page);
+    assert!(log_has(&log, "quillo: the page's state `sreader`: under quillo.confirmed a page's state holds no function", 30), "{}", read(&log));
+    assert!(log_has(&log, "quillo: the page's state `list`: under quillo.confirmed", 30), "{}", read(&log));
+    let set = send(port, "GET", "/set", &[], "");
+    assert_eq!(set.status, 500, "{}", set.body);
+    assert!(log_has(&log, "`sreader` is the page's state, and under quillo.confirmed a page's state holds no function", 30), "{}", read(&log));
+    drop(g);
+}
+
+/// Under `--watch --no-check` the names are read again as the program loads again: a taken file
+/// saved to use a name it does not take stops the new version, said, and the page goes on with the
+/// one before; saved back to take it, it loads (src/check.rs untaken_at_load, src/interp.rs
+/// load_file; FEEDBACK83.md Q-1300; branch feedback82-85).
+#[test]
+fn a_name_used_untaken_is_read_again_as_the_program_loads_again() {
+    let d = dir("f3-watch");
+    write(&d, "main.qwe", "import kit/k.qwe use word\nlet secret_word = \"kept\"\nroute GET / = word()\n");
+    write(&d, "kit/k.qwe", "fn word() {\n  return \"one\"\n}\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (g, port, log) = serve(&d, &["--watch", "--no-check"]);
+    assert_eq!(send(port, "GET", "/", &[], "").body, "one");
+    write(&d, "kit/k.qwe", "fn word() {\n  return secret_word\n}\n");
+    assert!(log_has(&log, "the program is not started\n  ./kit/k.qwe:2: error: `secret_word` comes from main.qwe", 30), "{}", read(&log));
+    assert_ne!(send(port, "GET", "/", &[], "").body, "kept");
+    write(&d, "kit/k.qwe", "import main.qwe use secret_word\nfn word() {\n  return secret_word\n}\n");
+    let until = Instant::now() + Duration::from_secs(30);
+    while send(port, "GET", "/", &[], "").body != "kept" {
+        assert!(Instant::now() < until, "{}", read(&log));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    drop(g);
+}
+
+/// A module's member taken as a value alone is given one stand-in, not one for each member of the
+/// module: 700 files each taking `http.get` (7 members) took 4,900 and ran past the table; now
+/// they take 700, and a taken file's own `http.get`, at a request, is still held to that file
+/// (src/interp.rs field_of_name; FEEDBACK83.md Q-1300, found by the review of 2a1d3f7; branch
+/// feedback82-85).
+#[test]
+fn a_modules_member_taken_alone_takes_one_stand_in() {
+    let d = dir("f3-member");
+    let mut main = String::from("use lib/config.qwe\n");
+    for i in 1..=700 {
+        write(&d, &format!("f/g{}.qwe", i), &format!("let g{} = http.get\n", i));
+        main.push_str(&format!("use f/g{}.qwe\n", i));
+    }
+    main.push_str("import kit/a.qwe use steal_a\nroute GET /a = steal_a().error ?? \"sent\"\nroute GET /g = g7(\"http://127.0.0.1:1/\").error ?? \"sent\"\n");
+    write(&d, "main.qwe", &main);
+    write(&d, "lib/config.qwe", X2_LIB);
+    write(&d, "kit/a.qwe", "use ../lib/config.qwe\nfn steal_a() = apply(http.get, \"http://127.0.0.1:1/\")\n");
+    write(&d, "quillo.confirmed", "[\"lib/config.qwe\"]\nfiles = [\".env\"]\nhttp = [\"127.0.0.1\"]\n\n[\"main.qwe\"]\n");
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(send(port, "GET", "/a", &[], "").body, "http: 127.0.0.1 is not confirmed for kit/a.qwe (quillo confirm)");
+    assert_eq!(send(port, "GET", "/g", &[], "").body, "http: 127.0.0.1 is not confirmed for f/g7.qwe (quillo confirm)");
+    drop(g);
+}
+
+/// `quillo check` writes a file's name as a terminal shows it: the review's taken file named
+/// `kit/x<ESC>[2Ky.qwe` was printed as it was, and the terminal erased the line the error was on.
+/// Each character a terminal acts on is written as Quillo writes it in a text, in the file's name
+/// and in the message (`comes from kit/x\u{1b}[2Ky.qwe`), at check and at a refused start; a tab
+/// and a turn of direction (U+202E) too; a name in other letters is as it is; a message's own line
+/// breaks stay (src/check.rs Diagnostic's Display; FEEDBACK83.md Q-1300 D.2, found by the review
+/// of 2a1d3f7; branch feedback82-85).
+#[test]
+fn check_shows_a_files_name_as_a_terminal_shows_it() {
+    let d = dir("f3-name-escaped");
+    write(&d, "main.qwe", "use \"kit/x\\u{1b}[2Ky.qwe\"\nuse \"kit/t\\tab\\u{202e}é.qwe\"\nprint(k())\nprint(t())\n");
+    write(&d, "kit/x\u{1b}[2Ky.qwe", "fn k() {\n  return read_file(\"data/z.txt\") ?? \"refused\"\n}\n");
+    write(&d, "kit/t\tab\u{202e}é.qwe", "fn t() {\n  return k()\n}\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(!out.chars().any(|c| c == '\u{1b}' || c == '\t' || c == '\u{202e}'), "{:?}", out);
+    assert!(out.contains("kit/x\\u{1b}[2Ky.qwe:2: error: reads data/z.txt: not confirmed for this file"), "{}", out);
+    assert!(out.contains("./kit/t\\tab\\u{202e}é.qwe:2: error: `k` comes from kit/x\\u{1b}[2Ky.qwe, which this file does not take"), "{}", out);
+    let (code, out) = quillo(&d, &["run", "--no-check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(!out.chars().any(|c| c == '\u{1b}' || c == '\t' || c == '\u{202e}'), "{:?}", out);
+    assert!(out.contains("\n  ./kit/t\\tab\\u{202e}é.qwe:2: error: `k` comes from kit/x\\u{1b}[2Ky.qwe"), "{}", out);
+    // Nothing either side: a plain name, and a message of several lines, as they are.
+    let plain = Diag { file: "kit/é.qwe".into(), line: 3, message: "one\ntwo".into() };
+    assert_eq!(plain.shown(), "kit/é.qwe:3: error: one\ntwo");
+}
+
+/// A diagnostic as `quillo check` prints it (src/check.rs), for the edge of what is escaped.
+struct Diag {
+    file: String,
+    line: u32,
+    message: String,
+}
+
+impl Diag {
+    fn shown(&self) -> String {
+        quillo::check::Diagnostic { file: self.file.clone(), line: self.line, severity: quillo::check::Severity::Error, message: self.message.clone() }.to_string()
+    }
 }

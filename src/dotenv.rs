@@ -16,8 +16,10 @@ use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 /// Where the keys a file set are passed on to the processes started from
-/// this one.
-const FROM_FILE_VAR: &str = "QUILLO_ENV_FROM_FILE";
+/// this one: Quillo's, the services `--split` starts. Not given to `--with`'s commands, which are
+/// no Quillo service (`with::start` in src/main.rs; FEEDBACK82.md, Q-1281, found by the review of
+/// bf40063; branch feedback82-85).
+pub const FROM_FILE_VAR: &str = "QUILLO_ENV_FROM_FILE";
 
 /// The names a file set in this process, and those its app's file set, as `take_marker` takes them
 /// from the app. None is taken from the environment unasked: `QUILLO_ENV_FROM_FILE` was believed in
@@ -29,13 +31,20 @@ fn from_file() -> &'static Mutex<HashSet<String>> {
     KEYS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// The names the app's `.env` gave, passed on in `QUILLO_ENV_FROM_FILE`, believed only in a service
-/// its app started (`from_app`: `--as-service`, started by `--split`), which is what the variable is
-/// for: there the service's own `.env` comes before them. Elsewhere it is no one's word but whoever
-/// set the environment's, and is taken out, so that it reaches no process started from this one.
-/// Never a name that chooses the policy, which no `.env` sets (`load_into_process`), whoever passes
-/// it on (FEEDBACK82.md, Q-1281, found by the coverage tests; branch feedback82-85). Called once, at
-/// startup, before the program's `.env` is read.
+/// The names the app's `.env` gave, passed on in `QUILLO_ENV_FROM_FILE`, believed only where
+/// `from_app`: the process was given `--as-service` and its environment had
+/// `QUILLO_STOP_WITH_APP` (`stop_with_app` in src/main.rs), as `--split` starts a service; there
+/// the service's own `.env` comes before them, which is what the variable is for. That is what is
+/// checked, not who started the process: any starter that gives both is believed. It is enough,
+/// as believing the marker gives that starter nothing it lacks: the marker only lets the
+/// service's `.env` replace a variable the environment set, and whoever sets the environment can
+/// leave that variable out, or set it to the file's value, directly. What a starter may not do
+/// is held apart, whatever the marker says: a name that chooses the policy is never taken from
+/// it, and one the host's `[env] set` forces no file replaces (`set_by_file`). Elsewhere the
+/// marker is no one's word but whoever set the environment's, and is taken out, so that it
+/// reaches no process started from this one (FEEDBACK82.md, Q-1281, found by the coverage tests,
+/// and the review of bf40063, which found "a service its app started" said more than is checked;
+/// branch feedback82-85). Called once, at startup, before the program's `.env` is read.
 pub fn take_marker(from_app: bool) {
     let inherited = std::env::var(FROM_FILE_VAR).unwrap_or_default();
     let mut keys = from_file().lock().unwrap_or_else(std::sync::PoisonError::into_inner);

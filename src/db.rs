@@ -604,6 +604,13 @@ pub(crate) fn json_text(v: &Value) -> String {
 }
 
 fn db_err(e: impl std::fmt::Display) -> Value {
+    // A file attached that the hold refused: why, not SQLite's words alone (`authorize`), as a
+    // statement is compiled, or as `VACUUM INTO` runs.
+    let e = e.to_string();
+    let e = match e.ends_with("not authorized") || e.ends_with("authorization denied") {
+        true => STATEMENTS_OF.try_with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.refused.take())).ok().flatten().unwrap_or(e),
+        false => e,
+    };
     Value::err(Value::str(format!("db: {}", e)))
 }
 
@@ -701,6 +708,17 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
         let _ = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
     }
     let c = if path == ":memory:" { Connection::open_in_memory()? } else { Connection::open(path)? };
+    // Where a `quillo.confirmed` holds the run, which is known before any program code runs: each
+    // statement's other files judged as it is compiled (`authorize`) (FEEDBACK83.md, Q-1300,
+    // found in review of the coverage fixes; branch feedback82-85). Where none does, `db.open`
+    // takes any path, and so may a statement: no statement pays for asking. SAFETY: the
+    // connection is open, and the callback keeps no pointer: it is handed none.
+    if crate::confirm::held() {
+        let rc = unsafe { rusqlite::ffi::sqlite3_set_authorizer(c.handle(), Some(authorize), std::ptr::null_mut()) };
+        if rc != rusqlite::ffi::SQLITE_OK {
+            return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rc), Some("the database's statements could not be held".into())));
+        }
+    }
     c.execute_batch("pragma foreign_keys = on")?;
     wal(&c)?;
     // The statements a program makes, compiled once each (see `rows`).
@@ -710,6 +728,113 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
         opened(Path::new(path));
     }
     Ok(c)
+}
+
+/// The code whose statements a thread runs, where a `quillo.confirmed` holds the run: its file and
+/// its folder, noted as each database call gets its database (`statements_of`), for `authorize`
+/// to judge what a statement attaches by; none before any call, the main file's. And why
+/// `authorize` refused the file a statement attaches, for the error the statement gives, which
+/// SQLite words as `not authorized` (`db_err`) (FEEDBACK83.md, Q-1300, found in review of the
+/// coverage fixes; branch feedback82-85).
+struct Statements {
+    file: Option<Arc<str>>,
+    base: Option<Arc<Path>>,
+    refused: Option<String>,
+}
+
+thread_local! {
+    static STATEMENTS_OF: std::cell::RefCell<Statements> = const { std::cell::RefCell::new(Statements { file: None, base: None, refused: None }) };
+    /// Where the file and folder `STATEMENTS_OF` holds are, which it keeps alive: a call of the
+    /// same code as the last is told by these alone, with nothing to drop (a refusal is taken by
+    /// the error it gives, `db_err`).
+    static STATEMENTS_AT: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Notes `it`'s code as the code whose statements run now (`STATEMENTS_OF`), where a run is held:
+/// the same file's calls in a row change nothing. One look at the hold where none is.
+#[inline]
+fn statements_of(it: &Interp) {
+    if crate::confirm::held() {
+        let at = (it.cur_file.as_ref().map_or(0, |f| Arc::as_ptr(f) as *const u8 as usize), Arc::as_ptr(&it.base_dir) as *const u8 as usize);
+        if STATEMENTS_AT.get() == at {
+            return;
+        }
+        STATEMENTS_AT.set(at);
+        STATEMENTS_OF.with(|s| {
+            let mut s = s.borrow_mut();
+            let same = match (&s.file, &it.cur_file) {
+                (None, None) => true,
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                _ => false,
+            };
+            if !same {
+                s.file = it.cur_file.clone();
+            }
+            if !s.base.as_ref().is_some_and(|b| Arc::ptr_eq(b, &it.base_dir)) {
+                s.base = Some(it.base_dir.clone());
+            }
+            s.refused = None;
+        });
+    }
+}
+
+/// What SQLite asks of each statement of a connection Quillo opens, as it compiles it
+/// (`sqlite3_set_authorizer`): a file it attaches, by `ATTACH` or by `VACUUM INTO` (whose copy
+/// SQLite attaches, its name as a text, as it runs), is judged as `db.open`'s file is, by what the
+/// file whose code runs it was confirmed to write (`confirm::attach_ok`). Asked only where a run is
+/// held (`connect`). Before, `attach '../outside/other.db'` read another app's
+/// tables, `vacuum into '../outside/dump.db'` copied the users out and an attached file was made
+/// anywhere, from a file confirmed for nothing (FEEDBACK83.md, Q-1300, found in review of the
+/// coverage fixes; branch feedback82-85). `load_extension()` stays refused, as SQLite ships it,
+/// and the folder of SQLite's temporary files is not moved.
+/// Every other action is let through at once: a statement kept compiled (`prepare_cached`) is
+/// not asked again.
+unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int, a1: *const std::ffi::c_char, a2: *const std::ffi::c_char, _: *const std::ffi::c_char, _: *const std::ffi::c_char) -> std::ffi::c_int {
+    use rusqlite::ffi;
+    let text = |p: *const std::ffi::c_char| (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) });
+    match action {
+        ffi::SQLITE_ATTACH => {}
+        ffi::SQLITE_FUNCTION => return if text(a2).is_some_and(|f| f.to_bytes().eq_ignore_ascii_case(b"load_extension")) { ffi::SQLITE_DENY } else { ffi::SQLITE_OK },
+        // The folder SQLite makes its temporary files in, the whole process's: not moved by a
+        // held program's code, which would have them made anywhere (found trying to get round
+        // the hold of ATTACH).
+        ffi::SQLITE_PRAGMA => {
+            let moves = text(a2).is_some() && text(a1).is_some_and(|p| p.to_bytes().eq_ignore_ascii_case(b"temp_store_directory") || p.to_bytes().eq_ignore_ascii_case(b"data_store_directory"));
+            if !moves {
+                return ffi::SQLITE_OK;
+            }
+            STATEMENTS_OF.with(|s| {
+                if let Ok(mut s) = s.try_borrow_mut() {
+                    s.refused = Some("the folder of SQLite's temporary files is not moved where a quillo.confirmed holds the run".into());
+                }
+            });
+            return ffi::SQLITE_DENY;
+        }
+        _ => return ffi::SQLITE_OK,
+    }
+    if !crate::confirm::held() {
+        return ffi::SQLITE_OK;
+    }
+    // A name worked out in the SQL (`attach ? as x`) is given as none: it is refused.
+    let name = text(a1).map(|n| n.to_string_lossy().into_owned());
+    let judged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        STATEMENTS_OF.with(|s| match s.try_borrow() {
+            Ok(s) => crate::confirm::attach_ok(s.file.as_deref(), s.base.as_deref(), name.as_deref()),
+            Err(_) => crate::confirm::attach_ok(None, None, name.as_deref()),
+        })
+    }));
+    match judged {
+        Ok(Ok(())) => ffi::SQLITE_OK,
+        Ok(Err(why)) => {
+            STATEMENTS_OF.with(|s| {
+                if let Ok(mut s) = s.try_borrow_mut() {
+                    s.refused = Some(why);
+                }
+            });
+            ffi::SQLITE_DENY
+        }
+        Err(_) => ffi::SQLITE_DENY,
+    }
 }
 
 /// Every SQLite file the program has open (`db.open`, `db.connect`, a tenant's, `$QUILLO_DB`),
@@ -1030,6 +1155,7 @@ pub fn close_all(wait: std::time::Duration) {
 /// The database a call is on: a connection's (`db.connect`), or the program's.
 pub(crate) fn backend_on(it: &mut Interp, on: Option<usize>) -> Result<Arc<Backend>, String> {
     let Some(i) = on else { return backend(it) };
+    statements_of(it);
     let slot = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(i).map(|(_, s)| s.clone());
     match slot {
         Some(DbSlot::One(b)) => Ok(b),
@@ -1088,6 +1214,7 @@ fn slot_on(it: &Interp, on: Option<usize>) -> Option<DbSlot> {
 /// The program's database (the tenant's, for one per tenant), opening the
 /// default one if needed.
 fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
+    statements_of(it);
     let slot = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     if let Some(slot) = slot {
         return backend_in(it, slot);
@@ -1155,6 +1282,10 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         if let Some(dir) = full.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
+        // Judged again where it now really is, its folder made, before the file is: what the
+        // system takes from a folder made since is that folder's (FEEDBACK83.md, Q-1300, found in
+        // review of the coverage fixes; branch feedback82-85).
+        crate::confirm::db_ok(dbs.held, &it.base_dir, &target).map_err(|e| format!("tenant {}: {}", name, e))?;
     }
     // A server that is down stays an error; only a schema or a database that is not there
     // means no such tenant.
@@ -1493,6 +1624,12 @@ pub(crate) fn claim_tenant(it: &mut Interp, name: &str, line: u32) -> Result<boo
         let full = if Path::new(&target).is_absolute() { Path::new(&target).to_path_buf() } else { it.base_dir.join(&target) };
         if let Some(dir) = full.parent() {
             let _ = std::fs::create_dir_all(dir);
+        }
+        // Judged again, its folder made, before the file is made: an empty file was made outside
+        // and only the open after refused it (FEEDBACK83.md, Q-1300, found in review of the
+        // coverage fixes; branch feedback82-85).
+        if let Err(e) = crate::confirm::db_ok(dbs.held, &it.base_dir, &target) {
+            return fail(line, format!("`new_tenant`: {}", e));
         }
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&full) {
             Ok(_) => Ok(true),

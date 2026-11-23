@@ -1188,3 +1188,40 @@ fn a_connection_the_policy_closes_names_its_file() {
         assert!(wait_exit(&mut g.0, 60).is_some());
     }
 }
+
+// ---- the marker and `--with`'s commands (fix slice F3) ------------------------------------------
+
+/// A service its app started believes the names its app's `.env` gave (`QUILLO_ENV_FROM_FILE`),
+/// and passed them on to the commands `--with` starts, which are no Quillo service: a `quillo run`
+/// there was told which of its variables a file had set. The command now has no marker at all,
+/// in such a service and in an app whose own `.env` set names; the service itself still believes
+/// it (src/main.rs with::start, FEEDBACK82.md Q-1281, found by the review of bf40063; branch
+/// feedback82-85).
+#[test]
+fn a_with_command_is_given_no_marker_of_what_a_dotenv_set() {
+    let d = Tmp::new("with-marker");
+    write(&d, "main.qwe", "print(env(\"REAL_X\") ?? \"none\")\nroute GET / = \"home\"\n");
+    write(&d, ".env", "REAL_X=from the file\nOWN_Y=own\n");
+    let probe = "sh -c 'echo marker=[${QUILLO_ENV_FROM_FILE-unset}] > marker.txt'";
+    let wait_marker = |d: &Path, log: &str| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !read(&d.join("marker.txt")).contains('\n') {
+            assert!(Instant::now() < deadline, "{}", read(&d.join(log)));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let text = read(&d.join("marker.txt"));
+        std::fs::remove_file(d.join("marker.txt")).unwrap();
+        text
+    };
+    // A service its app started: it believes the marker (its own `.env` wins), its command sees none.
+    let mut g = start(&d, &["run", "main.qwe", "--as-service", "--port", "0", "--with", probe], &[("REAL_X", "the app's file's"), ("QUILLO_ENV_FROM_FILE", "REAL_X"), ("QUILLO_STOP_WITH_APP", "1")], "s.log");
+    assert_eq!(wait_marker(&d, "s.log"), "marker=[unset]\n");
+    wait_for(&d.join("s.log.out"), "from the file\n", 60);
+    drop(g.0.stdin.take());
+    assert!(wait_exit(&mut g.0, 60).is_some());
+    // An app whose `.env` set OWN_Y: the marker names it in the app, and its command has none.
+    let mut g = start(&d, &["run", "main.qwe", "--port", "0", "--with", probe], &[], "a.log");
+    assert_eq!(wait_marker(&d, "a.log"), "marker=[unset]\n");
+    sigterm(&g.0);
+    assert!(wait_exit(&mut g.0, 60).is_some());
+}

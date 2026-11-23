@@ -255,6 +255,67 @@ thread_local! {
     /// Set while a service is checked for a program: its `server fn`s' facts are wanted
     /// (`Analysis::server_fns`; FEEDBACK56.md, Q-853, B.3, found in review; branch feedback56).
     static SERVER_FN_FACTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether a `quillo.confirmed` holds the program the outermost check on this thread reads,
+    /// and what it found used and not taken, in it and the programs it mounts or calls as
+    /// services (`Analysis::untaken`; FEEDBACK83.md, Q-1300, decided by the user 2026-11-24;
+    /// branch feedback82-85).
+    static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static UNTAKEN: std::cell::RefCell<Vec<Diagnostic>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The program whose names a check read under a `quillo.confirmed` and found each file to take
+/// what it uses: its main file as it really is, and each of its files' length and time of change
+/// then. A start that checked it is not made to read it again (`untaken_at_load`); a file changed
+/// since is read again.
+type Stamps = Vec<(String, Option<(u64, std::time::SystemTime)>)>;
+static NAMES_READ: std::sync::Mutex<Option<(PathBuf, Stamps)>> = std::sync::Mutex::new(None);
+
+fn stamps<'a>(files: impl Iterator<Item = &'a str>) -> Stamps {
+    files
+        .map(|f| {
+            let m = std::fs::metadata(f).ok();
+            (f.to_string(), m.and_then(|m| Some((m.len(), m.modified().ok()?))))
+        })
+        .collect()
+}
+
+/// Under a `quillo.confirmed`, why the program at `main` may not load: a file of it uses a name
+/// another file defines and does not take it (`import main.qwe use reader`). The main file's
+/// `let reader = read_file`, used by a taken file confirmed for nothing, read `.env` as the main
+/// file, which was confirmed for it, and `api.get` of its `let api = { get: http.get }` connected
+/// where only the main file was confirmed to: a name not taken was a warning, and the value under
+/// it carried what the file that made it was confirmed for (FEEDBACK83.md, Q-1300, found by the
+/// review of 2a1d3f7; decided by the user 2026-11-24: an error under a quillo.confirmed, refused
+/// as the program loads even with `--no-check`; branch feedback82-85). The checker is what knows a
+/// name from a local, so this is its reading, done as the program starts when no check of these
+/// files came first (a start that checked them stopped on the error already): the start's cost,
+/// and only under a hold. A program too complex to read through is refused too, as nothing then
+/// says which names its files take.
+pub fn untaken_at_load(main: &Path) -> Result<(), String> {
+    let key = crate::modules::key(main);
+    {
+        let read = NAMES_READ.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((k, was)) = read.as_ref() {
+            if *k == key && stamps(was.iter().map(|(f, _)| f.as_str())) == *was {
+                return Ok(());
+            }
+        }
+    }
+    let a = check_file_opts(main, HashMap::new(), Options::plain());
+    if let Some(d) = a.diagnostics.iter().find(|d| d.message == TOO_COMPLEX) {
+        return Err(format!("a quillo.confirmed holds the program, and which names each of its files takes cannot be read: {}", d));
+    }
+    if a.untaken.is_empty() {
+        return Ok(());
+    }
+    let files = a.untaken.iter().map(|d| d.file.as_str()).collect::<HashSet<_>>().len();
+    let lines: Vec<String> = a.untaken.iter().map(|d| format!("  {}", d)).collect();
+    Err(format!(
+        "a quillo.confirmed holds the program, and {} {} a name another file defines without taking it, so that it would reach what that file was confirmed for: the program is not started\n{}",
+        if files == 1 { "1 of its files".to_string() } else { format!("{} of its files", files) },
+        if files == 1 { "uses" } else { "use" },
+        lines.join("\n")
+    ))
 }
 
 /// What the walk of a tool's code is to read next: a function, or a type whose records' defaults
@@ -2123,12 +2184,34 @@ impl std::fmt::Display for Diagnostic {
             Severity::Warning => "warning",
             Severity::Hint => "hint",
         };
+        // The file's name and the message as a terminal shows them: a taken file named
+        // `kit/x\u{1b}[2Ky.qwe` was printed as it is, and the terminal acted on it, erasing the line
+        // it was on; each character a terminal acts on is written as Quillo writes it in a text, as
+        // the hold's messages and the listing are (`confirm::escaped`). A message's own line
+        // breaks stay (FEEDBACK83.md, Q-1300 D.2, found by the review of 2a1d3f7; branch
+        // feedback82-85).
+        let file = if printable(&self.file, false) { std::borrow::Cow::Borrowed(self.file.as_str()) } else { crate::confirm::escaped(&self.file) };
+        let message = escaped_lines(&self.message);
         if self.line > 0 {
-            write!(f, "{}:{}: {}: {}", self.file, self.line, sev, self.message)
+            write!(f, "{}:{}: {}: {}", file, self.line, sev, message)
         } else {
-            write!(f, "{}: {}: {}", self.file, sev, self.message)
+            write!(f, "{}: {}: {}", file, sev, message)
         }
     }
+}
+
+/// Whether `s` is printable ASCII (and line breaks, where `lines`): nothing in it to escape, found
+/// a byte at a time, without reading characters, as nearly every message is.
+fn printable(s: &str, lines: bool) -> bool {
+    s.bytes().all(|b| (0x20..0x7f).contains(&b) || (lines && b == b'\n'))
+}
+
+/// `s` with each line `confirm::escaped`, its line breaks kept.
+fn escaped_lines(s: &str) -> std::borrow::Cow<'_, str> {
+    if printable(s, true) || !s.split('\n').any(|l| matches!(crate::confirm::escaped(l), std::borrow::Cow::Owned(_))) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(s.split('\n').map(|l| crate::confirm::escaped(l)).collect::<Vec<_>>().join("\n"))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2227,6 +2310,11 @@ pub struct Analysis {
     /// `quillo check` reads for what the files reach, without parsing them again (FEEDBACK83.md,
     /// Q-1300; branch feedback82-85).
     pub parsed: HashMap<PathBuf, Arc<Vec<Stmt>>>,
+    /// Under a `quillo.confirmed`, each name a file uses that another file defines and this one
+    /// does not take, said as an error (among `diagnostics` too), in this program and the programs
+    /// it mounts or calls as services: what a start refuses, checked or not (`untaken_at_load`;
+    /// FEEDBACK83.md, Q-1300, decided by the user 2026-11-24; branch feedback82-85).
+    pub untaken: Vec<Diagnostic>,
 }
 
 /// A service's tools, offered by the program checked (`Analysis::service_tools`).
@@ -2559,6 +2647,13 @@ fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: Hash
         OVER_BUDGET.with(|o| o.set(false));
         CONFINED.with(|c| c.set(opts.confined));
         DEADLINE.with(|d| d.set(opts.confined.then(|| std::time::Instant::now() + opts.time.unwrap_or(CONFINED_TIME))));
+        // Held by a `quillo.confirmed`: the one beside the main file, or, in a run, the one the
+        // run is held to (a service its app started apart is held by its app's). Not code a
+        // program's users gave it, which is no file of the program (`confined`; FEEDBACK83.md,
+        // Q-1300, decided by the user 2026-11-24; branch feedback82-85).
+        let held = !opts.confined && (crate::confirm::held() || std::fs::symlink_metadata(base_dir.join(crate::confirm::FILE)).is_ok());
+        HELD.with(|h| h.set(held));
+        UNTAKEN.with(|u| u.borrow_mut().clear());
     }
     // A mounted program's types are its own.
     let outer_records = RECORDS.with(|r| std::mem::take(&mut *r.borrow_mut()));
@@ -2566,13 +2661,21 @@ fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: Hash
     // Past its budget, a check ends with one error in place of what it said, which a walk cut
     // short cannot be sure of (FEEDBACK75.md, Q-1053; branch feedback75). The tables are given
     // back at once, not kept until the thread's next check.
-    if outermost && OVER_BUDGET.with(|o| o.get()) {
+    let over = outermost && OVER_BUDGET.with(|o| o.get());
+    if over {
         a.diagnostics = vec![Diagnostic { file: file.to_string(), line: 0, severity: Severity::Error, message: TOO_COMPLEX.to_string() }];
         TABLES.with(|t| *t.borrow_mut() = Tables::default());
     }
     if outermost {
         DEADLINE.with(|d| d.set(None));
         CONFINED.with(|c| c.set(false));
+        // What a start refuses under a hold, and, where it found nothing, that these files were
+        // read: their start does not read them again (`untaken_at_load`).
+        a.untaken = UNTAKEN.with(|u| std::mem::take(&mut *u.borrow_mut()));
+        if HELD.with(|h| h.replace(false)) && a.untaken.is_empty() && !over {
+            let files = a.files.iter().map(String::as_str).chain([file]);
+            *NAMES_READ.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((crate::modules::key(Path::new(file)), stamps(files)));
+        }
     }
     // What AI clients are told of the program, its main file's `//!` block among it, past what a
     // client may keep (FEEDBACK56.md, Part D; branch feedback56).
@@ -2606,6 +2709,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
     let mut c = Checker::new(file);
     c.strict_null = opts.strict_null;
     c.confined = opts.confined;
+    c.held = HELD.with(|h| h.get());
     c.references = opts.references;
     c.root = base_dir.to_path_buf();
     c.overrides = overrides;
@@ -2990,6 +3094,8 @@ struct Checker {
     references: bool,
     /// See `Options::confined`.
     confined: bool,
+    /// A `quillo.confirmed` holds the program: a name used and not taken is an error (`taken`).
+    held: bool,
     /// The folder of the file checked first: what a confined check stays in.
     root: PathBuf,
     /// Files `use`d inside one another, and expressions inside one another,
@@ -3203,6 +3309,7 @@ impl Checker {
             hint: None,
             strict_null: false,
             references: true,
+            held: false,
             letting: Vec::new(),
             set_fields: Vec::new(),
             plain_dollars: HashSet::new(),
@@ -5120,7 +5227,15 @@ impl Checker {
     /// feedback19-fixes). For now that is a warning, and the name still works, so a
     /// program can move a file at a time; `quillo fix` writes the `use`.
     fn taken(&mut self, name: &str, v: &Var) {
-        if v.kind != Kind::Global || &*v.file == "<builtin>" || v.file == self.file || self.everywhere.contains(name) {
+        if v.kind != Kind::Global || &*v.file == "<builtin>" || v.file == self.file {
+            return;
+        }
+        // Types and services are the program's, seen in every file; under a `quillo.confirmed`
+        // a type is taken as other names are, as its defaults are its file's code: a taken file
+        // confirmed for nothing made the main file's `type Cfg = { v: str = read_file(".env") ?? "" }`
+        // and had `.env` (FEEDBACK83.md, Q-1300, found fixing the review of 2a1d3f7; branch
+        // feedback82-85). A service's code is held to its own files.
+        if self.everywhere.contains(name) && !(self.held && RECORDS.with(|r| r.borrow().contains_key(name))) {
             return;
         }
         let (file, from) = (self.key_of(&self.file.clone()), self.key_of(&v.file));
@@ -5138,10 +5253,24 @@ impl Checker {
         }
         let shown = crate::privacy::demangle(name);
         let at = self.links.written(&from);
-        self.warn(match script {
-            Some(_) => format!("`{}` is a browser library this file does not take: write its line here too (`quillo fix` does)", shown),
-            None => format!("`{}` comes from {}, which this file does not take: add `import {} use {}` (`quillo fix` writes it)", shown, at, at, shown),
-        });
+        let held = if self.held { ", and under quillo.confirmed a file uses only the names it takes, as each file is held to what it was confirmed for" } else { "" };
+        let msg = match script {
+            Some(_) => format!("`{}` is a browser library this file does not take{}: write its line here too (`quillo fix` does)", shown, held),
+            None => format!("`{}` comes from {}, which this file does not take{}: add `import {} use {}` (`quillo fix` writes it)", shown, at, held, at, shown),
+        };
+        // Under a `quillo.confirmed`, an error, and a start refuses it, checked or not
+        // (`untaken_at_load`): the value under the name is the other file's, and carries what that
+        // file was confirmed for, so main's `let reader = read_file` read `.env` for a taken file
+        // confirmed for nothing (FEEDBACK83.md, Q-1300, found by the review of 2a1d3f7; decided by
+        // the user 2026-11-24; branch feedback82-85). Without one it stays a warning, so a program
+        // can move a file at a time.
+        if !self.held {
+            self.warn(msg);
+        } else {
+            let message = crate::privacy::demangle(&msg).replace(OLD, "");
+            UNTAKEN.with(|u| u.borrow_mut().push(Diagnostic { file: self.file.to_string(), line: self.line, severity: Severity::Error, message }));
+            self.error(msg);
+        }
         self.out.imports.push(crate::check::Import {
             file: self.file.to_string(),
             name: shown,
@@ -6536,6 +6665,13 @@ impl Checker {
                     }
                 }
                 let assigned = self.assigned.contains(name);
+                // A page's state that is a function, under a quillo.confirmed: refused as each page
+                // starts, as every file reads a page's state without taking it (interp.rs
+                // `PAGE_STATE_FN`; FEEDBACK83.md, Q-1300, found fixing the review of 2a1d3f7;
+                // branch feedback82-85).
+                if self.held && self.scopes.is_empty() && t.bits == FN {
+                    self.error(format!("`{}` is the page's state, and under quillo.confirmed a page's state holds no function (every file reads it without taking it, and a function in it would reach what this file was confirmed for): keep the function in a `let` or `fn`, and take it by name where it is used", name));
+                }
                 self.twice(name, Kind::State);
                 // Set from a call that can fail (FEEDBACK81.md, Q-1272; branch feedback72-81).
                 if t.bits & ERR != 0 && !assigned && self.shows_failure(e) {

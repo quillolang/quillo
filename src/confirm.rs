@@ -106,6 +106,11 @@ pub struct Block {
     pub taken: bool,
     /// Its tools (`fn mcp`), whichever way it is taken. Found only.
     pub tools: Vec<String>,
+    /// The tools its `service mcp /s = "s.qwe"` lines offer: each by the name the door gives it
+    /// (`s.hello`), with the file of the service's program that declares it and its name there.
+    /// Found only (FEEDBACK83.md, Q-1301, found in review of the coverage fixes; branch
+    /// feedback82-85).
+    pub service_tools: Vec<(String, String, String)>,
 }
 
 impl Block {
@@ -211,6 +216,8 @@ struct Read {
     name: String,
     stmts: std::sync::Arc<Vec<Stmt>>,
     takes: Vec<(PathBuf, Option<Vec<String>>, bool)>,
+    /// Its `service mcp` lines' services: the name each one's tools are offered under, its file.
+    services: Vec<(String, PathBuf)>,
 }
 
 /// `scan_with`, from `main`, naming files from `dir`: a service started apart is held by its app's
@@ -248,6 +255,7 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
             }
         };
         let mut takes = Vec::new();
+        let mut services = Vec::new();
         for s in stmts.iter() {
             match s {
                 Stmt::Use(path, names, _, options) if !is_script(path) => {
@@ -259,13 +267,41 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
                     let p = base.join(path);
                     let own = p.parent().map_or_else(|| base.clone(), Path::to_path_buf);
                     takes.push((crate::modules::key(&p), None, false));
+                    if let Stmt::Service(name, _, _, _, _, true) = s {
+                        services.push((name.clone(), crate::modules::key(&p)));
+                    }
                     todo.push((p, own));
                 }
                 _ => {}
             }
         }
-        read.insert(key, Read { name, stmts, takes });
+        read.insert(key, Read { name, stmts, takes, services });
     }
+    // What each `service mcp` line offers, as the door names it (`mcp::tools`): the tools of the
+    // service's program, its file's and those of the files it takes by `use`, each with the file
+    // that declares it. The door asked for `s.hello` among the bare names, `hello`, and a mounted
+    // service's tools were never offered once a quillo.confirmed was there (FEEDBACK83.md, Q-1301,
+    // found in review of the coverage fixes; branch feedback82-85).
+    let offered = |root: &PathBuf| -> Vec<(String, String)> {
+        let (mut seen, mut todo, mut out) = (HashSet::new(), vec![root.clone()], Vec::new());
+        while let Some(k) = todo.pop() {
+            let Some(r) = read.get(&k).filter(|_| seen.insert(k.clone())) else { continue };
+            for s in r.stmts.iter() {
+                if let Stmt::Fn(d) = s {
+                    if d.mcp {
+                        out.push((r.name.clone(), d.name.clone()));
+                    }
+                }
+            }
+            todo.extend(r.takes.iter().filter(|(_, _, used)| *used).map(|(t, _, _)| t.clone()));
+        }
+        out
+    };
+    let service_tools: HashMap<PathBuf, Vec<(String, String, String)>> = read
+        .iter()
+        .filter(|(_, r)| !r.services.is_empty())
+        .map(|(k, r)| (k.clone(), r.services.iter().flat_map(|(s, file)| offered(file).into_iter().map(move |(f, t)| (format!("{}.{}", s, t), f, t))).collect()))
+        .collect();
     // Which files are taken for some of their names: those a `use` takes names of, and those such
     // a file takes whole, through any number of files; a file taken both ways is taken, whatever
     // the order the files were read in (FEEDBACK83.md, Q-1301, found in review; branch
@@ -299,11 +335,17 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
     }
     for (key, r) in read {
         let names = taken.get(&key);
-        let mut b = Block { taken: names.is_some(), ..Default::default() };
+        let mut b = Block { taken: names.is_some(), service_tools: service_tools.get(&key).cloned().unwrap_or_default(), ..Default::default() };
         let mut routes: Vec<(String, u32)> = Vec::new();
         let mut at_start: Vec<u32> = Vec::new();
         for s in r.stmts.iter() {
             match s {
+                // A taken file's `service mcp` line offers its service's tools: ways in, as its own
+                // tools are (Q-1301, found in review of the coverage fixes).
+                Stmt::Service(name, _, path, _, line, true) if b.taken && !is_address(path) => {
+                    let prefix = format!("{}.", name);
+                    routes.extend(b.service_tools.iter().filter(|(d, _, _)| d.starts_with(&prefix)).map(|(d, _, _)| (format!("fn mcp {}", d), *line)));
+                }
                 Stmt::Use(path, _, line, _) if is_script(path) && is_address(path) => add(&mut b.scripts, path.clone(), *line),
                 Stmt::Route(rd) if b.taken => routes.push((rd.shown(), rd.line)),
                 // A taken file's `server fn` is called from the browser, and its `fn mcp` by an AI
@@ -664,12 +706,37 @@ fn origin_written(e: &Expr) -> Option<String> {
 fn path_written(e: &Expr) -> Option<String> {
     let (s, whole) = written_start(e)?;
     if whole {
-        let n = normal(&s);
+        let n = listed(&s);
         return (!n.is_empty()).then_some(n);
     }
     let folder = &s[..s.rfind('/')? + 1];
-    let n = normal(folder);
+    let n = listed(folder);
     (!n.is_empty()).then(|| if n.ends_with('/') { n } else { format!("{}/", n) })
+}
+
+/// A path the code writes, as the listing shows it: `normal`'s, but with a `..` that follows a
+/// name kept as written, as the system takes it from where that name leads, which the hold judges
+/// so (`real_under`). Taken away, `data/{tenant}/../media/{tenant}.db` was listed as
+/// `data/media/{tenant}.db`, and the developer said yes to a path the code does not write
+/// (FEEDBACK83.md, Q-1300, found in review of the coverage fixes; branch feedback82-85).
+fn listed(p: &str) -> String {
+    let mut named = false;
+    let after_name = Path::new(p).components().any(|c| {
+        named |= matches!(c, Component::Normal(_));
+        named && c == Component::ParentDir
+    });
+    if !after_name {
+        return normal(p);
+    }
+    let parts: Vec<String> = Path::new(p).components().filter(|c| *c != Component::CurDir && *c != Component::RootDir).map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    let mut s = parts.join("/");
+    if p.starts_with('/') {
+        s.insert(0, '/');
+    }
+    if p.ends_with('/') {
+        s.push('/');
+    }
+    s
 }
 
 /// A path as it is compared: `./` and `x/..` taken away, `/` between its parts, a folder's `/`
@@ -1023,7 +1090,12 @@ fn rust_joined(code: &str) -> String {
         }
         if space(c) {
             let j = i + b[i..].iter().take_while(|x| space(**x)).count();
-            if b.get(j) == Some(&b'(') && out.last().is_some_and(|l| rust_name_byte(*l) || *l == b'!') {
+            // And between a macro's name and its `!`, which Rust allows: `include_str !("/etc/hosts")`
+            // read as `effects: none` (FEEDBACK83.md, Q-1305, found in review of the coverage fixes;
+            // branch feedback82-85). A `!` with its delimiter after it, not `!=` or a `!` before a
+            // value (`if !x`).
+            let mac = b.get(j) == Some(&b'!') && b[j + 1..].iter().find(|x| !space(**x)).is_some_and(|d| matches!(d, b'(' | b'[' | b'{'));
+            if (b.get(j) == Some(&b'(') || mac) && out.last().is_some_and(|l| rust_name_byte(*l) || *l == b'!') {
                 owed += b[i..j].iter().filter(|x| **x == b'\n').count();
                 i = j;
                 continue;
@@ -1345,34 +1417,48 @@ fn scan_rust(bytes: &[u8]) -> Block {
 /// What `quillo.confirmed` says, by file.
 pub type Confirmed = BTreeMap<String, Block>;
 
-fn unquote(s: &str) -> Option<(String, &str)> {
+/// A text as `quote` writes it, and what follows it; None where `s` does not start with one, or
+/// it does not end. Only what `quote` writes is read: `\"`, `\\`, `\n`, `\t`, `\r`, and
+/// `\u{1b}` (hex digits) for a character a terminal acts on (`unseen`); any other escape, and such
+/// a character written as it is, is an error. Before, `\u{+2e}` was read through
+/// `from_str_radix`, which takes a sign, and `\u{2e}` or `\.` as `.`: `"data/\u{+2e}\u{2e}/\u{2e}env"`
+/// confirmed `.env` where nothing showing the file shows it (FEEDBACK83.md, Q-1300, found in
+/// review of the coverage fixes; branch feedback82-85).
+fn unquote(s: &str) -> Result<Option<(String, &str)>, String> {
     let s = s.trim_start();
-    let rest = s.strip_prefix('"')?;
+    let Some(rest) = s.strip_prefix('"') else { return Ok(None) };
     let mut out = String::new();
     let mut chars = rest.char_indices();
     while let Some((i, c)) = chars.next() {
         match c {
-            '"' => return Some((out, &rest[i + 1..])),
-            '\\' => match chars.next()?.1 {
-                'n' => out.push('\n'),
-                't' => out.push('\t'),
-                'r' => out.push('\r'),
+            '"' => return Ok(Some((out, &rest[i + 1..]))),
+            '\\' => match chars.next().map(|(_, c)| c) {
+                None => return Ok(None),
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some(c @ ('"' | '\\')) => out.push(c),
                 // `\u{1b}`, as `quote` writes a control character (`unseen`).
-                'u' => match rest[i + 2..].strip_prefix('{').and_then(|r| r.split_once('}')).and_then(|(h, _)| u32::from_str_radix(h, 16).ok().and_then(char::from_u32).map(|c| (c, h.len()))) {
-                    Some((c, n)) => {
-                        out.push(c);
-                        for _ in 0..n + 2 {
-                            chars.next();
-                        }
+                Some('u') => {
+                    let hex = rest[i + 2..].strip_prefix('{').and_then(|r| r.split_once('}')).map(|(h, _)| h).filter(|h| (1..=6).contains(&h.len()) && h.bytes().all(|b| b.is_ascii_hexdigit()));
+                    let c = hex.and_then(|h| u32::from_str_radix(h, 16).ok()).and_then(char::from_u32).filter(|c| unseen(*c));
+                    let (Some(h), Some(c)) = (hex, c) else {
+                        // The escape as written, to its `}` or the text's end.
+                        let shown: String = rest[i..].chars().scan(false, |done, c| (!*done && c != '"').then(|| { *done = c == '}'; c })).take(16).collect();
+                        return Err(format!("`{}` is not written so: a text writes `\\u{{...}}` only in hex digits, for a character a terminal does not show", escaped(&shown)));
+                    };
+                    out.push(c);
+                    for _ in 0..h.len() + 2 {
+                        chars.next();
                     }
-                    None => out.push('u'),
-                },
-                c => out.push(c),
+                }
+                Some(c) => return Err(format!("`\\{}` is not written so: a text writes only `\\\"`, `\\\\`, `\\n`, `\\t`, `\\r` and `\\u{{...}}`", escaped(&c.to_string()))),
             },
+            c if unseen(c) => return Err(format!("a text writes a character a terminal acts on escaped, `{}`, not as it is", escaped(&c.to_string()))),
             c => out.push(c),
         }
     }
-    None
+    Ok(None)
 }
 
 /// Whether a terminal does something with `c` other than show it: a control character (C0, DEL,
@@ -1454,7 +1540,7 @@ pub fn parse(text: &str) -> Result<Confirmed, String> {
         }
         if let Some(inner) = line.strip_prefix('[') {
             let inner = inner.strip_suffix(']').ok_or_else(|| err("a file's block is `[\"path\"]`"))?;
-            let name = match unquote(inner) {
+            let name = match unquote(inner).map_err(|e| err(&e))? {
                 Some((name, rest)) if rest.trim().is_empty() => name,
                 _ => inner.trim().to_string(),
             };
@@ -1480,7 +1566,7 @@ pub fn parse(text: &str) -> Result<Confirmed, String> {
         let b = out.entry(file).or_default();
         match key {
             "sha256" | "effects" => {
-                let (v, rest) = unquote(&value).ok_or_else(|| err(&format!("`{}` is a text: \"...\"", key)))?;
+                let (v, rest) = unquote(&value).map_err(|e| err(&e))?.ok_or_else(|| err(&format!("`{}` is a text: \"...\"", key)))?;
                 if !rest.trim().is_empty() && !rest.trim().starts_with('#') {
                     return Err(err("one text after `=`"));
                 }
@@ -1508,7 +1594,7 @@ pub fn parse(text: &str) -> Result<Confirmed, String> {
                         }
                         break;
                     }
-                    let (item, after) = unquote(rest).ok_or_else(|| err(&format!("`{}` is a list of texts", k)))?;
+                    let (item, after) = unquote(rest).map_err(|e| err(&e))?.ok_or_else(|| err(&format!("`{}` is a list of texts", k)))?;
                     rest = after;
                     let (item, hash) = match item.split_once(' ') {
                         Some((u, h)) if k == "scripts" && h.starts_with("sha") => (u.to_string(), Some(h.trim().to_string())),
@@ -1797,7 +1883,19 @@ fn hold(dir: &Path, main: &Path, conf: &Confirmed, found: &Scan) {
             }
         }
     }
-    let known_tools: HashSet<String> = found.files.values().flat_map(|b| b.tools.iter().cloned()).collect();
+    // A service's tool by the name the door gives it, held where the file of the service's
+    // program that declares it is taken for some of its names and has not had it confirmed, as a
+    // taken file's own tool is (Q-1301, found in review of the coverage fixes).
+    for b in found.files.values() {
+        for (door, file, own) in &b.service_tools {
+            let route = format!("fn mcp {}", own);
+            let held = found.files.get(file).is_some_and(|f| f.taken && f.routes.contains_key(&route));
+            if held && !conf.get(file).is_some_and(|c| c.routes.contains_key(&route)) {
+                refused_tools.insert(door.clone());
+            }
+        }
+    }
+    let known_tools: HashSet<String> = found.files.values().flat_map(|b| b.tools.iter().cloned().chain(b.service_tools.iter().map(|(d, _, _)| d.clone()))).collect();
     // The page's policy from the files the program has now, not from blocks a file it no longer
     // takes left behind (found in review 2).
     let current: Confirmed = conf.iter().filter(|(f, _)| found.files.contains_key(*f)).map(|(f, b)| (f.clone(), b.clone())).collect();
@@ -1954,6 +2052,33 @@ pub fn db_ok(id: u32, base: &Path, target: &str) -> Result<(), String> {
     path_in(h, i, None, base, target, true)
 }
 
+/// Why SQLite may not attach the file `name` for the code of `cur_file` (whose folder is `base`),
+/// if it may not: `ATTACH`, and `VACUUM INTO`, which attaches its copy (`db::authorize`). Held
+/// as `db_ok` holds a database's file, to what the file was confirmed to write, as attaching
+/// opens it to be written, and makes it where it is not there. Its path counts from the folder
+/// the process runs in, as SQLite opens it, not from the program's. A temporary database (no
+/// name) and `:memory:` are none; a `file:` address is refused, as `db.open` takes none, and so
+/// is a name the SQL works out (`attach ? as x`), which SQLite gives as none (FEEDBACK83.md,
+/// Q-1300, found in review of the coverage fixes; branch feedback82-85).
+pub fn attach_ok(cur_file: Option<&str>, base: Option<&Path>, name: Option<&str>) -> Result<(), String> {
+    let Some(h) = HOLD.get() else { return Ok(()) };
+    let i = h.id(cur_file);
+    let refused = |what: String| -> Result<(), String> {
+        let file = if i == 0 { cur_file.map_or_else(|| h.main.clone(), |f| rel_name(&h.dir, Path::new(f))) } else { h.name_of(i).to_string() };
+        h.say(format!("{}: {} was refused (`quillo confirm` lists what a file may write)", file, what));
+        Err(format!("{} is refused for {} (quillo confirm)", what, file))
+    };
+    let Some(name) = name else { return refused("a database attached by a name worked out in the SQL".into()) };
+    if name.is_empty() || name == ":memory:" {
+        return Ok(());
+    }
+    if name.starts_with("file:") {
+        return refused(format!("the database {} attached by its address", name));
+    }
+    let full = if Path::new(name).is_absolute() { PathBuf::from(name) } else { std::env::current_dir().map_err(|e| e.to_string())?.join(name) };
+    path_in(h, i, cur_file, base.unwrap_or(&h.dir), &full.to_string_lossy(), true)
+}
+
 /// A packet's mark, where the run is held: what a UDP packet the program was handed says it came
 /// from, signed with a key of this process's, so a reply goes back to its sender and to no address
 /// the program wrote into a map of its own (`udp.reply`; found in review 2). None when nothing is
@@ -1999,19 +2124,22 @@ pub fn listen_ok(cur_file: Option<&str>, host: &str, port: u16) -> Result<(), St
 /// a link to `../../shared/media`, was judged as `data/y.bin` and written in `shared/`
 /// (FEEDBACK83.md, Q-1300, found by the coverage tests; branch feedback82-85). A path that is
 /// there costs one `canonicalize`, as before.
+///
+/// None too where a `..` follows a name that is not there, as `builtins::real_path` refuses it:
+/// once that name is made (a tenant's folder, by `create_dir_all`), the system takes the `..`
+/// from it, and the names after it from where they really lead. Taken as text, a link after the
+/// `..` was never followed: `data/{tenant}/../media/x.db`, with `data/media` a link to
+/// `../../shared/media`, was judged as `data/media/x.db` and made in `shared/` (FEEDBACK83.md,
+/// Q-1300, found in review of the coverage fixes; branch feedback82-85). What follows the part
+/// that is there is plain names, so a folder made for it is made where it was judged.
 fn real_under(base: &Path, p: &str) -> Option<PathBuf> {
     let full = if Path::new(p).is_absolute() { PathBuf::from(p) } else { base.join(p) };
     let mut at = full.as_path();
-    let mut after: Vec<Component> = Vec::new();
+    let mut after: Vec<&std::ffi::OsStr> = Vec::new();
     loop {
         if let Ok(mut r) = at.canonicalize() {
             for c in after.iter().rev() {
-                match c {
-                    Component::ParentDir => {
-                        r.pop();
-                    }
-                    c => r.push(c.as_os_str()),
-                }
+                r.push(c);
             }
             return Some(r);
         }
@@ -2019,7 +2147,7 @@ fn real_under(base: &Path, p: &str) -> Option<PathBuf> {
             return None;
         }
         match at.components().next_back()? {
-            c @ (Component::Normal(_) | Component::ParentDir) => after.push(c),
+            Component::Normal(n) => after.push(n),
             Component::CurDir => {}
             _ => return None,
         }

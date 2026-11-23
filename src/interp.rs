@@ -169,6 +169,10 @@ impl Interp {
             let v = self.eval(e, &globals);
             self.cur_file = was;
             let v = match v {
+                Ok(v) if crate::confirm::held() && holds_function(&v) => {
+                    eprintln!("quillo: the page's state `{}`: {}", name, PAGE_STATE_FN);
+                    Value::Nil
+                }
                 Ok(v) => v,
                 Err(Ctrl::Error(e)) => {
                     eprintln!("quillo: the page's state `{}`: {}", name, e);
@@ -181,6 +185,30 @@ impl Interp {
         self.pending_request = None;
         self.current_request = None;
     }
+}
+
+/// Under a `quillo.confirmed`, a page's state holds no function. Every file reads it without taking
+/// it (a page state is the page's, not a file's name to take), so the main file's `state reader =
+/// read_file` was called by a taken file confirmed for nothing, and read `.env` as the main file,
+/// as its `let reader` was before a name had to be taken (FEEDBACK83.md, Q-1300, found fixing the
+/// review of 2a1d3f7; branch feedback82-85). Its value goes to the browser as data anyway, where a
+/// function is a text. Said where it is set, and the state is null.
+const PAGE_STATE_FN: &str = "under quillo.confirmed a page's state holds no function (every file reads it without taking it, and a function in it would reach what the file that wrote it was confirmed for): keep the function in a `let` or `fn`, and take it by name where it is used";
+
+/// Whether `v` is or holds a function: a closure, a component, a builtin. Without recursion, as a
+/// value may be nested deeper than a stack goes.
+fn holds_function(v: &Value) -> bool {
+    let mut todo: Vec<&Value> = vec![v];
+    while let Some(v) = todo.pop() {
+        match v {
+            Value::Func(_) | Value::Builtin(..) => return true,
+            Value::List(xs) => todo.extend(xs.iter()),
+            Value::Map(m) => todo.extend(m.values()),
+            Value::Err(inner, ..) => todo.push(inner),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// A page state read or set where no page is being made: a job, a timer, a channel's handler, a
@@ -2214,6 +2242,28 @@ fn same_file(a: &Option<Arc<str>>, b: &Option<Arc<str>>) -> bool {
     }
 }
 
+thread_local! {
+    /// How many program files are loading on this thread, one inside another (a `mount`, a
+    /// service): the outermost is the program (`load_file`).
+    static LOADS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A file's load in progress (`LOADS`), ended on every way out, a panic's included.
+struct Loading;
+
+impl Loading {
+    fn enter() -> Loading {
+        LOADS.with(|l| l.set(l.get() + 1));
+        Loading
+    }
+}
+
+impl Drop for Loading {
+    fn drop(&mut self) {
+        LOADS.with(|l| l.set(l.get().saturating_sub(1)));
+    }
+}
+
 // ---- a builtin taken as a value, held to the file that named it --------------------------------
 //
 // A builtin named where it is not called (`apply(read_file, p)`, `let get = http.get`, `items |
@@ -2229,13 +2279,23 @@ fn same_file(a: &Option<Arc<str>>, b: &Option<Arc<str>>) -> bool {
 // may reach something (`carries_origin`); a builtin called by its name is called by the code that
 // names it, and is as it was (`eval_called`).
 
-/// How many builtins, each as one file names it, can be held to that file: a program names few
-/// that reach out as values. Past them a builtin so named is refused when it is called
-/// (`named_full`), never held to the file that calls it.
-const NAMED_SLOTS: usize = 1024;
+/// How many builtins, each as one file names it, can be held to that file. Past them a builtin so
+/// named is refused when it is called (`named_full`), never held to the file that calls it. 4,096:
+/// a module handed on whole takes one for each of its members (`db` 15, `http` 7), and 1,024 were
+/// gone in a program of some 46 files that each handed `db` and `http` on (FEEDBACK83.md, Q-1300,
+/// found by the review of 2a1d3f7; branch feedback82-85); a member taken alone takes one
+/// (`field_of_name`). Each stand-in is a function of 24 bytes, its name in the binary's symbols
+/// and its entry in `NAMED_FNS`: some 310 KB more of the binary than 1,024 took (0.9%), and their
+/// builtins and files (`NAMED`) are made only for a held run.
+const NAMED_SLOTS: usize = 4096;
 
-/// Each stand-in's builtin and the file that named it, given before the stand-in is.
-static NAMED: [OnceLock<(BuiltinFn, Option<Arc<str>>)>; NAMED_SLOTS] = [const { OnceLock::new() }; NAMED_SLOTS];
+/// Each stand-in's builtin and the file that named it, given before the stand-in is: made the first
+/// time a stand-in is given, which is in a held run only (32 bytes each), not kept in the binary.
+static NAMED: OnceLock<Box<[OnceLock<(BuiltinFn, Option<Arc<str>>)>]>> = OnceLock::new();
+
+fn named() -> &'static [OnceLock<(BuiltinFn, Option<Arc<str>>)>] {
+    NAMED.get_or_init(|| (0..NAMED_SLOTS).map(|_| OnceLock::new()).collect())
+}
 
 /// The stand-ins given: by builtin and file, and each by its address, to know one.
 #[derive(Default)]
@@ -2251,20 +2311,42 @@ fn named_slot<const K: usize>(it: &mut Interp, args: Vec<Value>, line: u32) -> R
 }
 
 macro_rules! named_row {
-    ($hi:literal) => {
+    ($hi:expr) => {
         named_row!(@ $hi; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
     };
-    (@ $hi:literal; $($lo:literal)*) => {
+    (@ $hi:expr; $($lo:literal)*) => {
         [$(named_slot::<{ $hi * 32 + $lo }> as BuiltinFn),*]
     };
 }
 
-static NAMED_FNS: [[BuiltinFn; 32]; NAMED_SLOTS / 32] = [
-    named_row!(0), named_row!(1), named_row!(2), named_row!(3), named_row!(4), named_row!(5), named_row!(6), named_row!(7),
-    named_row!(8), named_row!(9), named_row!(10), named_row!(11), named_row!(12), named_row!(13), named_row!(14), named_row!(15),
-    named_row!(16), named_row!(17), named_row!(18), named_row!(19), named_row!(20), named_row!(21), named_row!(22), named_row!(23),
-    named_row!(24), named_row!(25), named_row!(26), named_row!(27), named_row!(28), named_row!(29), named_row!(30), named_row!(31),
+/// 32 rows of 32 stand-ins, the `$block`th such.
+macro_rules! named_rows {
+    ($block:literal) => {
+        named_rows!(@ $block; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
+    };
+    (@ $block:literal; $($row:literal)*) => {
+        [$(named_row!($block * 32 + $row)),*]
+    };
+}
+
+static NAMED_FNS: [[[BuiltinFn; 32]; 32]; NAMED_SLOTS / 1024] = [
+    named_rows!(0), named_rows!(1), named_rows!(2), named_rows!(3),
 ];
+
+/// The interpreter of a stand-in's call, whose `cur_file` is the file that named the builtin, and
+/// the caller's, put back when the call ends, however it ends (`call_named`).
+struct FileBack<'a> {
+    it: &'a mut Interp,
+    was: std::mem::ManuallyDrop<Option<Arc<str>>>,
+}
+
+impl Drop for FileBack<'_> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // SAFETY: `was` is taken here only, once, as the guard ends, and not read after.
+        self.it.cur_file = unsafe { std::mem::ManuallyDrop::take(&mut self.was) };
+    }
+}
 
 /// A builtin named as a value past `NAMED_SLOTS`: refused, as a file builtin refuses a path, since
 /// no file can be said to hold it.
@@ -2316,23 +2398,34 @@ static NAMES_SEEN: [std::sync::atomic::AtomicU64; 256] = [const { std::sync::ato
 const NAME_KNOWN: u64 = 1 << 62;
 const NAME_CARRIES: u64 = 1 << 63;
 
-/// `carries_origin(n)`, asked once for each builtin's name rather than each time it is named.
+/// `carries_origin(n)`, asked once for each builtin's name rather than each time it is named. An
+/// entry is believed only for a name whose address and length fit its key, on the way in and on
+/// the way out: a name at or past 2^48, or of 2^14 bytes or more, wrote over the bits of the
+/// length and of `NAME_KNOWN` in its key, so that it could be read as another name's entry
+/// (FEEDBACK83.md, Q-1300, found by the review of 2a1d3f7; branch feedback82-85).
 #[inline(always)]
 fn carries_name(n: &'static str) -> bool {
-    let key = n.as_ptr() as u64 | (n.len() as u64) << 48 | NAME_KNOWN;
+    let (at, len) = (n.as_ptr() as u64, n.len() as u64);
+    let key = at | len << 48 | NAME_KNOWN;
     let seen = &NAMES_SEEN[(key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize];
     let e = seen.load(std::sync::atomic::Ordering::Relaxed);
-    if e & !NAME_CARRIES == key {
+    if e & !NAME_CARRIES == key && name_fits(at, len) {
         return e & NAME_CARRIES != 0;
     }
     name_carries_first(n, key, seen)
+}
+
+/// Whether a name's address and length fit an entry of `NAMES_SEEN`: below 2^48 and 2^14.
+#[inline(always)]
+fn name_fits(at: u64, len: u64) -> bool {
+    (at >> 48 | len >> 14) == 0
 }
 
 #[cold]
 #[inline(never)]
 fn name_carries_first(n: &'static str, key: u64, seen: &std::sync::atomic::AtomicU64) -> bool {
     let carries = carries_origin(n);
-    if (n.as_ptr() as u64) >> 48 == 0 && (n.len() as u64) < 1 << 14 {
+    if name_fits(n.as_ptr() as u64, n.len() as u64) {
         seen.store(key | if carries { NAME_CARRIES } else { 0 }, std::sync::atomic::Ordering::Relaxed);
     }
     carries
@@ -2355,8 +2448,8 @@ fn named_fn(f: BuiltinFn, file: &Option<Arc<str>>) -> BuiltinFn {
         return *g;
     }
     let k = given.by.len();
-    let Some(g) = NAMED_FNS.get(k / 32).map(|row| row[k % 32]) else { return named_full };
-    let _ = NAMED[k].set((f, file.clone()));
+    let Some(g) = NAMED_FNS.get(k / 1024).map(|block| block[k / 32 % 32][k % 32]) else { return named_full };
+    let _ = named()[k].set((f, file.clone()));
     given.fns.insert(g as usize);
     given.by.insert(key, g);
     g
@@ -3809,6 +3902,17 @@ impl Interp {
         } else {
             self.src_dir = Arc::from(Path::new(""));
         }
+        // Under a `quillo.confirmed`, a file that uses a name another file defines and does not
+        // take is refused as the program loads, `--no-check` or not, as `quillo check` says it is
+        // an error: the value under the name carries what the other file was confirmed for
+        // (`check::untaken_at_load`; FEEDBACK83.md, Q-1300, found by the review of 2a1d3f7;
+        // decided by the user 2026-11-24; branch feedback82-85). Once, for the program: a program
+        // it mounts or a service it loads is read with it, by its check.
+        let outermost = LOADS.with(|l| l.get()) == 0;
+        if outermost && crate::confirm::held() {
+            crate::check::untaken_at_load(path).map_err(|e| QuilloError::new(e, 0))?;
+        }
+        let _loading = Loading::enter();
         // Nothing asks a program run from its file for its value.
         let keep = std::mem::replace(&mut self.keep_last, false);
         let r = self.load_source(&src, &path.display().to_string());
@@ -4232,6 +4336,11 @@ impl Interp {
         if crate::value::loading() && assign(env, name, v.clone()) {
             return Ok(Value::Nil);
         }
+        // A page's state holds no function under a quillo.confirmed, set later as at its start
+        // (`PAGE_STATE_FN`; FEEDBACK83.md, Q-1300; branch feedback82-85).
+        if crate::confirm::held() && holds_function(&v) && self.page_states.iter().any(|(n, ..)| n.as_str() == name.as_str()) {
+            return fail(*line, format!("`{}` is the page's state, and {}", name, PAGE_STATE_FN));
+        }
         let function = matches!(v, Value::Func(_)) || matches!(lookup(env, name), Some(Value::Func(_)));
         // Which fields of a global map changed, for what follows
         // one field (FEEDBACK12.md, Q-084; branch open-fixes).
@@ -4380,6 +4489,10 @@ impl Interp {
                                 return self.get_field(Value::Map(m), name, env, *line);
                             }
                         }
+                    }
+                    // Under a quillo.confirmed, a module's member alone is held (`field_of_name`).
+                    if crate::confirm::held() {
+                        return self.field_of_name(obj, name, env, *line);
                     }
                 }
                 let v = self.eval(obj, env)?;
@@ -5801,13 +5914,15 @@ impl Interp {
     /// A stand-in's call (`named_slot`): its builtin's, with `cur_file` the file that named it, as
     /// a lambda's body runs in its own (`enter_call`; FEEDBACK83.md, Q-1300, found by the coverage
     /// tests; branch feedback82-85).
+    /// The caller's `cur_file` is put back on every way out, a builtin's panic included, which a
+    /// `catch_unwind` above may recover from with this interpreter: its code went on held to the
+    /// stand-in's file (FEEDBACK83.md, Q-1300, found by the review of 2a1d3f7; branch feedback82-85).
     #[inline(never)]
     fn call_named(&mut self, k: usize, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
-        let Some((f, file)) = NAMED.get(k).and_then(OnceLock::get) else { return named_full(self, args, line) };
+        let Some((f, file)) = NAMED.get().and_then(|n| n.get(k)).and_then(OnceLock::get) else { return named_full(self, args, line) };
         let was = std::mem::replace(&mut self.cur_file, file.clone());
-        let r = f(self, args, line);
-        self.cur_file = was;
-        r
+        let back = FileBack { it: self, was: std::mem::ManuallyDrop::new(was) };
+        f(&mut *back.it, args, line)
     }
 
     /// `v`, which the code of `cur_file` names as a value while a `quillo.confirmed` holds the run:
@@ -5867,6 +5982,28 @@ impl Interp {
             Some(v) if !crate::value::is_page_state(&v) => Ok(v),
             found => Err(name_missing(n, *line, found.is_some())),
         }
+    }
+
+    /// `obj.name` taken as a value, `obj` a name: a module's member (`let get = http.get`) is the
+    /// one given a stand-in, held to this file (`named_here`), not every member of the module, as
+    /// the module named was (`eval`): the process's `NAMED_SLOTS` went 20 or so to a file that took
+    /// one function of `db`. A module handed on whole still gives each of its members one
+    /// (FEEDBACK83.md, Q-1300, found by the review of 2a1d3f7; branch feedback82-85).
+    /// Asked only while a `quillo.confirmed` holds the run; a value that holds no such builtin (a
+    /// record, `config.port`) is read as `eval` reads it, with no look for `name` more.
+    #[inline(never)]
+    fn field_of_name(&mut self, obj: &Expr, name: &str, env: &Env, line: u32) -> Result<Value, Ctrl> {
+        let v = self.called_value(obj, env)?;
+        if !carries_any(&v) {
+            return self.get_field(v, name, env, line);
+        }
+        if matches!(&v, Value::Map(m) if m.contains_key(name)) {
+            let x = self.get_field(v, name, env, line)?;
+            return Ok(self.named_here(x));
+        }
+        // A builtin's own field (`read_file.curry`), or one a module has not: all of it, as `eval`.
+        let v = self.named_here(v);
+        self.get_field(v, name, env, line)
     }
 
     /// A method call's receiver that is a name, `recv` of `recv.name(...)`: as a callee is
@@ -8681,5 +8818,23 @@ fn lib_root(e: &Expr, env: &Env) -> bool {
         Expr::Ident(n, _) => matches!(lookup(env, n), Some(Value::Builtin("__jslib", _))),
         Expr::Field(o, _, _) => lib_root(o, env),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod named_tests {
+    /// An entry of `NAMES_SEEN` is believed only for a name whose address and length fit its key,
+    /// below 2^48 and 2^14, the limit and one past it each way (FEEDBACK83.md, Q-1300, found by the
+    /// review of 2a1d3f7; branch feedback82-85).
+    #[test]
+    fn a_name_fits_its_key_only_below_its_limits() {
+        assert!(super::name_fits(0, 0));
+        assert!(super::name_fits((1 << 48) - 1, (1 << 14) - 1));
+        assert!(!super::name_fits(1 << 48, 1));
+        assert!(!super::name_fits(1, 1 << 14));
+        assert!(!super::name_fits(u64::MAX, u64::MAX));
+        // A name the program has is below them.
+        let n: &'static str = "read_file";
+        assert!(super::name_fits(n.as_ptr() as u64, n.len() as u64));
     }
 }

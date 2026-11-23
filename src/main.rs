@@ -1637,6 +1637,11 @@ mod with {
     pub fn start(cmd: &str, dir: &Path) -> Result<(), String> {
         let mut c = std::process::Command::new("sh");
         c.arg("-c").arg(cmd).current_dir(dir).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        // Without the names a `.env` gave (`QUILLO_ENV_FROM_FILE`), which are for a Quillo service
+        // its app starts: a service that believed them passed them on to its commands, where a
+        // `quillo run` would be told which of its variables a file had set (FEEDBACK82.md, Q-1281,
+        // found by the review of bf40063; branch feedback82-85).
+        c.env_remove(quillo::dotenv::FROM_FILE_VAR);
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
