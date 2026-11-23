@@ -2324,3 +2324,451 @@ fn a_taken_files_mount_is_held_whichever_way_it_is_written() {
     assert_eq!(send(port, "GET", "/x/", &[], "").status, 404, "{}", read(&log));
     drop(g);
 }
+
+// ---- what a taken file sets for the whole site, SQLite's lock file, db.migrate's folder, what an
+// ---- import hands over (fix slice K)
+
+/// A cross-site form post to `path` (the CSRF gate's case): its status.
+fn cross_site_post(port: u16, path: &str) -> u16 {
+    send(port, "POST", path, &[("origin", "https://evil.example"), ("sec-fetch-site", "cross-site")], "").status
+}
+
+/// A file taken for some of its names that calls `allow_cross_site("/")` and `site_headers` with
+/// `x-frame-options: null` and credentialed CORS for another site changed the whole site's security
+/// under a quillo.confirmed that confirmed nothing of it: a cross-site post to the main file's
+/// /transfer was taken, the page could be framed, and evil.example read answers with the visitor's
+/// cookies. Each call is listed (`site-wide allow_cross_site /`), `quillo check` says it is not
+/// confirmed, and a run does not apply it, said, checked or not; confirmed, it is applied. With no
+/// quillo.confirmed, as before, and check's note names them. The main file's own calls are the
+/// program's (src/confirm.rs site_ok and scan_from, src/builtins.rs site_wide; FEEDBACK83.md Q-1301,
+/// found by the coverage tests; branch feedback82-85).
+#[test]
+fn a_taken_files_calls_for_the_whole_site_are_held_to_the_list() {
+    let d = dir("k1-site-wide");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nroute POST /transfer = \"transferred\"\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nallow_cross_site(\"/\")\nsite_headers({ \"x-frame-options\": null, \"access-control-allow-origin\": \"https://evil.example\", \"access-control-allow-credentials\": \"true\" })\n");
+    let opened = |port: u16| {
+        let page = send(port, "GET", "/", &[], "");
+        (cross_site_post(port, "/transfer"), page.header("x-frame-options").map(str::to_string), page.header("access-control-allow-origin").map(str::to_string))
+    };
+    let applied = (200, None, Some("https://evil.example".to_string()));
+    let held = (403, Some("SAMEORIGIN".to_string()), None);
+    // No quillo.confirmed: as before, and check's note names the calls.
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("kit/k.qwe:4: warning: kit/k.qwe is taken for Badge, and also sets for the whole site allow_cross_site /, site_headers /"), "{}", out);
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(opened(port), applied);
+    drop(g);
+    let (code, out) = quillo(&d, &["confirm", "--list"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.starts_with(&format!("kit/k.qwe\n{}{}", list_line("site-wide", "allow_cross_site /", "4"), list_line("site-wide", "site_headers /", "5"))), "{}", out);
+    // Held to a quillo.confirmed that confirms nothing of the kit.
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    for (line, item) in [(4, "allow_cross_site /"), (5, "site_headers /")] {
+        assert!(out.contains(&format!("kit/k.qwe:{}: error: site-wide {}: not confirmed for this file", line, item)), "{}", out);
+    }
+    for opts in [&[][..], &["--no-check"][..]] {
+        let (g, port, log) = serve(&d, opts);
+        assert_eq!(opened(port), held, "{:?}: {}", opts, read(&log));
+        assert!(log_has(&log, "quillo: kit/k.qwe: allow_cross_site / is not applied: it is not confirmed for this file (`quillo confirm` lists it)", 30), "{}", read(&log));
+        assert!(log_has(&log, "quillo: kit/k.qwe: site_headers / is not applied: it is not confirmed for this file", 30), "{}", read(&log));
+        drop(g);
+    }
+    // The main file's own calls are the program's: applied, nothing listed.
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nallow_cross_site(\"/transfer\")\nroute POST /transfer = \"transferred\"\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!((code, out.contains("site-wide")), (Some(0), false), "{}", out);
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(cross_site_post(port, "/transfer"), 200);
+    drop(g);
+    // Confirmed: the developer's, and applied.
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nroute POST /transfer = \"transferred\"\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nallow_cross_site(\"/\")\nsite_headers({ \"x-frame-options\": null, \"access-control-allow-origin\": \"https://evil.example\", \"access-control-allow-credentials\": \"true\" })\n");
+    assert_eq!(quillo(&d, &["confirm", "--yes"]).0, Some(0));
+    assert!(read(&d.join("quillo.confirmed")).contains("[\"kit/k.qwe\"]\nsite = [\"allow_cross_site /\", \"site_headers /\"]\n"), "{}", read(&d.join("quillo.confirmed")));
+    assert_eq!(quillo(&d, &["check", "main.qwe"]).0, Some(0));
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(opened(port), applied);
+    drop(g);
+}
+
+/// The other calls that set something for the whole program, each held as a taken file makes it:
+/// `tenant_from` (whose database a request uses), `moves_in_place`, `accept_calls`, `channel.on`,
+/// `media.on`, `ready` (a failing check made /_quillo/ready 503), `locale_from`, `translations`,
+/// `style_with`; and whichever way it is written: in a function the main file calls, piped, a path
+/// worked out (listed as `allow_cross_site *`, which covers any), handed to the main file's
+/// `apply(f, x)` (held to the kit, which named it, not called as the main file's), a module taken as
+/// a value (`c.on`, never listed, so refused even once the rest is confirmed). `__callers`, which
+/// `server fn f() for [...]` writes, sets another file's function's callers for no file
+/// (src/confirm.rs site_ok, callers_ok, site_item, src/interp.rs carries_origin, src/wt.rs,
+/// src/media.rs, src/ready.rs, src/i18n.rs; FEEDBACK83.md Q-1301, found by the coverage tests;
+/// branch feedback82-85).
+#[test]
+fn each_call_for_the_whole_site_is_held_however_it_is_written() {
+    let d = dir("k1-site-calls");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, setup\nfn apply(f, x) {\n  return f(x)\n}\nserver fn transfer(n: int) -> int for [\"shop\"] {\n  return n\n}\nsetup()\nroute GET / = <html><body><Badge/></body></html>\nroute GET /who = tenant() ?? \"none\"\n");
+    write(
+        &d,
+        "kit/k.qwe",
+        "import main.qwe use apply\ncomponent Badge() {\n  return <b>b</b>\n}\nfn setup() {\n  allow_cross_site(\"/a\")\n  apply(allow_cross_site, \"/d\")\n}\n\"/b\" | allow_cross_site()\nallow_cross_site(\"/\" + \"c\")\ntenant_from(\"example.com\")\nmoves_in_place()\naccept_calls { keys: { evil: \"an evil caller key of 32 bytes or more\" } }\nchannel.on(\"chat\", (msg, peer) => msg)\nmedia.on(\"cam\", { publish: (peer, name) => true, watch: (peer, name) => true })\nready(\"kit\", () => false)\nlocale_from((request) => \"fr\")\ntranslations({ en: { hi: \"hello\" }, fr: { hi: \"bonjour\" } })\nstyle_with(\"false\")\n__callers(\"transfer\", [\"evil\"])\nlet c = channel\nc.on(\"other\", (msg, peer) => msg)\n",
+    );
+    let items = [
+        ("accept_calls", "13"),
+        ("allow_cross_site *", "10"),
+        ("allow_cross_site /a", "6"),
+        ("allow_cross_site /b", "9"),
+        ("channel chat", "14"),
+        ("locale_from", "17"),
+        ("media cam", "15"),
+        ("moves_in_place", "12"),
+        ("ready kit", "16"),
+        ("style_with", "19"),
+        ("tenant_from", "11"),
+        ("translations", "18"),
+    ];
+    let (code, out) = quillo(&d, &["confirm", "--list"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.starts_with(&format!("kit/k.qwe\n{}", items.map(|(i, l)| list_line("site-wide", i, l)).concat())), "{}", out);
+    assert!(!out.contains("channel other") && !out.contains("transfer"), "{}", out);
+    let site = |port: u16| (send(port, "GET", "/who", &[("host", "acme.example.com")], "").body, send(port, "GET", "/_quillo/ready", &[], "").status, ["/a", "/b", "/c", "/d"].map(|p| cross_site_post(port, p)));
+    // Unheld: each applied, as before.
+    let (g, port, _) = serve(&d, &[]);
+    assert_eq!(site(port), ("acme".to_string(), 503, [404; 4]));
+    drop(g);
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    for (i, l) in items {
+        assert!(out.contains(&format!("kit/k.qwe:{}: error: site-wide {}: not confirmed for this file", l, i)), "{}: {}", i, out);
+    }
+    let (g, port, log) = serve(&d, &["--no-check"]);
+    assert_eq!(site(port), ("none".to_string(), 200, [403; 4]), "{}", read(&log));
+    for i in ["allow_cross_site /a", "allow_cross_site /b", "allow_cross_site /c", "allow_cross_site /d", "tenant_from", "moves_in_place", "accept_calls", "channel chat", "media cam", "ready kit", "locale_from", "translations", "style_with", "channel other"] {
+        assert!(log_has(&log, &format!("quillo: kit/k.qwe: {} is not applied: it is not confirmed for this file", i), 30), "{}: {}", i, read(&log));
+    }
+    assert!(log_has(&log, "quillo: kit/k.qwe: the callers of server fn transfer are not set: the function is another file's", 30), "{}", read(&log));
+    drop(g);
+    // Confirmed: applied, but for what no listing could show.
+    assert_eq!(quillo(&d, &["confirm", "--yes"]).0, Some(0));
+    let (g, port, log) = serve(&d, &[]);
+    assert_eq!(site(port), ("acme".to_string(), 503, [404; 4]), "{}", read(&log));
+    assert!(log_has(&log, "quillo: kit/k.qwe: channel other is not applied", 30) && log_has(&log, "the callers of server fn transfer are not set", 30), "{}", read(&log));
+    assert!(!read(&log).contains("allow_cross_site /d is not applied"), "{}", read(&log));
+    drop(g);
+}
+
+/// macOS's SQLite makes and locks the file `pragma lock_proxy_file` names, wherever it is: a file
+/// confirmed for nothing made `../outside/proxy.lock`, and opened an existing file outside to lock
+/// it. Refused where a quillo.confirmed holds the run, however it is written (the function form,
+/// a schema's name before it, other letters, `:auto:`, on a connection of `db.connect`), with the
+/// hold's words; the pragma read without a value, and others, work as before (src/db.rs authorize;
+/// FEEDBACK83.md Q-1300, found by the coverage tests; branch feedback82-85).
+#[test]
+fn sqlites_lock_proxy_file_is_refused_where_a_quillo_confirmed_holds_the_run() {
+    let d = dir("k2-lock-proxy");
+    let (app, outside) = (d.join("app"), d.join("outside"));
+    std::fs::create_dir_all(&outside).unwrap();
+    write(&outside, "existing.txt", "keep me\n");
+    write(&app, "main.qwe", "import kit/k.qwe use Badge, steal\ndb.open(\"data/app.db\")\ndb.exec(\"create table if not exists t (x int)\")\nprint(steal())\n");
+    write(
+        &app,
+        "kit/k.qwe",
+        "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  let said = (r) => is_err(r) ? str(r) : \"ran\"\n  let out = [said(db.query(\"pragma journal_mode = delete\"))]\n  for sql in [\"pragma lock_proxy_file = '../outside/proxy.lock'\", \"PRAGMA main.LOCK_PROXY_FILE('../outside/existing.txt')\", \"pragma lock_proxy_file = ':auto:'\", \"pragma lock_proxy_file = '../outside/ünï.lock'\"] {\n    out = push(out, said(db.exec(sql)))\n  }\n  let c = db.connect(\":memory:\")\n  out = push(out, said(c.exec(\"pragma lock_proxy_file = '../outside/m.lock'\")))\n  out = push(out, said(db.query(\"pragma lock_proxy_file\")))\n  out = push(out, said(db.exec(\"insert into t values (1)\")))\n  return join(out, \"\\n\")\n}\n",
+    );
+    std::fs::create_dir_all(app.join("data")).unwrap();
+    write(&app, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n");
+    let (code, out) = quillo(&app, &["run", "--no-check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    let refused = "err(\"db: SQLite's lock_proxy_file names a file to make and lock, which is not done where a quillo.confirmed holds the run\")";
+    let lines: Vec<&str> = out.lines().filter(|l| !l.starts_with("quillo: ")).collect();
+    assert_eq!(lines, ["ran", refused, refused, refused, refused, refused, "ran", "ran"], "{}", out);
+    let names: Vec<String> = std::fs::read_dir(&outside).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(names, ["existing.txt"]);
+    assert_eq!(read(&outside.join("existing.txt")), "keep me\n");
+    // Nothing held: the pragma is SQLite's, as before (where it has one: macOS).
+    #[cfg(target_os = "macos")]
+    {
+        std::fs::remove_file(app.join("quillo.confirmed")).unwrap();
+        let (code, out) = quillo(&app, &["run", "--no-check", "main.qwe"]);
+        assert_eq!(code, Some(0), "{}", out);
+        assert!(!out.contains("lock_proxy_file names"), "{}", out);
+    }
+}
+
+/// `db.migrate(dir)` read and ran the SQL of any folder: a kit confirmed for nothing ran
+/// `../outside/m`'s files. The folder and each file in it are judged as `read_file` judges a path:
+/// inside the program's folder or one `--allow-path` names, links followed, with or without a
+/// quillo.confirmed; and under one, among what the calling file was confirmed to read, which the
+/// scan lists (`reads migrations/`, the default; a connection's `migrate` too). A refused `attach`
+/// in a migration says the hold's words, at the start and in a request, where the migration runs
+/// on another thread and is still judged as the code that called it (src/db.rs migrate and
+/// migrate_as, src/confirm.rs read_call; FEEDBACK83.md Q-1300, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn db_migrate_reads_only_a_folder_its_file_may_read() {
+    let d = dir("k3-migrate");
+    let (app, outside) = (d.join("app"), d.join("outside"));
+    write(&outside, "m/001_x.sql", "create table leaked (v text);\ninsert into leaked values ('from outside');\n");
+    write(&app, "migrations/001_users.sql", "create table users (n text);\n");
+    write(&app, "main.qwe", "import kit/k.qwe use Badge, s\ndb.open(\"data/app.db\")\nprint(\"main: \" + str(db.migrate()))\nprint(s())\n");
+    write(&app, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nfn s() {\n  return \"kit: \" + str(db.migrate(\"../outside/m\"))\n}\n");
+    let fresh = || {
+        let _ = std::fs::remove_dir_all(app.join("data"));
+        std::fs::create_dir_all(app.join("data")).unwrap();
+    };
+    fresh();
+    // No quillo.confirmed: the kit's folder is outside the program, refused as read_file refuses it.
+    let (code, out) = quillo(&app, &["run", "--no-check", "main.qwe"]);
+    assert_ne!(code, Some(0), "{}", out);
+    assert!(out.contains("main: [\"001_users.sql\"]") && out.contains("db.migrate: the folder must stay inside the program's folder: ../outside/m; `--allow-path ../outside`"), "{}", out);
+    assert!(!out.contains("001_x.sql"), "{}", out);
+    // Named by --allow-path, read as read_file would.
+    fresh();
+    let (code, out) = quillo(&app, &["run", "--no-check", "main.qwe", "--allow-path", "../outside"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("kit: [\"001_x.sql\"]"), "{}", out);
+    // A link in the program's migrations leading out is refused, as read_file refuses it.
+    fresh();
+    write(&app, "main.qwe", "db.open(\"data/app.db\")\nprint(\"main: \" + str(db.migrate()))\n");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("../../outside/m/001_x.sql", app.join("migrations/002_link.sql")).unwrap();
+        let (code, out) = quillo(&app, &["run", "--no-check", "main.qwe"]);
+        assert_ne!(code, Some(0), "{}", out);
+        assert!(out.contains("db.migrate: migrations/002_link.sql must stay inside the program's folder; migrations/002_link.sql is a link to "), "{}", out);
+        std::fs::remove_file(app.join("migrations/002_link.sql")).unwrap();
+    }
+    // Under a quillo.confirmed: listed as a read of the main file, refused until confirmed.
+    write(&app, "main.qwe", "import kit/k.qwe use Badge, s\ndb.open(\"data/app.db\")\nprint(\"main: \" + str(db.migrate()))\nlet other = db.connect(\"data/other.db\")\nprint(\"other: \" + str(other.migrate(\"mïg/\")))\nprint(s())\n");
+    write(&app, "mïg/001_o.sql", "create table o (x int);\n");
+    write(&app, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nfn s() {\n  return \"kit: \" + str(db.migrate(\"migrations\"))\n}\n");
+    write(&app, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n");
+    let (code, out) = quillo(&app, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    for (f, l, item) in [("main.qwe", 3, "migrations/"), ("main.qwe", 5, "mïg/"), ("kit/k.qwe", 5, "migrations/")] {
+        assert!(out.contains(&format!("{}:{}: error: reads {}: not confirmed for this file", f, l, item)), "{}: {}", item, out);
+    }
+    fresh();
+    let (code, out) = quillo(&app, &["run", "--no-check", "main.qwe"]);
+    assert_ne!(code, Some(0), "{}", out);
+    assert!(out.contains("main.qwe:3: db.migrate: migrations is not confirmed for main.qwe (quillo confirm)"), "{}", out);
+    // Confirmed for the main file, not the kit: the kit's call is refused.
+    write(&app, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\nfiles = [\"migrations/\", \"mïg/\"]\n");
+    let (code, out) = quillo(&app, &["run", "--no-check", "main.qwe"]);
+    assert_ne!(code, Some(0), "{}", out);
+    assert!(out.contains("main: [\"001_users.sql\"]") && out.contains("other: [\"001_o.sql\"]") && out.contains("db.migrate: migrations is not confirmed for kit/k.qwe (quillo confirm)"), "{}", out);
+    // An attach in a migration refused with the hold's words, at the start and in a request.
+    fresh();
+    write(&app, "migrations/002_a.sql", "attach database '../outside/mig.db' as o;\ncreate table o.t (x int);\n");
+    write(&app, "main.qwe", "db.open(\"data/app.db\")\nprint(str(db.migrate()))\n");
+    let (code, out) = quillo(&app, &["run", "--no-check", "main.qwe"]);
+    assert_ne!(code, Some(0), "{}", out);
+    assert!(out.contains("db.migrate: migration 002_a.sql failed: ") && out.contains("mig.db is not confirmed for main.qwe (quillo confirm)") && !out.contains("not authorized"), "{}", out);
+    fresh();
+    write(&app, "main.qwe", "import kit/k.qwe use Badge, m\ndb.open(\"data/app.db\")\nroute GET /m = m()\n");
+    write(&app, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nfn m() {\n  return str(db.migrate(\"kit/m\"))\n}\n");
+    write(&app, "kit/m/001_a.sql", "attach database 'data/kit.db' as o;\ncreate table o.t (x int);\n");
+    write(&app, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\nfiles = [\"migrations/\", \"mïg/\"]\n\n[\"kit/k.qwe\"]\nfiles = [\"kit/m/\"]\n");
+    let (g, port, log) = serve(&app, &["--no-check"]);
+    assert_eq!(send(port, "GET", "/m", &[], "").status, 500);
+    assert!(log_has(&log, "db.migrate: migration 001_a.sql failed: ", 30) && log_has(&log, "kit.db is not confirmed for kit/k.qwe (quillo confirm)", 30), "{}", read(&log));
+    assert!(!app.join("data/kit.db").exists() && !outside.join("mig.db").exists());
+    drop(g);
+}
+
+/// What a file takes by name of another file that carries what that file reaches is said, as the
+/// grant it is (the user's decision of 2026-11-24: a file uses another's name only by taking it,
+/// and the import is not refused): `quillo fix` wrote `import main.qwe use api, reader, reader2`
+/// into a kit confirmed for nothing and said only that line, check was then clean, and the kit read
+/// `.env` through `reader` as main.qwe. Now fix, `quillo check` (a warning at the import) and
+/// `quillo confirm` (its listing, and `--list`) say each: a builtin held (`read_file`), a module's
+/// (`http.get`), a module whole, a lambda and a function value of the file's own, through a global
+/// of the file (`let r = reader`), a call for the whole site, under the name taken (`as`) or not.
+/// Not said: a `fn` declared (code taken to call), a value that carries nothing (a text, a lambda of
+/// arithmetic, `now`), and anything with no quillo.confirmed (src/confirm.rs carried, fix_note,
+/// for_check; FEEDBACK83.md Q-1300, found by the coverage tests; branch feedback82-85).
+#[test]
+fn what_a_files_imports_hand_it_of_another_files_reach_is_said() {
+    let d = dir("k4-grants");
+    write(&d, ".env", "SECRET=s3cr3t\n");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal, steal2, steal3\nlet reader = read_file\nlet reader2 = (p) => read_file(p)\nlet api = { get: http.get }\nprint(\"kit alias: \" + str(steal()))\nprint(\"kit lambda: \" + str(steal2()))\nprint(\"kit module field: \" + str(steal3()))\n");
+    let kit = "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  return reader(\".env\") ?? \"refused\"\n}\nfn steal2() {\n  return reader2(\".env\") ?? \"refused\"\n}\nfn steal3() {\n  return api.get(\"http://127.0.0.1:9/x\").error ?? \"sent\"\n}\n";
+    write(&d, "kit/k.qwe", kit);
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nfiles = [\".env\"]\nhttp = [\"127.0.0.1\"]\n");
+    let notes = [
+        "kit/k.qwe takes main.qwe's api (http.get, as main.qwe reaches it)",
+        "kit/k.qwe takes main.qwe's reader (read_file, as main.qwe reaches it)",
+        "kit/k.qwe takes main.qwe's reader2 (a function that calls read_file, as main.qwe reaches it)",
+    ];
+    let (code, out) = quillo(&d, &["fix", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert_eq!(out, format!("./kit/k.qwe: import main.qwe use api, reader, reader2\n{}", notes.map(|n| format!("note: {}\n", n)).concat()));
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    for n in notes {
+        assert!(out.contains(&format!("kit/k.qwe:1: warning: {}\n", n)), "{}: {}", n, out);
+    }
+    assert!(out.ends_with("3 warnings\n"), "{}", out);
+    let (code, out) = quillo(&d, &["confirm", "--list"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains(&format!("kit/k.qwe\n{}", notes.map(|n| format!("  note: {}\n", n)).concat())), "{}", out);
+    let (code, out) = quillo(&d, &["run", "--no-check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("kit alias: SECRET=s3cr3t"), "the grant, as decided: {}", out);
+    // The other ways a value carries, and the ways it carries nothing.
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, go\nlet reader = read_file\nlet r = reader\nlet h = http\nlet acs = allow_cross_site\nfn load(p) {\n  return read_file(p)\n}\nlet loader = load\nlet word = \"hi\"\nlet double = (x) => x * 2\nlet clock = now\nlet shadow = (read_file) => read_file\nprint(go())\n");
+    write(&d, "kit/k.qwe", "import main.qwe use r as mine, h, acs, load, loader, word, double, clock, shadow\ncomponent Badge() {\n  return <b>b</b>\n}\nfn go() {\n  return str(len(word)) + str(double(2)) + str(type_of(mine)) + str(type_of(h)) + str(type_of(acs)) + str(type_of(load)) + str(type_of(loader)) + str(type_of(clock)) + str(type_of(shadow))\n}\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    let said: Vec<&str> = out.lines().filter(|l| l.contains(": warning: ")).collect();
+    assert_eq!(
+        said,
+        [
+            "kit/k.qwe:1: warning: kit/k.qwe takes main.qwe's r (read_file, as main.qwe reaches it)",
+            "kit/k.qwe:1: warning: kit/k.qwe takes main.qwe's h (http, as main.qwe reaches it)",
+            "kit/k.qwe:1: warning: kit/k.qwe takes main.qwe's acs (allow_cross_site, as main.qwe reaches it)",
+            "kit/k.qwe:1: warning: kit/k.qwe takes main.qwe's loader (a function that calls read_file, as main.qwe reaches it)",
+        ],
+        "{}",
+        out
+    );
+    let (code, out) = quillo(&d, &["confirm"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("  note: kit/k.qwe takes main.qwe's loader (a function that calls read_file, as main.qwe reaches it)\n"), "{}", out);
+    // No quillo.confirmed: nothing is held, and nothing said of it.
+    std::fs::remove_file(d.join("quillo.confirmed")).unwrap();
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!((code, out.contains("takes main.qwe's")), (Some(0), false), "{}", out);
+}
+
+/// A path refused where a link is what leads it out names the link, where it leads and the folder
+/// to give `--allow-path` for it, or that it leads nowhere: a link leading nowhere in a folder
+/// `--allow-path ../shared` names was told to give `--allow-path ../shared`, the option given.
+/// read_file, write_file and delete_file; a link in the program's folder (to a file, and a folder
+/// on the way); without the link, the way out as before (src/builtins.rs why_out; FEEDBACK83.md,
+/// found by the docs agent writing up 2a1d3f7; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_link_that_leads_a_path_out_is_named_in_its_refusal() {
+    let d = dir("k6-link-said");
+    let (app, shared, outside) = (d.join("app"), d.join("shared"), d.join("outside"));
+    for f in [&app, &shared, &outside] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    write(&outside, "real.txt", "x");
+    std::os::unix::fs::symlink("../outside/made.txt", shared.join("dl")).unwrap();
+    std::os::unix::fs::symlink("../outside/real.txt", shared.join("out")).unwrap();
+    std::os::unix::fs::symlink("../outside", app.join("up")).unwrap();
+    std::os::unix::fs::symlink("../outside/ünï", app.join("lien")).unwrap();
+    write(&app, "main.qwe", "print(write_file(\"../shared/dl\", \"x\"))\nprint(read_file(\"../shared/out\"))\nprint(read_file(\"up/real.txt\"))\nprint(delete_file(\"up/real.txt\"))\nprint(read_file(\"lien\"))\nprint(read_file(\"../nowhere/x\"))\n");
+    let (code, out) = quillo_env(&app, &["run", "main.qwe", "--allow-path", "../shared"], 60, &[]);
+    assert_eq!(code, Some(0), "{}", out);
+    let real = outside.canonicalize().unwrap().display().to_string();
+    let lines: Vec<&str> = out.lines().filter(|l| l.starts_with("err(")).collect();
+    assert_eq!(
+        lines,
+        [
+            "err(\"write_file: path must stay inside the program's folder: ../shared/dl; ../shared/dl is a link that leads nowhere (to ../outside/made.txt)\")".to_string(),
+            format!("err(\"read_file: path must stay inside the program's folder: ../shared/out; ../shared/out is a link to {r}/real.txt, outside the program's folder and those `--allow-path` names; `--allow-path {r}` (on `quillo run` or `quillo mcp`) lets the program read it\")", r = real),
+            format!("err(\"read_file: path must stay inside the program's folder: up/real.txt; up is a link to {r}, outside the program's folder and those `--allow-path` names; `--allow-path {r}` (on `quillo run` or `quillo mcp`) lets the program read it\")", r = real),
+            format!("err(\"delete_file: path must be inside the program's folder: up/real.txt; up is a link to {r}, outside the program's folder and those `--allow-path` names; `--allow-path {r}` (on `quillo run` or `quillo mcp`) lets the program delete it\")", r = real),
+            "err(\"read_file: path must stay inside the program's folder: lien; lien is a link that leads nowhere (to ../outside/ünï)\")".to_string(),
+            "err(\"read_file: path must stay inside the program's folder: ../nowhere/x; `--allow-path ../nowhere` (on `quillo run` or `quillo mcp`) lets the program read it\")".to_string(),
+        ],
+        "{}",
+        out
+    );
+    // No --allow-path: ../shared is the folder to name, as before.
+    let (code, out) = quillo(&app, &["run", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("write_file: path must stay inside the program's folder: ../shared/dl; `--allow-path ../shared` (on `quillo run` or `quillo mcp`) lets the program write it"), "{}", out);
+}
+
+/// `quillo fix` with its output piped to what closes it (`quillo fix main.qwe | head -1`) writes
+/// its files and ends with 141, as a script's `print` does on a closed pipe, saying nothing, where
+/// it panicked with a trace after writing them; each of 20 runs (the trace could come before the
+/// signal). With the pipe open, it says its lines as before (src/modules.rs fix; FEEDBACK83.md,
+/// found by the docs agent writing up 4bc1ac9; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn quillo_fix_on_a_closed_pipe_writes_its_files_and_ends_quietly() {
+    for _ in 0..20 {
+        fix_on_a_closed_pipe();
+    }
+    let d = dir("k7-fix-open");
+    write(&d, "main.qwe", "use a.qwe\nroute GET / = x() + y()\n");
+    write(&d, "a.qwe", "fn x() {\n  return 1\n}\nuse b.qwe\n");
+    write(&d, "b.qwe", "fn y() {\n  return 2\n}\n");
+    assert_eq!(quillo(&d, &["fix", "main.qwe"]), (Some(0), "main.qwe: import b.qwe use y\n".to_string()));
+}
+
+#[cfg(unix)]
+fn fix_on_a_closed_pipe() {
+    let d = dir("k7-fix-pipe");
+    write(&d, "main.qwe", "use a.qwe\nroute GET / = x() + y()\n");
+    write(&d, "a.qwe", "fn x() {\n  return 1\n}\nuse b.qwe\n");
+    write(&d, "b.qwe", "fn y() {\n  return 2\n}\n");
+    // The pipe's other end closed before quillo writes to it.
+    let mut fds = [0; 2];
+    // SAFETY: pipe fills in two descriptors, each owned once below.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    use std::os::fd::FromRawFd;
+    // SAFETY: the descriptors were just made, and are this test's.
+    let (r, w) = unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) };
+    drop(r);
+    let err = d.join("err.log");
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(["fix", "main.qwe"])
+        .current_dir(&*d)
+        .env_remove("QUILLO_POLICY_PATH")
+        .stdin(Stdio::null())
+        .stdout(w)
+        .stderr(std::fs::File::create(&err).unwrap())
+        .spawn()
+        .unwrap();
+    let mut g = Guard::new(child);
+    let until = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(s) = g.0.try_wait().unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < until, "quillo fix did not end");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(141), "{}", read(&err));
+    assert_eq!(read(&err), "");
+    assert_eq!(read(&d.join("main.qwe")), "use a.qwe\nimport b.qwe use y\nroute GET / = x() + y()\n");
+}
+
+/// `db.open` and `db.system` set every file's database (and where Quillo keeps its sessions and
+/// tables): a file taken for some of its names, confirmed to write `data/`, replaced the main
+/// file's database with its own by `db.open("data/kit.db")`. Listed as `site-wide db.open`, refused
+/// until confirmed with the error a refused `db.open` gives (the start stops on it where nothing
+/// takes it), applied once confirmed; the main file's are the program's (src/db.rs open and system;
+/// FEEDBACK83.md Q-1301, found by the coverage tests; branch feedback82-85).
+#[test]
+fn a_taken_file_sets_the_programs_database_only_where_confirmed() {
+    let d = dir("k1-db-open");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, switch\ndb.open(\"data/app.db\")\ndb.exec(\"create table if not exists mains (x int)\")\nlet r = switch()\nroute GET / = str(is_err(r)) + \" \" + (db.query(\"select name from sqlite_master where type = 'table' order by name\") | map((t) => t.name) | join(\",\"))\n");
+    write(&d, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nfn switch() {\n  let r = db.open(\"data/kit.db\")\n  db.exec(\"create table if not exists kits (x int)\")\n  return r\n}\ndb.system(\"data/sys.db\")\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("kit/k.qwe:5: error: site-wide db.open: not confirmed for this file") && out.contains("kit/k.qwe:9: error: site-wide db.system: not confirmed for this file"), "{}", out);
+    let (g, port, log) = serve(&d, &["--no-check"]);
+    assert_eq!(send(port, "GET", "/", &[], "").body, "true kits,mains", "{}", read(&log));
+    assert!(log_has(&log, "quillo: kit/k.qwe: db.open is not applied: it is not confirmed for this file", 30) && log_has(&log, "quillo: kit/k.qwe: db.system is not applied", 30), "{}", read(&log));
+    assert!(!d.join("data/kit.db").exists() && !d.join("data/sys.db").exists());
+    drop(g);
+    assert_eq!(quillo(&d, &["confirm", "--yes"]).0, Some(0));
+    assert!(read(&d.join("quillo.confirmed")).contains("site = [\"db.open\", \"db.system\"]"), "{}", read(&d.join("quillo.confirmed")));
+    let (g, port, log) = serve(&d, &[]);
+    assert_eq!(send(port, "GET", "/", &[], "").body, "false kits", "{}", read(&log));
+    assert!(d.join("data/sys.db").exists());
+    drop(g);
+}

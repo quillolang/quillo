@@ -400,6 +400,10 @@ fn migrations_apply_once_and_roll_back_on_failure(url: &str) {
     std::fs::create_dir_all(&m).unwrap();
     std::fs::write(m.join("001_todos.sql"), "create table todos (id serial primary key, text text not null);").unwrap();
     std::fs::write(m.join("002_seed.sql"), "insert into todos (text) values ('first');").unwrap();
+    // The folder is outside the program's (`.`): named as `--allow-path` names one, as db.migrate's
+    // folder is judged as read_file's path is (FEEDBACK83.md, Q-1300, found by the review of
+    // 4bc1ac9; branch feedback82-85).
+    quillo::builtins::allow_real_path(d.canonicalize().unwrap());
     let migrate = format!("db.migrate(\"{}\")", m.display());
     assert_eq!(run(url, &migrate), "[\"001_todos.sql\", \"002_seed.sql\"]");
     assert_eq!(run(url, &migrate), "[]");

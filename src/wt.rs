@@ -1436,6 +1436,11 @@ fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         Some(v) => return fail(line, format!("`channel.on` expects options as a map, got {}", v.type_name())),
     }
+    // What pages may send to the server: a taken file's channel, only where it was confirmed
+    // (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9; branch feedback82-85).
+    if !crate::builtins::site_wide(it, || format!("channel {}", name)) {
+        return Ok(Value::Nil);
+    }
     let site = Arc::make_mut(&mut it.site);
     if site.channels.iter().any(|h| h.name == name) {
         return fail(line, format!("`channel.on`: the program already handles channel {:?}", name));

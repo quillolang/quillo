@@ -1922,6 +1922,9 @@ pub(crate) fn name_as_taken(name: &str) -> &str {
 /// feedback36-39). See src/svcauth.rs.
 fn accept_calls(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match crate::svcauth::accept_of(args.first().unwrap_or(&Value::Nil)) {
+        // Who may call the program's `server fn`s: a taken file's, only where it was confirmed
+        // (`site_wide`).
+        Ok(_) if !site_wide(it, || "accept_calls".into()) => Ok(Value::Nil),
         Ok(a) => {
             it.accept = Some(Arc::new(a));
             Ok(Value::Nil)
@@ -1935,6 +1938,17 @@ fn callers(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let (Some(Value::Str(f) | Value::Css(f)), Some(Value::List(l))) = (args.first(), args.get(1)) else {
         return fail(line, "`__callers` is written by `server fn ... for [...]`");
     };
+    // A file says the callers of its own `server fn` only, where a quillo.confirmed holds the run
+    // (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9; branch feedback82-85).
+    if crate::confirm::held() {
+        let declared = match crate::value::lookup(&it.globals, &**f) {
+            Some(Value::Func(c)) => c.def.file.clone(),
+            _ => None,
+        };
+        if !crate::confirm::callers_ok(it.cur_file.as_deref(), declared.as_deref(), f) {
+            return Ok(Value::Nil);
+        }
+    }
     let names = l.iter().map(|v| v.display()).collect();
     Arc::make_mut(&mut it.fn_callers).insert(f.to_string(), names);
     Ok(Value::Nil)
@@ -2387,6 +2401,18 @@ fn read_upload(it: &mut Interp, args: Vec<Value>, _: u32) -> R {
     }
 }
 
+/// Whether a call that sets `item` (as `quillo.confirmed` lists it: `allow_cross_site /`) for the
+/// whole program or site is applied: where a quillo.confirmed holds the run, a file taken for some
+/// of its names sets only what was confirmed for it (`confirm::site_ok`), and said once where it is
+/// not; the program's own files set what they set. A kit taken for `Badge` called
+/// `allow_cross_site("/")` and `site_headers` with `x-frame-options: null` and credentialed CORS
+/// for another site, and every route of the main file took that site's posts (FEEDBACK83.md,
+/// Q-1301, found by the review of 4bc1ac9; branch feedback82-85). One look at the hold where none
+/// is; asked after the arguments are judged, so a wrong one is said as before.
+pub(crate) fn site_wide(it: &Interp, item: impl FnOnce() -> String) -> bool {
+    !crate::confirm::held() || crate::confirm::site_ok(it.cur_file.as_deref(), &item())
+}
+
 /// `allow_cross_site("/payments/return")`, at the top of a program: routes
 /// under the path take form posts from other sites' pages (a payment
 /// provider's return, a single sign-on callback), which are otherwise
@@ -2395,6 +2421,9 @@ fn allow_cross_site(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let p = s_arg(&args, 0, "allow_cross_site", line)?;
     if !p.starts_with('/') {
         return fail(line, format!("`allow_cross_site` needs a path that starts with /, got {:?}", &*p));
+    }
+    if !site_wide(it, || format!("allow_cross_site {}", p)) {
+        return Ok(Value::Nil);
     }
     Arc::make_mut(&mut it.site).cross_site_ok.push(p.to_string());
     Ok(Value::Nil)
@@ -2409,6 +2438,9 @@ fn allow_cross_site(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn moves_in_place(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if !args.is_empty() {
         return fail(line, "`moves_in_place()` takes nothing");
+    }
+    if !site_wide(it, || "moves_in_place".into()) {
+        return Ok(Value::Nil);
     }
     Arc::make_mut(&mut it.site).in_place = true;
     Ok(Value::Nil)
@@ -2453,6 +2485,9 @@ fn site_headers(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         };
         hs.push((name, value));
     }
+    if !site_wide(it, || format!("site_headers {}", prefix)) {
+        return Ok(Value::Nil);
+    }
     Arc::make_mut(&mut it.site).headers.push((prefix, hs));
     Ok(Value::Nil)
 }
@@ -2481,6 +2516,9 @@ fn tenant_from(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             return fail(line, format!("`tenant_from` expects a domain or a function of the request, got {}", other.map_or("nothing", |v| v.type_name())))
         }
     };
+    if !site_wide(it, || "tenant_from".into()) {
+        return Ok(Value::Nil);
+    }
     Arc::make_mut(&mut it.site).tenant_rule = Some(rule);
     Ok(Value::Nil)
 }
@@ -3218,6 +3256,41 @@ pub(crate) fn way_out(p: &str, verb: &str) -> String {
     format!("; `--allow-path {}` (on `quillo run` or `quillo mcp`) lets the program {} it", dir, verb)
 }
 
+/// `way_out`, or where a link is what leads `p` out, that link: where it leads (and the folder to
+/// name for it), or that it leads nowhere. The link nearest the name whose own folder is the
+/// program's or one `--allow-path` names is the one: a link that leads nowhere in `../shared`,
+/// given as `--allow-path ../shared`, was told to give `--allow-path ../shared` (FEEDBACK83.md,
+/// found by the docs agent writing up 2a1d3f7; branch feedback82-85). An error's word: the cost
+/// is a refusal's.
+pub(crate) fn why_out(it: &Interp, p: &str, verb: &str) -> String {
+    if p.is_empty() {
+        return String::new();
+    }
+    let full = if Path::new(p).is_absolute() { std::path::PathBuf::from(p) } else { it.base_dir.join(p) };
+    let named = allowed_paths();
+    let roots: Vec<std::path::PathBuf> = it.base_dir.canonicalize().into_iter().chain(named.iter().cloned()).collect();
+    for at in full.ancestors().take(64) {
+        let Ok(m) = std::fs::symlink_metadata(at) else { continue };
+        if !m.file_type().is_symlink() {
+            continue;
+        }
+        if !at.parent().and_then(|d| d.canonicalize().ok()).is_some_and(|d| roots.iter().any(|r| d.starts_with(r))) {
+            break;
+        }
+        let shown = at.strip_prefix(&*it.base_dir).map_or_else(|_| at.display().to_string(), |r| r.display().to_string());
+        let to = std::fs::read_link(at).map(|t| t.display().to_string()).unwrap_or_default();
+        return match real_path(at) {
+            None => format!("; {} is a link that leads nowhere (to {})", shown, to),
+            Some(real) => {
+                let past = real.join(full.strip_prefix(at).unwrap_or(Path::new("")));
+                let outside = if named.is_empty() { "outside the program's folder" } else { "outside the program's folder and those `--allow-path` names" };
+                format!("; {} is a link to {}, {}{}", shown, real.display(), outside, way_out(&past.display().to_string(), verb))
+            }
+        };
+    }
+    way_out(p, verb)
+}
+
 /// Whether `p` names the program's folder itself, which no `--allow-path` lets a program delete.
 fn full_is_base(it: &Interp, p: &str) -> bool {
     p.is_empty() || local_path(it, p).is_some_and(|f| f.as_path() == &*it.base_dir)
@@ -3227,7 +3300,7 @@ fn full_is_base(it: &Interp, p: &str) -> bool {
 fn read_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let p = s_arg(&args, 0, "read_file", line)?;
     let Some(full) = local_path(it, &p) else {
-        return Ok(Value::err(Value::str(format!("read_file: path must stay inside the program's folder: {}{}", p, way_out(&p, "read")))));
+        return Ok(Value::err(Value::str(format!("read_file: path must stay inside the program's folder: {}{}", p, why_out(it, &p, "read")))));
     };
     // The paths its file was confirmed for (FEEDBACK83.md, Q-1300; branch feedback82-85).
     if let Err(why) = crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &p, false) {
@@ -3283,7 +3356,7 @@ fn write_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // A list's text held as `str` holds it (FEEDBACK71.md, Q-977; branch security).
     let text = arg(&args, 1).display_held().map_err(|o| o.at(line))?;
     let Some(full) = local_path(it, &p) else {
-        return Ok(Value::err(Value::str(format!("write_file: path must stay inside the program's folder: {}{}", p, way_out(&p, "write")))));
+        return Ok(Value::err(Value::str(format!("write_file: path must stay inside the program's folder: {}{}", p, why_out(it, &p, "write")))));
     };
     if let Err(why) = crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &p, true) {
         return Ok(Value::err(Value::str(format!("write_file: {}", why))));
@@ -3355,7 +3428,7 @@ fn check_program(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn delete_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let p = s_arg(&args, 0, "delete_file", line)?;
     let Some(full) = local_path(it, &p).filter(|f| f.as_path() != &*it.base_dir) else {
-        return Ok(Value::err(Value::str(format!("delete_file: path must be inside the program's folder: {}{}", p, if full_is_base(it, &p) { String::new() } else { way_out(&p, "delete") }))));
+        return Ok(Value::err(Value::str(format!("delete_file: path must be inside the program's folder: {}{}", p, if full_is_base(it, &p) { String::new() } else { why_out(it, &p, "delete") }))));
     };
     if let Some(why) = own_file(it, &full, false) {
         return Ok(Value::err(Value::str(format!("delete_file: will not delete {}: {}", p, why))));
@@ -4255,12 +4328,18 @@ fn style_with(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // A function takes all the styles, marked, and gives them back made (FEEDBACK37.md, Q-455;
     // branch feedback36-39).
     if let Some(f @ (Value::Func(_) | Value::Builtin(..))) = args.first() {
-        it.style_with_fn = Some(f.clone());
+        if site_wide(it, || "style_with".into()) {
+            it.style_with_fn = Some(f.clone());
+        }
         return Ok(Value::Nil);
     }
     let cmd = s_arg(&args, 0, "style_with", line)?;
     if cmd.trim().is_empty() {
         return fail(line, "`style_with` takes the command to run, like style_with(\"npx postcss\")");
+    }
+    // A command run over all the program's CSS: a taken file's, only where it was confirmed.
+    if !site_wide(it, || "style_with".into()) {
+        return Ok(Value::Nil);
     }
     it.style_with = Some(cmd.to_string());
     Ok(Value::Nil)

@@ -798,14 +798,21 @@ unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int
         // The folder SQLite makes its temporary files in, the whole process's: not moved by a
         // held program's code, which would have them made anywhere (found trying to get round
         // the hold of ATTACH).
+        // And the file macOS's SQLite keeps a database's lock in, `lock_proxy_file`, which it makes
+        // and locks wherever it is named, or opens there: a file confirmed for nothing made
+        // `../outside/proxy.lock` (FEEDBACK83.md, Q-1300, found by the review of 4bc1ac9; branch
+        // feedback82-85). No other pragma names a file: `journal_mode` and `wal` keep theirs
+        // beside the database.
         ffi::SQLITE_PRAGMA => {
-            let moves = text(a2).is_some() && text(a1).is_some_and(|p| p.to_bytes().eq_ignore_ascii_case(b"temp_store_directory") || p.to_bytes().eq_ignore_ascii_case(b"data_store_directory"));
-            if !moves {
-                return ffi::SQLITE_OK;
-            }
+            let named = |n: &[u8]| text(a1).is_some_and(|p| p.to_bytes().eq_ignore_ascii_case(n));
+            let why = match text(a2) {
+                Some(_) if named(b"temp_store_directory") || named(b"data_store_directory") => "the folder of SQLite's temporary files is not moved where a quillo.confirmed holds the run",
+                Some(_) if named(b"lock_proxy_file") => "SQLite's lock_proxy_file names a file to make and lock, which is not done where a quillo.confirmed holds the run",
+                _ => return ffi::SQLITE_OK,
+            };
             STATEMENTS_OF.with(|s| {
                 if let Ok(mut s) = s.try_borrow_mut() {
-                    s.refused = Some("the folder of SQLite's temporary files is not moved where a quillo.confirmed holds the run".into());
+                    s.refused = Some(why.into());
                 }
             });
             return ffi::SQLITE_DENY;
@@ -1299,7 +1306,9 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
     let dir = dbs.migrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().or_else(|| if is_default { it.site.migrations.clone() } else { None });
     if let Some(dir) = dir {
         let mb = b.clone();
-        let applied = it.unlocked(move || crate::migrate::run(&mb, &dir)).map_err(|e| format!("tenant {}: {}", name, e))?;
+        // Its statements judged as the code that opened the tenant's (`migrate_as`).
+        let code = (it.cur_file.clone(), it.base_dir.clone());
+        let applied = it.unlocked(move || migrate_as(code, || crate::migrate::run(&mb, &dir))).map_err(|e| format!("tenant {}: {}", name, e))?;
         for m in applied {
             eprintln!("quillo: applied migration {} for tenant {}", m, name);
         }
@@ -2327,7 +2336,13 @@ fn slot_for(it: &mut Interp, args: &[Value], f: &str, line: u32) -> Result<Resul
 pub static OPENED: Mutex<Option<String>> = Mutex::new(None);
 
 fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
-    match slot_for(it, &args, "db.open", line)? {
+    // Every file's database: a taken file's `db.open`, only where it was confirmed, refused as a
+    // database it may not open is, with an error value (`site_refused`).
+    let slot = match site_refused(it, &args, "db.open") {
+        Some(e) => Ok(Err(e)),
+        None => slot_for(it, &args, "db.open", line),
+    };
+    match slot? {
         Ok(slot) => {
             let before = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(slot);
             // Another database: pages showing the old one's rows ask again, and what was shared
@@ -2479,7 +2494,34 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         return Ok(Value::list(out));
     }
-    let full = it.base_dir.join(&dir);
+    // The folder, and each file in it, judged as `read_file` judges a path: inside the program's
+    // folder or one `--allow-path` names, links followed, and where a quillo.confirmed holds the
+    // run, among what the calling file was confirmed to read. A kit confirmed for nothing ran
+    // `db.migrate("../outside/m")`, its SQL from outside the program (FEEDBACK83.md, Q-1300, found
+    // by the review of 4bc1ac9; branch feedback82-85).
+    let full = match crate::builtins::local_path(it, &dir) {
+        Some(f) => f,
+        None => return fail(line, format!("db.migrate: the folder must stay inside the program's folder: {}{}", dir, crate::builtins::why_out(it, &dir, "read"))),
+    };
+    let folder = format!("{}/", dir.trim_end_matches('/'));
+    if let Err(why) = crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &folder, false) {
+        return fail(line, format!("db.migrate: {}", why));
+    }
+    if let Ok(entries) = std::fs::read_dir(&full) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if e.path().extension().is_none_or(|x| x != "sql") {
+                continue;
+            }
+            let p = format!("{}{}", folder, name);
+            if crate::builtins::local_path(it, &p).is_none() {
+                return fail(line, format!("db.migrate: {} must stay inside the program's folder{}", p, crate::builtins::why_out(it, &p, "read")));
+            }
+            if let Err(why) = crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &p, false) {
+                return fail(line, format!("db.migrate: {}", why));
+            }
+        }
+    }
     if on.is_none() {
         std::sync::Arc::make_mut(&mut it.site).migrations = Some(full.clone());
     }
@@ -2495,7 +2537,8 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Err(e) => return fail(line, format!("db.migrate: {}", e)),
     };
     let to = full.clone();
-    match it.unlocked(move || crate::migrate::run(&b, &to)) {
+    let code = (it.cur_file.clone(), it.base_dir.clone());
+    match it.unlocked(move || migrate_as(code, || crate::migrate::run(&b, &to))) {
         Ok(applied) => {
             for name in &applied {
                 eprintln!("quillo: applied migration {}", name);
@@ -2504,6 +2547,36 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         Err(e) => fail(line, format!("db.migrate: {}", e)),
     }
+}
+
+/// `run` (a migration's), its statements judged by `authorize` as the code of `code` (its file and
+/// folder), on whichever thread runs it: in a request, `unlocked` runs it on another thread, whose
+/// `STATEMENTS_OF` was another code's, or none (the main file's). And a statement the hold refused
+/// gives the hold's words, not SQLite's "not authorized" alone (`db_err`'s): "migration 001_a.sql
+/// failed: not authorized" was all a refused `attach` in a migration said (FEEDBACK83.md, Q-1300,
+/// found by the review of 4bc1ac9; branch feedback82-85). Nothing is set where nothing is held.
+fn migrate_as<T>(code: (Option<Arc<str>>, Arc<Path>), run: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    if !crate::confirm::held() {
+        return run();
+    }
+    let was = STATEMENTS_OF.with(|s| {
+        let mut s = s.borrow_mut();
+        let was = (s.file.take(), s.base.take());
+        (s.file, s.base, s.refused) = (code.0, Some(code.1), None);
+        was
+    });
+    STATEMENTS_AT.set((0, 0));
+    let r = run();
+    let refused = STATEMENTS_OF.with(|s| {
+        let mut s = s.borrow_mut();
+        (s.file, s.base) = was;
+        s.refused.take()
+    });
+    STATEMENTS_AT.set((0, 0));
+    r.map_err(|e| match refused {
+        Some(why) if e.ends_with("not authorized") || e.ends_with("authorization denied") => format!("{}: {}", e.trim_end_matches("not authorized").trim_end_matches("authorization denied").trim_end_matches([':', ' ']), why),
+        _ => e,
+    })
 }
 
 /// The columns a `create table` or `alter table` gives SQLite as `money`, `decimal` or
@@ -2802,6 +2875,24 @@ pub fn uses_atomic(it: &Interp) -> bool {
     it.uses_atomic
 }
 
+/// Why the code of `it` may not call `what` (`db.open`, `db.system`), which sets the database of
+/// every file, or where Quillo keeps its sessions and tables: a file taken for some of its names,
+/// confirmed to write `data/`, replaced the main file's database with its own (FEEDBACK83.md,
+/// Q-1301, found by the review of 4bc1ac9; branch feedback82-85). None where it may, and where
+/// nothing is held. A database the file may not open at all (its path or host not confirmed) is
+/// said first, as it was, nothing opened.
+fn site_refused(it: &Interp, args: &[Value], what: &str) -> Option<String> {
+    if crate::builtins::site_wide(it, || what.to_string()) {
+        return None;
+    }
+    if let Some(Value::Str(t) | Value::Css(t)) = args.first().filter(|t| !matches!(t, Value::Str(t) | Value::Css(t) if t.contains("{tenant}"))) {
+        if let Err(e) = crate::confirm::db_ok(crate::confirm::held_id(it.cur_file.as_deref()), &it.base_dir, t) {
+            return Some(e);
+        }
+    }
+    Some(format!("{} sets every file's database, and is not confirmed for {} (quillo confirm)", what, crate::confirm::held_name(it.cur_file.as_deref())))
+}
+
 /// `db.system(target)`: where Quillo keeps its own tables, when the
 /// program's databases are one per tenant (or to keep them apart).
 fn system(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
@@ -2810,6 +2901,9 @@ fn system(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     };
     if t.contains("{tenant}") {
         return fail(line, "`db.system` is one database for every tenant: no {tenant} in it");
+    }
+    if let Some(e) = site_refused(it, &args, "db.system") {
+        return Ok(db_err(e));
     }
     let held = crate::confirm::held_id(it.cur_file.as_deref());
     let b = match open_held(it, t, held) {

@@ -707,8 +707,29 @@ pub fn fix(main: &Path) -> Result<Vec<String>, String> {
     for (f, text) in files {
         std::fs::write(&f, text).map_err(|e| format!("cannot write {}: {}", crate::confirm::escaped(&f), e))?;
     }
-    if let Some(note) = before.and_then(|b| crate::confirm::fix_note(main, &b)) {
-        said.push(note);
+    if let Some(b) = before {
+        said.extend(crate::confirm::fix_note(main, &b));
+    }
+    // What is said goes to a pipe that may be closed by then (`quillo fix | head -1`): the files
+    // are written, and the process ends with 141, as a script's `print` ends on a closed pipe
+    // (`builtins::print_line`), where the print after this panicked with a trace (FEEDBACK83.md,
+    // found by the docs agent writing up 4bc1ac9; branch feedback82-85). The signal's default
+    // was not enough: macOS delivers it to the process, and the trace could come first. Only in
+    // the process of the command `quillo fix`, never in a program that calls this function.
+    if std::env::args().nth(1).as_deref() == Some("fix") {
+        let pipe = std::io::Error::from(std::io::ErrorKind::BrokenPipe).to_string();
+        #[cfg(unix)]
+        let gone = std::io::Error::from_raw_os_error(libc::EPIPE).to_string();
+        #[cfg(not(unix))]
+        let gone = pipe.clone();
+        let shown = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let said = info.payload().downcast_ref::<String>().map(String::as_str).or_else(|| info.payload().downcast_ref::<&str>().copied()).unwrap_or("");
+            if said.starts_with("failed printing to stdout") && (said.contains(&pipe) || said.contains(&gone)) {
+                std::process::exit(141);
+            }
+            shown(info)
+        }));
     }
     Ok(said)
 }

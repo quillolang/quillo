@@ -821,6 +821,11 @@ fn on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     fn nobody(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
         Ok(Value::Bool(false))
     }
+    // The streams pages may send and watch: a taken file's, only where it was confirmed
+    // (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9; branch feedback82-85).
+    if !crate::builtins::site_wide(it, || format!("media {}", name)) {
+        return Ok(Value::Nil);
+    }
     let channel = format!("media:{}", name);
     let site = std::sync::Arc::make_mut(&mut it.site);
     if site.channels.iter().any(|h| h.name == channel) {

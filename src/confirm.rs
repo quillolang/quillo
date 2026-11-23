@@ -57,7 +57,7 @@ pub fn stops(version: &str) -> bool {
 
 /// What is listed of a `.qwe` file, each with the key it has in the file and the words a
 /// listing says it with.
-pub const KINDS: &[(&str, &str)] = &[("http", "reaches"), ("files", "reads"), ("writes", "writes"), ("listens", "listens on"), ("scripts", "page script"), ("loads", "page loads"), ("calls", "page calls"), ("routes", "adds a route")];
+pub const KINDS: &[(&str, &str)] = &[("http", "reaches"), ("files", "reads"), ("writes", "writes"), ("listens", "listens on"), ("scripts", "page script"), ("loads", "page loads"), ("calls", "page calls"), ("routes", "adds a route"), ("site", "site-wide")];
 
 /// Each item, with the lines it is written on (none for what was read from `quillo.confirmed`).
 pub type Items = BTreeMap<String, Vec<u32>>;
@@ -84,6 +84,12 @@ pub struct Block {
     pub calls: Items,
     /// The routes a file taken for some of its names adds (FEEDBACK83.md, Q-1301).
     pub routes: Items,
+    /// What such a file sets for the whole program or site (`SITE_CALLS`): `allow_cross_site /`,
+    /// `site_headers /`, `channel chat`, `tenant_from`, ... A kit taken for `Badge` let every
+    /// site's form post to the main file's routes, took `x-frame-options` away and answered with
+    /// credentialed CORS for another site, under a quillo.confirmed that confirmed nothing of it
+    /// (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9; branch feedback82-85).
+    pub site: Items,
     /// A Rust file: its SHA-256, what its header says it does, and what a reading of it finds.
     pub rust: bool,
     pub sha256: Option<String>,
@@ -111,6 +117,11 @@ pub struct Block {
     /// Found only (FEEDBACK83.md, Q-1301, found in review of the coverage fixes; branch
     /// feedback82-85).
     pub service_tools: Vec<(String, String, String)>,
+    /// What the file takes of another file that carries what that file reaches (`carried`): a
+    /// global holding a builtin that reaches something, a function value or a module, each with
+    /// the line of its `import`. The import is the grant (the user's decision of 2026-11-24), and
+    /// said where the program's reach is said. Found only.
+    pub grants: Vec<(u32, String)>,
 }
 
 impl Block {
@@ -124,6 +135,7 @@ impl Block {
             "loads" => &self.loads,
             "calls" => &self.calls,
             "routes" => &self.routes,
+            "site" => &self.site,
             "env" => &self.env,
             "crates" => &self.crates,
             _ => &self.written,
@@ -140,6 +152,7 @@ impl Block {
             "loads" => &mut self.loads,
             "calls" => &mut self.calls,
             "routes" => &mut self.routes,
+            "site" => &mut self.site,
             "env" => &mut self.env,
             "crates" => &mut self.crates,
             _ => return None,
@@ -218,6 +231,8 @@ struct Read {
     takes: Vec<(PathBuf, Option<Vec<String>>, bool)>,
     /// Its `service mcp` lines' services: the name each one's tools are offered under, its file.
     services: Vec<(String, PathBuf)>,
+    /// The files it takes names of by `use`, with those names and the line (`Block::grants`).
+    named_at: Vec<(PathBuf, Vec<String>, u32)>,
 }
 
 /// `scan_with`, from `main`, naming files from `dir`: a service started apart is held by its app's
@@ -256,11 +271,16 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
         };
         let mut takes = Vec::new();
         let mut services = Vec::new();
+        let mut named_at = Vec::new();
         for s in stmts.iter() {
             match s {
-                Stmt::Use(path, names, _, options) if !is_script(path) => {
+                Stmt::Use(path, names, line, options) if !is_script(path) => {
                     let p = base.join(crate::modules::resolve_use(&base, &full, path, options.implied));
-                    takes.push((crate::modules::key(&p), names.as_ref().map(|n| n.iter().map(|(n, _)| n.clone()).collect()), true));
+                    let names: Option<Vec<String>> = names.as_ref().map(|n| n.iter().map(|(n, _)| n.clone()).collect());
+                    if let Some(n) = &names {
+                        named_at.push((crate::modules::key(&p), n.clone(), *line));
+                    }
+                    takes.push((crate::modules::key(&p), names, true));
                     todo.push((p, base.clone()));
                 }
                 Stmt::Mount(_, path, _) | Stmt::Service(_, _, path, _, _, _) if !is_address(path) => {
@@ -275,7 +295,7 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
                 _ => {}
             }
         }
-        read.insert(key, Read { name, stmts, takes, services });
+        read.insert(key, Read { name, stmts, takes, services, named_at });
     }
     // What each `service mcp` line offers, as the door names it (`mcp::tools`): the tools of the
     // service's program, its file's and those of the files it takes by `use`, each with the file
@@ -364,11 +384,41 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
             taken.entry(t).or_default().push(why);
         }
     }
+    // What each file takes by name of another that carries what that other file reaches
+    // (`carried`): the import is the grant the user chose, a file using another's name only by
+    // taking it, but nothing said what it handed over: `quillo fix` wrote `import main.qwe use
+    // reader` into a kit confirmed for nothing, which then read `.env` as main.qwe (FEEDBACK83.md,
+    // Q-1300, the user's decision of 2026-11-24, found by the review of 4bc1ac9; branch
+    // feedback82-85).
+    let mut grants: HashMap<PathBuf, Vec<(u32, String)>> = HashMap::new();
+    for (rk, r) in &read {
+        for (gk, names, line) in &r.named_at {
+            let Some(g) = read.get(gk).filter(|_| gk != rk) else { continue };
+            let mut said: Vec<&str> = Vec::new();
+            for n in names {
+                if said.contains(&n.as_str()) {
+                    continue;
+                }
+                said.push(n);
+                if let Some(what) = carried(&g.stmts, n) {
+                    grants.entry(rk.clone()).or_default().push((*line, format!("{} takes {}'s {} ({}, as {} reaches it)", r.name, g.name, n, what, g.name)));
+                }
+            }
+        }
+    }
     for (key, r) in read {
         let names = taken.get(&key);
-        let mut b = Block { taken: names.is_some(), service_tools: service_tools.get(&key).cloned().unwrap_or_default(), ..Default::default() };
+        let mut b = Block { taken: names.is_some(), service_tools: service_tools.get(&key).cloned().unwrap_or_default(), grants: grants.remove(&key).unwrap_or_default(), ..Default::default() };
         let mut routes: Vec<(String, u32)> = Vec::new();
         let mut at_start: Vec<u32> = Vec::new();
+        // What a taken file sets for the whole program or site, however its call is written (in
+        // a function, a route, an `if`, piped): listed, and held at the call (`site_ok`); the main
+        // file's, a file it takes whole and a mounted program's are the program's own, as their
+        // routes are (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9; branch feedback82-85).
+        let site = if b.taken { site_calls(&r.stmts) } else { Vec::new() };
+        for (item, line) in &site {
+            add(&mut b.site, item.clone(), *line);
+        }
         for s in r.stmts.iter() {
             match s {
                 // A taken file's `service mcp` line offers its service's tools: ways in, as its own
@@ -419,12 +469,193 @@ pub fn scan_from(main: &Path, dir: &Path, parsed: &HashMap<PathBuf, std::sync::A
         }
         // A file taken for some of its names that also adds ways in or works as the program
         // starts (FEEDBACK83.md, Q-1301; branch feedback82-85).
-        if let Some(n) = names.and_then(|names| taken_note(&r.name, names, &routes, &at_start)) {
+        if let Some(n) = names.and_then(|names| taken_note(&r.name, names, &routes, &site, &at_start)) {
             b.notes.push(n);
         }
         out.files.insert(r.name, b);
     }
     out
+}
+
+/// The builtins that set something for the whole program or site, by the name a call is written
+/// with: the word a taken file's call is listed by (`site_item`), and whether the path or name it
+/// is given first is part of what is confirmed (`allow_cross_site /pay`, `channel chat`). Each is
+/// held at its call (`site_ok`): `allow_cross_site` (a path's routes take other sites' form
+/// posts), `site_headers` (every answer's headers: CORS, framing, a CSP), `tenant_from` (whose
+/// database a request uses), `moves_in_place` (how every page moves), `accept_calls` (who may call
+/// the program's `server fn`s), `db.open` and `db.system` (every file's database, and where
+/// Quillo keeps its sessions), `translations` and `locale_from` (every page's words), `style_with`
+/// (a command run over all the program's CSS), `ready` (what the readiness answer says, a check of
+/// that name replaced), `channel.on` and `media.on` (what pages may send to the server)
+/// (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9; branch feedback82-85).
+pub const SITE_CALLS: &[(&str, &str, bool)] = &[
+    ("allow_cross_site", "allow_cross_site", true),
+    ("site_headers", "site_headers", true),
+    ("tenant_from", "tenant_from", false),
+    ("moves_in_place", "moves_in_place", false),
+    ("accept_calls", "accept_calls", false),
+    ("translations", "translations", false),
+    ("locale_from", "locale_from", false),
+    ("style_with", "style_with", false),
+    ("ready", "ready", true),
+    ("channel.on", "channel", true),
+    ("media.on", "media", true),
+    ("db.open", "db.open", false),
+    ("db.system", "db.system", false),
+];
+
+/// Whether the builtin `name` sets something for the whole program (`SITE_CALLS`), or for another
+/// file's `server fn` (`__callers`, which `server fn f() for [...]` writes): held to the file that
+/// names it when it is handed on as a value, as a builtin that reaches something is
+/// (`interp::carries_origin`).
+pub fn is_site_call(name: &str) -> bool {
+    name == "__callers" || SITE_CALLS.iter().any(|(n, _, _)| *n == name)
+}
+
+/// `site_headers`' path as the builtin keeps it: no `/` at the end, `/` for every answer.
+pub fn site_prefix(p: &str) -> String {
+    let t = p.trim_end_matches('/');
+    if t.is_empty() { "/".to_string() } else { t.to_string() }
+}
+
+/// How a call of the builtin `name` with `args` (as written) is listed, if it is one of
+/// `SITE_CALLS`: its word, and its path or name where that is written out, else `*` (any), which a
+/// developer confirms knowing that the file works it out.
+fn site_item(name: &str, args: &[&Expr]) -> Option<String> {
+    let (_, word, named) = SITE_CALLS.iter().find(|(n, _, _)| *n == name)?;
+    if !named {
+        return Some(word.to_string());
+    }
+    let written = |e: Option<&&Expr>| e.and_then(|e| written_start(e)).filter(|(_, whole)| *whole).map(|(s, _)| s);
+    let what = match (name, args.first()) {
+        ("site_headers", Some(Expr::Map(_))) => "/".to_string(),
+        ("site_headers", first) if args.len() > 1 => written(first).map_or_else(|| "*".to_string(), |p| site_prefix(&p)),
+        ("site_headers", _) => "*".to_string(),
+        (_, first) => written(first).unwrap_or_else(|| "*".to_string()),
+    };
+    Some(format!("{} {}", word, what))
+}
+
+/// Each call in `stmts` of a builtin that sets something for the whole program (`site_item`), with
+/// its line; a call given its first argument by a pipe is read with it, as `read_calls` reads one.
+fn site_calls(stmts: &[Stmt]) -> Vec<(String, u32)> {
+    let mut out = Vec::new();
+    let mut piped: HashSet<*const Expr> = HashSet::new();
+    crate::check::each_expr_of(stmts, &mut |e| match e {
+        Expr::Pipe(lhs, rhs, _) => {
+            if let Expr::Call(c, args, line) = &**rhs {
+                piped.insert(&**rhs as *const Expr);
+                let mut all: Vec<&Expr> = vec![&**lhs];
+                all.extend(args.iter());
+                if let Some(i) = site_item(&callee(c), &all) {
+                    out.push((i, *line));
+                }
+            }
+        }
+        Expr::Call(c, args, line) if !piped.contains(&(e as *const Expr)) => {
+            let all: Vec<&Expr> = args.iter().collect();
+            if let Some(i) = site_item(&callee(c), &all) {
+                out.push((i, *line));
+            }
+        }
+        _ => {}
+    });
+    out
+}
+
+/// The modules whose builtins reach what a `quillo.confirmed` holds, as `interp::carries_origin`
+/// counts them: the others (`math`, `json`, `crypto`, ...) reach nothing it holds.
+const HELD_MODULES: &[&str] = &["db", "http", "udp", "channel", "media", "image", "later", "notification"];
+
+/// Whether the builtin `name`, not a module's, reaches what a `quillo.confirmed` holds: files, the
+/// network, a database, or the whole site (`is_site_call`). The time, chance and `env` are not
+/// held to a file, so handing them on grants nothing.
+fn reaches_held(name: &str) -> bool {
+    let held = ["fs", "http", "db", "net"].iter().fold(0, |m, e| m | crate::ast::effect_bit(e));
+    crate::ast::builtin_effect(name) & held != 0 || is_site_call(name)
+}
+
+/// What the top-level `let name = ...` of a file (`stmts`) carries that reaches what a
+/// `quillo.confirmed` holds, as the code is written: the builtins and modules it holds or calls
+/// (`read_file`, `http.get`, `http`), through the file's own functions and globals it names; a
+/// function value (a lambda, a function of the file's) said as one, as its code runs as its
+/// file's. None where it carries nothing, and for a `fn` declared: a file takes one by name as code
+/// to call, ordinary reuse whose code is read where it is written (decided for the review of
+/// 4bc1ac9: only a value made to be handed on is said) (FEEDBACK83.md, Q-1300, the user's decision
+/// of 2026-11-24; branch feedback82-85).
+fn carried(stmts: &[Stmt], name: &str) -> Option<String> {
+    let mut tops: HashMap<&str, (&Expr, bool)> = HashMap::new();
+    // What a global is set to after its `let`, at the top (`r = read_file`): read with it.
+    let mut set: Vec<(&str, &Expr)> = Vec::new();
+    for s in stmts {
+        match s {
+            Stmt::Let(Pattern::Bind(n), e, _) => {
+                tops.insert(n.as_str(), (e, false));
+            }
+            Stmt::Fn(d) => {
+                tops.insert(d.name.as_str(), (&d.body, true));
+            }
+            Stmt::Assign(n, _, e, _) => set.push((n.as_str(), e)),
+            _ => {}
+        }
+    }
+    let (start, _) = *tops.get(name).filter(|(_, is_fn)| !is_fn)?;
+    let function = match start {
+        Expr::Lambda(_) => true,
+        Expr::Ident(n, _) => tops.get(n.as_str()).is_some_and(|(_, is_fn)| *is_fn),
+        _ => false,
+    };
+    let mut found: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::from([name.to_string()]);
+    let mut todo: Vec<&Expr> = vec![start];
+    let sets = |n: &str| set.iter().filter(|(m, _)| *m == n).map(|(_, e)| *e).collect::<Vec<&Expr>>();
+    todo.extend(sets(name));
+    while let Some(e) = todo.pop() {
+        // The names it uses, a module's member as one (`http.get`), less a lambda's parameters.
+        let (mut names, mut members, mut bound) = (Vec::new(), Vec::new(), HashSet::new());
+        let mut object: HashSet<usize> = HashSet::new();
+        crate::check::walk_expr(e, &mut |x| match x {
+            Expr::Lambda(d) => bound.extend(d.params.iter().map(|p| p.name.as_str().to_string())),
+            Expr::Field(o, f, _) => {
+                if let Expr::Ident(m, _) = &**o {
+                    object.insert(&**o as *const Expr as usize);
+                    members.push((m.as_str().to_string(), f.clone()));
+                }
+            }
+            Expr::Ident(n, _) if !object.contains(&(x as *const Expr as usize)) => names.push(n.as_str().to_string()),
+            _ => {}
+        });
+        let mut say = |w: String| {
+            if !found.contains(&w) {
+                found.push(w);
+            }
+        };
+        for n in names.into_iter().filter(|n| !bound.contains(n)) {
+            match tops.get(n.as_str()) {
+                Some((body, _)) => {
+                    if seen.insert(n.clone()) {
+                        todo.push(body);
+                        todo.extend(sets(&n));
+                    }
+                }
+                None if HELD_MODULES.contains(&n.as_str()) || reaches_held(&n) => say(n),
+                None => {}
+            }
+        }
+        for (m, f) in members {
+            if !bound.contains(&m) && !tops.contains_key(m.as_str()) && HELD_MODULES.contains(&m.as_str()) {
+                say(format!("{}.{}", m, f));
+            } else if let Some((body, _)) = tops.get(m.as_str()).filter(|_| !bound.contains(&m)) {
+                if seen.insert(m) {
+                    todo.push(body);
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        return None;
+    }
+    Some(if function { format!("a function that calls {}", found.join(", ")) } else { found.join(", ") })
 }
 
 /// How a `server fn` or a tool is listed among a file's ways in.
@@ -487,8 +718,11 @@ fn scan_taken(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>>>)
                 _ => {}
             }
         }
+        // What it sets for the whole site, as `scan_from` lists it (Q-1301, found by the review of
+        // 4bc1ac9).
+        let site = site_calls(stmts);
         let mut b = Block { taken: true, ..Default::default() };
-        if let Some(n) = taken_note(&name, &names, &routes, &at_start) {
+        if let Some(n) = taken_note(&name, &names, &routes, &site, &at_start) {
             b.notes.push(n);
         }
         out.files.insert(name, b);
@@ -496,19 +730,29 @@ fn scan_taken(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>>>)
     out
 }
 
-/// What is said of a file taken for `names` that adds `routes` or reaches out at start.
-fn taken_note(name: &str, names: &[String], routes: &[(String, u32)], at_start: &[u32]) -> Option<(u32, String)> {
-    if routes.is_empty() && at_start.is_empty() {
+/// What is said of a file taken for `names` that adds `routes`, sets something for the whole
+/// program (`site`) or reaches out at start.
+fn taken_note(name: &str, names: &[String], routes: &[(String, u32)], site: &[(String, u32)], at_start: &[u32]) -> Option<(u32, String)> {
+    if routes.is_empty() && site.is_empty() && at_start.is_empty() {
         return None;
     }
     let mut also = Vec::new();
     if !routes.is_empty() {
         also.push(format!("adds {}", routes.iter().map(|(r, _)| r.as_str()).collect::<Vec<_>>().join(", ")));
     }
+    if !site.is_empty() {
+        let mut items: Vec<&str> = Vec::new();
+        for (i, _) in site {
+            if !items.contains(&i.as_str()) {
+                items.push(i);
+            }
+        }
+        also.push(format!("sets for the whole site {}", items.join(", ")));
+    }
     if !at_start.is_empty() {
         also.push(format!("reaches out as the program starts (line {})", at_start.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")));
     }
-    let line = routes.first().map(|r| r.1).into_iter().chain(at_start.first().copied()).min().unwrap_or(0);
+    let line = routes.first().map(|r| r.1).into_iter().chain(site.iter().map(|s| s.1).min()).chain(at_start.first().copied()).min().unwrap_or(0);
     let mut names = names.to_vec();
     names.dedup();
     Some((line, format!("{} is taken for {}, and also {}", name, names.join(", "), also.join(" and "))))
@@ -662,6 +906,20 @@ fn read_call(name: &str, args: &[&Expr], line: u32, b: &mut Block) {
         "files" => {
             if let Some(p) = args.first().and_then(|e| written_start(e)).filter(|(_, whole)| *whole).map(|(s, _)| normal(&format!("{}/", s.trim_end_matches('/')))) {
                 add(&mut b.files, p, line);
+            }
+        }
+        // The folders `db.migrate` (or a connection's `migrate`) and `translations` read, held as
+        // a read of each file in them (FEEDBACK83.md, Q-1300, found by the review of 4bc1ac9;
+        // branch feedback82-85).
+        n if n == "db.migrate" || n.ends_with(".migrate") || n == "translations" => {
+            let folder = match args.first() {
+                None if n != "translations" => Some("migrations".to_string()),
+                Some(e) => written_start(e).filter(|(_, whole)| *whole).map(|(s, _)| s),
+                None => None,
+            };
+            // The program's folder itself (`"."`) is no item a list can hold: refused where held.
+            if let Some(f) = folder.map(|f| normal(&format!("{}/", f.trim_end_matches('/')))).filter(|f| !f.is_empty()) {
+                add(&mut b.files, f, line);
             }
         }
         "write_file" | "delete_file" => path(0, true, b),
@@ -1635,7 +1893,7 @@ pub fn parse(text: &str) -> Result<Confirmed, String> {
             k => {
                 let mut hashes: Vec<(String, String)> = Vec::new();
                 let Some(items) = b.items_mut(k) else {
-                    return Err(err(&format!("`{}` is not something quillo.confirmed says (it says http, files, writes, listens, scripts, loads, calls, routes, sha256, effects, env, crates)", k)));
+                    return Err(err(&format!("`{}` is not something quillo.confirmed says (it says http, files, writes, listens, scripts, loads, calls, routes, site, sha256, effects, env, crates)", k)));
                 };
                 let mut rest = value.strip_prefix('[').ok_or_else(|| err(&format!("`{}` is a list: [\"...\", ...]", k)))?.trim_start();
                 loop {
@@ -1682,7 +1940,7 @@ pub fn render(c: &Confirmed) -> String {
                 s.push_str(&format!("effects = {}\n", quote(e)));
             }
         }
-        for k in ["http", "files", "writes", "listens", "scripts", "loads", "calls", "routes", "env", "crates"] {
+        for k in ["http", "files", "writes", "listens", "scripts", "loads", "calls", "routes", "site", "env", "crates"] {
             let items = b.items(k);
             if items.is_empty() {
                 continue;
@@ -1788,7 +2046,7 @@ pub fn merged(scan: &Scan, conf: &Confirmed, chosen: &dyn Fn(&str) -> bool) -> C
         let mut b = found.clone();
         b.notes.clear();
         b.written.clear();
-        for k in ["http", "files", "writes", "listens", "scripts", "loads", "calls", "routes", "env", "crates"] {
+        for k in ["http", "files", "writes", "listens", "scripts", "loads", "calls", "routes", "site", "env", "crates"] {
             if let Some(items) = b.items_mut(k) {
                 items.values_mut().for_each(Vec::clear);
             }
@@ -1865,9 +2123,17 @@ pub fn listing(scan: &Scan, missing: &[Missing]) -> String {
 /// What the program at `main` reaches that the `quillo.confirmed` beside it does not confirm; none
 /// where no such file holds it, or it cannot be read (`quillo check` says why). For `quillo fix`,
 /// before it writes imports (`fix_note`).
-pub fn left_unconfirmed(main: &Path) -> Option<Vec<Missing>> {
+pub fn left_unconfirmed(main: &Path) -> Option<Before> {
     let conf = read(&dir_of(main).join(FILE)).ok()??;
-    Some(missing(&scan(main), &conf))
+    let found = scan(main);
+    Some(Before { missing: missing(&found, &conf), grants: found.files.values().flat_map(|b| b.grants.iter().map(|(_, g)| g.clone())).collect() })
+}
+
+/// What a held program reached unconfirmed, and what its files' imports handed them, before
+/// `quillo fix` wrote imports (`left_unconfirmed`).
+pub struct Before {
+    missing: Vec<Missing>,
+    grants: Vec<String>,
 }
 
 /// What `quillo fix` says once the imports it wrote under a `quillo.confirmed` make the program
@@ -1875,14 +2141,21 @@ pub fn left_unconfirmed(main: &Path) -> Option<Vec<Missing>> {
 /// file the imports take for some of its names is a taken file now, whose routes are held to the
 /// list. Said as the listing has it, with what to run (FEEDBACK83.md, Q-1300, the user's decision
 /// of 2026-11-24; branch feedback82-85).
-pub fn fix_note(main: &Path, before: &[Missing]) -> Option<String> {
-    let conf = read(&dir_of(main).join(FILE)).ok()??;
+///
+/// And, a line each, what the imports it wrote hand a file of another file's reach (`carried`):
+/// `import main.qwe use reader` made a kit confirmed for nothing read `.env` as main.qwe, through
+/// main's `let reader = read_file`, with nothing said. The import is the grant the user chose, not
+/// refused; it is said (FEEDBACK83.md, Q-1300, the user's decision of 2026-11-24, found by the
+/// review of 4bc1ac9; branch feedback82-85).
+pub fn fix_note(main: &Path, before: &Before) -> Vec<String> {
+    let Some(conf) = read(&dir_of(main).join(FILE)).ok().flatten() else { return Vec::new() };
     let found = scan(main);
-    let new: Vec<Missing> = missing(&found, &conf).into_iter().filter(|m| !before.iter().any(|b| (b.file.as_str(), b.kind, b.item.as_str()) == (m.file.as_str(), m.kind, m.item.as_str()))).collect();
+    let mut said: Vec<String> = found.files.values().flat_map(|b| b.grants.iter()).filter(|(_, g)| !before.grants.contains(g)).map(|(_, g)| format!("note: {}", escaped(g))).collect();
+    let new: Vec<Missing> = missing(&found, &conf).into_iter().filter(|m| !before.missing.iter().any(|b| (b.file.as_str(), b.kind, b.item.as_str()) == (m.file.as_str(), m.kind, m.item.as_str()))).collect();
     if new.is_empty() {
-        return None;
+        return said;
     }
-    Some(format!(
+    said.push(format!(
         "{}: with these imports, {}: run `quillo confirm` to confirm {} (until then `quillo check` stops on {}, and a run refuses {}):{}",
         FILE,
         summary(&new),
@@ -1890,7 +2163,8 @@ pub fn fix_note(main: &Path, before: &[Missing]) -> Option<String> {
         if new.len() == 1 { "it" } else { "them" },
         if new.len() == 1 { "it" } else { "each" },
         listing(&found, &new).trim_end()
-    ))
+    ));
+    said
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -2342,6 +2616,56 @@ pub fn route_ok(cur_file: Option<&str>, shown: &str) -> bool {
     false
 }
 
+/// Whether the call `item` (as `SITE_CALLS` lists it: `allow_cross_site /`), made by the code of
+/// `cur_file`, which sets something for the whole program or site, is applied: a file taken for
+/// some of its names sets only what was confirmed for it (`site`, `name *` covering any path or
+/// name), as its routes are held (`route_ok`); the main file's, a file it takes whole and a
+/// mounted program's are the program's own. Said once where it is not. Asked at the call, where
+/// the value is the one used, however it was worked out; one look at the hold where none is
+/// (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9; branch feedback82-85).
+pub fn site_ok(cur_file: Option<&str>, item: &str) -> bool {
+    let Some(h) = HOLD.get() else { return true };
+    let i = h.id(cur_file);
+    let file = || if i == 0 { cur_file.map_or_else(|| "a file".to_string(), |f| rel_name(&h.dir, Path::new(f))) } else { h.name_of(i).to_string() };
+    // A file no start read (one `--watch` took since), as `route_ok` has it.
+    if i == 0 {
+        h.say(format!("{}: {} is not applied: its file was not read as the program started (restart it once it is confirmed)", file(), item));
+        return false;
+    }
+    let b = &h.blocks[i as usize];
+    let any = item.split_once(' ').map(|(w, _)| format!("{} *", w));
+    if !h.routes_held.contains(&i) || b.site.contains_key(item) || any.is_some_and(|a| b.site.contains_key(&a)) {
+        return true;
+    }
+    h.say(format!("{}: {} is not applied: it is not confirmed for this file (`quillo confirm` lists it)", file(), item));
+    false
+}
+
+/// The name `quillo.confirmed` has for the file of the code of `cur_file`, for a refusal's words.
+pub fn held_name(cur_file: Option<&str>) -> String {
+    let Some(h) = HOLD.get() else { return cur_file.unwrap_or("this file").to_string() };
+    match h.id(cur_file) {
+        0 => cur_file.map_or_else(|| h.main.clone(), |f| rel_name(&h.dir, Path::new(f))),
+        i => h.name_of(i).to_string(),
+    }
+}
+
+/// Whether the code of `cur_file` may say which callers the `server fn` `name`, declared in
+/// `fn_file`, takes (`__callers`, which `server fn f() for ["shop"]` writes after it): its own, or
+/// the program's own code. A builtin any code may call, so a kit taken for `Badge` could change the
+/// main file's `server fn transfer for ["shop"]` to take another caller (FEEDBACK83.md, Q-1301,
+/// found by the review of 4bc1ac9; branch feedback82-85).
+pub fn callers_ok(cur_file: Option<&str>, fn_file: Option<&str>, name: &str) -> bool {
+    let Some(h) = HOLD.get() else { return true };
+    let i = h.id(cur_file);
+    if i != 0 && (!h.routes_held.contains(&i) || h.id(fn_file) == i) {
+        return true;
+    }
+    let file = if i == 0 { cur_file.map_or_else(|| "a file".to_string(), |f| rel_name(&h.dir, Path::new(f))) } else { h.name_of(i).to_string() };
+    h.say(format!("{}: the callers of server fn {} are not set: the function is another file's, whose `for [...]` says them", file, name));
+    false
+}
+
 /// Why the Rust file `qwer` may not load, if it may not: it is not the file confirmed, by its
 /// SHA-256 (D.3: a Rust file is asked about again whenever it changes).
 pub fn plugin_ok(qwer: &Path) -> Result<(), String> {
@@ -2597,6 +2921,14 @@ pub fn for_check(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>
     }
     match &conf {
         Some(conf) => {
+            // What a file's imports hand it of another file's reach, said beside the rest
+            // (`Block::grants`; FEEDBACK83.md, Q-1300, the user's decision of 2026-11-24, found
+            // by the review of 4bc1ac9; branch feedback82-85).
+            for (file, b) in &found.files {
+                for (line, g) in &b.grants {
+                    out.push(Diagnostic { file: shown(file), line: *line, severity: Severity::Warning, message: escaped(g).into_owned() });
+                }
+            }
             let left = missing(&found, conf);
             for m in &left {
                 let message = if m.kind == "sha256" {
@@ -2700,10 +3032,12 @@ pub fn main(args: &[String]) -> i32 {
             }
         }
         println!("quillo: everything the program's files reach is confirmed ({})", path.display());
+        print!("{}", grants_said(&found));
         return 0;
     }
     let n = left.iter().map(|m| &m.file).collect::<HashSet<_>>().len();
     println!("quillo: {} something not confirmed yet{}", plural(n, "file reaches", "files reach"), listing(&found, &left));
+    print!("{}", grants_said(&found));
     let mut take: HashSet<String> = HashSet::new();
     if yes {
         take.extend(left.iter().map(|m| m.file.clone()));
@@ -2763,7 +3097,7 @@ fn read_answer() -> String {
 fn whole_listing(found: &Scan) -> String {
     let mut s = String::new();
     for (file, b) in &found.files {
-        if b.is_empty() && b.notes.is_empty() {
+        if b.is_empty() && b.notes.is_empty() && b.grants.is_empty() {
             continue;
         }
         s.push_str(&format!("{}\n", escaped(file)));
@@ -2782,11 +3116,17 @@ fn whole_listing(found: &Scan) -> String {
                 s.push_str(&format!("  {:<13} {:<40} {}\n", word, escaped(item), lines.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")));
             }
         }
-        for (_, n) in &b.notes {
+        for (_, n) in b.notes.iter().chain(b.grants.iter()) {
             s.push_str(&format!("  note: {}\n", escaped(n)));
         }
     }
     s
+}
+
+/// What each file's imports hand it of another file's reach (`Block::grants`), a line each, as
+/// `quillo confirm` says it after its listing.
+fn grants_said(found: &Scan) -> String {
+    found.files.values().flat_map(|b| b.grants.iter()).map(|(_, g)| format!("  note: {}\n", escaped(g))).collect()
 }
 
 /// `quillo confirm --effects FILE...`: the line a reading proposes for each Rust file, and where

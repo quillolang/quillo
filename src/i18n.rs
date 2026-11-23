@@ -72,7 +72,7 @@ fn locale_name_ok(name: &str) -> bool {
         && parts.all(|p| (2..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
-fn load_dir(dir: &std::path::Path) -> Result<Vec<(String, Map)>, String> {
+fn load_dir(dir: &std::path::Path, judge: &dyn Fn(&str) -> Result<(), String>) -> Result<Vec<(String, Map)>, String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {}", dir.display(), e))?;
     let mut out = Vec::new();
     for e in entries.flatten() {
@@ -80,6 +80,8 @@ fn load_dir(dir: &std::path::Path) -> Result<Vec<(String, Map)>, String> {
         if path.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
+        // Each file as the hold judges a read of it, a link in the folder where it leads.
+        judge(&e.file_name().to_string_lossy())?;
         let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
         let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
         // A byte-order mark, as Windows' editors write one, is no part of the JSON: it was
@@ -98,13 +100,28 @@ fn load_dir(dir: &std::path::Path) -> Result<Vec<(String, Map)>, String> {
 /// `translations("locales", { default })` or `translations({ en: {...}, fr:
 /// {...} })`, at the top of the program.
 fn translations(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    // Every page's words: a taken file's, only where it was confirmed (FEEDBACK83.md, Q-1301, found
+    // by the review of 4bc1ac9; branch feedback82-85).
+    if matches!(args.first(), Some(Value::Str(_) | Value::Css(_) | Value::Map(_))) && !crate::builtins::site_wide(it, || "translations".into()) {
+        return Ok(Value::Nil);
+    }
     let sources = match args.first() {
         Some(Value::Str(p) | Value::Css(p)) => {
             let rel = std::path::Path::new(&**p);
             if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
                 return fail(line, format!("`translations` needs a folder inside the program's, got {:?}", &**p));
             }
-            match load_dir(&it.base_dir.join(rel)) {
+            // The folder and each file read as the file builtins are held, to what the calling
+            // file was confirmed to read: read unheld, a kit confirmed for nothing loaded any folder
+            // of the program as every page's words (FEEDBACK83.md, Q-1300, found by the review of
+            // 4bc1ac9; branch feedback82-85).
+            let folder = format!("{}/", p.trim_end_matches('/'));
+            let (file, base) = (it.cur_file.clone(), it.base_dir.clone());
+            let judge = |name: &str| crate::confirm::path_ok(file.as_deref(), &base, &format!("{}{}", folder, name), false);
+            if let Err(why) = judge("") {
+                return fail(line, format!("`translations`: {}", why));
+            }
+            match load_dir(&it.base_dir.join(rel), &judge) {
                 Ok(s) => s,
                 Err(e) => return fail(line, format!("`translations`: {}", e)),
             }
@@ -181,6 +198,9 @@ fn first_default(locales: &IndexMap<Arc<str>, HashMap<String, Value>>) -> Arc<st
 /// usual choice (cookie, `Accept-Language`, default).
 fn locale_from(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match args.first() {
+        // Every request's locale: a taken file's, only where it was confirmed (FEEDBACK83.md,
+        // Q-1301, found by the review of 4bc1ac9; branch feedback82-85).
+        Some(Value::Func(_) | Value::Builtin(..)) if !crate::builtins::site_wide(it, || "locale_from".into()) => Ok(Value::Nil),
         Some(f @ (Value::Func(_) | Value::Builtin(..))) => {
             Arc::make_mut(&mut it.site).locale_rule = Some(f.clone());
             Ok(Value::Nil)

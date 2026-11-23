@@ -2366,7 +2366,11 @@ fn carries_origin(name: &str) -> bool {
     }
     match name.split_once('.') {
         Some((module, _)) => !matches!(module, "math" | "stats" | "re" | "bit" | "json" | "vec" | "date" | "money" | "crypto"),
-        None => crate::ast::builtin_effect(name) != 0,
+        // And one that sets something for the whole program (`allow_cross_site`, `site_headers`,
+        // `__callers`, ...), held to the file that names it at its call (`confirm::site_ok`): a kit
+        // handing `allow_cross_site` to the main file's `apply(f, x)` had it called as the main
+        // file's (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9; branch feedback82-85).
+        None => crate::ast::builtin_effect(name) != 0 || crate::confirm::is_site_call(name),
     }
 }
 

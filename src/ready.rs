@@ -130,6 +130,12 @@ fn remote_ready(url: &str) -> bool {
 pub fn add_check(it: &mut Interp, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
     match (args.first(), args.get(1)) {
         (Some(Value::Str(name) | Value::Css(name)), Some(f @ (Value::Func(_) | Value::Builtin(..)))) => {
+            // What the readiness answer says, a check of the name replaced: a taken file's, only
+            // where it was confirmed (FEEDBACK83.md, Q-1301, found by the review of 4bc1ac9;
+            // branch feedback82-85).
+            if !crate::builtins::site_wide(it, || format!("ready {}", name)) {
+                return Ok(Value::Nil);
+            }
             let checks = std::sync::Arc::make_mut(&mut it.ready_checks);
             checks.retain(|(n, _)| **n != **name);
             checks.push((name.to_string(), f.clone()));
