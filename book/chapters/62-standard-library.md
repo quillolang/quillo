@@ -452,7 +452,9 @@ path is judged where it really leads, with its links followed:
   /srv/outside/s.txt, and is refused; --allow-path FOLDER lets the program reach a
   folder outside`.
 - A link that leads nowhere is refused too: writing through it would make its target,
-  wherever that is.
+  wherever that is. So is one inside a folder `--allow-path` names *(since 0.8.11: there it
+  made a file outside every folder named)*, and a `..` after a name that is not there
+  (`../shared/gone/../x.txt`).
 - A program run through a link (a deploy's `current -> releases/42`) is inside the
   folder the link leads to, so its own files work as before. A main file that is itself
   a link (`app.qwe -> /srv/releases/42/main.qwe`) takes its `use`, `import`, `mount` and
@@ -531,7 +533,11 @@ turns it around. A later release removes it.
   price`". `quillo fix main.qwe` writes those lines, in every file of the program
   (run it once for each program, a service's or a mounted one's too), after a byte-order
   mark and with the file's own line ends (CRLF in a CRLF file). A later release
-  makes this an error.
+  makes this an error. Under a `quillo.confirmed` it is one already *(since 0.8.11)*, in
+  `quillo check` and as the program starts, `--no-check` or not, and a record made from
+  another file's `type` must be taken too: each file is held to what it was confirmed for,
+  and a value under another file's name would carry that file's (see [What a program
+  reaches](#what-a-program-reaches)). `quillo fix` writes those imports there too.
 - Two files may define one name: a `helper` in `lib/a.qwe` and a `helper` in `lib/b.qwe`
   are two functions, and each `fn`, `view`, `component` and top-level `let` works this
   way. A file's own name comes first, and then a name it took by name. A file that
@@ -542,7 +548,8 @@ turns it around. A later release removes it.
 - Three things stay the program's. A `server fn`'s name is its address, so it is defined
   once in a program, and a plain function of that name in another file gives way to it.
   A `type` and a `service` are defined once too, and every file sees them without a
-  `use`.
+  `use` (under a `quillo.confirmed`, a file that makes a record of another file's type,
+  `Cfg({})`, takes it; annotations and patterns still need no `use`).
 - So a file makes sense only in its program: `quillo check main.qwe` checks it with
   the rest, and so does the editor (a file is checked as part of the program whose main
   file `use`s it; below). Go to definition finds where a name comes from.
@@ -1383,7 +1390,10 @@ program started from elsewhere (`quillo run app/main.qwe`, or a service manager)
 with `unable to open database`. Start the program in its folder (systemd's
 `WorkingDirectory=`), or give an absolute path: `pragma database_list` gives the
 database's, so `db.exec("vacuum into ?", db.one("pragma database_list").file + ".bak")`
-puts the copy beside it from any folder.
+puts the copy beside it from any folder. Under a `quillo.confirmed` *(since 0.8.11)*, a file
+SQL attaches (`attach`, `vacuum into`) is held as `db.open`'s is, to what the file running the
+statement was confirmed to write, counted from that same folder (see [What a program
+reaches](#what-a-program-reaches)).
 
 **PostgreSQL:**
 
@@ -1969,8 +1979,9 @@ http.post("https://api.bank.example/payments", order, {}, { cert: "certs/client.
   program's own files``); a file that was there keeps its read, write and run bits. A save
   needs the `fs` effect as well as `http`, and it is a write: a prefetch, a hover's guess
   or a move in place never makes one, and a `GET` route that saves and reads who the
-  visitor is gets `writes`' warning (see [Routes](#routes)). `save` with `cache`, on
-  `http.stream`, or in a component is an error.
+  visitor is gets `writes`' warning (see [Routes](#routes)). `save` with `cache`, `save` or
+  `max_bytes` on `http.stream`, or a save in a component is an error, in `quillo check` when
+  written in the call as when it runs; `save: null` is no option, in `http.stream` too.
 
 Another option is an error, in `quillo check` when the options are written in the call,
 and when it runs: `{ timout: 5 }` is not ignored.

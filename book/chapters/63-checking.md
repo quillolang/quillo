@@ -38,6 +38,12 @@ to `/dev/zero` ate memory)*. The program or
 `quillo run <(...)` printed nothing)*. `.env` and `--env-file` are
 read as they come.
 
+A file's name and the program's text in a message (`quillo check`'s, `quillo fix`'s, a run's,
+a reload's, the MCP door's) are written with the characters a terminal acts on escaped, as a
+text writes them: control characters, DEL, C1, U+2028 and U+2029 and the bidi marks are
+`\u{1b}` and the like *(since 0.8.11: a file named with `ESC[1A ESC[2K` in it erased the
+line above)*.
+
 Its warnings: an unused variable (name it `_x` to keep it); a function named like a
 builtin, or a variable named like a module; a line starting `-x` that does nothing;
 `||`, `&&`, `!`, `if` or `? :` on a value known to be a string or a number; SQL put
@@ -124,7 +130,12 @@ reaches](#what-a-program-reaches)):
   call, where it was an error value at run time.
 - Once the program has a `quillo.confirmed`, each thing a file reaches that it does not
   confirm, an error at its line (``reaches example.com: not confirmed for this file``), and
-  a Rust file that is not the one confirmed by its SHA-256.
+  a Rust file that is not the one confirmed by its SHA-256. There too, a name a file uses
+  from another file without taking it is an error, not the warning it is elsewhere
+  (`` `price` comes from main.qwe, which this file does not take, and under quillo.confirmed
+  a file uses only the names it takes ...: add `import main.qwe use price` ``), a record made
+  from another file's `type` too; and so is a page state that holds a function (`state pick
+  = (x) => ...`), which every file reads without taking it.
 - Under a provider's policy (the host's layers and `QUILLO_POLICY_PATH`; a `--policy` file
   does not ask), a program with no `quillo.confirmed`, or one that leaves something out: a warning in 0.8.11, which says the release it stops in, and an error from
   0.8.12.

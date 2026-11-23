@@ -1242,7 +1242,11 @@ twice.
 - On the server it writes the head the page is sent with, so a link's preview and a search
   engine read it. In the browser it follows state: a component's `page_head({ title:
   `${n} unread` })` changes the tab's title as `n` changes, and when the component goes, its
-  values go with it. A page with no `<head>` gets one; a part of a page (a route that gives
+  values go with it. The page is read as the browser reads it: the tags go in its head, and
+  where the browser ends the head early (at text, or an element that is not a head element,
+  such as an `<svg>` or a custom element), just before that; a `<title>` in an `<svg>`, a
+  `<template>` or a script is not the page's, and stays. A page with no `<head>` gets the tags
+  where the browser makes its head, before the `<body>`; a part of a page (a route that gives
   an `<li>`) gets nothing.
 - In a deferred part (`state x = defer(...)`), it reaches the browser only, after the page
   is sent, and the log says so.

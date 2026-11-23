@@ -195,7 +195,8 @@ well, in one process and under [`--split`](#options-of-quillo-run) alike: its va
 control.
 
 Under a provider's policy *(since 0.8.11)*, what the host sets comes first: a policy's `[env]
-set` is what `env()` gives, whatever `.env` or the shell says, and a `.env` may not set the
+set` is what `env()` gives, whatever any `.env` (a `--split` service's own too) or the shell
+says, and a `.env` may not set the
 variables that steer Quillo, its builds or its policy (`QUILLO_POLICY*`, `QUILLO_HOST*`,
 `LD_*`, `DYLD_*`, `CARGO*`, `RUSTC*`, `RUSTUP_*`, `RUSTFLAGS`, `RUSTDOCFLAGS`,
 `QUILLO_NATIVE_CACHE`, `XDG_CACHE_HOME`, `HOME`, `TMPDIR`, `TMP`, `TEMP`, `PATH`, `USER`):
@@ -219,6 +220,7 @@ Everything Quillo reads from the environment:
 | `LIMER_ADMIN_SECRET` | for [`--register`](#options-of-quillo-run) (see [Several servers](#several-servers)) |
 | `QUILLO_NATIVE_CACHE`, `CARGO` | where `.qwer` files are built, and with what (see [Rust](#rust)) |
 | `QUILLO_POLICY_PATH` *(since 0.8.11)* | a provider's policy files, a list as `PATH` is (`:`, `;` on Windows), read after `/etc/quillo/policy.toml` and its `policy.d/` (see [The policy](#the-policy)); never read from a `.env` |
+| `QUILLO_ENV_FROM_FILE` | not a setting: Quillo's own note to the services [`--split`](#options-of-quillo-run) starts, of the names the app's `.env` gave, so a service's own `.env` comes first for those. Set anywhere else it is ignored and removed *(since 0.8.11: any process believed it, so a `.env` replaced the variables it named)*; it is never believed for a `QUILLO_POLICY*` name nor over what a policy's `[env] set` forces, and a `--with` command gets none |
 | `PUBLIC_...` | any such variable may be read in a component (see [What the browser can reach](#what-the-browser-can-reach)) |
 | `QUILLO_PUSH_LOCAL` | `1`: `notification.send` may post to a push service on this machine over plain http, for tests that play one (see [Notifications](#notifications)) |
 | `QUILLO_CHROME`, `QUILLO_TEST_PG_BIN`, `QUILLO_TEST_MYSQL_BIN`, `QUILLO_TEST_LOG`, `LIMER` | `cargo test`: where Chrome, PostgreSQL, MariaDB and limer are; show the test servers' output |

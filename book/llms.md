@@ -186,7 +186,9 @@ import lib/notes.qwe use load_notes, add_note
 - Paths count from the main file's folder, in every file: `use "lib/x.qwe"` in
   `ui/a.qwe`, never `"../lib/x.qwe"`.
 - A file that calls a name from another file takes it: `import path use name` *(since 0.7)*, or the
-  whole file with `use "path"`. `quillo fix` writes these lines for you.
+  whole file with `use "path"`. `quillo fix` writes these lines for you. Under a
+  `quillo.confirmed` *(since 0.8.11)* a name not taken is an error, not a warning, and so is
+  a record made from another file's `type` not taken, and a page `state` holding a function.
 - Start each file with a comment saying what it holds.
 
 ## Routes
@@ -212,7 +214,8 @@ route GET /assets/*path = files("public", path)
   `file(path)`, `stream(...)` or `events(...)`.
 - `http.get(url, {}, { save: "downloads/a.pdf" })` *(since 0.8.11)* writes a 2xx body to a
   file and gives `{ status, ok, headers, file, bytes }` (needs `fs` as well as `http`);
-  without `save` a body is text.
+  without `save` a body is text. Not with `cache`, and not on `http.stream` (`save` and
+  `max_bytes` are errors there).
 - `request` has `path`, `query`, `form`, `json`, `body`, `headers`, `cookies`, `files`,
   `ip`. Prefer patterns in the route line to reading `request` by hand: a route whose
   pattern does not match lets the next route try.
@@ -375,4 +378,7 @@ db.transaction(() => {
 - `0` and `""` were not used as false.
 - No builtin was guessed: each is in the list below.
 - With a `quillo.confirmed`, a new host, path or script a change reaches makes `quillo check`
-  fail: tell the user to run `quillo confirm`, do not edit the file.
+  fail: tell the user to run `quillo confirm`, do not edit the file. Each file takes the
+  names it uses (`quillo fix`, then `quillo confirm` if fix says so). A file SQL attaches
+  (`attach`, `vacuum into`) must be under the file's `writes`, counted from the folder the
+  process runs in; `attach ?` is refused.

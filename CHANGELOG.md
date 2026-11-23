@@ -12,7 +12,8 @@ opt-in; `[run]`, `[fs] paths` and `[env] set`; `QUILLO_POLICY_PATH` with `includ
 `require_path`; a broken layer stops; every file scanned, held, unconfirmed refused, the catalog
 included, a complete `quillo.confirmed` asked by a provider's policy (not by `--policy`, revised
 2026-11-23), a warning in this release
-and a stop from 0.8.12; `save:` on the HTTP calls; per-function effects lines that only narrow;
+and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2026-11-24);
+`save:` on the HTTP calls; per-function effects lines that only narrow;
 `quillo mcp --serve`. Q-1343 is answered in the guide (the catalog's `cli_run` and
 `ffmpeg_cli`).
 
@@ -34,6 +35,33 @@ and a stop from 0.8.12; `save:` on the HTTP calls; per-function effects lines th
   the `url` crate and each database driver read them (`http://127.0.0.1:9\@good.example/`,
   `postgres://good/app@evil`). Three reviews' attacks each have a test (FEEDBACK83.md, Q-1300,
   Q-1301).
+- **The hold, as the coverage tests and later reviews tried to get round it** (Q-1300,
+  Q-1301): a path is judged where the system takes it, each link followed before the `..`
+  after it, and a `..` after a name that is not there is refused (a link and a `..` wrote
+  outside the confirmed folder, and made a tenant's database there); a builtin handed on as
+  a value (`map(xs, read_file)`, `let get = http.get`) is held to the file that names it,
+  not to the code that calls it; SQLite's `attach` and `vacuum into` are held to the running
+  file's `writes`, counted from the process's folder (a file confirmed for nothing read
+  another app's database and copied its users out), with `file:` names, names the SQL works
+  out and `temp_store_directory` refused; a taken file's `mount` and `service` lines are
+  listed and held as its routes are (its `mount /admin` replaced the main file's); `quillo
+  mcp`'s stdio door, alone or beside `--serve`, offers only confirmed tools; `quillo.confirmed`
+  takes only the escapes `quillo confirm` writes (`\u{+2e}` confirmed `.env` unseen), its
+  temporary file is never written through a link, and one that is a link is said at start.
+- **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
+  of 2026-11-24): a name another file defines, used without taking it, is an error in
+  `quillo check`, and the start refuses it with `--no-check` too, as the value under it
+  carried what that file was confirmed for; a record made from another file's `type` and a
+  page state holding a function are refused alike. Without one it stays a warning. `quillo
+  fix` writes those imports there too, and says what they leave for `quillo confirm`.
+- **A link that leads nowhere, inside a folder `--allow-path` names**, made a file outside
+  every folder named, with or without a hold; it is refused, as one in the program's folder
+  is (found by the coverage tests).
+- **What a terminal acts on is shown escaped**: `quillo check`, `quillo fix`, a run's and a
+  reload's errors, the MCP door, `quillo confirm`'s listing and the hold's messages write a
+  file's name and the program's text with control characters, DEL, C1, U+2028/9 and the bidi
+  marks as `\u{1b}` and the like (a path holding `ESC[1A ESC[2K` erased a line just before
+  the question).
 - **A confirmed plugin loads only a library this machine built.** A `.quillo/native` a clone or
   an archive brought along no longer loads behind a confirmed source: what was built is
   recorded outside any project (`~/.cache/quillo/built.txt`, 0600, the user's alone), and a
@@ -50,7 +78,12 @@ and a stop from 0.8.12; `save:` on the HTTP calls; per-function effects lines th
   `LD_PRELOAD`, `CARGO`, `RUSTFLAGS`, `HOME` or `PATH`, which reached every process started
   from the program and a pinned build. `QUILLO_POLICY_PATH` is never taken from a `.env`, and
   under a host's layer a `.env` that sets any of those names stops the start (FEEDBACK82.md,
-  Q-1281, found in review).
+  Q-1281, found in review). `QUILLO_ENV_FROM_FILE`, Quillo's own note to the services
+  `--split` starts, is believed only there, never for a `QUILLO_POLICY*` name, and is given
+  to no `--with` command: set in the environment, it dropped the provider's
+  `QUILLO_POLICY_PATH` layer and let a `.env` replace the variables it named. A name the
+  host's `[env] set` forces is never a `.env`'s, a service's own included (Q-1280, Q-1281,
+  found by the coverage tests).
 - **Moves in place never cross what a page load would.** A page swapped in place keeps the
   current page's scripts and headers, so a move is a full load when the two differ in the
   program or mount, its version, the head's scripts, the content security policy, frame,
@@ -70,7 +103,8 @@ What a program may notice:
   no longer allows every effect, and a file that says nothing may do anything. Add `run` to the
   list, or an effects line to the file (FEEDBACK83.md, Q-1308).
 - **In `quillo.confirmed`, `files` is read-only**: a path written or deleted (`write_file`,
-  `delete_file`, `save_upload`, `save:`, a SQLite file) is confirmed under `writes`.
+  `delete_file`, `save_upload`, `save:`, a SQLite file and what its SQL attaches) is confirmed
+  under `writes`, and is read too, with no `files` entry.
 - **New builtins `page_head`, `page_url` and `moves_in_place`**: a program's own function of
   that name still wins, with a warning, `` `page_url` hides the builtin `page_url` `` (rename
   it). quillolang.org's own `page_url` is one.
@@ -117,10 +151,11 @@ What a program may notice:
   (`with`, `watch`, `describe`, `plain_http`, `split`, `join`), forced values (`check = true`,
   `log`, `base`, `listen = "unix"`, `trust_proxy`, which `--trust-proxy` may only narrow) and
   ceilings (`instances`, `max_connections`, `connections_per_client`, `live_per_client`,
-  `drain`, `socket_mode`); `[fs] paths`, the ceiling of `--allow-path`; `[env] set`, from the
-  host's layers only, ahead of `.env` and the shell.
+  `drain`, `socket_mode`; a connection a policy's ceiling closes names its file); `[fs]
+  paths`, the ceiling of `--allow-path`; `[env] set`, from the host's layers only, ahead of
+  any `.env` and the shell.
 - **More places for the host's layers** (Q-1281): the anchor's `include = [...]`,
-  `policy.d/*.toml` beside it, `QUILLO_POLICY_PATH` (a list), then `--policy` and
+  `policy.d/*.toml` beside it (`.TOML` too), `QUILLO_POLICY_PATH` (a list), then `--policy` and
   `quillo.policy`; `require_path = true` stops a start without the variable; a provider's build
   can compile its anchor in (`QUILLO_HOST_POLICY`).
 - **`quillo policy [main.qwe] [--policy FILE]`**: each layer, the places with none, and each
@@ -129,7 +164,9 @@ What a program may notice:
 - **`page_head({ title, description, image, canonical })`** writes the page's `<title>`,
   description, `og:` tags and canonical link from any view or component, the innermost call
   winning, on the server and, following state, in the browser (FEEDBACK84.md, Q-1320, Q-1321;
-  FEEDBACK81.md, Q-1275).
+  FEEDBACK81.md, Q-1275). The page is read as the browser reads it, checked against parse5:
+  the tags go where it puts the head, before the text or element that ends it early, and an
+  `<svg>`'s, a `<template>`'s or a script's `<title>` stays.
 - **`page_url()` and `page_url(path)`**: the page's public address, with its scheme (https only
   through a trusted proxy), host and `--base` prefix (Q-1328).
 - **`moves_in_place()`**: same-site links and `navigate` move between the program's routes
@@ -141,11 +178,13 @@ What a program may notice:
 - **`save:` and `max_bytes:` on `http.get`, `delete`, `post`, `put`, `patch` and
   `request`**: a 2xx body streamed to a file (64 KiB at a time, renamed over the target once
   whole, 64 MiB at most unless given), giving `{ status, ok, headers, file, bytes }`; the path
-  held as `write_file`'s; needs `fs` as well as `http` (FEEDBACK85.md, Q-1342).
+  held as `write_file`'s; needs `fs` as well as `http`; `save: null` is no option, on
+  `http.stream` too (FEEDBACK85.md, Q-1342).
 - **A plugin function's own `/// effects:` line** narrows its file's for that function; a
   wider one is an error at check and at load (Q-1344).
 - **`quillo mcp main.qwe --serve [--port N]`**: the program's routes served beside the stdio
-  door, in one process, held to the policy as `quillo run` is (Q-1347).
+  door, in one process, held to the policy as `quillo run` is; a tool's call runs as a request
+  does, so one that waits (`sleep`, `http.get`) holds up no route (Q-1347).
 
 ### Fixed
 
@@ -169,8 +208,11 @@ What a program may notice:
   an error value with no log line at run time (FEEDBACK83.md, Q-1302).
 - **A file taken for some of its names that adds routes or tools, or reaches out at start**, is
   warned of (Q-1301); **a Rust file whose effects line leaves out what its code plainly calls**
-  (`std::process::Command` without `run`) is warned of, a reading, not a proof (Q-1305).
-- **What `quillo.confirmed` does not confirm** is an error at its line.
+  (`std::process::Command` without `run`) is warned of, a reading, not a proof, that follows
+  `use ... as` names, `::` and `!` however spaced, and `include_str!` and the like as `fs`
+  (Q-1305).
+- **What `quillo.confirmed` does not confirm** is an error at its line, and so is a name used
+  from another file and not taken, under one (see Security).
 - **`"""` and `'''`** say that text over several lines is a backtick string (FEEDBACK85.md,
   Q-1345).
 - **A host that comes only from `env()`** (with text written in the program and their trims) is
