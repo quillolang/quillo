@@ -155,6 +155,9 @@ impl Conn {
                 true
             }
             Err(e) if matches!(e.kind(), ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe) => false,
+            // A signal to this process (CI's runner sends them) interrupts the read: read again,
+            // as a read loop does; it was the known flake of this file (EINTR, os error 4).
+            Err(e) if e.kind() == ErrorKind::Interrupted => true,
             Err(e) => panic!("no answer in time: {} (so far {:?})", e, String::from_utf8_lossy(&self.buf)),
         }
     }
