@@ -2248,6 +2248,11 @@ fn toolchain_reached(qwer: &Path) -> Result<(), String> {
     // dependency's build script runs (found getting round this check; FEEDBACK82.md, Q-1285;
     // branch feedback82-85).
     used.extend(std::env::split_paths(&real("PATH").unwrap_or_default()).filter(|d| d.is_absolute()).map(|d| ("a folder of its PATH, whose programs it runs", Some(d))));
+    // And each folder its C and C++ compilers search on their own, for headers, libraries and the
+    // programs they run (`compiler_folders`): a crate's C took `<string.h>` from
+    // `/usr/local/include` under `--allow-path` of it (FEEDBACK82.md, Q-1285, found by the review
+    // of 5aafb04; branch feedback82-85).
+    used.extend(compiler_folders().into_iter().map(|d| ("a folder its C compiler searches on its own (for headers, libraries or the programs it runs)", Some(d))));
     let reach = program_reach();
     // The user's own temporary folder on macOS, where xcrun keeps the cache (`xcrun_db`) that picks
     // the clang and ld `/usr/bin/cc` runs, whatever TMPDIR says: under `--allow-path` of it, the
@@ -2454,11 +2459,13 @@ fn pinned_by_hash(qwer: &Path) -> bool {
 /// `cargo` on the PATH, never `$CARGO`, and that PATH not one `.env` gave.
 fn path_cargo() -> PathBuf {
     let name = if cfg!(windows) { "cargo.exe" } else { "cargo" };
-    std::env::split_paths(&std::env::var_os("PATH").filter(|_| !crate::dotenv::set_by_file("PATH")).unwrap_or_default())
-        .filter(|d| d.is_absolute())
-        .map(|d| d.join(name))
-        .find(|p| runnable(p))
-        .unwrap_or_else(|| PathBuf::from(name))
+    on_path(name).unwrap_or_else(|| PathBuf::from(name))
+}
+
+/// The program `name` in the first folder of the PATH of whoever started Quillo (not `.env`'s)
+/// that has it, as a pinned build's cargo and what it runs find it.
+fn on_path(name: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH").filter(|_| !crate::dotenv::set_by_file("PATH")).unwrap_or_default()).filter(|d| d.is_absolute()).map(|d| d.join(name)).find(|p| runnable(p))
 }
 
 /// A plugin a policy holds to its source's SHA-256, built from exactly the bytes judged: read
@@ -2567,9 +2574,18 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         // 47371f6; branch feedback82-85). No build script runs before this; the build then takes
         // that lock as it is (`--locked`), and is refused where it changed.
         let manifest_file = crate_dir.join("Cargo.toml");
+        let host = host_triple();
         let metadata = |offline: bool| {
             let mut c = cargo();
             c.args(["metadata", "--format-version", "1", "--manifest-path"]).arg(&manifest_file).stdin(std::process::Stdio::null());
+            // The packages built for this host alone (`--filter-platform`), which the build
+            // takes: cargo metadata wants every platform's, and where only the host's were
+            // fetched (`cargo fetch --target <host>`), offline, it failed where the build works,
+            // and a pinned jwt was refused (FEEDBACK82.md, Q-1285, found by the review of 5aafb04;
+            // branch feedback82-85). The lock it writes is the whole resolve, judged whole.
+            if let Some(h) = &host {
+                c.args(["--filter-platform", h]);
+            }
             if offline {
                 c.arg("--offline");
             }
@@ -3533,17 +3549,103 @@ fn toolchain_sysroot() -> Option<PathBuf> {
 }
 
 fn sysroot_asked() -> Option<PathBuf> {
+    PathBuf::from(rustc_says(&["--print", "sysroot"])?.trim()).canonicalize().ok()
+}
+
+/// The triple of the host the `rustc` beside a pinned build's cargo builds for (`-vV`'s `host:`),
+/// asked as `toolchain_sysroot` is, once a run.
+fn host_triple() -> Option<String> {
+    static HOST: OnceLock<Option<String>> = OnceLock::new();
+    HOST.get_or_init(|| rustc_says(&["-vV"])?.lines().find_map(|l| l.strip_prefix("host:")).map(|h| h.trim().to_string()).filter(|h| !h.is_empty())).clone()
+}
+
+/// What the `rustc` beside the build's cargo prints given `args`, run as cargo is, in the same
+/// folder with the same variables, so rustup picks the same toolchain; None where it fails.
+fn rustc_says(args: &[&str]) -> Option<String> {
     let cargo = path_cargo();
     let rustc = cargo.with_file_name(if cfg!(windows) { "rustc.exe" } else { "rustc" });
-    let mut cmd = std::process::Command::new(if rustc.is_absolute() { rustc } else { PathBuf::from("rustc") });
-    cmd.current_dir(cargo_dir()).env_clear().args(["--print", "sysroot"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let mut cmd = as_built(&if rustc.is_absolute() { rustc } else { PathBuf::from("rustc") });
+    cmd.args(args).stderr(std::process::Stdio::null());
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `program`, to run as a pinned build runs what it runs: in `cargo_dir`, with the variables of
+/// `BUILD_ENV` alone, as whoever started Quillo has them, and nothing to read on its input.
+fn as_built(program: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    cmd.current_dir(cargo_dir()).env_clear().stdin(std::process::Stdio::null());
     for k in BUILD_ENV {
         if let Some(v) = std::env::var_os(k).filter(|_| !crate::dotenv::set_by_file(k)) {
             cmd.env(k, v);
         }
     }
-    let out = cmd.output().ok().filter(|o| o.status.success())?;
-    PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()).canonicalize().ok()
+    cmd
+}
+
+/// The folders the C and C++ compilers of a pinned build search on their own: `cc` and `c++` of
+/// its PATH, which cc-rs runs where no variable names another (a build is given none), and which,
+/// with no `-isysroot` (cc-rs gives one only for a toolchain under `.xctoolchain` or another
+/// target), take `<string.h>` from `/usr/local/include` first where a file is there: ring's C
+/// (jwt) built so under `--allow-path /usr/local/include` (FEEDBACK82.md, Q-1285, found by the
+/// review of 5aafb04; branch feedback82-85). What each lists for `#include` (`-E -v`) and for its
+/// programs and libraries (`-print-search-dirs`), with `/usr/local/include`, `/usr/include` and
+/// `/usr/local/lib`, which macOS's and Linux's compilers and linkers search though a compiler does
+/// not list one that is not there yet. Asked once a run.
+fn compiler_folders() -> Vec<PathBuf> {
+    static FOLDERS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    FOLDERS
+        .get_or_init(|| {
+            let mut all: Vec<PathBuf> = Vec::new();
+            if cfg!(unix) {
+                all.extend(["/usr/local/include", "/usr/include", "/usr/local/lib"].iter().map(PathBuf::from));
+                for (name, lang) in [("cc", "c"), ("c++", "c++")] {
+                    let Some(cc) = on_path(name) else { continue };
+                    let said = |args: &[&str], err: bool| {
+                        let out = as_built(&cc).args(args).output().ok();
+                        out.map(|o| String::from_utf8_lossy(if err { &o.stderr } else { &o.stdout }).into_owned()).unwrap_or_default()
+                    };
+                    for p in compiler_folders_said(&said(&["-E", "-v", "-x", lang, "/dev/null"], true), &said(&["-print-search-dirs"], false)) {
+                        if !all.contains(&p) {
+                            all.push(p);
+                        }
+                    }
+                }
+            }
+            all
+        })
+        .clone()
+}
+
+/// The folders a C compiler says it searches: those of `-E -v`'s lists of where `#include` looks
+/// (`verbose`, what it writes to its standard error; a framework folder's mark taken off), and of
+/// `-print-search-dirs`'s `programs:` and `libraries:` (`dirs`). Each absolute; the disk's root is
+/// none of them.
+pub fn compiler_folders_said(verbose: &str, dirs: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut listing = false;
+    for l in verbose.lines() {
+        if l.contains("search starts here:") {
+            listing = true;
+        } else if l.trim() == "End of search list." {
+            listing = false;
+        } else if listing {
+            let t = l.trim();
+            found.push(PathBuf::from(t.strip_suffix(" (framework directory)").or_else(|| t.strip_suffix(" (headermap)")).unwrap_or(t)));
+        }
+    }
+    for l in dirs.lines() {
+        if let Some(rest) = l.strip_prefix("programs: =").or_else(|| l.strip_prefix("libraries: =")) {
+            found.extend(std::env::split_paths(rest.trim()));
+        }
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in found {
+        if p.is_absolute() && p.parent().is_some() && !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// The developer folder macOS's linker takes its SDK from, as `xcode-select -p` says with no

@@ -393,7 +393,10 @@ What a program may notice:
   build script rewrote the lock before it was read; a folder package named like the
   plugin's crate passed), and the build is `--locked` to the judged lock; on macOS the
   developer folder and xcrun's cache folder join the toolchain's reach check (found by the
-  review of 47371f6).
+  review of 47371f6). A pinned build is refused where the program can reach a folder the C compiler
+  searches on its own (`/usr/local/include` and the like), and dependencies are resolved for
+  the host alone, so an offline host that fetched only its own platform's packages builds
+  (found by the review of 5aafb04).
 - **What `quillo.confirmed` does not confirm** is an error at its line, and so is a name used
   from another file and not taken, under one (see Security).
 - **`"""` and `'''`** say that text over several lines is a backtick string (FEEDBACK85.md,

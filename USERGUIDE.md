@@ -11027,7 +11027,13 @@ Asking, and who answers:
   manifest's path) comes from crates.io, none from a folder, git or another registry; it then
   builds with `--locked`, and is refused if the lock changed. On macOS it is also refused
   where the program can reach the developer folder or the user's temporary folder, where
-  xcrun keeps the cache that picks the linker. A plugin pinned by
+  xcrun keeps the cache that picks the linker, or a folder its C compiler searches on its own
+  (`/usr/local/include` and the like, as the compiler says). Dependencies are resolved for
+  this machine's platform, so a host offline with only its own platform's packages builds.
+  A plugin's SHA-256 covers its own source and which packages its build takes (each from
+  crates.io, by its version). It does not cover what a crates.io dependency's build script
+  or procedural macro reads or runs while it is built (a C header, a file it opens, a
+  program it starts): that dependency's code is what crates.io holds for that version. A plugin pinned by
   its library's SHA-256 is never built: only that library loads. On macOS each install name's
   folders must be the system's alone, and a weak load of a file that is not there is
   refused. It is still a reading, not a proof: a crate can do what it does

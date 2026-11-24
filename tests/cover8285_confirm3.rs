@@ -1691,3 +1691,38 @@ fn what_cargo_resolved_is_judged_by_each_packages_source_and_place() {
     assert_eq!(quillo::native::packages_refused(&meta(vec![]), &root), Some("no package".to_string()));
     assert_eq!(quillo::native::packages_refused("not json", &root), Some("what cargo resolved, which cannot be read".to_string()));
 }
+
+// Fix round 14
+
+/// The folders a C compiler says it searches are each folder of `-E -v`'s `#include` lists, a
+/// framework folder's mark taken off, and of `-print-search-dirs`'s programs and libraries, as
+/// clang on macOS and gcc on Linux print them; relative names, the disk's root, a second name of
+/// one, and what is no list are none (src/native.rs compiler_folders_said, FEEDBACK82.md Q-1285,
+/// found by the coverage tests; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn the_folders_a_c_compiler_searches_on_its_own_are_read_from_what_it_says() {
+    let clang_v = "Apple clang version 17.0.0\nignoring nonexistent directory \"/x/missing\"\n#include \"...\" search starts here:\n#include <...> search starts here:\n /usr/local/include\n /Dev/usr/lib/clang/21/include\n /Dev/SDK/usr/include\n /Dev/SDK/System/Library/Frameworks (framework directory)\nEnd of search list.\n";
+    let clang_dirs = "programs: =/Dev/usr/bin\nlibraries: =/Dev/usr/lib/clang/21\n";
+    let p = |s: &str| PathBuf::from(s);
+    assert_eq!(
+        quillo::native::compiler_folders_said(clang_v, clang_dirs),
+        vec![p("/usr/local/include"), p("/Dev/usr/lib/clang/21/include"), p("/Dev/SDK/usr/include"), p("/Dev/SDK/System/Library/Frameworks"), p("/Dev/usr/bin"), p("/Dev/usr/lib/clang/21")]
+    );
+    let gcc_v = "#include \"...\" search starts here:\n /q/quoted\n#include <...> search starts here:\n /usr/lib/gcc/x86_64-linux-gnu/13/include\n /usr/local/include\n /usr/include\nEnd of search list.\n /after/the/list\n";
+    let gcc_dirs = "install: /usr/lib/gcc/x86_64-linux-gnu/13/\nprograms: =/usr/libexec/gcc/x86_64-linux-gnu/13/:/usr/lib/gcc/x86_64-linux-gnu/13/../../../../x86_64-linux-gnu/bin/\nlibraries: =/usr/lib/gcc/x86_64-linux-gnu/13/:/lib/x86_64-linux-gnu/:relative/lib:/:/usr/include\n";
+    assert_eq!(
+        quillo::native::compiler_folders_said(gcc_v, gcc_dirs),
+        vec![
+            p("/q/quoted"),
+            p("/usr/lib/gcc/x86_64-linux-gnu/13/include"),
+            p("/usr/local/include"),
+            p("/usr/include"),
+            p("/usr/libexec/gcc/x86_64-linux-gnu/13/"),
+            p("/usr/lib/gcc/x86_64-linux-gnu/13/../../../../x86_64-linux-gnu/bin/"),
+            p("/usr/lib/gcc/x86_64-linux-gnu/13/"),
+            p("/lib/x86_64-linux-gnu/"),
+        ]
+    );
+    assert!(quillo::native::compiler_folders_said("cc: error: no input files\n", "").is_empty());
+}

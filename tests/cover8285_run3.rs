@@ -2144,3 +2144,98 @@ fn a_pinned_build_is_refused_where_the_program_reaches_xcruns_cache_or_the_devel
         assert!(out.contains(&said) && !out.contains("building "), "{}: {}", a, out);
     }
 }
+
+// Fix round 14 (F3)
+
+/// A pinned build where cargo, offline, has only the host's packages (its cargo home filled by
+/// `cargo fetch --target <host>`) builds and loads: its dependencies are resolved for this host
+/// alone (`--filter-platform`), and the lock it built with is judged whole. Before, cargo metadata
+/// wanted every platform's packages (getrandom's r-efi, wasip2), failed where the build works, and
+/// the start was refused, "cannot resolve the dependencies" (src/native.rs build_private,
+/// FEEDBACK82.md Q-1285, found by the coverage tests; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_pinned_build_offline_with_only_the_hosts_packages_builds() {
+    use sha2::Digest;
+    let d = Dir(support::temp_dir("cov8285r3-offline").canonicalize().unwrap());
+    let (app, tmp, ch, fetch) = (d.0.join("app"), d.0.join("tmp"), d.0.join("cargo-home"), d.0.join("fetch"));
+    for f in [&app, &tmp, &ch, &fetch] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    let run = |cmd: &mut Command, secs: u64| {
+        let mut child = cmd.env("CARGO_HOME", &ch).env_remove("CARGO_TARGET_DIR").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+        let mut err = child.stderr.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut err, &mut s);
+            s
+        });
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break Some(s);
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        (status.is_some_and(|s| s.success()), reader.join().unwrap())
+    };
+    let vv = String::from_utf8(Command::new("rustc").arg("-vV").output().unwrap().stdout).unwrap();
+    let host = vv.lines().find_map(|l| l.strip_prefix("host: ")).unwrap().trim().to_string();
+    // The private crate's manifest, so what is fetched is what it resolves to.
+    std::fs::write(fetch.join("Cargo.toml"), "[package]\nname = \"quillo_hi_pinned\"\nversion = \"0.0.0\"\nedition = \"2021\"\npublish = false\nbuild = false\n\n[lib]\npath = \"lib.rs\"\n\n[dependencies]\ngetrandom = \"0.3\"\nserde_json = \"1\"\n\n[workspace]\n").unwrap();
+    std::fs::write(fetch.join("lib.rs"), "").unwrap();
+    let manifest = fetch.join("Cargo.toml");
+    let (fetched, said) = run(Command::new("cargo").args(["fetch", "--target", &host, "--manifest-path"]).arg(&manifest), 300);
+    assert!(fetched, "cargo fetch: {}", said);
+    std::fs::write(ch.join("config.toml"), "[net]\noffline = true\n").unwrap();
+    // What the review saw: offline, cargo metadata of every platform fails here.
+    let (all, said) = run(Command::new("cargo").args(["metadata", "--format-version", "1", "--manifest-path"]).arg(&manifest), 120);
+    assert!(!all && said.contains("--offline"), "cargo metadata of every platform did not fail offline: {}", said);
+    let src = "//! version: 1.0.0\n//! effects: none\n//! [dependencies]\n//! getrandom = \"0.3\"\npub fn hi() -> i64 { 7 }\n";
+    std::fs::write(app.join("hi.qwer"), src).unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let hash: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
+    std::fs::write(app.join("pin.toml"), format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash)).unwrap();
+    let (t, c, record) = (tmp.display().to_string(), ch.display().to_string(), d.0.join("record").display().to_string());
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--policy", "pin.toml"], &[("TMPDIR", &t), ("CARGO_HOME", &c), ("QUILLO_BUILT_RECORD_DIR", &record)], &d.0.join("run.log"), 600);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.lines().any(|l| l.trim() == "7") && !out.contains("cannot resolve"), "{}", out);
+}
+
+/// A pinned build is refused where the program can reach a folder its C compiler searches on its
+/// own, `/usr/local/include`, from which `cc`, given no `-isysroot`, takes `<string.h>` before the
+/// system's: the start says which folder, and nothing is built. Before, it was built, and a
+/// crate's C (ring's, for jwt) could take a header the program wrote (src/native.rs
+/// toolchain_reached, compiler_folders, FEEDBACK82.md Q-1285, found by the coverage tests; branch
+/// feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_pinned_build_is_refused_where_the_program_reaches_a_folder_its_c_compiler_searches() {
+    use sha2::Digest;
+    let inc = Path::new("/usr/local/include");
+    if !inc.is_dir() {
+        eprintln!("no /usr/local/include on this machine: nothing to allow");
+        return;
+    }
+    let inc = inc.canonicalize().unwrap();
+    let d = Dir(support::temp_dir("cov8285r3-include").canonicalize().unwrap());
+    let (app, tmp) = (d.0.join("app"), d.0.join("tmp"));
+    for f in [&app, &tmp] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    let src = "//! version: 1.0.0\n//! effects: none\npub fn hi() -> i64 { 7 }\n";
+    std::fs::write(app.join("hi.qwer"), src).unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let hash: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
+    std::fs::write(app.join("pin.toml"), format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash)).unwrap();
+    let (t, record, a) = (tmp.display().to_string(), d.0.join("record").display().to_string(), inc.display().to_string());
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--policy", "pin.toml", "--allow-path", &a], &[("TMPDIR", &t), ("QUILLO_BUILT_RECORD_DIR", &record)], &d.0.join("run.log"), 120);
+    assert_eq!(code, Some(1), "{}", out);
+    let said = format!("and the build would use a folder its C compiler searches on its own (for headers, libraries or the programs it runs), /usr/local/include, which is inside {}", inc.display());
+    assert!(out.contains(&said) && !out.contains("building "), "{}", out);
+}
