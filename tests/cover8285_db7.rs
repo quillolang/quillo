@@ -893,7 +893,7 @@ fn the_sql_a_kit_ordinarily_writes_runs_under_a_hold_on_each_database() {
         ("db.exec", "create or replace view k_v as select name from k_users", ""),
         ("db.query", "select * from k_v", ""),
         ("db.exec", "drop view if exists k_v", ""),
-        ("db.exec", "create temporary table if not exists k_t (x int)", ""),
+        // Round 11: a temporary table is refused on MySQL too (below); `drop temporary` of none runs.
         ("db.exec", "drop temporary table if exists k_t", ""),
         ("db.exec", "create table if not exists k_e (engine varchar(10), kind int) engine = InnoDB", ""),
         ("db.exec", "create table if not exists k_like like k_users", ""),
@@ -1325,4 +1325,304 @@ fn on_postgresql_a_tables_argument_is_counted_past_every_bracket_and_the_reg_fun
     let mut want = vec!["kit:".to_string()];
     want.extend(calls.iter().map(|(_, _, w)| w.clone()));
     assert!(out.contains(&format!("{}\nmade: []\n", want.join("\n"))), "{}", out);
+}
+
+// Fix round 11
+
+/// What every refusal of a file in the program's own `.quillo` ends with.
+const OWN_QUILLO: &str = "it is in the program's .quillo folder, which holds its built plugins, their lock and its keys";
+
+/// In any run, with or without a quillo.confirmed, SQLite opens no database file in the program's
+/// own `.quillo`, by its name in any letters or where the `.quillo` link leads: an attached one by
+/// its name as written, worked out in the SQL or given as a value, and `VACUUM INTO`'s copy, as
+/// written and given as a value, are refused as SQLite opens them, and a tenant's database is
+/// refused before its file is made (`db.open(".quillo/{tenant}.lock")` then `new_tenant`). Run: a
+/// database attached in `data/`, `:memory:`, `VACUUM INTO` a file in `data/`. Nothing is made in
+/// `.quillo` (src/db.rs quillo_open, Running, new_tenant; FEEDBACK85.md Q-1340, found by the final
+/// review of a6cee54; branch feedback82-85).
+#[test]
+fn no_database_file_is_opened_or_made_in_the_programs_own_quillo() {
+    let d = dir("quillodb");
+    for f in ["data", ".quillo/native", "store/native", "other"] {
+        std::fs::create_dir_all(d.join(f)).unwrap();
+    }
+    std::os::unix::fs::symlink("../store", d.join("other/.quillo")).unwrap();
+    write(&d, "other/k.qwe", "fn noop() {\n  return 1\n}\n");
+    let calls: Vec<(&str, &str, &str, &str)> = vec![
+        ("db.exec", "attach '.quillo/x.db' as q", "", ".quillo/x.db"),
+        ("db.exec", "attach '.quil' || 'lo/c.db' as q", "", ".quillo/c.db"),
+        ("db.exec", "attach ? as q", "\".quillo/p.db\"", ".quillo/p.db"),
+        ("db.exec", "attach '.QUILLO/plugins.lock' as l", "", ".QUILLO/plugins.lock"),
+        ("db.exec", "vacuum into '.quillo/native/libhi-0000.dylib'", "", ".quillo/native/libhi-0000.dylib"),
+        ("db.exec", "vacuum into ?", "\".quillo/.quillo-secret\"", ".quillo/.quillo-secret"),
+        ("db.exec", "vacuum into 'store/plugins.lock'", "", "store/plugins.lock"),
+        ("db.exec", "attach 'store/native/caf\u{e9}.db' as s", "", "store/native/caf\u{e9}.db"),
+        ("db.exec", "attach 'data/other.db' as o", "", ""),
+        ("db.exec", "attach ':memory:' as m", "", ""),
+        ("db.exec", "vacuum into 'data/copy.db'", "", ""),
+    ];
+    let lines: Vec<String> = calls.iter().map(|(f, s, v, _)| format!("print(said({}({}{})))", f, lit(s), if v.is_empty() { String::new() } else { format!(", {}", v) })).collect();
+    write(
+        &d,
+        "main.qwe",
+        &format!(
+            "import other/k.qwe use noop\nlet said = (r) => is_err(r) ? r.error : \"ran\"\ndb.open(\"data/app.db\")\ndb.exec(\"create table if not exists t (x text)\")\n{}\ndb.open(\".quillo/{{tenant}}.lock\")\nprint(said(new_tenant(\"plugins\", () => null)))\n",
+            lines.join("\n")
+        ),
+    );
+    let (code, out) = run(&d, &[]);
+    assert_ne!(code, 0, "new_tenant's refusal stops the run: {}", out);
+    let printed: Vec<&str> = out.lines().filter(|l| l.starts_with("db: ") || *l == "ran").collect();
+    assert_eq!(printed.len(), calls.len(), "{}", out);
+    for ((_, sql, _, file), line) in calls.iter().zip(&printed) {
+        if file.is_empty() {
+            assert_eq!(*line, "ran", "{}: {}", sql, out);
+        } else {
+            assert!(line.ends_with(&format!("{}: {}", file, OWN_QUILLO)), "{}: {}", sql, out);
+        }
+    }
+    assert!(out.contains(&format!("`new_tenant`: ./.quillo/plugins.lock: {}", OWN_QUILLO)) || out.contains(&format!(".quillo/plugins.lock: {}", OWN_QUILLO)), "{}", out);
+    let made: Vec<String> = ["", "native"].iter().flat_map(|f| std::fs::read_dir(d.join(".quillo").join(f)).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned())).filter(|n| n != "native").collect();
+    assert!(made.is_empty(), "{:?}", made);
+    assert!(std::fs::read_dir(d.join("store/native")).unwrap().next().is_none() && !d.join("store/plugins.lock").exists());
+    assert!(d.join("data/copy.db").exists() && d.join("data/other.db").exists());
+}
+
+/// Under a quillo.confirmed on SQLite a taken file detaches no database: `detach b; attach
+/// ':memory:' as b` swapped the main file's attached `b` for the kit's, its later inserts going to
+/// memory and its reads giving the kit's rows. `detach b`, `DETACH DATABASE "b"` and a `detach` of
+/// one the kit attached are refused; `attach ... as b` again is SQLite's own error; a new name is
+/// attached. The main file's `b.events` keeps its row (src/db.rs authorize, SQLITE_DETACH,
+/// detach_refused; FEEDBACK83.md Q-1300, found by the final review of a6cee54; branch
+/// feedback82-85).
+#[test]
+fn on_sqlite_a_taken_file_detaches_no_database() {
+    let d = dir("detach");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    let detach = |name: &str| format!("db: `detach {}` is refused for kit/k.qwe's SQL where a quillo.confirmed holds the run: the databases attached on the program's connection are what every file's later statements reach by their names. {}", name, TAIL);
+    let calls: Vec<(&str, &str, String)> = vec![
+        ("db.exec", "detach b", detach("b")),
+        ("db.exec", "DETACH DATABASE \"b\"", detach("b")),
+        ("db.exec", "attach ':memory:' as b", "db: database b is already in use".into()),
+        ("db.exec", "attach ':memory:' as k\u{e9}", "ran".into()),
+        ("db.exec", "detach k\u{e9}", detach("k\u{e9}")),
+        ("db.query", "select who from b.events", "ran".into()),
+    ];
+    let made: Vec<(&str, &str, &str)> = calls.iter().map(|(f, s, _)| (*f, *s, "")).collect();
+    write(&d, "kit/k.qwe", &kit_ran(&made));
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\ndb.open(\"data/app.db\")\ndb.exec(\"attach 'data/b.db' as b\")\ndb.exec(\"create table if not exists b.events (who text)\")\nprint(steal())\nprint(\"main: \" + str(db.exec(\"insert into b.events values ('main')\")) + \" \" + str(db.query(\"select who from b.events\")))\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/app.db\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    let mut want = vec!["kit:".to_string()];
+    want.extend(calls.iter().map(|(_, _, w)| w.clone()));
+    assert!(out.contains(&format!("{}\nmain: {{ changes: 1, last_id: 1 }} [{{ who: \"main\" }}]\n", want.join("\n"))), "{}", out);
+    assert_eq!(column(&d.join("data/b.db"), "select who from events"), ["main"]);
+}
+
+/// Under a quillo.confirmed a taken file makes no temporary table, view or sequence on PostgreSQL
+/// and MySQL (MariaDB) either: inside the main file's `db.transaction` a kit's `create temp table
+/// users` had the main file's insert go into it, gone at the commit. `create temp`, `create
+/// temporary ... if not exists`, `global temporary`, a temporary view and sequence, and
+/// PostgreSQL's `select ... into temp`, are refused; a table named `temp` is made and written. On
+/// PostgreSQL `setseed` (in any letters), by which a kit fixed the main file's later `random()`, and
+/// pg_trgm's `set_limit` are refused as a `set` is. The main file's row is in its `users` (src/db.rs
+/// text_run_in, TextRun::Temp, TextRun::Session; FEEDBACK83.md Q-1300, found by the final review of
+/// a6cee54; branch feedback82-85).
+#[test]
+fn temporary_tables_and_setseed_are_refused_to_a_taken_file_on_postgresql_and_mysql() {
+    let temp = |kind: &str| format!("db: a temporary {} stands for the program's of its name in every later statement on its connection, the main file's in a transaction too, and is refused for kit/k.qwe's SQL where a quillo.confirmed holds the run: a taken file makes its tables in the database. {}", kind, TAIL);
+    let session = |f: &str| format!("db: the function {} sets the connection's own state, which every file's later statements on the pooled connection see, and is refused for kit/k.qwe's SQL where a quillo.confirmed holds the run, as a `set` is. {}", f, TAIL);
+    let pg_calls: Vec<(&str, &str, String)> = vec![
+        ("db.exec", "create temp table users (name text)", temp("table")),
+        ("db.exec", "create temporary table if not exists users (name varchar(50))", temp("table")),
+        ("db.exec", "create global temporary table k1 (x int)", temp("table")),
+        ("db.exec", "create temp view kv as select 1 as one", temp("view")),
+        ("db.exec", "create temporary sequence ks", temp("sequence")),
+        ("db.query", "select 1 as x into temp kt", temp("table")),
+        ("db.query", "select setseed(0.25) as s", session("setseed")),
+        ("db.query", "select SetSeed(0.5) as s", session("setseed")),
+        ("db.query", "select set_limit(0.1) as s", session("set_limit")),
+        ("db.exec", "insert into users (name) values ('caf\u{e9}')", "ran".into()),
+        ("db.exec", "create table if not exists temp (x int)", "ran".into()),
+        ("db.exec", "insert into temp values (1)", "ran".into()),
+    ];
+    let my_calls: Vec<(&str, &str, String)> = vec![
+        ("db.exec", "create temporary table users (name varchar(50))", temp("table")),
+        ("db.exec", "create temporary table if not exists users (name varchar(50))", temp("table")),
+        ("db.exec", "CREATE TEMPORARY SEQUENCE ks", temp("sequence")),
+        ("db.exec", "insert into users (name) values ('caf\u{e9}')", "ran".into()),
+    ];
+    for (name, calls) in [("pg", &pg_calls), ("my", &my_calls)] {
+        let (_pg, _my);
+        let url = if name == "pg" {
+            let Some(pg) = support::postgres("cov8285db7r11") else {
+                eprintln!("PostgreSQL is not installed: skipped");
+                continue;
+            };
+            let url = pg.database("round11");
+            _pg = pg;
+            url
+        } else {
+            let Some(my) = support::mariadb("cov8285db7r11") else {
+                eprintln!("MariaDB is not installed: skipped");
+                continue;
+            };
+            let url = my.url("round11");
+            _my = my;
+            url
+        };
+        let d = dir(&format!("temp-{}", name));
+        let made: Vec<(&str, &str, &str)> = calls.iter().map(|(f, s, _)| (*f, *s, "")).collect();
+        write(&d, "kit/k.qwe", &kit_ran(&made));
+        write(
+            &d,
+            "main.qwe",
+            "import kit/k.qwe use Badge, steal\ndb.exec(\"create table if not exists users (name varchar(50))\")\nprint(db.transaction(() => {\n  let k = steal()\n  db.exec(\"insert into users values ('main')\")\n  return k\n}))\nprint(\"users: \" + str(db.query(\"select name from users order by name\")))\n",
+        );
+        write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+        checked(&d);
+        let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+        assert_eq!(code, 0, "{}", out);
+        let mut want = vec!["kit:".to_string()];
+        want.extend(calls.iter().map(|(_, _, w)| w.clone()));
+        assert!(out.contains(&format!("{}\nusers: [{{ name: \"caf\u{e9}\" }}, {{ name: \"main\" }}]\n", want.join("\n"))), "{}: {}", name, out);
+    }
+}
+
+/// Under a quillo.confirmed a taken file's migrations are recorded under its folder before their
+/// names (`kit/m/002_lock_down.sql`), the main file's under their names as they always were: a
+/// kit confirmed for `db.migrate` that ran its `002_lock_down.sql` first had the main file's own
+/// `migrations/002_lock_down.sql` never run ("changed after it was applied; it is not run again").
+/// Now both are applied, each said by its name, on SQLite and on PostgreSQL, and the main file's
+/// table is there (src/db.rs migration_prefix, src/migrate.rs run_keyed; FEEDBACK83.md Q-1300,
+/// found by the final review of a6cee54; branch feedback82-85).
+#[test]
+fn a_taken_files_migrations_are_recorded_apart_from_the_main_files() {
+    for name in ["sqlite", "pg"] {
+        let _pg;
+        let url = if name == "pg" {
+            let Some(pg) = support::postgres("cov8285db7r11m") else {
+                eprintln!("PostgreSQL is not installed: skipped");
+                continue;
+            };
+            let url = pg.database("round11m");
+            _pg = pg;
+            url
+        } else {
+            String::new()
+        };
+        let d = dir(&format!("migkey-{}", name));
+        std::fs::create_dir_all(d.join("data")).unwrap();
+        let open = if name == "sqlite" { "db.open(\"data/app.db\")\n" } else { "" };
+        write(&d, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  return \"kit: \" + str(db.migrate(\"kit/m\"))\n}\n");
+        write(&d, "kit/m/002_lock_down.sql", "create table kit_lock (x text);\n");
+        write(&d, "migrations/002_lock_down.sql", "create table lock_down (x text);\ninsert into lock_down values ('main ran caf\u{e9}');\n");
+        write(
+            &d,
+            "main.qwe",
+            &format!("import kit/k.qwe use Badge, steal\n{}print(steal())\nprint(\"main: \" + str(db.migrate(\"migrations\")))\nprint(\"rows: \" + str(db.query(\"select name from _quillo_migrations order by name\")))\nprint(\"locked: \" + str(db.query(\"select x from lock_down\")))\n", open),
+        );
+        let kit_writes = if name == "sqlite" { "writes = [\"data/app.db\"]\n" } else { "" };
+        write(&d, "quillo.confirmed", &format!("[\"main.qwe\"]\nwrites = [\"data/\"]\nfiles = [\"migrations/\"]\n\n[\"kit/k.qwe\"]\n{}files = [\"kit/m/\"]\nsite = [\"db.migrate\"]\n", kit_writes));
+        checked(&d);
+        let vars: Vec<(&str, &str)> = if name == "pg" { vec![("QUILLO_DB", &url)] } else { vec![] };
+        let (code, out) = run(&d, &vars);
+        assert_eq!(code, 0, "{}: {}", name, out);
+        assert!(
+            out.contains("kit: [\"002_lock_down.sql\"]\nquillo: applied migration 002_lock_down.sql\nmain: [\"002_lock_down.sql\"]\nrows: [{ name: \"002_lock_down.sql\" }, { name: \"kit/m/002_lock_down.sql\" }]\nlocked: [{ x: \"main ran caf\u{e9}\" }]\n"),
+            "{}: {}",
+            name,
+            out
+        );
+    }
+}
+
+/// In any run, with or without a quillo.confirmed, SQLite opens or makes no database where a write
+/// of the program's is refused, for every program of the process: a mounted program's `.quillo`
+/// through its link (`shop/.quillo -> qs`, in any letters), a source of the main program's or the
+/// mounted one's, `.env.local` and `.ENV` (a SQLite `.env.local` stopped the next start), the
+/// program's quillo.confirmed, and the journal or log of the database it has open, each by
+/// `attach` or `vacuum into`; another database, the open one attached again, and a copy in `data/`
+/// run. Nothing is made and the sources are as they were (src/builtins.rs own_file_apart, src/db.rs
+/// quillo_open; FEEDBACK85.md Q-1340, found by the re-review of 00e83c3; branch feedback82-85).
+#[test]
+fn no_database_file_is_opened_or_made_where_a_write_of_the_programs_is_refused() {
+    let d = dir("ownfiledb");
+    for f in ["data", "shop/qs"] {
+        std::fs::create_dir_all(d.join(f)).unwrap();
+    }
+    std::os::unix::fs::symlink("qs", d.join("shop/.quillo")).unwrap();
+    write(&d, "shop/app.qwe", "route GET / = \"s\"\n");
+    let (quillo, source, settings, confirmed, open) = (OWN_QUILLO, "it is one of the program's own files", "it is the program's settings (.env)", "it is what the program was confirmed to reach (quillo.confirmed)", "it is the database the program has open");
+    let calls: Vec<(&str, &str, &str)> = vec![
+        ("attach 'shop/qs/plugins.lock' as k", "shop/qs/plugins.lock", quillo),
+        ("attach 'shop/QS/x.db' as k2", "shop/QS/x.db", quillo),
+        ("vacuum into 'main.qwe'", "main.qwe", source),
+        ("attach 'shop/app.qwe' as m", "shop/app.qwe", source),
+        ("vacuum into '.env.local'", ".env.local", settings),
+        ("attach '.ENV' as e", ".ENV", settings),
+        ("vacuum into 'quillo.confirmed'", "quillo.confirmed", confirmed),
+        ("attach 'data/app.db-journal' as j", "data/app.db-journal", open),
+        ("vacuum into 'data/app.db-wal'", "data/app.db-wal", open),
+        ("attach 'data/other.db' as o", "", ""),
+        ("attach 'data/app.db' as again", "", ""),
+        ("vacuum into 'data/copy.db'", "", ""),
+    ];
+    let lines: Vec<String> = calls.iter().map(|(s, _, _)| format!("print(said(db.exec({})))", lit(s))).collect();
+    let main = format!(
+        "mount /shop = \"shop/app.qwe\"\nlet said = (r) => is_err(r) ? r.error : \"ran\"\ndb.open(\"data/app.db\")\ndb.exec(\"create table if not exists t (x text)\")\ndb.exec(\"insert into t values ('a')\")\n{}\nexit(0)\n",
+        lines.join("\n")
+    );
+    write(&d, "main.qwe", &main);
+    let (code, out) = quillo_env(&d, &["run", "--no-check", "main.qwe"], 120, &[]);
+    assert_eq!(code, Some(0), "{}", out);
+    let printed: Vec<&str> = out.lines().filter(|l| l.starts_with("db: ") || *l == "ran").collect();
+    assert_eq!(printed.len(), calls.len(), "{}", out);
+    for ((sql, file, why), line) in calls.iter().zip(&printed) {
+        if file.is_empty() {
+            assert_eq!(*line, "ran", "{}: {}", sql, out);
+        } else {
+            assert!(line.ends_with(&format!("/{}: {}", file, why)), "{}: {}", sql, line);
+        }
+    }
+    for f in ["shop/qs/plugins.lock", "shop/qs/x.db", ".env.local", ".ENV", ".env", "quillo.confirmed"] {
+        assert!(!d.join(f).exists(), "{} was made", f);
+    }
+    // The open database's own log and journal are SQLite's, and hold no database.
+    for f in ["data/app.db-journal", "data/app.db-wal"] {
+        let head = std::fs::read(d.join(f)).unwrap_or_default();
+        assert!(!head.starts_with(b"SQLite format 3"), "{} was made a database", f);
+    }
+    assert_eq!(std::fs::read_to_string(d.join("main.qwe")).unwrap(), main);
+    assert_eq!(std::fs::read_to_string(d.join("shop/app.qwe")).unwrap(), "route GET / = \"s\"\n");
+    assert!(d.join("data/copy.db").exists() && d.join("data/other.db").exists());
+}
+
+/// A tenant's database in a `.quillo`, the program's (`db.open(".quillo/native/lib{tenant}")`) or a
+/// mounted program's through its link (`shop/.quillo -> qs`), is refused by `new_tenant` before its
+/// folder or its file is made: the first left a 0-byte `.quillo/native/libbeta` for the next start
+/// to load as a plugin's library (src/db.rs new_tenant; FEEDBACK85.md Q-1340, found by the
+/// re-review of 00e83c3; branch feedback82-85).
+#[test]
+fn a_tenants_database_in_a_quillo_is_refused_before_anything_is_made() {
+    let d = dir("tenantquillo");
+    for f in [".quillo/native", "shop/qs"] {
+        std::fs::create_dir_all(d.join(f)).unwrap();
+    }
+    std::os::unix::fs::symlink("qs", d.join("shop/.quillo")).unwrap();
+    write(&d, "shop/app.qwe", "route GET / = \"s\"\n");
+    for (target, tenant, file) in [(".quillo/native/lib{tenant}", "beta", ".quillo/native/libbeta"), ("shop/qs/{tenant}.db", "acme", "shop/qs/acme.db"), ("shop/.quillo/sub/{tenant}.db", "acme", "shop/.quillo/sub/acme.db")] {
+        write(&d, "main.qwe", &format!("mount /shop = \"shop/app.qwe\"\ntenant_from(\"example.com\")\ndb.open({})\nprint(new_tenant({}, () => 1))\nexit(0)\n", lit(target), lit(tenant)));
+        let (code, out) = quillo_env(&d, &["run", "--no-check", "main.qwe"], 120, &[]);
+        assert_ne!(code, Some(0), "{}: {}", target, out);
+        assert!(out.contains(&format!("`new_tenant`: ./{}: {}", file, OWN_QUILLO)), "{}: {}", target, out);
+        let left: Vec<String> = [".quillo/native", "shop/qs"].iter().flat_map(|f| std::fs::read_dir(d.join(f)).unwrap().flatten().map(|e| e.path().display().to_string())).collect();
+        assert!(left.is_empty(), "{}: {:?}", target, left);
+    }
 }

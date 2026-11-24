@@ -129,6 +129,16 @@ pub(crate) fn folders() -> Vec<std::path::PathBuf> {
 /// applied. Stops at the first file that fails, which is rolled back. Each file is judged as it is
 /// read (`judge`), all of them before any runs.
 pub fn run(db: &Backend, dir: &Path, judge: Judge<'_>) -> Result<Vec<String>, String> {
+    run_keyed(db, dir, judge, "")
+}
+
+/// `run`, each file recorded in `_quillo_migrations` under its name with `prefix` before it, and
+/// said by its name alone. A taken file's migrations are recorded under its folder (db.rs:
+/// `kit/m/002_lock_down.sql`), the main file's and an unheld program's by their names as they
+/// always were: recorded by the bare name whatever the folder, a kit's `002_lock_down.sql` run first
+/// kept the main file's own `migrations/002_lock_down.sql` from ever running ("changed after it was
+/// applied") (FEEDBACK83.md, Q-1300, found by the final review of a6cee54; branch feedback82-85).
+pub fn run_keyed(db: &Backend, dir: &Path, judge: Judge<'_>, prefix: &str) -> Result<Vec<String>, String> {
     {
         let mut f = FOLDERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if f.len() < 64 && !f.iter().any(|d| d == dir) {
@@ -159,7 +169,7 @@ pub fn run(db: &Backend, dir: &Path, judge: Judge<'_>) -> Result<Vec<String>, St
                 if off {
                     own(&c, "pragma foreign_keys = off").map_err(|e| e.to_string())?;
                 }
-                let r = sqlite_one(&c, name, text, &says, off);
+                let r = sqlite_one(&c, &format!("{}{}", prefix, name), name, text, &says, off);
                 if off {
                     let _ = own(&c, "pragma foreign_keys = on");
                 }
@@ -171,7 +181,7 @@ pub fn run(db: &Backend, dir: &Path, judge: Judge<'_>) -> Result<Vec<String>, St
         }
         Backend::Postgres(pool) => {
             let mut c = pool.checkout()?;
-            let r = pg_run(&mut c, &todo);
+            let r = pg_run(&mut c, prefix, &todo);
             // What a migration set in the session (`set search_path`) is not the next request's
             // (FEEDBACK55.md, Q-708; branch feedback55).
             if c.batch(pg::RESET).is_ok() {
@@ -184,7 +194,7 @@ pub fn run(db: &Backend, dir: &Path, judge: Judge<'_>) -> Result<Vec<String>, St
         #[cfg(feature = "mysql")]
         Backend::Mysql(pool) => {
             let mut c = pool.checkout()?;
-            let r = my_run(&mut c, &todo);
+            let r = my_run(&mut c, prefix, &todo);
             pool.give_back(c);
             r
         }
@@ -203,7 +213,7 @@ fn own(c: &rusqlite::Connection, sql: &str) -> rusqlite::Result<()> {
     c.execute_batch(sql)
 }
 
-fn sqlite_one(c: &rusqlite::Connection, name: &str, text: &str, says: &SqliteSays, off: bool) -> Result<bool, String> {
+fn sqlite_one(c: &rusqlite::Connection, key: &str, name: &str, text: &str, says: &SqliteSays, off: bool) -> Result<bool, String> {
     let hash = digest(text);
     own(c, "begin immediate").map_err(|e| e.to_string())?;
     // Quillo's own table, read as its own: the file's code may not read it (db.rs `authorize`), and
@@ -211,7 +221,7 @@ fn sqlite_one(c: &rusqlite::Connection, name: &str, text: &str, says: &SqliteSay
     // (FEEDBACK83.md, Q-1300, found by tests/cover8285_confirm.rs; branch feedback82-85).
     let had: Option<String> = {
         let _own = crate::db::OwnSql::enter();
-        c.query_row("select sha256 from _quillo_migrations where name = ?1", [name], |r| r.get(0)).ok()
+        c.query_row("select sha256 from _quillo_migrations where name = ?1", [key], |r| r.get(0)).ok()
     };
     if let Some(had) = had {
         let _ = own(c, "commit");
@@ -239,7 +249,7 @@ fn sqlite_one(c: &rusqlite::Connection, name: &str, text: &str, says: &SqliteSay
         .execute_batch(text)
         .and_then(|_| {
             let _own = crate::db::OwnSql::enter();
-            c.execute("insert into _quillo_migrations (name, sha256, applied_at) values (?1, ?2, datetime('now'))", [name, &hash])
+            c.execute("insert into _quillo_migrations (name, sha256, applied_at) values (?1, ?2, datetime('now'))", [key, &hash])
         })
         .map_err(|e| e.to_string())
         .and_then(|_| if off { foreign_key_check(c, name, &before) } else { Ok(()) });
@@ -405,14 +415,14 @@ fn foreign_key_check(c: &rusqlite::Connection, name: &str, before: &[(String, Op
 /// changes the schema commits at once there (MySQL's rule), so a migration
 /// that fails part way may leave what came before it done.
 #[cfg(feature = "mysql")]
-fn my_run(c: &mut crate::my::Conn, todo: &[(String, String)]) -> Result<Vec<String>, String> {
+fn my_run(c: &mut crate::my::Conn, prefix: &str, todo: &[(String, String)]) -> Result<Vec<String>, String> {
     c.query("select get_lock('quillo_migrations', 600) as got", &[], Some(1))?;
     let r = (|| {
         c.batch("create table if not exists _quillo_migrations (name varchar(255) primary key, sha256 char(64) not null, applied_at varchar(32) not null)")?;
         let mut applied = Vec::new();
         for (name, text) in todo {
-            let hash = digest(text);
-            let had = c.query("select sha256 from _quillo_migrations where name = ?", &[Value::str(name)], Some(1))?;
+            let (hash, key) = (digest(text), format!("{}{}", prefix, name));
+            let had = c.query("select sha256 from _quillo_migrations where name = ?", &[Value::str(&key)], Some(1))?;
             if let Some(Value::Map(row)) = had.first() {
                 if !matches!(row.get("sha256"), Some(Value::Str(s) | Value::Css(s)) if **s == *hash) {
                     eprintln!("quillo: warning: migration {} changed after it was applied; it is not run again", name);
@@ -423,7 +433,7 @@ fn my_run(c: &mut crate::my::Conn, todo: &[(String, String)]) -> Result<Vec<Stri
             let done = c.batch(text).and_then(|_| {
                 c.exec(
                     "insert into _quillo_migrations (name, sha256, applied_at) values (?, ?, cast(now() as char))",
-                    &[Value::str(name), Value::str(&hash)],
+                    &[Value::str(&key), Value::str(&hash)],
                 )
             });
             match done {
@@ -446,15 +456,15 @@ fn my_run(c: &mut crate::my::Conn, todo: &[(String, String)]) -> Result<Vec<Stri
     r
 }
 
-fn pg_run(c: &mut pg::Conn, todo: &[(String, String)]) -> Result<Vec<String>, String> {
+fn pg_run(c: &mut pg::Conn, prefix: &str, todo: &[(String, String)]) -> Result<Vec<String>, String> {
     // One server at a time, across every server sharing the database.
     c.batch("select pg_advisory_lock(7171717171)")?;
     let r = (|| {
         c.batch(TABLE)?;
         let mut applied = Vec::new();
         for (name, text) in todo {
-            let hash = digest(text);
-            let had = c.query("select sha256 from _quillo_migrations where name = $1", &[Value::str(name)], Some(1))?;
+            let (hash, key) = (digest(text), format!("{}{}", prefix, name));
+            let had = c.query("select sha256 from _quillo_migrations where name = $1", &[Value::str(&key)], Some(1))?;
             if let Some(Value::Map(row)) = had.first() {
                 if !matches!(row.get("sha256"), Some(Value::Str(s) | Value::Css(s)) if **s == *hash) {
                     eprintln!("quillo: warning: migration {} changed after it was applied; it is not run again", name);
@@ -465,7 +475,7 @@ fn pg_run(c: &mut pg::Conn, todo: &[(String, String)]) -> Result<Vec<String>, St
             let done = c.batch(text).and_then(|_| {
                 c.exec(
                     "insert into _quillo_migrations (name, sha256, applied_at) values ($1, $2, now()::text)",
-                    &[Value::str(name), Value::str(&hash)],
+                    &[Value::str(&key), Value::str(&hash)],
                 )
             });
             match done {

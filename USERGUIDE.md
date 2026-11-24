@@ -8123,7 +8123,10 @@ path is judged where it really leads, with its links followed:
   has open. `.quillo` is Quillo's *(since 0.8.11: it was writable)*: no part of a program may
   write, delete, upload or save to a path with a `.quillo` in it, anywhere, or under where
   the program's own `.quillo` folders lead (a `.quillo` that is a link, to what is there or
-  not yet), nor open a database there. Quillo reads nothing in it through a link below it,
+  not yet). SQLite opens or makes no database where the program may not write (in a
+  `.quillo`, also through a link, a source, `.env*`, `quillo.confirmed`, a database's
+  journal), by `db.open`, a tenant's file, `attach` or `vacuum into`, with or without a
+  `quillo.confirmed`. Quillo reads nothing in it through a link below it,
   or from a file with a second hard link, and a `.quillo` that leads to the program's folder
   or above stops the start. The `.quillo` folders of every program the process runs, mounted
   ones and services too, are refused to all of them, and `file()` and `files()` answer 404
@@ -11102,7 +11105,15 @@ for the site and the visitor.
   `temp.x`), which would stand for the program's table of its name in every file's later
   statements, and its migrations begin or end no transaction, judged as SQLite runs each
   statement (its parameters read as SQLite reads them, `:a(...)` too); Quillo's own
-  transaction and its foreign-keys switch around the file are its own. A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
+  transaction and its foreign-keys switch around the file are its own. A taken file may not
+  `detach` a database, make a temporary table, view or sequence on any database, or call
+  PostgreSQL's `setseed` or `set_limit`; its migrations are recorded under their folder
+  (`kit/m/002_x.sql`), so a main-file migration of the same name still runs. Not held: a
+  kit reads the main file's last sequence value (`lastval`, `currval`) on a shared
+  PostgreSQL connection; a file confirmed to read or write the database's own file
+  (`writes = ["data/app.db"]`, `files = ["data/"]`) reads all of it, Quillo's own rows
+  included; MariaDB's `information_schema` gives Quillo's tables' row counts and sizes, not
+  their values. A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
   `DELETE`, `MERGE`, `WITH`, `VALUES`, `TABLE`, `REPLACE`, `REFRESH MATERIALIZED VIEW`,
   `EXPLAIN` of one of these (MySQL's in
   brackets too), `CREATE` or `ALTER` as above (a MySQL table's engine InnoDB, Aria, MyISAM

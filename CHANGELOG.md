@@ -122,7 +122,15 @@ and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2
   reading: parameters are read as SQLite reads them now), and Quillo's own transaction and
   foreign-keys switch are its own SQL; on PostgreSQL the functions that make a `reg*` value
   are refused by name and a table's argument is counted past `[]` and `{}` (found by the
-  live review of b3a2998).
+  live review of b3a2998). A taken file may not `detach` a database (the main file's attached database was
+  swapped for one in memory), make a temporary table on PostgreSQL or MySQL/MariaDB either,
+  or call `setseed`/`set_limit`, and its migrations are recorded under their folder, so a
+  kit's `002_x.sql` no longer stops the main file's (found by the final review of a6cee54).
+  SQLite opens or makes no database where the program may not write, held or not: in a
+  `.quillo` (also through a link, a mounted program's), a source, `.env*`,
+  `quillo.confirmed`, a journal (`vacuum into '.env.local'` stopped the next start), and a
+  tenant's path is judged before anything is made (found by the reviews of a6cee54 and
+  00e83c3).
 - **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
   of 2026-11-24): a name another file defines, used without taking it, is an error in
   `quillo check`, and the start refuses it with `--no-check` too, as the value under it

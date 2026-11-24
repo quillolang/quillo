@@ -472,7 +472,10 @@ path is judged where it really leads, with its links followed:
   has open. `.quillo` is Quillo's *(since 0.8.11: it was writable)*: no part of a program may
   write, delete, upload or save to a path with a `.quillo` in it, anywhere, or under where
   the program's own `.quillo` folders lead (a `.quillo` that is a link, to what is there or
-  not yet), nor open a database there. Quillo reads nothing in it through a link below it,
+  not yet). SQLite opens or makes no database where the program may not write (in a
+  `.quillo`, also through a link, a source, `.env*`, `quillo.confirmed`, a database's
+  journal), by `db.open`, a tenant's file, `attach` or `vacuum into`, with or without a
+  `quillo.confirmed`. Quillo reads nothing in it through a link below it,
   or from a file with a second hard link, and a `.quillo` that leads to the program's folder
   or above stops the start. The `.quillo` folders of every program the process runs, mounted
   ones and services too, are refused to all of them, and `file()` and `files()` answer 404

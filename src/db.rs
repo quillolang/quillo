@@ -632,10 +632,98 @@ fn db_err(e: impl std::fmt::Display) -> Value {
     let e = e.to_string();
     let e = match sqlite_refused_at(&e).is_some() {
         true => STATEMENTS_OF.try_with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.refused.take())).ok().flatten().unwrap_or(e),
-        false => e,
+        // And a file SQLite was to open in the program's own `.quillo` (`quillo_open`).
+        false => open_refused(e),
     };
     Value::err(Value::str(format!("db: {}", e)))
 }
+
+/// SQLite's words `e`, or why `quillo_open` refused the file they say it could not open: out of
+/// `db_err`, whose every caller it would make larger.
+#[inline(never)]
+fn open_refused(e: String) -> String {
+    match e.contains("unable to open") {
+        true => OPEN_REFUSED.try_with(|r| r.take()).ok().flatten().unwrap_or(e),
+        false => e,
+    }
+}
+
+// ---- the program's own `.quillo`, as SQLite opens a file ------------------------------------
+
+thread_local! {
+    /// Why the file SQLite was last to open for this thread was refused, for the error said
+    /// (`db_err`).
+    static OPEN_REFUSED: std::cell::Cell<Option<String>> = const { std::cell::Cell::new(None) };
+}
+
+type OpenFn = unsafe extern "C" fn(*mut rusqlite::ffi::sqlite3_vfs, rusqlite::ffi::sqlite3_filename, *mut rusqlite::ffi::sqlite3_file, std::ffi::c_int, *mut std::ffi::c_int) -> std::ffi::c_int;
+
+/// Each of SQLite's file systems (its VFSes: `unix`, `unix-dotfile`, ... and `memdb`) and how it
+/// opened a file before `quillo_open` stood in front of it.
+static OPENS: std::sync::OnceLock<Vec<(usize, OpenFn)>> = std::sync::OnceLock::new();
+
+/// Puts `quillo_open` in front of every file system SQLite has, once, before the program's first
+/// connection: a file is judged where SQLite opens it, whichever name SQLite was given and
+/// whichever file system a URI names (`file:x?vfs=unix`), which no reading of a statement sees.
+fn quillo_opens() {
+    OPENS.get_or_init(|| {
+        let mut opens = Vec::new();
+        // SAFETY: SQLite's list of file systems, walked and changed before any connection of the
+        // program's opens (`connect` asks here first); each keeps its other functions, and its own
+        // `xOpen` is called by `quillo_open` with its own pointer.
+        unsafe {
+            let mut v = rusqlite::ffi::sqlite3_vfs_find(std::ptr::null());
+            while !v.is_null() {
+                if let Some(open) = (*v).xOpen {
+                    opens.push((v as usize, open));
+                    (*v).xOpen = Some(quillo_open);
+                }
+                v = (*v).pNext;
+            }
+        }
+        opens
+    });
+}
+
+/// Every database file SQLite opens, an attached one (`attach '.quillo/x.db' as q`, its name worked
+/// out in the SQL too) and `VACUUM INTO`'s copy, is refused where a write of the program's would
+/// be, held or not: in a `.quillo` of the process's programs, by its name or where it leads, a
+/// source, the settings, the key, quillo.confirmed, a journal. `attach '.QUILLO/plugins.lock' as l`
+/// and `vacuum into '.quillo/native/libhi-0000.dylib'` made Quillo's own files there
+/// (FEEDBACK85.md, Q-1340, found by the final review of a6cee54; branch feedback82-85), and
+/// `vacuum into '.env.local'` a database of the settings, which stopped the next start (found by
+/// the re-review of 00e83c3). Judged with no interpreter (`builtins::own_file_apart`, for every
+/// program of the process), so no statement pays for it: a thread's cell noting the program cost
+/// every SQLite statement some 20 instructions. Only a main database's open is looked at: its
+/// journal, log and shared memory are named after it and beside it, and SQLite opens them on
+/// every write.
+unsafe extern "C" fn quillo_open(vfs: *mut rusqlite::ffi::sqlite3_vfs, name: rusqlite::ffi::sqlite3_filename, file: *mut rusqlite::ffi::sqlite3_file, flags: std::ffi::c_int, out: *mut std::ffi::c_int) -> std::ffi::c_int {
+    if flags & rusqlite::ffi::SQLITE_OPEN_MAIN_DB != 0 && !name.is_null() {
+        // SAFETY: the name is a C string SQLite hands.
+        let path = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned();
+        let refused = match std::panic::catch_unwind(|| {
+            // By the name SQLite opens and where it really is, as a write of the file is judged.
+            crate::builtins::own_file_apart(Path::new(&path)).map(|why| format!("{}: {}", path, why))
+        }) {
+            Ok(why) => why,
+            Err(_) => Some(format!("{}: {}", path, OWN_QUILLO_OPEN)),
+        };
+        if let Some(why) = refused {
+            OPEN_REFUSED.set(Some(why));
+            // SAFETY: no file is open: SQLite closes none.
+            unsafe { (*file).pMethods = std::ptr::null() };
+            return rusqlite::ffi::SQLITE_CANTOPEN;
+        }
+    }
+    match OPENS.get().and_then(|o| o.iter().find(|(v, _)| *v == vfs as usize)) {
+        // SAFETY: the file system's own `xOpen`, with its own pointer, as SQLite would call it.
+        Some((_, open)) => unsafe { open(vfs, name, file, flags, out) },
+        None => rusqlite::ffi::SQLITE_CANTOPEN,
+    }
+}
+
+/// What a refusal of `quillo_open` says where judging it failed.
+const OWN_QUILLO_OPEN: &str = "it could not be judged as a file the program may write, and is not opened";
 
 /// Where SQLite's words for a statement its authorizer refused start in `e`, if they are there:
 /// `not authorized` (or `authorization denied`, as a statement runs), and `access to t.c is
@@ -743,6 +831,7 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
         use std::os::unix::fs::OpenOptionsExt;
         let _ = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
     }
+    quillo_opens();
     let c = if path == ":memory:" { Connection::open_in_memory()? } else { Connection::open(path)? };
     // Where a `quillo.confirmed` holds the run, which is known before any program code runs: each
     // statement's other files judged as it is compiled (`authorize`) (FEEDBACK83.md, Q-1300,
@@ -1604,7 +1693,7 @@ fn looked_for(w: &[u8]) -> bool {
         b"pg_read_file" | b"pg_read_binary_file" | b"pg_ls_dir" | b"pg_stat_file" | b"lo_import" | b"lo_export" | b"load_file" | b"pg_file_write" => true,
         b"pg_stats" | b"pg_statistic" | b"pg_stats_ext" | b"pg_stats_ext_exprs" | b"pg_statistic_ext_data" | b"pg_prepared_statements" | b"pg_stat_statements" | b"pg_stat_statements_info" | b"pg_stat_activity"
         | b"performance_schema" | b"general_log" | b"slow_log" | b"processlist" | b"innodb_trx" | b"optimizer_trace" => true,
-        b"set_config" | b"mysql" => true,
+        b"set_config" | b"mysql" | b"setseed" | b"set_limit" | b"temp" | b"temporary" => true,
         _ if l.starts_with(b"pg_") || l.starts_with(b"innodb_") || l.starts_with(b"pgstat") || regclass_fn(l) => true,
         _ => matches!(l[0], b'q' | b'c' | b't' | b's' | b'd' | b'e') && (runs_text(l) || holds_others(l)),
     }
@@ -1631,6 +1720,10 @@ enum TextRun {
     /// drop" said a word the list takes (FEEDBACK83.md, Q-1300, found by the coverage tests of
     /// 3117dea; branch feedback82-85).
     Of { head: &'static str, what: Option<String> },
+    /// A function that sets the connection's own state without `set` (PostgreSQL's `setseed`).
+    Session(String),
+    /// A temporary table, view or sequence: `create temp ...`, PostgreSQL's `select ... into temp`.
+    Temp(String),
 }
 
 /// What in `sql`, read as the server `d` reads it, has the database run SQL from text or name a
@@ -1849,6 +1942,14 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
                 if let Some(n) = names.clone().find(|n| pg && runs_text(n)) {
                     return runs(format!("the function {}", String::from_utf8_lossy(n).to_ascii_lowercase()));
                 }
+                // And what sets the pooled connection's state without `set`: `setseed`, by which a
+                // kit fixed the main file's later `random()`, and pg_trgm's `set_limit`, its
+                // similarity threshold. `set_config` is above; the advisory locks are `pg_...`
+                // (FEEDBACK83.md, Q-1300, found by the final review of a6cee54; branch
+                // feedback82-85).
+                if let Some(n) = names.clone().find(|n| pg && (n.eq_ignore_ascii_case(b"setseed") || n.eq_ignore_ascii_case(b"set_limit"))) {
+                    return Some(TextRun::Session(String::from_utf8_lossy(n).to_ascii_lowercase()));
+                }
             }
             if !pg {
                 continue;
@@ -1899,6 +2000,31 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
                 let what = if reg_type(n) { "type" } else { "function" };
                 return runs(format!("the {} {}, by which a text names a catalog object as it runs,", what, String::from_utf8_lossy(n).to_ascii_lowercase()));
             }
+        }
+        // A temporary table, view or sequence of a taken file's, on PostgreSQL and MySQL as on
+        // SQLite (`authorize`): inside the main file's `db.transaction` a kit's `create temp table
+        // users` had the main file's insert go into it, gone at the commit (FEEDBACK83.md, Q-1300,
+        // found by the final review of a6cee54; branch feedback82-85). PostgreSQL's `select ...
+        // into temp t` makes one too.
+        let temp = |w: Option<&Tk<'_>>| is(w, "temp") || is(w, "temporary");
+        if is(head, "create") {
+            let mut k = h + 1;
+            while let Some(Tk::Word(x)) = stmt.get(k) {
+                if temp(stmt.get(k)) {
+                    let kind = stmt[k + 1..].iter().find_map(|t| match t {
+                        Tk::Word(w) if [&b"table"[..], b"view", b"sequence"].iter().any(|n| w.eq_ignore_ascii_case(n)) => Some(String::from_utf8_lossy(w).to_ascii_lowercase()),
+                        _ => None,
+                    });
+                    return Some(TextRun::Temp(kind.unwrap_or_else(|| "table".into())));
+                }
+                if [&b"table"[..], b"view", b"sequence", b"index"].iter().any(|n| x.eq_ignore_ascii_case(n)) {
+                    break;
+                }
+                k += 1;
+            }
+        }
+        if pg && (is(head, "select") || is(head, "with")) && stmt.windows(2).any(|w| is(w.first(), "into") && temp(w.get(1))) {
+            return Some(TextRun::Temp("table".into()));
         }
         if let Some(why) = head_refused(my, stmt, h) {
             return Some(why);
@@ -2275,6 +2401,18 @@ fn taken_sql_refused(d: crate::sql::Dialect, sql: &str, file: impl Fn() -> Strin
             tail
         ),
         TextRun::Pg(name) => format!("{} is one of PostgreSQL's own catalogs and functions (`pg_...`), which hold or reach other tables and statements, and is refused for {}'s SQL where a quillo.confirmed holds the run. {}", name, file(), tail),
+        TextRun::Session(name) => format!(
+            "the function {} sets the connection's own state, which every file's later statements on the pooled connection see, and is refused for {}'s SQL where a quillo.confirmed holds the run, as a `set` is. {}",
+            name,
+            file(),
+            tail
+        ),
+        TextRun::Temp(kind) => format!(
+            "a temporary {} stands for the program's of its name in every later statement on its connection, the main file's in a transaction too, and is refused for {}'s SQL where a quillo.confirmed holds the run: a taken file makes its tables in the database. {}",
+            kind,
+            file(),
+            tail
+        ),
         TextRun::Of { head, what } => format!(
             "`{}` of {} is refused for {}'s SQL where a quillo.confirmed holds the run: a taken file's `{}` is of {}. {}",
             head,
@@ -2483,6 +2621,24 @@ fn tx_refused(savepoint: bool, what: Option<&std::ffi::CStr>) -> std::ffi::c_int
     rusqlite::ffi::SQLITE_DENY
 }
 
+/// `authorize`'s refusal of a taken file's `detach` of the schema `name`, out of the way of the
+/// actions every statement asks for.
+#[cold]
+#[inline(never)]
+fn detach_refused(name: Option<&std::ffi::CStr>) -> std::ffi::c_int {
+    let name = name.map_or(String::new(), |t| t.to_string_lossy().into_owned());
+    let file = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| STATEMENTS_OF.with(|s| s.try_borrow().ok().map(|s| crate::confirm::held_name(s.file.as_deref()))))).ok().flatten().unwrap_or_else(|| "this file".into());
+    STATEMENTS_OF.with(|s| {
+        if let Ok(mut s) = s.try_borrow_mut() {
+            s.refused = Some(format!(
+                "`detach {}` is refused for {}'s SQL where a quillo.confirmed holds the run: the databases attached on the program's connection are what every file's later statements reach by their names. Run it from the main file's SQL, or from a migration the main file runs",
+                name, file
+            ));
+        }
+    });
+    rusqlite::ffi::SQLITE_DENY
+}
+
 thread_local! {
     /// A migration runs on this thread (`migrate_as`): a taken file's statements there begin or
     /// end no transaction (`authorize`).
@@ -2586,6 +2742,14 @@ unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int
         // Q-1300, found by the live review of b3a2998; branch feedback82-85).
         if MIGRATING.get() && matches!(action, ffi::SQLITE_TRANSACTION | ffi::SQLITE_SAVEPOINT) {
             return tx_refused(action == ffi::SQLITE_SAVEPOINT, text(a1));
+        }
+        // And its `detach`: the databases attached on the program's connection are the main
+        // file's, which a kit's `detach b; attach ':memory:' as b` swapped for its own, the main
+        // file's later writes going to memory and its reads giving the kit's rows (FEEDBACK83.md,
+        // Q-1300, found by the final review of a6cee54; branch feedback82-85). SQLite names no
+        // schema as it asks of an `attach`: a name attached already is its own error.
+        if action == ffi::SQLITE_DETACH {
+            return detach_refused(text(a1));
         }
         if writes || reads || mirrors || analyze || trigger || over {
             STATEMENTS_OF.with(|s| {
@@ -3143,6 +3307,11 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
     crate::confirm::db_ok(dbs.held, &it.base_dir, &target).map_err(|e| format!("tenant {}: {}", name, e))?;
     if !is_server_url(&target) && target != ":memory:" {
         let full = if Path::new(&target).is_absolute() { Path::new(&target).to_path_buf() } else { it.base_dir.join(&target) };
+        // Never a file of the program's own `.quillo`, judged before its folder is made
+        // (`new_tenant`'s too).
+        if let Some(why) = crate::builtins::quillo_refused(it, &full) {
+            return Err(format!("tenant {}: {}", name, why));
+        }
         if !make && !full.exists() {
             return Err(no_such(it));
         }
@@ -3168,9 +3337,10 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         let mb = b.clone();
         // Its statements judged as the code that set the migrations (`migrate_as`), the site's (a
         // call confirmed for the whole site) as the main file's.
+        let prefix = migration_prefix(by.as_deref(), &it.base_dir, &dir);
         let code = (by, it.base_dir.clone());
         let judge = migration_judge(code.clone(), b.dialect(), String::new());
-        let applied = it.unlocked(move || migrate_as(code, || crate::migrate::run(&mb, &dir, &judge))).map_err(|e| format!("tenant {}: {}", name, e))?;
+        let applied = it.unlocked(move || migrate_as(code, || crate::migrate::run_keyed(&mb, &dir, &judge, &prefix))).map_err(|e| format!("tenant {}: {}", name, e))?;
         for m in applied {
             eprintln!("quillo: applied migration {} for tenant {}", m, name);
         }
@@ -3493,6 +3663,13 @@ pub(crate) fn claim_tenant(it: &mut Interp, name: &str, line: u32) -> Result<boo
         Ok(true)
     } else {
         let full = if Path::new(&target).is_absolute() { Path::new(&target).to_path_buf() } else { it.base_dir.join(&target) };
+        // A tenant's file is never one of the program's own `.quillo`, judged before its folder or
+        // its file is made: `db.open(".quillo/{tenant}.lock")` then `new_tenant("plugins", ...)`
+        // made an empty `.quillo/plugins.lock` before its open refused it (FEEDBACK85.md, Q-1340,
+        // found by the final review of a6cee54; branch feedback82-85).
+        if let Some(why) = crate::builtins::quillo_refused(it, &full) {
+            return fail(line, format!("`new_tenant`: {}", why));
+        }
         if let Some(dir) = full.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -4546,9 +4723,10 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Err(e) => return fail(line, format!("db.migrate: {}", e)),
     };
     let to = full.clone();
+    let prefix = migration_prefix(it.cur_file.as_deref(), &it.base_dir, &full);
     let code = (it.cur_file.clone(), it.base_dir.clone());
     let judge = migration_judge(code.clone(), b.dialect(), folder.clone());
-    match it.unlocked(move || migrate_as(code, || crate::migrate::run(&b, &to, &judge))) {
+    match it.unlocked(move || migrate_as(code, || crate::migrate::run_keyed(&b, &to, &judge, &prefix))) {
         Ok(applied) => {
             for name in &applied {
                 eprintln!("quillo: applied migration {}", name);
@@ -4557,6 +4735,23 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         Err(e) => fail(line, format!("db.migrate: {}", e)),
     }
+}
+
+/// What a migration the code of `file` runs from the folder `dir` is recorded under before its name
+/// (`migrate::run_keyed`): its folder in the program's, `kit/m/`, for a taken file's where a
+/// quillo.confirmed holds the run, which no name the main file's migrations are recorded by (a
+/// file's name alone) can be; nothing for the main file's and an unheld program's, whose
+/// databases keep the names they have (FEEDBACK83.md, Q-1300, found by the final review of
+/// a6cee54; branch feedback82-85).
+fn migration_prefix(file: Option<&str>, base: &Path, dir: &Path) -> String {
+    if !crate::confirm::held() || !crate::confirm::held_taken(file) {
+        return String::new();
+    }
+    // Both as they really are, so what is recorded is the same on every machine.
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let (base, dir) = (real(base), real(dir));
+    let rel = dir.strip_prefix(&base).map(Path::to_path_buf).unwrap_or(dir).to_string_lossy().replace('\\', "/");
+    format!("{}/", rel.trim_end_matches('/'))
 }
 
 /// What judges each file of a migration the code of `code` runs on a database of `d`'s, as

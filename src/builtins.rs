@@ -3428,8 +3428,10 @@ fn quillo_roots(it: &Interp) -> Arc<QuilloRoots> {
 static ALL_ROOTS: std::sync::RwLock<Vec<std::path::PathBuf>> = std::sync::RwLock::new(Vec::new());
 
 /// Whether `real`, a path as it really is, is in a `.quillo` by its name or under where one of the
-/// process's leads (`ALL_ROOTS`).
-fn quillo_led(real: &Path) -> bool {
+/// process's leads (`ALL_ROOTS`). db.rs asks it too, of a database file SQLite opens, where no
+/// interpreter is at hand (FEEDBACK85.md, Q-1340, found by the final review of a6cee54; branch
+/// feedback82-85).
+pub(crate) fn quillo_led(real: &Path) -> bool {
     if crate::statics::quillo_part(real) {
         return true;
     }
@@ -3439,6 +3441,56 @@ fn quillo_led(real: &Path) -> bool {
     }
     let folded = std::path::PathBuf::from(fold_name(&crate::statics::sys_form_of(real).to_string_lossy()));
     roots.iter().any(|r| under(&folded, r))
+}
+
+/// `own_file` of `full` where no interpreter is at hand, for every program of the process: a
+/// database file SQLite opens or makes (db.rs `quillo_open`: `attach`'s file, `vacuum into`'s
+/// copy), held or not. Without a quillo.confirmed `vacuum into '.env.local'` made a database of the
+/// settings, which stopped the next start, and `attach` wrote into a mounted program's `.quillo`
+/// through its link (FEEDBACK85.md, Q-1340, found by the re-review of 00e83c3; branch
+/// feedback82-85). Refused: in a `.quillo` by its name or under where one of the process's leads,
+/// as it does now (`QUILLO_FOLDERS`, and `ALL_ROOTS`); a `.env`, a `.env.*` or quillo.confirmed by
+/// its name; one of the process's own files by what it is (a source, the settings, the key, the
+/// policy, a second link to one); what a path of the settings or the key names; and the `-wal`,
+/// `-shm` or `-journal` of a database. Not a database the program has open (`db::OPEN`): SQL
+/// attaches one as SQLite shares it between connections, and `vacuum into` writes no file that
+/// holds anything.
+pub(crate) fn own_file_apart(full: &Path) -> Option<&'static str> {
+    let real = real_as_made(full);
+    let name = real.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let taken = name_as_taken(&name);
+    let target = if taken.len() == name.len() || taken.is_empty() { real.clone() } else { real.with_file_name(taken) };
+    let both = if target == real { vec![&real] } else { vec![&real, &target] };
+    let fold = |p: &Path| std::path::PathBuf::from(fold_name(&crate::statics::sys_form_of(p).to_string_lossy()));
+    if crate::statics::quillo_part(full) || both.iter().any(|f| quillo_led(f)) {
+        return Some(OWN_QUILLO);
+    }
+    let folders = QUILLO_FOLDERS.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    // Where each leads as it is now: a link to a folder not made yet holds no file SQLite can make.
+    let roots: Vec<std::path::PathBuf> = folders.into_iter().chain(crate::privacy::root()).map(|d| crate::statics::sys_form(d).join(".quillo")).map(|q| q.canonicalize().map_or_else(|_| fold(&q), |e| fold(&crate::statics::sys_form(e)))).collect();
+    if both.iter().any(|f| roots.iter().any(|r| under(&fold(f), r))) {
+        return Some(OWN_QUILLO);
+    }
+    let folded = fold_name(taken);
+    if folded == ".env" || folded.starts_with(".env.") {
+        return Some(OWN_SETTINGS);
+    }
+    if folded == crate::confirm::FILE {
+        return Some(OWN_CONFIRMED);
+    }
+    for f in &both {
+        if let Ok(m) = std::fs::metadata(f) {
+            if let Some(why) = own_meta(&m).filter(|w| *w != crate::db::OPEN).or_else(|| crate::statics::id_of(&m).and_then(named_id)) {
+                return Some(why);
+            }
+        }
+    }
+    let named: Vec<(std::path::PathBuf, &'static str)> = own().named.clone();
+    if let Some((_, why)) = named.iter().find(|(n, _)| [n.clone(), real_as_made(n)].iter().any(|n| both.iter().any(|f| fold(n) == fold(f)))) {
+        return Some(why);
+    }
+    // A journal's database is read only where it is a file of bytes, as `own_target` reads it.
+    both.iter().filter(|f| crate::db::journal_of(f).is_some_and(|db| std::fs::metadata(&db).map_or(true, |m| m.is_file()))).find_map(|f| crate::db::database_file(f))
 }
 
 /// Whether `file()` or `files()` keep the file asked for as `rel` (from the program's folder, as

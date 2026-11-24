@@ -1215,7 +1215,15 @@ for the site and the visitor.
   `temp.x`), which would stand for the program's table of its name in every file's later
   statements, and its migrations begin or end no transaction, judged as SQLite runs each
   statement (its parameters read as SQLite reads them, `:a(...)` too); Quillo's own
-  transaction and its foreign-keys switch around the file are its own. A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
+  transaction and its foreign-keys switch around the file are its own. A taken file may not
+  `detach` a database, make a temporary table, view or sequence on any database, or call
+  PostgreSQL's `setseed` or `set_limit`; its migrations are recorded under their folder
+  (`kit/m/002_x.sql`), so a main-file migration of the same name still runs. Not held: a
+  kit reads the main file's last sequence value (`lastval`, `currval`) on a shared
+  PostgreSQL connection; a file confirmed to read or write the database's own file
+  (`writes = ["data/app.db"]`, `files = ["data/"]`) reads all of it, Quillo's own rows
+  included; MariaDB's `information_schema` gives Quillo's tables' row counts and sizes, not
+  their values. A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
   `DELETE`, `MERGE`, `WITH`, `VALUES`, `TABLE`, `REPLACE`, `REFRESH MATERIALIZED VIEW`,
   `EXPLAIN` of one of these (MySQL's in
   brackets too), `CREATE` or `ALTER` as above (a MySQL table's engine InnoDB, Aria, MyISAM
