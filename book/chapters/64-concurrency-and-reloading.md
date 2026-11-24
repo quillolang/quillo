@@ -1078,10 +1078,31 @@ Asking, and who answers:
 - `quillo confirm --effects tools.rs` reads a Rust file for what it does (the standard
   library's file, network, process, clock and random calls, the crates that do them) and
   proposes its `//! effects:` line, saying where the file's own leaves something out. It
-  follows the names the file gives them (`use std::fs as disk`, `extern crate reqwest as
-  web`, a dependency's `package = "reqwest"`), however `::` and `!` are spaced, and reads
-  `include_str!`, `include_bytes!` and `include!` as `fs`. It is a reading of the text, not
-  a proof: a crate can do what it does unseen.
+  follows the names the file gives them (`use std::fs as disk`, `use std::{fs::*}`, `r#fs`,
+  `extern crate reqwest as web`, a dependency's `package = "reqwest"`), however `::` and `!`
+  are spaced, and reads `include_str!`, `include_bytes!` and `include!` as `fs`. What it
+  cannot follow it reads as every effect but `db`, and says where: a path a macro builds
+  from its argument, a foreign block (`extern "C" { ... }`), `asm!`, a `use` nested more than
+  64 deep. A file that builds another into it is refused under a `quillo.confirmed`, by
+  `quillo confirm`, `check`, `build`, the start and a reload, since the other file is outside
+  its SHA-256; without one, it is a warning. That is `include!`, `include_str!` or
+  `include_bytes!` however it is written or named, `#[path]`, a `mod x;` that is not `mod x
+  { ... }` (one a macro writes too), a macro named by a macro's argument (`$m!`), a
+  dependency by anything but its version (`path`, `git`, `registry`), and a crate whose
+  macros build files in (`rust-embed`, `include_dir`, `askama`, `sqlx` and the like). The
+  file is read as Rust reads it, by its tokens: comments, every kind of string and Rust's
+  whitespace, from where rustc starts (after a byte order mark and a `#!` first line that is
+  not `#![...]`); a dependency line's texts as TOML reads them (`'x'` as written; a `\`
+  escape or a text over lines is refused under a hold). Under a `quillo.confirmed` the build
+  itself is then judged by what the compiler read: a plugin is built apart, and if rustc's own
+  list of the files it read for the plugin (its dep-info) has any file but the plugin's
+  source and Quillo's glue, it does not load, at a start, a load, a `--watch` reload or
+  `quillo build`, and what was built is not kept (``./hi.qwer is held to its SHA-256, and
+  building it read /work/secret.txt, which that hash does not cover``). That catches what a
+  reading of the text misses, as a dependency's macro that includes a file
+  (`doc_comment::doctest!`). It is still a reading, not a proof: a crate can do what it does
+  unseen (`libc::kill` reads as the `libc` crate, which the file's `crates` list confirms by
+  name), and a proc macro that reads a file without telling rustc is not seen.
 
 Not held yet: [`--watch`](#options-of-quillo-run) does not read `quillo.confirmed` again
 when it changes (restart after `quillo confirm`); what a page loads and calls is only
@@ -1103,6 +1124,38 @@ for the site and the visitor.
   can read and write the program's tables through `db`. What is held is opening one
   (`db.open`, `db.system`, a tenant's file), its migrations (`db.migrate()`), the files SQL
   attaches, and Quillo's own `_quillo_*` tables, which a taken file's SQL never touches.
+  *(since 0.8.11)* So that what its SQL reaches can be read, a taken file's statement on
+  PostgreSQL or MySQL/MariaDB that has the database run SQL, or name a table, from text is
+  refused: `DO`, `PREPARE` and `EXECUTE` (`EXECUTE IMMEDIATE`), `CALL`, `CREATE FUNCTION`,
+  `PROCEDURE`, `TRIGGER`, `RULE` or `EVENT`, the `*_to_xml` functions, `::regclass`,
+  `to_regclass` or a cast to `regclass`, and a function that takes a table (`nextval`,
+  `setval`, `has_table_privilege`, `row_security_active`, ...) given it by anything but a
+  plain string such as `'kit_seq'`. A word inside a string, a comment or a quoted name
+  is not one. The refusal says to run it from the main file's SQL, or a migration the main
+  file runs; the main file's SQL, and a program without a `quillo.confirmed`, are not read
+  this way. A function the program's own SQL made that runs SQL text can still be called
+  from a taken file: it is the program's. So can one an extension the program installed
+  adds, beyond `crosstab`, `connectby`, `ts_stat`, `ts_rewrite`, the `dblink` functions and
+  the `*_to_xml` ones, which are refused by their names, and so can a trigger the program
+  made that a taken file's write sets off. The reading fails closed: what it cannot read for
+  certain is refused (MySQL's `/*!` comments, a `[` outside a string on MySQL/MariaDB, which
+  `sql_mode=MSSQL` reads as a quoted name, a string left open, a statement inside an `IF`
+  or a label), `EXECUTE`, `CALL` and `PREPARE` anywhere in the statement, a `CREATE` of
+  anything but a table, an index, a view or a sequence, SQL that reaches the server's files
+  (`COPY`, `INTO OUTFILE`, `pg_read_file`, `LOAD`), and the catalogs that hold other tables'
+  values or SQL text (`pg_stats`, `pg_prepared_statements`, `performance_schema`'s
+  statements, `sys.`, the process list, the `mysql` schema, and on PostgreSQL every
+  `pg_...` name). A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
+  `DELETE`, `WITH`, `VALUES`, `TABLE`, `REPLACE`, `EXPLAIN` of one of these, `CREATE` or
+  `ALTER` as above (a MySQL table's engine InnoDB, Aria, MyISAM or MEMORY), `DROP` of a table,
+  an index, a view or a sequence, or `TRUNCATE`; any other first word (`SET`, `GRANT`,
+  `SHOW`, `INSTALL` and the rest) is refused, as is a character outside ASCII just before a
+  `\` or a backtick. Tables of other databases the database user can read are not held.
+- **A connection is its maker's.** A connection `db.connect` (or `db.shards`) opened is
+  held to the file that opened it: a taken file that builds a connection's map by hand
+  reaches nothing through it, and one that connects to the same database is held to its own
+  list, as for any database it opens. One the main file hands a taken
+  file, or a `c.query` read from it, runs as the main file's, as its functions do.
 - **A function is its own file's.** A `fn` another file declares, taken by name (`import
   main.qwe use secret`), runs with that file's reach, a site-wide call inside it included:
   a kit confirmed for nothing that takes main's `secret()`, which reads `.env`, reads it.

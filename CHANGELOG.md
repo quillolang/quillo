@@ -182,11 +182,22 @@ What a program may notice:
 - **Moves in place are opt-in**: without `moves_in_place()`, links, `url()` and `navigate`
   work as in 0.8.10, but for `navigate`'s new options, Back's scroll and the focus after a
   move (below).
-- **Speed**: no per-request code runs without a `quillo.confirmed`, a policy or
-  `moves_in_place()` (text, JSON and Fortunes within noise of 0.8.10; quillolang.org's check
-  +0.1%). With a `quillo.confirmed`: `check` +2%, a start +0.8% after the one build per change.
+- **Speed**: against 0.8.10 built the same way, whole-process instructions, best of 3 to 9.
+  `quillo check` of quillolang.org's site takes 6.2% fewer: check asks the main file's real
+  path once, the parser looks at a token without copying it, and the table of what a hold
+  stands in for (4,096 addresses every process wrote into place as it started) is made in a
+  held run only. A program starts with what it did (102.0 M to its first answer). vs-python's
+  `int histogram` takes 9.3% fewer and `word frequency` 2.2% fewer: a counted map's two ints
+  are added as `eval` adds them. `group json` takes 0.6% more, as the map library's table
+  code is compiled apart from its callers since the code grew; the other 23 cases are within
+  0.6%. A request costs what it did (in process, `Interp::handle`, best of 8): text -0.4%,
+  json +0.2%, fortunes 0.0%, db -0.1%, compute -0.1%, a page 0.0%, a stream -0.4% (median); no
+  per-request code runs without a `quillo.confirmed`, a policy or `moves_in_place()`. With a
+  `quillo.confirmed`: `check` +2.9% and a start +3.2% (3.2 M: what the files reach, read and
+  judged), a page +1.5 k a request (+3%, its `content-security-policy-report-only`), a JSON
+  answer as without. `page_head` costs a page 12 k over the same tags written by hand.
   Runtime: a counter page +79 B (+32 B gzipped); a page with `url()` or `navigate` +3,862 B
-  (+1,170 B gzipped).
+  (+1,170 B gzipped) (Q-1300).
 
 ### Added
 
