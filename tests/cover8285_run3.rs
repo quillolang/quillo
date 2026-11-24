@@ -866,3 +866,63 @@ fn the_firmlinks_are_known_where_the_systems_list_cannot_be_read() {
     let (code, out) = sandboxed_at(&app, &profile, &["run", "r.qwe", "--allow-path", &ls], &[], &root.join("b.log"), 60);
     assert_eq!((code, out.as_str()), (Some(0), "from shared\n"));
 }
+
+// Fix round 7 (F3)
+
+/// A pinned build is refused where the program can reach what the build runs or reads besides
+/// its own folder: its cargo home (`CARGO_HOME`, made, or not made yet, which the program could
+/// make), rustup's home (`RUSTUP_HOME`), the `cargo` on `PATH`, and a folder of `PATH` with no
+/// cargo in it (whose `cc` the link runs), each in a folder `--allow-path` gives the program. The start says which, and where, and to pin the library instead; nothing is
+/// built and no private folder is made. With that folder allowed and none of them in it, the plugin
+/// builds and loads (src/native.rs toolchain_reached, FEEDBACK82.md Q-1285, found by the coverage
+/// tests; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_pinned_build_is_refused_a_cargo_home_toolchain_or_cargo_the_program_reaches() {
+    use sha2::Digest;
+    use std::os::unix::fs::PermissionsExt;
+    let d = Dir(support::temp_dir("cov8285r3-pin-toolchain").canonicalize().unwrap());
+    let (app, tmp, open) = (d.0.join("app"), d.0.join("tmp"), d.0.join("open"));
+    for f in [&app, &tmp, &open.join("bin"), &open.join("cargo-home"), &open.join("tools")] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    let cargo = open.join("bin/cargo");
+    std::fs::write(&cargo, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let src = "//! version: 1.0.0\n//! effects: none\npub fn hi() -> String { \"from the pin\".into() }\n";
+    std::fs::write(app.join("hi.qwer"), src).unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let hash: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
+    std::fs::write(app.join("pin.toml"), format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash)).unwrap();
+    let (t, record, o) = (tmp.display().to_string(), d.0.join("record").display().to_string(), open.display().to_string());
+    let path = format!("{}:{}", open.join("bin").display(), std::env::var("PATH").unwrap_or_default());
+    let tools = format!("{}:{}", std::env::var("PATH").unwrap_or_default(), open.join("tools").display());
+    let args = ["run", "main.qwe", "--no-check", "--policy", "pin.toml", "--allow-path", &o];
+    let cases = [
+        ("its cargo home (CARGO_HOME)", "CARGO_HOME", open.join("cargo-home").display().to_string()),
+        ("its cargo home (CARGO_HOME)", "CARGO_HOME", open.join("not-made/yet").display().to_string()),
+        ("rustup's home (RUSTUP_HOME)", "RUSTUP_HOME", open.join("rustup").display().to_string()),
+        ("the cargo it runs", "PATH", path.clone()),
+        ("a folder of its PATH, whose programs it runs", "PATH", tools.clone()),
+    ];
+    for (what, var, value) in &cases {
+        let (code, out) = quillo_at(&app, &args, &[("TMPDIR", &t), ("QUILLO_BUILT_RECORD_DIR", &record), (var, value)], &d.0.join("run.log"), 120);
+        assert_eq!(code, Some(1), "{}: {}", what, out);
+        let shown = match (*var, what.starts_with("a folder")) {
+            ("PATH", true) => open.join("tools").display().to_string(),
+            ("PATH", false) => cargo.display().to_string(),
+            _ => value.clone(),
+        };
+        assert!(
+            out.contains(&format!("is held to its source's SHA-256 and built here, and the build would use {}, {}, which is inside {}, which the program can reach and so could steer what is built: it does not load (have the policy pin its library by its own SHA-256 instead, as .quillo/plugins.lock has it)", what, shown, o)),
+            "{}: {}",
+            what,
+            out
+        );
+        assert!(!out.contains("building ") && !out.contains("from the pin"), "{}: {}", what, out);
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "{}: a private folder was made", what);
+    }
+    let (code, out) = quillo_at(&app, &args, &[("TMPDIR", &t), ("QUILLO_BUILT_RECORD_DIR", &record)], &d.0.join("run.log"), 300);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.ends_with("from the pin\n"), "{}", out);
+}

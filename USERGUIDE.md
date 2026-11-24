@@ -10979,12 +10979,19 @@ Asking, and who answers:
   list of the files it read for the plugin (its dep-info) has any file but the plugin's
   source and Quillo's glue, it does not load, at a start, a load, a `--watch` reload or
   `quillo build`, and what was built is not kept (``./hi.qwer is held to its SHA-256, and
-  building it read /work/secret.txt, which that hash does not cover``). That catches what a
-  reading of the text misses, as a dependency's macro that includes a file
-  (`doc_comment::doctest!`). It is still a reading, not a proof: a crate can do what it does
+  building it read /work/secret.txt, which that hash does not cover``), and by what its
+  assembler and linker read: the plugin's crate is built with its LLVM IR, and any assembly
+  in it refuses it; the linker lists each file it reads, and one that is not the build's own,
+  the Rust toolchain's or the system's refuses it (a `-sys` crate that links a library from
+  elsewhere, as under `/opt/homebrew`, too). That catches what a reading of the text misses,
+  as a dependency's macro that includes a file (`doc_comment::doctest!`) or a macro that
+  hands assembly its `!` apart. Nor is a source pin built where the program can reach its
+  cargo home, rustup's home, its `cargo` or `rustc`, a folder of its `PATH`, or the folder
+  Quillo runs in: the message names which, and the way out is to pin the built library. It is still a reading, not a proof: a crate can do what it does
   unseen (`libc::kill` reads as the `libc` crate, which the file's `crates` list confirms by
   name), and a proc macro that reads a file without telling rustc, or a dependency's own
-  macro that writes assembly, is not seen.
+  macro that writes assembly into a function inlined into the plugin (refused, as assembly,
+  though it may be none of the plugin's), is not seen.
 
 Not held yet: [`--watch`](#options-of-quillo-run) does not read `quillo.confirmed` again
 when it changes (restart after `quillo confirm`); what a page loads and calls is only

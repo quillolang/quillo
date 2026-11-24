@@ -1212,6 +1212,10 @@ const RUST_CALLS: &[(&str, &str)] = &[
     // Q-1305, found by the coverage tests of 0038a97; branch feedback82-85).
     ("env!", "env"),
     ("option_env!", "env"),
+    // A `.env` file read into it as it is built: `dotenvy_macro::dotenv!("TOKEN")` read as
+    // `effects: none`, as `env!` is; by any name that ends so, `try_dotenv!` too (`effects_in`)
+    // (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch feedback82-85).
+    ("dotenv!", "env"),
     ("SystemTime::now", "time"),
     // The clock read by what a time has elapsed since: `UNIX_EPOCH.elapsed()` read as `effects:
     // none` (FEEDBACK83.md, Q-1305, found by the review of a867750; branch feedback82-85).
@@ -1645,6 +1649,9 @@ fn rust_tok<'a>(src: &'a str, t: &RTok) -> &'a str {
     }
 }
 
+/// The keywords after which a `<` starts a type or a value, not a comparison (`rust_written`).
+const RUST_BEFORE_VALUE: &[&str] = &["return", "if", "match", "while", "in", "else", "mut", "as", "box", "yield", "break", "where", "dyn", "impl", "for", "move", "loop", "unsafe", "become"];
+
 /// A Rust file's code as the reading looks through it, written from its tokens (`rust_tokens`):
 /// each string as `""` and each character as `' '`, comments out; no space where a path, a call
 /// or a macro is written as one (`std :: fs`, `read (p)`, `include_str ! (`, `p . exists ( )`), one
@@ -1672,6 +1679,26 @@ fn rust_written(src: &str, toks: &[RTok]) -> (String, Vec<(u32, usize, String)>)
     // over (`<P as From<T>>::`): `<(std::net::TcpStream)>::connect(a)`, which rustc compiles, read
     // as `effects: none` (FEEDBACK83.md, Q-1305, found by the coverage tests of 3117dea; branch
     // feedback82-85).
+    // Where the generics that open at the `<` `j` end, after their `>` (not the `>` of a `->`):
+    // names, punctuation, lifetimes and numbers only.
+    let generics_end = |mut j: usize| -> Option<usize> {
+        let mut depth = 0usize;
+        while let Some(t) = toks.get(j) {
+            if !matches!(t.kind, RKind::Ident | RKind::RawIdent | RKind::Punct | RKind::Lifetime | RKind::Number) {
+                return None;
+            }
+            if punct(j, '<') {
+                depth += 1;
+            } else if punct(j, '>') && !punct(j - 1, '-') {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(j + 1);
+                }
+            }
+            j += 1;
+        }
+        None
+    };
     let qualified = |k: usize| -> Option<(usize, usize, usize)> {
         let mut j = k + 1;
         let mut parens = 0usize;
@@ -1687,6 +1714,11 @@ fn rust_written(src: &str, toks: &[RTok]) -> (String, Vec<(u32, usize, String)>)
         if path_end == path_start {
             return None;
         }
+        // The type's own generics, `<std::net::TcpStream<>>::connect(a)` read as `effects: none`
+        // (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch feedback82-85).
+        if punct(j, '<') {
+            j = generics_end(j)?;
+        }
         for _ in 0..parens {
             if !punct(j, ')') {
                 return None;
@@ -1698,24 +1730,8 @@ fn rust_written(src: &str, toks: &[RTok]) -> (String, Vec<(u32, usize, String)>)
             while pathy(j) {
                 j += 1;
             }
-            // Its generics, to the `>` that closes them (not the `>` of a `->`).
             if punct(j, '<') {
-                let mut depth = 0usize;
-                while let Some(t) = toks.get(j) {
-                    if !matches!(t.kind, RKind::Ident | RKind::RawIdent | RKind::Punct | RKind::Lifetime | RKind::Number) {
-                        return None;
-                    }
-                    if punct(j, '<') {
-                        depth += 1;
-                    } else if punct(j, '>') && !punct(j - 1, '-') {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    j += 1;
-                }
-                j += 1;
+                j = generics_end(j)?;
             }
         }
         (punct(j, '>') && punct(j + 1, ':') && punct(j + 2, ':')).then_some((path_start, path_end, j + 1))
@@ -1752,8 +1768,11 @@ fn rust_written(src: &str, toks: &[RTok]) -> (String, Vec<(u32, usize, String)>)
             }
         }
         // `<` where a value starts, not after a name, `>` or `)` (`Vec<u8>`, `f()<x`).
-        let starts = k == 0 || !(word(k - 1) || punct(k - 1, '>') || punct(k - 1, ')') || punct(k - 1, ']'));
-        if punct(k, '<') && skip_to.is_none() && starts {
+        // A keyword before it is no value: `return <std::net::TcpStream>::connect(a)` and `if <..>`
+        // read as `effects: none` (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch
+        // feedback82-85). Asked only at a `<`.
+        let starts = |k: usize| k == 0 || (word(k - 1) && RUST_BEFORE_VALUE.contains(&rust_tok(src, &toks[k - 1]))) || !(word(k - 1) || punct(k - 1, '>') || punct(k - 1, ')') || punct(k - 1, ']'));
+        if punct(k, '<') && skip_to.is_none() && starts(k) {
             if let Some((path_start, path_end, resume)) = qualified(k) {
                 skip_to = Some((path_end, resume));
                 owed += toks[k + 1..path_start].iter().map(|t| t.gap_lines).sum::<u32>();
@@ -1863,11 +1882,17 @@ const USE_DEPTH: u32 = 64;
 /// What `rust_use_names` reads of a file's `use` declarations: the names (`(name, path, as)`),
 /// where each declaration is, the path each name and glob takes with where it is, and where a
 /// tree is deeper than `USE_DEPTH`.
+#[derive(Default)]
 struct RustUses {
     names: Vec<(String, String, bool)>,
     spans: Vec<(usize, usize)>,
     leaves: Vec<(String, usize)>,
     too_deep: Option<usize>,
+    /// The names a `use` of the file's own path gives (`use self::g as h;`), each with its path
+    /// with `self::`, `crate::` and `super::` taken off (`g`).
+    own: Vec<(String, String)>,
+    /// Where the first `impl` for a type a macro is given is (`impl X for $t`).
+    given_impl: Option<usize>,
 }
 
 /// The names `use` declarations (and `extern crate x as y`) in `code` give: each name, the path
@@ -1879,7 +1904,7 @@ struct RustUses {
 /// file each time.
 fn rust_use_names(code: &str) -> RustUses {
     let b = code.as_bytes();
-    let mut out = RustUses { names: Vec::new(), spans: Vec::new(), leaves: Vec::new(), too_deep: None };
+    let mut out = RustUses::default();
     for kw in ["use", "extern crate", "type"] {
         let mut from = 0;
         while let Some(at) = code[from..].find(kw).map(|a| a + from) {
@@ -1933,14 +1958,40 @@ fn rust_use_names(code: &str) -> RustUses {
         if (at > 0 && (rust_name_byte(b[at - 1]) || b[at - 1] == b':')) || b.get(from).is_some_and(|c| rust_name_byte(*c)) {
             continue;
         }
-        let Some(end) = b[from..].iter().position(|c| matches!(c, b'{' | b';')).map(|e| e + from) else { break };
-        if let Some((ty, ty_at)) = impl_self_type(&code[from..end]) {
-            out.leaves.push((ty, from + ty_at));
+        // To its `{` or `;` outside its generics: `impl X<{ 1 }> for std::net::TcpStream` was cut
+        // at the `{` of the const generic, and its `Self::connect(a)` read as `effects: none`
+        // (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch feedback82-85).
+        let Some(end) = impl_header_end(b, from) else { break };
+        match impl_self_type(&code[from..end]) {
+            // A type a macro is given (`impl X for $t`), which the reading cannot follow.
+            Some((ty, ty_at)) if ty.starts_with('$') => {
+                out.given_impl.get_or_insert(from + ty_at);
+            }
+            Some((ty, ty_at)) => out.leaves.push((ty, from + ty_at)),
+            None => {}
         }
         from = end;
     }
+    // A type a macro is given, where the macro writes it as an `impl`'s type (`impl X for $t`) or
+    // a qualified path's (`<$t>::connect(a)`): `i!(std::net::TcpStream)` with `impl X for $t {
+    // .. Self::connect(a) .. }`, and `c!(std::net::TcpStream)` with `<$t>::connect(a)`, read as
+    // `effects: none`. Each path the file's macro calls are given is read as a path a `use` takes
+    // (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch feedback82-85).
+    if out.given_impl.is_some() || code.contains("<$") {
+        out.leaves.extend(given_paths(code));
+    }
     out.spans.sort_unstable();
-    out.names.retain(|(n, full, _)| n != "_" && *n != *full && !["crate", "self", "super"].iter().any(|s| full.split("::").next() == Some(*s)));
+    let own_path = |full: &str| ["crate", "self", "super"].iter().any(|s| full.split("::").next() == Some(*s));
+    for (n, full, _) in &out.names {
+        if n != "_" && own_path(full) {
+            let mut p = full.as_str();
+            while let Some(rest) = ["crate::", "self::", "super::"].iter().find_map(|s| p.strip_prefix(s)) {
+                p = rest;
+            }
+            out.own.push((n.clone(), p.to_string()));
+        }
+    }
+    out.names.retain(|(n, full, _)| n != "_" && *n != *full && !own_path(full));
     // A path that starts at a name another `use` gives is the path that name stands for: `use
     // std::fs as f; use f::read_to_string;` and `use std::fs as f; use f::*;`, then a bare
     // `read_to_string(p)`, read as `effects: none` (FEEDBACK83.md, Q-1305, found by the coverage
@@ -1956,7 +2007,95 @@ fn rust_use_names(code: &str) -> RustUses {
     for leaf in out.leaves.iter_mut() {
         leaf.0 = by.resolved(&leaf.0, &out.names, None);
     }
+    // A name of the file's own path that starts at a name another `use` gives stands for what that
+    // name does: `use std::include_str as g; use self::g as h;` then `h!("/etc/hosts")` read as
+    // `effects: none` (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch
+    // feedback82-85). One that names a module of the file's own (`self::m::store`) is read where
+    // it is written, as before.
+    let more: Vec<(String, String, bool)> = out.own.iter().filter_map(|(n, p)| Some(by.resolved(p, &out.names, None)).filter(|r| r != p).map(|r| (n.clone(), r, true))).collect();
+    out.names.extend(more);
     out
+}
+
+/// The paths of two or more parts (`std::net::TcpStream`) that the macro calls in `code` are
+/// given, each with where it is: what is between the brackets of each `name!(...)`, `name![...]`
+/// or `name!{...}` but `macro_rules!`'s. Each call read once, a call inside it with it.
+fn given_paths(code: &str) -> Vec<(String, usize)> {
+    let b = code.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while let Some(k) = code[i..].find('!').map(|k| k + i) {
+        i = k + 1;
+        let Some(&open) = b.get(k + 1).filter(|c| matches!(c, b'(' | b'[' | b'{')) else { continue };
+        let name_at = k - b[..k].iter().rev().take_while(|c| rust_name_byte(**c)).count();
+        if name_at == k || &code[name_at..k] == "macro_rules" {
+            continue;
+        }
+        let close = match open {
+            b'(' => b')',
+            b'[' => b']',
+            _ => b'}',
+        };
+        let (mut depth, mut j) = (0usize, k + 1);
+        while j < b.len() {
+            if b[j] == open {
+                depth += 1;
+            } else if b[j] == close {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            j += 1;
+        }
+        let mut p = k + 2;
+        while p < j {
+            if rust_name_byte(b[p]) && !b[p].is_ascii_digit() && !(rust_name_byte(b[p - 1]) || matches!(b[p - 1], b':' | b'$' | b'.')) {
+                let n = b[p..j].iter().take_while(|c| rust_name_byte(**c) || **c == b':').count();
+                let path = code[p..p + n].trim_end_matches(':');
+                if path.contains("::") {
+                    out.push((path.to_string(), p));
+                }
+                p += n.max(1);
+            } else {
+                p += 1;
+            }
+        }
+        i = j.max(k + 1);
+    }
+    out
+}
+
+/// Where the header of an `impl` that goes on at `from` of `b` ends: at its `{` or `;`, a `{` inside
+/// its generics (a const generic, `X<{ 1 }>`) passed over to its `}`. None where it does not end.
+fn impl_header_end(b: &[u8], from: usize) -> Option<usize> {
+    let (mut angle, mut i) = (0usize, from);
+    while i < b.len() {
+        match b[i] {
+            b'<' => angle += 1,
+            b'>' if b[i - 1] != b'-' => angle = angle.saturating_sub(1),
+            b'{' if angle > 0 => {
+                let mut braces = 0usize;
+                while i < b.len() {
+                    match b[i] {
+                        b'{' => braces += 1,
+                        b'}' => {
+                            braces -= 1;
+                            if braces == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            b'{' | b';' => return Some(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// The type the `impl` whose header is `head` (what is between `impl` and its `{`) is for, as a
@@ -2010,6 +2149,9 @@ fn impl_self_type(head: &str) -> Option<(String, usize)> {
         }
     }
     let at = at + head[at..].bytes().take_while(|c| *c == b':').count();
+    if head[at..].starts_with('$') {
+        return Some((head[at..].chars().take_while(|c| *c == '$' || c.is_ascii_alphanumeric() || *c == '_').collect(), at));
+    }
     let path: String = head[at..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':' || !c.is_ascii()).collect();
     let path = path.trim_end_matches(':');
     (!path.is_empty() && !path.starts_with(|c: char| c.is_ascii_digit())).then(|| (path.to_string(), at))
@@ -2157,7 +2299,7 @@ struct RustSpelled {
 /// Q-1305, found by the review of 109f6b1; branch feedback82-85).
 fn rust_spelled(code: &str, deps: &[(String, String)]) -> RustSpelled {
     let joined = rust_joined(code);
-    let RustUses { mut names, spans, leaves, too_deep } = rust_use_names(&joined);
+    let RustUses { mut names, spans, leaves, too_deep, .. } = rust_use_names(&joined);
     let starts = line_starts(&joined);
     let leaves: Vec<(String, u32)> = leaves.into_iter().map(|(p, at)| (p, line_at(&starts, at))).collect();
     let too_deep = too_deep.map(|at| line_at(&starts, at));
@@ -2355,8 +2497,12 @@ fn effects_in(code: &str, starts_programs: bool) -> (Effects, Vec<(&'static str,
     let starts = line_starts(code);
     // Each pattern looked for once through the whole text, its line counted only where it is
     // found: looked for line by line, a 53 KB plugin cost `quillo check` 0.6% of the site's check
-    // (found measuring review 1's fixes).
-    for (pat, effect) in RUST_CALLS {
+    // (found measuring review 1's fixes). Each by memchr's searcher, made once a run: the search
+    // is most of the reading's time, and `str::find`'s took 4.9% more over the catalog's 632
+    // plugins for the patterns of fix round 7 (FEEDBACK83.md, Q-1305; branch feedback82-85).
+    static FINDERS: OnceLock<Vec<memchr::memmem::Finder<'static>>> = OnceLock::new();
+    let finders = FINDERS.get_or_init(|| RUST_CALLS.iter().map(|(p, _)| memchr::memmem::Finder::new(p.as_bytes())).collect());
+    for ((pat, effect), finder) in RUST_CALLS.iter().zip(finders) {
         let mut from = 0;
         // For `.open(`: the start of the statement each is in, and the last `Builder` before it,
         // read as the matches come, in order, each part of the text once.
@@ -2364,7 +2510,7 @@ fn effects_in(code: &str, starts_programs: bool) -> (Effects, Vec<(&'static str,
         // Where the name of the last call this pattern counted ends: one found inside it is part
         // of that call (`fs::` in `std::fs::read`), counted already.
         let mut counted_to = 0usize;
-        while let Some(at) = code[from..].find(pat).map(|a| a + from) {
+        while let Some(at) = finder.find(&tb[from..]).map(|a| a + from) {
             from = at + pat.len();
             if *pat == ".open(" {
                 if let Some(k) = code[read_to..at].rfind([';', '{', '}']) {
@@ -2378,7 +2524,7 @@ fn effects_in(code: &str, starts_programs: bool) -> (Effects, Vec<(&'static str,
             // A name of its own, not the end of another (`my_fs::read`); `Command::new` is a
             // program started only where the file takes it from `std::process` (clap's reads
             // arguments: B.4).
-            let word = pat.as_bytes()[0].is_ascii_alphanumeric();
+            let word = pat.as_bytes()[0].is_ascii_alphanumeric() && *pat != "dotenv!";
             if word && at > 0 && (tb[at - 1].is_ascii_alphanumeric() || tb[at - 1] == b'_') {
                 continue;
             }
@@ -2528,7 +2674,7 @@ fn scan_rust(bytes: &[u8]) -> Block {
         }
     }
     // Another file built into it, which neither the reading nor its SHA-256 sees (`builds_in`).
-    b.compiles = builds_in_toks(&src, &toks);
+    b.compiles = builds_in_toks(&src, &toks, false);
     b
 }
 
@@ -2562,15 +2708,23 @@ const VISUALIZER: &str = "`#[debugger_visualizer(...)]`, a file rustc reads in";
 /// (FEEDBACK83.md, Q-1305, found by the coverage tests of 3117dea; branch feedback82-85). A
 /// `#![feature]` is not one: a plugin is built as a module (`#[path = "x.qwer"] mod user;`),
 /// where rustc leaves it unread.
-fn attribute_built_in(src: &str, toks: &[RTok], k: usize) -> Option<String> {
+///
+/// The last two, `#[$m]` and a `#` handed to a macro, only where `strict`: they refused ordinary
+/// code, `$(#[$m:meta])*` that hands a struct its attributes and maud's `html!(div #main { .. })`,
+/// and a pinned build is judged by what its linker read (`native::linked_in`), which no spelling
+/// gets round. `strict` is the judge of a build where no linker's list is read (FEEDBACK83.md,
+/// Q-1305, found by the review of e181c7e; branch feedback82-85).
+fn attribute_built_in(src: &str, toks: &[RTok], k: usize, strict: bool) -> Option<String> {
     let punct = |j: usize, c: u8| toks.get(j).is_some_and(|t| t.kind == RKind::Punct && src.as_bytes()[t.at] == c);
     let word = |j: usize, s: &str| toks.get(j).is_some_and(|t| matches!(t.kind, RKind::Ident | RKind::RawIdent) && rust_tok(src, t) == s);
     let open = if punct(k + 1, b'[') {
         k + 1
     } else if punct(k + 1, b'!') && punct(k + 2, b'[') {
         k + 2
-    } else {
+    } else if strict {
         return Some(format!("a `#` that starts no attribute, handed to a macro, which can make one of it, `#[link(...)]`: {}", LINKED));
+    } else {
+        return None;
     };
     // How deep in `[` and in `(` it is, and whether its own `=` came (`#[doc = ...]`), after which
     // all is its value.
@@ -2599,7 +2753,7 @@ fn attribute_built_in(src: &str, toks: &[RTok], k: usize) -> Option<String> {
         if word(j, "debugger_visualizer") {
             return Some(VISUALIZER.to_string());
         }
-        if punct(j, b'$') && !valued {
+        if strict && punct(j, b'$') && !valued {
             return Some(format!("an attribute a macro is given (`#[$m]`), which can be `#[link(...)]`: {}", LINKED));
         }
         if punct(j, b'[') && punct(j + 1, b'<') {
@@ -2677,6 +2831,11 @@ const RUST_FILE_CRATES: &[&str] = &[
     "git-version-macro",
     "dotenv_codegen",
     "dotenv_codegen_implementation",
+    // dotenvy's, whose `dotenv!` reads the `.env` of the folder rustc runs in or any above it, to
+    // `/` (on Linux `/tmp/.env`, which anyone may write), and dotenv's first (FEEDBACK83.md,
+    // Q-1305, found by the review of e181c7e; branch feedback82-85).
+    "dotenvy_macro",
+    "dotenv_macros",
 ];
 
 /// The keys a plugin's dependency may give: what crates.io's crate of that version is built with.
@@ -2701,20 +2860,45 @@ const RUST_DEP_KEYS: &[&str] = &["version", "features", "default-features", "def
 /// `path` dependency each got to the build, and the name `grab` was read at a start but not as
 /// the file loaded (FEEDBACK83.md, Q-1305, found by the review of a867750; branch feedback82-85).
 fn builds_in(src: &str) -> Option<(u32, String)> {
-    builds_in_toks(src, &rust_tokens(src))
+    builds_in_toks(src, &rust_tokens(src), false)
 }
 
-/// `builds_in`, of the file `src` whose tokens (`rust_tokens`) are `toks`.
-fn builds_in_toks(src: &str, toks: &[RTok]) -> Option<(u32, String)> {
+/// `builds_in`, of the file `src` whose tokens (`rust_tokens`) are `toks`; `strict` where no
+/// linker's list judges the build (`attribute_built_in`).
+fn builds_in_toks(src: &str, toks: &[RTok], strict: bool) -> Option<(u32, String)> {
     let text = |k: usize| toks.get(k).map(|t| rust_tok(src, t));
     let is = |k: usize, kind: RKind, s: &str| toks.get(k).is_some_and(|t| t.kind == kind && rust_tok(src, t) == s);
     let punct = |k: usize, s: &str| toks.get(k).is_some_and(|t| t.kind == RKind::Punct && src.as_bytes()[t.at] == s.as_bytes()[0]);
     let name = |k: usize| toks.get(k).is_some_and(|t| matches!(t.kind, RKind::Ident | RKind::RawIdent));
     // The names `use`s give the macros that include, and those of assembly: only where the file
     // names one, as a `use` that gives one names it.
-    let uses = if src.contains("include") || src.contains("asm") { rust_use_names(&rust_joined(&rust_written(src, toks).0)).names } else { Vec::new() };
-    let given = |list: &'static [&'static str]| -> HashSet<&str> { list.iter().copied().chain(uses.iter().filter(|(_, full, _)| full.rsplit("::").next().is_some_and(|l| list.contains(&l))).map(|(n, _, _)| n.as_str())).collect() };
-    let (includes, asms) = (given(RUST_INCLUDES), given(RUST_ASM));
+    let uses = if src.contains("include") || src.contains("asm") { rust_use_names(&rust_joined(&rust_written(src, toks).0)) } else { RustUses::default() };
+    // A name stands for one of `list` where the last part of the path it takes is one of them, or
+    // a name that does: `use core::arch::global_asm as g; use self::g as h;` gives `h`, which was
+    // read as nothing, a path of the file's own (`self::`, `crate::`, `super::`) left unread
+    // (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch feedback82-85). Followed name
+    // by name from each, so a long chain of names is read in time as its length.
+    let all: Vec<(&str, &str)> = uses.names.iter().map(|(n, f, _)| (n.as_str(), f.as_str())).chain(uses.own.iter().map(|(n, f)| (n.as_str(), f.as_str()))).collect();
+    let mut by_last: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (n, full) in &all {
+        by_last.entry(full.rsplit("::").next().unwrap_or(full)).or_default().push(n);
+    }
+    let given = |list: &'static [&'static str]| -> (HashSet<&str>, HashSet<&str>) {
+        let (mut set, mut named): (HashSet<&str>, HashSet<&str>) = (list.iter().copied().collect(), HashSet::new());
+        let mut todo: Vec<&str> = list.to_vec();
+        while let Some(x) = todo.pop() {
+            for n in by_last.get(x).into_iter().flatten() {
+                named.insert(n);
+                if set.insert(n) {
+                    todo.push(n);
+                }
+            }
+        }
+        (set, named)
+    };
+    let ((includes, _), (asms, asm_named)) = (given(RUST_INCLUDES), given(RUST_ASM));
+    // Inside a `use` declaration, to its `;`.
+    let mut in_use = false;
     let mut found: Option<(u32, String)> = None;
     // What rustc reads otherwise than this reading, which cannot then be sure of the rest: a byte
     // order mark past the first character, and a string or a character that does not end as
@@ -2727,6 +2911,13 @@ fn builds_in_toks(src: &str, toks: &[RTok]) -> Option<(u32, String)> {
     }
     for k in 0..toks.len() {
         let t = &toks[k];
+        // Its text where it is a name, read once.
+        let w = if matches!(t.kind, RKind::Ident | RKind::RawIdent) { rust_tok(src, t) } else { "" };
+        if t.kind == RKind::Ident && w == "use" {
+            in_use = true;
+        } else if punct(k, ";") {
+            in_use = false;
+        }
         let why = if !t.closed {
             Some(format!("{} that does not end as rustc reads one", if t.kind == RKind::Str { "a string" } else { "a character" }))
         } else if is(k, RKind::Ident, "mod") {
@@ -2739,7 +2930,25 @@ fn builds_in_toks(src: &str, toks: &[RTok]) -> Option<(u32, String)> {
                 (false, _, _) => Some("`mod` handed to a macro, which can make a module in another file of it".to_string()),
             }
         } else if punct(k, "#") {
-            attribute_built_in(src, toks, k)
+            attribute_built_in(src, toks, k, strict)
+        } else if !w.is_empty() && !in_use && (w == "global_asm" || w == "naked_asm" || (w == "asm" && k >= 2 && punct(k - 1, ":") && punct(k - 2, ":")) || (!asm_named.is_empty() && asm_named.contains(w))) && !(punct(k + 1, "!") && !punct(k + 2, "=")) {
+            // An assembly macro named where it is not called: what a macro is given can call it,
+            // its `!` handed apart (`m!(! core::arch::global_asm)` with `$($p)* $b (...)`), and
+            // that built another file's bytes in, confirmed by its SHA-256 (FEEDBACK83.md,
+            // Q-1305, found by the review of e181c7e; branch feedback82-85). A name a `use` gives
+            // one too; a value or a field named `asm` is not one.
+            Some(format!("`{}`, an assembly macro named, which a macro can call: {}", w, ASM_HOW))
+        } else if w == "debugger_visualizer" {
+            // However it is reached: its `#` can be a doc comment's, handed to a macro.
+            Some(VISUALIZER.to_string())
+        } else if (w == "link" && punct(k + 1, "(") && is(k + 2, RKind::Ident, "name") && punct(k + 3, "=")) || (punct(k, "[") && is(k + 1, RKind::Ident, "link") && punct(k + 2, "(")) {
+            // A library linked whose `#` is not written: a doc comment is a `#` and a `[doc = ..]`
+            // that a macro can take apart (`($h:tt $d:tt $b:tt) => { $h $b ... }` with
+            // `m!(/// x\n[link(name = "evil")])`), and rustc linked libevil.a (FEEDBACK83.md,
+            // Q-1305, found by the review of e181c7e; branch feedback82-85).
+            Some(format!("`link(name = ...)`, which a macro can make `#[link(...)]` of: {}", LINKED))
+        } else if strict && punct(k, "[") && punct(k + 1, "$") && name(k + 2) && punct(k + 3, "(") {
+            Some(format!("a `[...]` a macro fills (`$h [ $a (...) ]`), which can be `#[link(...)]`: {}", LINKED))
         } else if punct(k, "!") && !punct(k + 1, "=") && k > 0 {
             if name(k - 1) && includes.contains(text(k - 1).unwrap_or("")) {
                 let n = text(k - 1).unwrap_or("");
@@ -2930,8 +3139,11 @@ fn compiled_in_refused(name: &str, b: &Block) -> Option<String> {
 /// to the source's SHA-256 where no quillo.confirmed holds the run (`native::build_private`),
 /// whose judge, rustc's list of what it read, does not list what the assembler or the linker reads
 /// (FEEDBACK83.md, Q-1305, found by the coverage tests of 3117dea; branch feedback82-85).
-pub fn built_in_refused(name: &str, src: &str) -> Option<String> {
-    let (line, how) = builds_in(src)?;
+///
+/// `strict`: where the build's linker gives no list of what it read (`native::linked_in`), the
+/// reading refuses too what can make a `#[link]` it does not see (`attribute_built_in`).
+pub fn built_in_refused(name: &str, src: &str, strict: bool) -> Option<String> {
+    let (line, how) = builds_in_toks(src, &rust_tokens(src), strict)?;
     Some(format!("{} builds another file into it ({} at line {}), which the SHA-256 its source is held to would not cover, so it does not load ({})", escaped(name), how, line, built_in_instead(&how, name)))
 }
 

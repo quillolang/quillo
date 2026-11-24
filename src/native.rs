@@ -1968,14 +1968,7 @@ fn private_dir() -> Result<PathBuf, String> {
     #[cfg(not(unix))]
     let base = if from_file { return Err("a pinned plugin is built in the temporary folder of whoever starts Quillo, and .env set TMP or TEMP".into()) } else { std::env::temp_dir() };
     let base = base.canonicalize().map_err(|e| format!("cannot use the temporary folder {}: {}", base.display(), e))?;
-    // Each with whether it counts as the disk's root (`reached`): the folders the program's file
-    // builtins reach do, the one it runs in and a policy's ceilings do not.
-    let mut reach: Vec<(PathBuf, bool)> = crate::builtins::allowed_paths().into_iter().map(|p| (p, true)).collect();
-    reach.extend(crate::privacy::root().map(|p| (p, true)));
-    reach.extend(std::env::current_dir().ok().and_then(|d| d.canonicalize().ok()).map(|p| (p, false)));
-    for (_, paths) in &crate::policy::get().fs_paths {
-        reach.extend(paths.iter().map(|p| (p.clone(), false)));
-    }
+    let reach = program_reach();
     if let Some(r) = reached(&base, &reach) {
         return Err(format!("a pinned plugin is built apart, and the temporary folder {} is inside {}, which the program can reach", base.display(), r.display()));
     }
@@ -1996,6 +1989,75 @@ fn private_dir() -> Result<PathBuf, String> {
         }
     }
     Ok(dir)
+}
+
+/// The folders the program can reach, as `reached` takes them, each with whether it counts as
+/// the disk's root: the folders the program's file builtins reach do, the one it runs in and a
+/// policy's ceilings do not.
+fn program_reach() -> Vec<(PathBuf, bool)> {
+    let mut reach: Vec<(PathBuf, bool)> = crate::builtins::allowed_paths().into_iter().map(|p| (p, true)).collect();
+    reach.extend(crate::privacy::root().map(|p| (p, true)));
+    reach.extend(std::env::current_dir().ok().and_then(|d| d.canonicalize().ok()).map(|p| (p, false)));
+    for (_, paths) in &crate::policy::get().fs_paths {
+        reach.extend(paths.iter().map(|p| (p.clone(), false)));
+    }
+    reach
+}
+
+/// What a pinned build of `qwer` runs and reads besides its own folder, if the program can reach
+/// one of them: the cargo home (its `config.toml`, the sources in `registry/src`), rustup's home
+/// (its toolchains), the `cargo` the build runs and the `rustc` beside it, the toolchain's
+/// sysroot, and each folder of its PATH, each resolved as far as it is there (one not there yet
+/// can be made). Under `--allow-path ~` the program could write each and steer what a source pin
+/// builds, as it could the temporary folder (`private_dir`) (FEEDBACK82.md, Q-1285, found by the
+/// review of 3e793e3; branch feedback82-85).
+fn toolchain_reached(qwer: &Path) -> Result<(), String> {
+    let real = |k: &str| std::env::var_os(k).filter(|_| !crate::dotenv::set_by_file(k)).map(PathBuf::from);
+    let home = real("HOME");
+    let cargo = path_cargo();
+    let rustc = cargo.with_file_name(if cfg!(windows) { "rustc.exe" } else { "rustc" });
+    let mut used = vec![
+        ("its cargo home (CARGO_HOME)", real("CARGO_HOME").or_else(|| home.as_ref().map(|h| h.join(".cargo")))),
+        ("rustup's home (RUSTUP_HOME)", real("RUSTUP_HOME").or_else(|| home.as_ref().map(|h| h.join(".rustup")))),
+        ("the cargo it runs", Some(cargo.clone()).filter(|c| c.is_absolute())),
+        ("the rustc beside that cargo", Some(rustc).filter(|c| c.is_absolute())),
+        ("the Rust toolchain's sysroot", toolchain_sysroot()),
+    ];
+    // And each folder of its PATH, whose programs it runs: rustc's linker `cc`, and what a
+    // dependency's build script runs (found getting round this check; FEEDBACK82.md, Q-1285;
+    // branch feedback82-85).
+    used.extend(std::env::split_paths(&real("PATH").unwrap_or_default()).filter(|d| d.is_absolute()).map(|d| ("a folder of its PATH, whose programs it runs", Some(d))));
+    let reach = program_reach();
+    for (what, p) in used {
+        let Some(p) = p else { continue };
+        // Each name as far as it is there, resolved, then the rest: a cargo home not made yet can
+        // be made by the program.
+        let mut there = p.as_path();
+        let mut rest = Vec::new();
+        let real = loop {
+            if let Ok(r) = there.canonicalize() {
+                break r;
+            }
+            match (there.parent(), there.file_name()) {
+                (Some(up), Some(name)) => {
+                    rest.push(name.to_os_string());
+                    there = up;
+                }
+                _ => break p.clone(),
+            }
+        };
+        let full = rest.iter().rev().fold(real, |acc, n| acc.join(n));
+        if let Some(r) = reached(&full, &reach) {
+            return Err(format!(
+                "{} is held to its source's SHA-256 and built here, and the build would use {}, {}, which is inside {}, which the program can reach and so could steer what is built: it does not load (have the policy pin its library by its own SHA-256 instead, as .quillo/plugins.lock has it)",
+                qwer.display(),
+                what,
+                p.display(),
+                r.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The folder of `reach` that holds `dir` (each resolved), judged by the folders themselves
@@ -2056,7 +2118,8 @@ fn path_cargo() -> PathBuf {
 /// home, and the library was opened again by its name in `.quillo/native` (FEEDBACK82.md, Q-1285,
 /// found in review; branch feedback82-85). What is left is the account's own toolchain: its
 /// `CARGO_HOME` (config, registry sources) and rustup's toolchains, which only a pin by the
-/// library's own SHA-256, built by the host, holds.
+/// library's own SHA-256, built by the host, holds; the program itself may reach none of them
+/// (`toolchain_reached`).
 fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
     let bytes = crate::error::read_file(qwer).map_err(|e| format!("cannot read {}: {}", qwer.display(), e))?;
     let hash = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
@@ -2074,7 +2137,10 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
     // source pin with no quillo.confirmed, built the other file's code in and loaded it, as
     // `include!`, `#[link]` and the like would (FEEDBACK82.md Q-1285, FEEDBACK83.md Q-1305, found
     // by the coverage tests of 3117dea; branch feedback82-85). Judged before anything is built.
-    if let Some(why) = crate::confirm::built_in_refused(&qwer.display().to_string(), &src) {
+    // Where no linker's list of what it read judges the build (`linked_in`), the reading refuses
+    // too what can make a `#[link]` it does not see (FEEDBACK83.md, Q-1305, found by the review
+    // of e181c7e; branch feedback82-85).
+    if let Some(why) = crate::confirm::built_in_refused(&qwer.display().to_string(), &src, !LINK_LISTED) {
         return Err(why);
     }
     let version = crate::install::header_version(&src);
@@ -2101,6 +2167,8 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
     if real("HOME").is_none() && real("CARGO_HOME").is_none() {
         return Err(format!("{} is held to its source's SHA-256 and is built here, which needs HOME (or CARGO_HOME) from whoever starts Quillo, not from .env", qwer.display()));
     }
+    // Nor with a cargo home, a toolchain or a cargo the program can write (`toolchain_reached`).
+    toolchain_reached(qwer)?;
     let dir = private_dir()?;
     let mut made = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -2134,11 +2202,18 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         // in `release/deps` (`read_in`). Set, not taken from whoever starts Quillo (FEEDBACK83.md,
         // Q-1305, found by CI run 45354741594 on Rust 1.100; branch feedback82-85).
         cmd.env("CARGO_BUILD_BUILD_DIR", target.join("build"));
+        // The plugin's own crate is built with its LLVM IR beside it, and the linker lists each
+        // file it reads (`judged_args`), so the build is judged where the assembler and the linker
+        // act, as `read_in` judges it where rustc reads (FEEDBACK83.md, Q-1305, found by the
+        // review of e181c7e; branch feedback82-85).
+        let list = dir.join("linked.list");
         let out = cmd
-            .args(["build", "--release", "--message-format=short", "--manifest-path"])
+            .args(["rustc", "--release", "--lib", "--message-format=short", "--manifest-path"])
             .arg(crate_dir.join("Cargo.toml"))
             .arg("--target-dir")
             .arg(&target)
+            .arg("--")
+            .args(judged_args(&list))
             .output()
             .map_err(|e| format!("cannot build {}: cargo did not run ({})", qwer.display(), e))?;
         if !out.status.success() {
@@ -2154,6 +2229,27 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
                 qwer.display(),
                 other.display(),
                 qwer.display()
+            ));
+        }
+        // Nor any assembly of its own crate: the assembler reads what `.include` and `.incbin`
+        // name, and no list says so. A spelling the reading of its text did not see,
+        // `m!(! core::arch::global_asm)` with `$($p)* $b (".incbin ...")`, built another file's
+        // bytes in, which changed under the same SHA-256.
+        if let Some(line) = assembled_in(&target, &crate_name)? {
+            return Err(format!(
+                "{} is held to its SHA-256, and building it assembled code of its own (`{}` in rustc's IR), whose `.include` and `.incbin` read files that hash does not cover: it does not load, and what was built is not kept (write that code in Rust, without assembly)",
+                qwer.display(),
+                crate::confirm::escaped(&line)
+            ));
+        }
+        // Nor a library or an object file the linker read from elsewhere than the build's own
+        // folder, the Rust toolchain or the system: `m!(/// x\n[link(name = "evil", kind =
+        // "static")])`, a doc comment's `#` handed to a macro, linked libevil.a.
+        if let Some(other) = linked_in(&list, &crate_dir, &target)? {
+            return Err(format!(
+                "{} is held to its SHA-256, and its linker read {}, which is not the build's own, the Rust toolchain's or the system's, and which that hash does not cover: it does not load, and what was built is not kept (link only the system's libraries and what its crates build)",
+                qwer.display(),
+                other.display()
             ));
         }
         let built = target.join("release").join(format!("{}{}.{}", std::env::consts::DLL_PREFIX, crate_name, std::env::consts::DLL_EXTENSION));
@@ -2214,6 +2310,248 @@ fn read_in(target: &Path, crate_name: &str, crate_dir: &Path, own: &[PathBuf]) -
         }
     }
     Ok(None)
+}
+
+/// Whether the linker of a pinned build lists what it read (`judged_args`): Apple's ld and the
+/// GNU ld (2.35 on), lld and mold of Linux do. Elsewhere the reading judges alone, and refuses
+/// more (`confirm::built_in_refused`'s `strict`).
+const LINK_LISTED: bool = cfg!(any(target_os = "macos", target_os = "linux"));
+
+/// What `cargo rustc` is given past `--` for the plugin's own crate in a pinned build: its LLVM IR
+/// beside the library (`assembled_in`), and the linker's list of each file it read, written to
+/// `list` (`linked_in`): Apple's ld's `-dependency_info`, Linux's linkers' `--dependency-file`
+/// (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch feedback82-85).
+fn judged_args(list: &Path) -> Vec<String> {
+    let mut args = vec!["--emit=llvm-ir,link".to_string()];
+    let linker = |a: &str| ["-C".to_string(), format!("link-arg={}", a)];
+    if cfg!(target_os = "macos") {
+        for a in ["-Xlinker", "-dependency_info", "-Xlinker", &list.display().to_string()] {
+            args.extend(linker(a));
+        }
+    } else if cfg!(target_os = "linux") {
+        for a in ["-Xlinker", &format!("--dependency-file={}", list.display())] {
+            args.extend(linker(a));
+        }
+    }
+    args
+}
+
+/// The first line of the LLVM IR of the crate `crate_name` built in `target` that assembles: a
+/// `module asm` (`global_asm!`) or a call of inline assembly (`asm!`, `naked_asm!`), whose
+/// `.include` and `.incbin` have the assembler read a file no list names. The IR is the crate's
+/// own: what Quillo's glue and std put in it has none (a plugin of Rust alone, with serde_json,
+/// has no line of it), and a dependency's own assembly is in its own crate, built from crates.io's
+/// bytes. IR that is not there, one file per codegen unit or `<crate>.ll`, refuses the build
+/// (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch feedback82-85).
+fn assembled_in(target: &Path, crate_name: &str) -> Result<Option<String>, String> {
+    let files = ir_of(target, crate_name);
+    if files.is_empty() {
+        return Err(format!("the compiler's IR of {} is not in {}: it does not load", crate_name, target.display()));
+    }
+    for f in files {
+        let text = std::fs::read_to_string(&f).map_err(|e| format!("cannot read {}: {}", f.display(), e))?;
+        if let Some(line) = ir_assembly(&text) {
+            return Ok(Some(line.chars().take(160).collect()));
+        }
+    }
+    Ok(None)
+}
+
+/// The `.ll` files of the crate `crate_name` in `target`: `<crate>.ll`, and `<crate>.<..>.ll` for
+/// each codegen unit, in the folder rustc wrote its dep-info to (`dep_info_of`), as it writes all
+/// it emits there: `release/deps` up to cargo 1.99, a folder of 1.100's build dir after.
+fn ir_of(target: &Path, crate_name: &str) -> Vec<PathBuf> {
+    let (alone, dotted, dashed) = (format!("{}.ll", crate_name), format!("{}.", crate_name), format!("{}-", crate_name));
+    let ours = |p: &Path| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".ll") && (n == alone || n.starts_with(&dotted) || n.starts_with(&dashed)));
+    let mut found: Vec<PathBuf> = dep_info_of(target, crate_name)
+        .iter()
+        .filter_map(|d| d.parent())
+        .flat_map(|dir| std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()))
+        .filter(|p| p.is_file() && ours(p))
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// The first line of LLVM IR `text` that assembles: `module asm "..."`, or a call of inline
+/// assembly, the word `asm` outside its strings and its comment after `call`, `invoke` or
+/// `callbr` (`call void asm sideeffect "nop", ""()`), each with a template that is not empty. An
+/// empty one is no assembly: rustc writes `asm sideeffect "", "~{memory}"()` and `"", "r,~{memory}"`
+/// for `black_box` and the fences std's and tokio's code reach, which read nothing (found
+/// building the catalog's amqp.qwer). A string of the plugin's that says `asm` is a constant's
+/// `c"..."`, never a call.
+fn ir_assembly(text: &str) -> Option<&str> {
+    for line in text.lines() {
+        if !line.contains("asm") {
+            continue;
+        }
+        // The line as words and strings (`"..."`, whose `"` is written `\22`), to its comment.
+        let mut toks: Vec<(bool, String)> = Vec::new();
+        let mut cur = String::new();
+        let mut quoted = false;
+        for c in line.chars() {
+            match c {
+                '"' if quoted => {
+                    toks.push((true, std::mem::take(&mut cur)));
+                    quoted = false;
+                }
+                '"' => {
+                    if !cur.is_empty() {
+                        toks.push((false, std::mem::take(&mut cur)));
+                    }
+                    quoted = true;
+                }
+                ';' if !quoted => break,
+                c if quoted => cur.push(c),
+                c if c.is_whitespace() || c == ',' || c == '(' => {
+                    if !cur.is_empty() {
+                        toks.push((false, std::mem::take(&mut cur)));
+                    }
+                }
+                c => cur.push(c),
+            }
+        }
+        if !cur.is_empty() && !quoted {
+            toks.push((false, cur));
+        }
+        let word = |k: usize, w: &str| toks.get(k).is_some_and(|(q, t)| !q && t == w);
+        let at = if word(0, "module") && word(1, "asm") {
+            Some(1)
+        } else {
+            toks.iter().position(|(q, t)| !q && t == "asm").filter(|i| toks[..*i].iter().any(|(q, t)| !q && matches!(t.as_str(), "call" | "invoke" | "callbr")))
+        };
+        // Its template: the first string after `asm`.
+        if let Some(i) = at {
+            if toks[i + 1..].iter().find(|(q, _)| *q).is_some_and(|(_, t)| !t.is_empty()) {
+                return Some(line);
+            }
+        }
+    }
+    None
+}
+
+/// The first file the linker of a pinned build read, as its list (`list`, `judged_args`) has
+/// them, that is not the build's own (in `target`), the Rust toolchain's (its sysroot, as the
+/// `rustc` beside the cargo that built it says) or the system's (each folder of its path and the
+/// file root's, that no one else may write; on macOS also the developer folder `xcode-select`
+/// names, whose SDK it links against): a library a `#[link]` named, from its search paths or a
+/// path, which its SHA-256 does not cover, however the attribute was made. A list that is not
+/// there, or has nothing in it, refuses the build. Where no list is known, nothing (`LINK_LISTED`)
+/// (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch feedback82-85).
+fn linked_in(list: &Path, crate_dir: &Path, target: &Path) -> Result<Option<PathBuf>, String> {
+    if !LINK_LISTED {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(list).map_err(|e| format!("the linker's list of what it read is not in {} ({}): it does not load", list.display(), e))?;
+    linked_from(&bytes, crate_dir, target).map_err(|e| format!("{}, {}: it does not load", e, list.display()))
+}
+
+/// `linked_in`, of a list's bytes as this system's linker writes them (`link_inputs`): the first
+/// file it names that is not the build's own (in `target`), the toolchain's or the system's.
+/// Public so its reading of a list is tested on its own.
+pub fn linked_from(bytes: &[u8], crate_dir: &Path, target: &Path) -> Result<Option<PathBuf>, String> {
+    let inputs = link_inputs(bytes, crate_dir);
+    if inputs.is_empty() {
+        return Err("the linker's list of what it read has nothing in it".to_string());
+    }
+    let mut roots: Vec<PathBuf> = [target.canonicalize().ok(), toolchain_sysroot()].into_iter().flatten().collect();
+    let mut developer: Option<Option<PathBuf>> = None;
+    for p in inputs {
+        let real = p.canonicalize().unwrap_or_else(|_| p.clone());
+        if roots.iter().any(|r| crate::statics::holds(r, &real)) || system_owned(&real) {
+            continue;
+        }
+        // The developer folder, asked once and only for what is not otherwise the build's own.
+        if developer.is_none() {
+            let d = developer_dir();
+            roots.extend(d.clone());
+            developer = Some(d);
+            if roots.iter().any(|r| crate::statics::holds(r, &real)) {
+                continue;
+            }
+        }
+        return Ok(Some(p));
+    }
+    Ok(None)
+}
+
+/// The files a linker's list (`judged_args`) names as read: Apple's ld writes records of an
+/// opcode byte and a path ended by a NUL (`0x10` a file read; `0x11` one looked for and not
+/// found, `0x40` the output and `0x00` the linker's version, not read); Linux's linkers a make
+/// rule, the output then each file read (`\` ends a line that goes on, `\ ` is a space), and a
+/// rule of each file alone. A relative name is from the crate's folder, where cargo runs rustc.
+fn link_inputs(bytes: &[u8], crate_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if cfg!(target_os = "macos") {
+        let mut i = 0;
+        while i < bytes.len() {
+            let op = bytes[i];
+            let end = bytes[i + 1..].iter().position(|b| *b == 0).map_or(bytes.len(), |e| i + 1 + e);
+            if op == 0x10 {
+                out.push(crate_dir.join(String::from_utf8_lossy(&bytes[i + 1..end]).as_ref()));
+            }
+            i = end + 1;
+        }
+    } else {
+        let text = String::from_utf8_lossy(bytes).replace("\\\n", " ").replace("\\\r\n", " ");
+        let mut output: Option<String> = None;
+        for line in text.lines() {
+            let names = make_names(line);
+            let Some(first) = names.first() else { continue };
+            let output = output.get_or_insert_with(|| first.clone());
+            out.extend(names.iter().filter(|n| *n != output).map(|n| crate_dir.join(n)));
+        }
+    }
+    out
+}
+
+/// The sysroot of the Rust toolchain a pinned build used: what the `rustc` beside its cargo says
+/// (`--print sysroot`), run as cargo is, in the same folder with the same variables, so rustup
+/// picks the same toolchain. Asked once a run.
+fn toolchain_sysroot() -> Option<PathBuf> {
+    static SYSROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    SYSROOT.get_or_init(sysroot_asked).clone()
+}
+
+fn sysroot_asked() -> Option<PathBuf> {
+    let cargo = path_cargo();
+    let rustc = cargo.with_file_name(if cfg!(windows) { "rustc.exe" } else { "rustc" });
+    let mut cmd = std::process::Command::new(if rustc.is_absolute() { rustc } else { PathBuf::from("rustc") });
+    cmd.current_dir(cargo_dir()).env_clear().args(["--print", "sysroot"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    for k in BUILD_ENV {
+        if let Some(v) = std::env::var_os(k).filter(|_| !crate::dotenv::set_by_file(k)) {
+            cmd.env(k, v);
+        }
+    }
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()).canonicalize().ok()
+}
+
+/// The developer folder macOS's linker takes its SDK from, as `xcode-select -p` says with no
+/// variable of the environment (a pinned build passes it no `DEVELOPER_DIR` or `SDKROOT`).
+fn developer_dir() -> Option<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = std::process::Command::new("/usr/bin/xcode-select").arg("-p").env_clear().stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok().filter(|o| o.status.success())?;
+    PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()).canonicalize().ok()
+}
+
+/// Whether the file `p` (resolved) is the system's: it and each folder of its path are root's,
+/// and no one else may write in them (a folder with the sticky bit, `/tmp`, lets no one rename
+/// what is root's in it).
+fn system_owned(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        p.ancestors().filter(|a| !a.as_os_str().is_empty()).all(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.uid() == 0 && (m.mode() & 0o022 == 0 || (m.is_dir() && m.mode() & 0o1000 != 0))))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        false
+    }
 }
 
 /// The dep-info files rustc wrote for the crate `crate_name` built in `target`, the build dir
@@ -2303,7 +2641,10 @@ fn build_confirmed(qwer: &Path, program: &Path) -> Result<(PathBuf, Parsed), Str
     let lib = lib_path(qwer, &src);
     // Recorded as judged by what the compiler read (`read_in`): one recorded before is built again
     // once (FEEDBACK83.md, Q-1305, found by the review of 152bc1b; branch feedback82-85).
-    let key = format!("{} {} {}-{} read-judged", source, lib_name(&lib), std::env::consts::ARCH, std::env::consts::OS);
+    // And by what its assembler and linker read (`assembled_in`, `linked_in`): one recorded as
+    // judged before them is built and judged again once (FEEDBACK83.md, Q-1305, found by the
+    // review of e181c7e; branch feedback82-85).
+    let key = format!("{} {} {}-{} read-asm-link-judged", source, lib_name(&lib), std::env::consts::ARCH, std::env::consts::OS);
     let record = built_record(program);
     if lib.is_file() {
         // Opened by what was hashed, as a pinned build's is (`checked_lib`; found in review 2).

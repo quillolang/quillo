@@ -316,7 +316,14 @@ What a program may notice:
   lines as TOML reads them. Under a hold the build itself is judged by what rustc read: a
   plugin whose dep-info lists any file but its source and Quillo's glue does not load and is
   not kept (a dependency's macro that includes a file, `doc_comment::doctest!`); the bytes
-  built are checked against the confirmed SHA-256 (found in review).
+  built are checked against the confirmed SHA-256 (found in review). The build is judged by
+  its LLVM IR too (no assembly) and by its linker's own list (only the build's, the
+  toolchain's and the system's files), and a source pin is not built where the program can
+  reach CARGO_HOME, RUSTUP_HOME, its `cargo`, a `PATH` folder or the folder Quillo runs in
+  (Q-1285; found by the review of e181c7e: assembly whose `!` a macro hands apart, a doc
+  comment's `#` given to `[link(...)]`). `dotenvy_macro` is refused with the crates that
+  build files in, and `<T>::` after a keyword, `<T<>>`, an impl's const generics and a
+  macro's `impl X for $t` read as `T`.
 - **What `quillo.confirmed` does not confirm** is an error at its line, and so is a name used
   from another file and not taken, under one (see Security).
 - **`"""` and `'''`** say that text over several lines is a backtick string (FEEDBACK85.md,

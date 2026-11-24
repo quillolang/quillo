@@ -622,17 +622,20 @@ fn a_plugin_that_assembles_another_file_in_does_not_load_where_it_is_held() {
     assert!(out.contains(&refused), "{}", out);
     assert!(!d.join(".quillo").join("native").exists(), "something was built");
     assert_eq!(
-        quillo::confirm::built_in_refused("hi.qwer", &src),
+        quillo::confirm::built_in_refused("hi.qwer", &src, false),
         Some(format!("hi.qwer builds another file into it ({}), which the SHA-256 its source is held to would not cover, so it does not load (write that code in Rust, without assembly)", how))
     );
-    assert_eq!(quillo::confirm::built_in_refused("hi.qwer", &plugin("pub fn hi() -> i64 { 42 }")), None);
-    assert_eq!(quillo::confirm::built_in_refused("hi.qwer", ""), None);
+    assert_eq!(quillo::confirm::built_in_refused("hi.qwer", &plugin("pub fn hi() -> i64 { 42 }"), false), None);
+    assert_eq!(quillo::confirm::built_in_refused("hi.qwer", "", false), None);
 }
 
 /// An attribute that has the linker read a library in is refused under a hold, however it is
-/// written: `#[link(...)]`, in a `cfg_attr`, raw (`r#link`), spaced, in a module; one a macro is
-/// given (`#[$a(...)]` with `m!(link)`, `#[$m]` with a `meta`); one made of a `#` a macro is given
-/// (`$h [ $a (...) ]` with `m!(# link)`); and `#![debugger_visualizer]`, a file rustc reads in.
+/// written: `#[link(...)]`, in a `cfg_attr`, raw (`r#link`), spaced, in a module; `#[$m]` given
+/// `link(name = ..)` by a `meta`; and `#![debugger_visualizer]`, a file rustc reads in. Where the
+/// attribute's name or its `#` is all a macro is given (`#[$a(...)]` with `m!(link)`, `$h [ $a
+/// (...) ]` with `m!(# link)`), the reading refuses it only where no linker's list judges the build
+/// (`strict`); elsewhere the build is judged by what its linker read, and the reading no longer
+/// refuses `$(#[$m:meta])*` and a `#` in a macro's input (fix round 7, which decides it).
 /// rustc compiles each (the visualizer with its file there). What reads no file is confirmed: a
 /// function and a value named `link`, `#[derive]`, `#[cfg(feature = ..)]`, `#![allow]`,
 /// `#[doc = concat!(..)]`, a raw lifetime's `#` (`'r#a`) (src/confirm.rs attribute_built_in, FEEDBACK83.md
@@ -650,15 +653,24 @@ fn an_attribute_that_links_a_library_in_is_refused_under_a_hold() {
         ("rawlink", "#[r#link(name = \"evil\")]\nextern \"C\" { fn f(); }", lib, 3, instead),
         ("spaced", "pub fn hi() -> String { \"hi\".into() }\n# [ link ( name = \"evil\" ) ]\nextern \"C\" { fn f(); }", lib, 4, instead),
         ("inmodule", "mod m { #![allow(unused)] #[link(name = \"evil\")] extern \"C\" { fn f(); } }", lib, 3, instead),
-        ("givenname", "macro_rules! m { ($a:ident) => { #[$a(name = \"evil\")] extern \"C\" { fn f(); } } }\nm!(link);", given, 3, instead),
-        ("meta", "macro_rules! m { ($m:meta) => { #[$m] extern \"C\" { fn f(); } } }\nm!(link(name = \"evil\"));", given, 3, instead),
-        ("lone", "macro_rules! m { ($h:tt $a:ident) => { $h [ $a (name = \"evil\") ] extern \"C\" { fn f(); } } }\nm!(# link);", "a `#` that starts no attribute, handed to a macro, which can make one of it, `#[link(...)]`: a library the linker reads in", 4, instead),
+        ("meta", "macro_rules! m { ($m:meta) => { #[$m] extern \"C\" { fn f(); } } }\nm!(link(name = \"evil\"));", "`link(name = ...)`, which a macro can make `#[link(...)]` of: a library the linker reads in", 4, instead),
         ("visualizer", "#![debugger_visualizer(gdb_script_file = \"x.py\")]", "`#[debugger_visualizer(...)]`, a file rustc reads in", 3, "leave the visualizer out"),
     ];
     for (name, code, why, line, instead) in &cases {
         assert!(rustc_compiles(&d, name, code), "{}: rustc does not compile it", name);
         assert_eq!(confirm_plugin(&d, code), (Some(1), built_in_said(why, *line, instead)), "{}", name);
         assert!(!d.join("quillo.confirmed").exists(), "{}", name);
+    }
+    // All a macro is given: refused where no linker's list judges the build, read as nothing else.
+    let strict = [
+        ("givenname", "macro_rules! m { ($a:ident) => { #[$a(name = \"evil\")] extern \"C\" { fn f(); } } }\nm!(link);", given, 3),
+        ("lone", "macro_rules! m { ($h:tt $a:ident) => { $h [ $a (name = \"evil\") ] extern \"C\" { fn f(); } } }\nm!(# link);", "a `[...]` a macro fills (`$h [ $a (...) ]`), which can be `#[link(...)]`: a library the linker reads in", 3),
+    ];
+    for (name, code, why, line) in strict {
+        assert!(rustc_compiles(&d, name, code), "{}: rustc does not compile it", name);
+        let src = plugin(code);
+        assert_eq!(quillo::confirm::built_in_refused("hi.qwer", &src, true), Some(format!("hi.qwer builds another file into it ({} at line {}), which the SHA-256 its source is held to would not cover, so it does not load ({})", why, line, instead)), "{}", name);
+        assert_eq!(quillo::confirm::built_in_refused("hi.qwer", &src, false), None, "{}", name);
     }
     let fine = [
         ("fnlink", "pub fn link(a: u8) -> u8 { a }\npub fn hi() -> String { format!(\"{}\", link(1)) }"),
@@ -780,5 +792,254 @@ fn the_macro_crate_of_a_crate_that_builds_files_in_is_refused_under_a_hold() {
         assert_eq!(code, Some(0), "{}: {}", dep, out);
         assert!(read(&d.join("quillo.confirmed")).contains("[\"hi.qwer\"]\nsha256 = "), "{}", dep);
         std::fs::remove_file(d.join("quillo.confirmed")).unwrap();
+    }
+}
+
+// Fix round 7
+
+/// An assembly macro named where it is not called is refused under a hold, as a macro can call
+/// it with its `!` handed apart: `m!(! core::arch::global_asm)` with `$($p)* $b (...)`,
+/// `m!(core::arch::global_asm)` with `$($p)*!(...)`, `m!(! a)` where `use core::arch::asm as a;`;
+/// and a name a `use` of the file's own path gives one (`use self::g as h; h!(...)`,
+/// `crate::`, `super::` from a module), which was read as nothing. rustc compiles each. A field
+/// and a value named `asm`, and an `asm` in a string, are no assembly: confirmed
+/// (src/confirm.rs builds_in, FEEDBACK83.md Q-1305, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn assembly_whose_bang_is_handed_apart_is_refused_under_a_hold() {
+    let d = dir("fix7-asm");
+    let i = "\".incbin \\\"/nonexistent/x\\\"\"";
+    let how = "assembly, whose `.include` and `.incbin` read another file in";
+    let instead = "write that code in Rust, without assembly";
+    let named = |n: &str| format!("`{}`, an assembly macro named, which a macro can call: {}", n, how);
+    let other = |n: &str| format!("`{}!`, an assembly macro by another name: {}", n, how);
+    let cases: Vec<(&str, String, String, u32)> = vec![
+        ("apart", format!("macro_rules! m {{ ($b:tt $($p:tt)*) => {{ $($p)* $b ({}); }} }}\nm!(! core::arch::global_asm);", i), named("global_asm"), 4),
+        ("after", format!("macro_rules! m {{ ($($p:tt)*) => {{ $($p)*!({}); }} }}\nm!(core::arch::global_asm);", i), named("global_asm"), 4),
+        ("bare", format!("use core::arch::global_asm;\nmacro_rules! m {{ ($b:tt $($p:tt)*) => {{ $($p)* $b ({}); }} }}\nm!(! global_asm);", i), named("global_asm"), 5),
+        ("aliasapart", format!("use core::arch::asm as a;\nmacro_rules! m {{ ($b:tt $($p:tt)*) => {{ pub fn f() {{ unsafe {{ $($p)* $b ({}) }} }} }} }}\nm!(! a);", i), named("a"), 5),
+        ("pathasm", format!("macro_rules! m {{ ($b:tt $($p:tt)*) => {{ pub fn f() {{ unsafe {{ $($p)* $b ({}) }} }} }} }}\nm!(! core::arch::asm);", i), named("asm"), 4),
+        ("selfalias", format!("use core::arch::global_asm as g;\nuse self::g as h;\nh!({});", i), other("h"), 5),
+        ("cratealias", format!("use core::arch::global_asm as g;\nmod m {{ use crate::g as h; h!({}); }}", i), other("h"), 4),
+        ("superalias", format!("use core::arch::global_asm as g;\nmod m {{ use super::g as h; h!({}); }}", i), other("h"), 4),
+    ];
+    for (name, code, why, line) in &cases {
+        assert!(rustc_compiles(&d, name, code), "{}: rustc does not compile it", name);
+        assert_eq!(confirm_plugin(&d, code), (Some(1), built_in_said(why, *line, instead)), "{}", name);
+        assert!(!d.join("quillo.confirmed").exists(), "{}", name);
+    }
+    let fine = "pub struct S { pub asm: u8, pub link: u8 }\npub fn g(s: &S) -> u8 { let asm = s.asm; asm + s.link }\npub fn hi() -> &'static str { \"asm!(x) #[link(name = \\\"z\\\")] global_asm\" }";
+    assert!(rustc_compiles(&d, "fine", fine));
+    let (got, out) = confirm_plugin(&d, fine);
+    assert_eq!(got, Some(0), "{}", out);
+}
+
+/// A doc comment is a `#` and a `[doc = ".."]` to a macro, which can hand the `#` to another
+/// group: `m!(/// x\n[link(name = "evil", kind = "static")])` with `$h $b extern ...`, and with
+/// `$h [ $($a)* ]` given `link(name = ..)`, and with a `+verbatim` path; and the same of
+/// `[debugger_visualizer(..)]` on an inline module. rustc compiles each; each is refused under a
+/// hold at its line (src/confirm.rs builds_in, FEEDBACK83.md Q-1305, found by the coverage tests;
+/// branch feedback82-85).
+#[test]
+fn a_doc_comments_hash_handed_to_a_macro_links_nothing_under_a_hold() {
+    let d = dir("fix7-doc");
+    write(&d, "x.py", "print('x')\n");
+    let lib = "`link(name = ...)`, which a macro can make `#[link(...)]` of: a library the linker reads in";
+    let instead = "take that library through a crate instead, and write each attribute out";
+    let verbatim = format!("{}/libevil.a", d.display());
+    let cases: Vec<(&str, String, &str, u32, &str)> = vec![
+        ("group", "macro_rules! m { ($h:tt $d:tt $b:tt) => { $h $b extern \"C\" { fn evil_f() -> i32; } } }\nm!(/// x\n[link(name = \"evil\", kind = \"static\")]);".to_string(), lib, 5, instead),
+        ("inner", "macro_rules! m { ($h:tt $d:tt $($a:tt)*) => { $h [ $($a)* ] extern \"C\" { fn evil_f() -> i32; } } }\nm!(/// x\nlink(name = \"evil\", kind = \"static\"));".to_string(), lib, 5, instead),
+        ("verbatim", format!("macro_rules! m {{ ($h:tt $d:tt $b:tt) => {{ $h $b extern \"C\" {{ fn evil_f() -> i32; }} }} }}\nm!(/// x\n[link(name = {:?}, kind = \"static\", modifiers = \"+verbatim\")]);", verbatim), lib, 5, instead),
+        ("kindfirst", "macro_rules! m { ($h:tt $d:tt $b:tt) => { $h $b extern \"C\" { fn evil_f() -> i32; } } }\nm!(/** x */ [link(kind = \"static\", name = \"evil\")]);".to_string(), lib, 4, instead),
+        ("visualizer", "macro_rules! m { ($h:tt $d:tt $b:tt) => { $h $b mod v {} } }\nm!(/// x\n[debugger_visualizer(gdb_script_file = \"x.py\")]);".to_string(), "`#[debugger_visualizer(...)]`, a file rustc reads in", 5, "leave the visualizer out"),
+    ];
+    for (name, code, why, line, instead) in &cases {
+        assert!(rustc_compiles(&d, name, code), "{}: rustc does not compile it", name);
+        assert_eq!(confirm_plugin(&d, code), (Some(1), built_in_said(why, *line, instead)), "{}", name);
+        assert!(!d.join("quillo.confirmed").exists(), "{}", name);
+    }
+}
+
+/// A held program whose plugin's text the reading reads as nothing, but whose build assembles or
+/// links another file in, does not load: the pinned build is judged by its own crate's LLVM IR
+/// (`m!(! asm)` under `use core::arch::*;`, which the reading does not see, calls inline
+/// assembly) and on macOS by what its linker read (a framework named through `../` from the
+/// SDK's folder, by a `#` and a name a macro is given, linked a library of the test's folder,
+/// which the built plugin would load). `quillo confirm --yes` confirms each, as the reading sees
+/// nothing; the start says why it does not load, nothing is kept in `.quillo/native`, and the
+/// plugin's code never runs (src/native.rs build_private, assembled_in, linked_in, FEEDBACK83.md
+/// Q-1305, found by the coverage tests; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_held_build_is_judged_by_what_its_assembler_and_linker_read() {
+    let d = dir("fix7-judged");
+    write(&d, "main.qwe", "use \"hi.qwer\"\nprint(hi())\n");
+    let asm = plugin("use core::arch::*;\nmacro_rules! m { ($b:tt $($p:tt)*) => { pub fn f() { unsafe { $($p)* $b (\"nop\") } } } }\nm!(! asm);\npub fn hi() -> String { f(); \"ran\".into() }");
+    let mut cases = vec![("asm", asm, "and building it assembled code of its own (`".to_string(), "in rustc's IR), whose `.include` and `.incbin` read files that hash does not cover: it does not load, and what was built is not kept (write that code in Rust, without assembly)".to_string())];
+    if cfg!(target_os = "macos") {
+        // A library of the test's folder, named as a framework from the SDK's folder up.
+        write(&d, "fw/e.c", "int evil_f(void) { return 4242; }\n");
+        write(&d, "fw/E.framework/keep", "");
+        let lib = d.join("fw/E");
+        let mut cc = Command::new("cc").args(["-dynamiclib", "-o"]).arg(&lib).arg(d.join("fw/e.c")).arg("-install_name").arg(&lib).stdin(Stdio::null()).spawn().unwrap();
+        assert_eq!(ended(&mut cc, 120), Some(0));
+        let name = format!("{}{}", "../".repeat(40), lib.display().to_string().trim_start_matches('/'));
+        let src = plugin(&format!("macro_rules! m {{ ($h:tt $a:ident $n:literal $k:literal) => {{ $h [ $a (name = $n, kind = $k) ] extern \"C\" {{ fn evil_f() -> i32; }} }} }}\nm!(# link {:?} \"framework\");\npub fn hi() -> String {{ unsafe {{ evil_f() }}.to_string() }}", name));
+        cases.push(("link", src, "and its linker read ".to_string(), format!("{}, which is not the build's own, the Rust toolchain's or the system's, and which that hash does not cover: it does not load, and what was built is not kept (link only the system's libraries and what its crates build)", name.rsplit("../").next().unwrap())));
+    }
+    for (name, src, before, after) in &cases {
+        write(&d, "hi.qwer", src);
+        let _ = std::fs::remove_file(d.join("quillo.confirmed"));
+        let (code, out) = quillo(&d, &["confirm", "--yes"]);
+        assert_eq!(code, Some(0), "{}: the reading refused it: {}", name, out);
+        let (code, out) = quillo(&d, &["run", "main.qwe"]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.contains(&format!("hi.qwer is held to its SHA-256, {}", before)) && out.contains(after.as_str()), "{}: {}", name, out);
+        assert!(!out.contains("ran") && !out.contains("4242"), "{}: {}", name, out);
+        let kept = std::fs::read_dir(d.join(".quillo/native")).map(|r| r.count()).unwrap_or(0);
+        assert_eq!(kept, 0, "{}: a library was kept", name);
+    }
+}
+
+/// The linker's list is judged file by file: the build's own objects, the toolchain's rlibs (its
+/// sysroot, as `rustc --print sysroot` says) and the system's files (root's, that no one else may
+/// write: `/bin/sh`) pass; a library of the test's folder, by its name or through `../` from a
+/// system folder, is the one named; a list with nothing read in it is refused; a file looked for
+/// and not found, the output and the linker's version are not files read (macOS's records; Linux's
+/// make rule with `\` lines and `\ ` spaces) (src/native.rs linked_from, FEEDBACK83.md Q-1305, found
+/// by the coverage tests; branch feedback82-85).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn the_linkers_list_is_judged_file_by_file() {
+    let d = dir("fix7-list");
+    let (target, crate_dir) = (d.join("target"), d.join("crate"));
+    write(&d, "target/release/deps/x.o", "");
+    write(&d, "crate/lib.rs", "");
+    write(&d, "evil lib/libevil.a", "");
+    let out = Command::new("rustc").args(["--print", "sysroot"]).output().unwrap();
+    let sysroot = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let rlib = std::fs::read_dir(sysroot.join("lib/rustlib")).unwrap().flatten().map(|e| e.path().join("lib")).find(|p| p.is_dir()).and_then(|p| std::fs::read_dir(p).unwrap().flatten().map(|e| e.path()).find(|p| p.extension().is_some_and(|x| x == "rlib"))).unwrap();
+    let evil = d.join("evil lib/libevil.a");
+    let through = PathBuf::from(format!("/usr/{}{}", "../".repeat(3), evil.display().to_string().trim_start_matches('/')));
+    let own = target.join("release/deps/x.o");
+    let list = |read: &[&Path]| -> Vec<u8> {
+        if cfg!(target_os = "macos") {
+            let mut b = b"\x00@(#)PROGRAM:ld PROJECT:ld-1\n\x00".to_vec();
+            for (op, p) in [(0x11u8, Path::new("/nonexistent/libgone.a")), (0x40, Path::new("/out/lib.dylib"))].into_iter().chain(read.iter().map(|p| (0x10u8, *p))) {
+                b.push(op);
+                b.extend_from_slice(p.display().to_string().as_bytes());
+                b.push(0);
+            }
+            b
+        } else {
+            let names: Vec<String> = read.iter().map(|p| p.display().to_string().replace(' ', "\\ ")).collect();
+            let mut t = format!("/out/lib.so:{}\n", names.iter().map(|n| format!(" \\\n  {}", n)).collect::<String>());
+            for n in &names {
+                t.push_str(&format!("\n{}:\n", n));
+            }
+            t.into_bytes()
+        }
+    };
+    let judged = |read: &[&Path]| quillo::native::linked_from(&list(read), &crate_dir, &target);
+    assert_eq!(judged(&[&own, &rlib, Path::new("/bin/sh")]), Ok(None));
+    assert_eq!(judged(&[&own, &rlib, &evil, Path::new("/bin/sh")]), Ok(Some(evil.clone())));
+    assert_eq!(judged(&[&own, &through]), Ok(Some(through.clone())));
+    assert_eq!(judged(&[Path::new("lib.rs")]), Ok(Some(crate_dir.join("lib.rs"))), "a relative name is from the crate's folder, which is not the build's target");
+    assert!(judged(&[]).is_err());
+}
+
+/// dotenvy's and dotenv's macro crates are refused under a hold, as dotenv_codegen is: their
+/// `dotenv!` reads a `.env` as the plugin is built, from the folder rustc runs in up to `/`. A
+/// macro named `dotenv!`, `try_dotenv!` or `x::dotenv!` reads as env, where it read as `effects:
+/// none`; a name that only holds the word (`dotenv_path`) does not (src/confirm.rs
+/// RUST_FILE_CRATES, RUST_CALLS, FEEDBACK83.md Q-1305, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn the_crates_of_a_dotenv_macro_are_refused_and_it_reads_as_env() {
+    let d = dir("fix7-dotenv");
+    write(&d, "main.qwe", "import hi.qwer use hi\nroute GET / = hi()\n");
+    for (dep, name) in [("dotenvy_macro = \"0.15\"", "dotenvy_macro"), ("dotenv_macros = \"0.10\"", "dotenv_macros"), ("dotenvy-macro = \"0.15\"", "dotenvy-macro")] {
+        write(&d, "hi.qwer", &format!("//! version: 1.0.0\n//! effects: none\n//! [dependencies]\n//! {}\npub fn hi() -> String {{ \"hi\".into() }}\n", dep));
+        let (code, out) = quillo(&d, &["confirm", "--yes"]);
+        let krate = if name == "dotenvy-macro" { "dotenvy_macro" } else { name };
+        assert_eq!((code, out.as_str()), (Some(1), built_in_said(&format!("the dependency `{}`, {}, whose macros build files in", name, krate), 4, "put that code in hi.qwer").as_str()), "{}", dep);
+        assert!(!d.join("quillo.confirmed").exists(), "{}", dep);
+    }
+    for (name, code, call) in [
+        ("dotenvy", "pub fn hi() -> String { dotenvy_macro::dotenv!(\"TOKEN\").to_string() }", "dotenvy_macro::dotenv!"),
+        ("bare", "pub fn hi() -> String { dotenv!(\"TOKEN\").to_string() }", "dotenv!"),
+        ("try", "pub fn hi() -> String { try_dotenv!(\"TOKEN\").to_string() }", "try_dotenv!"),
+    ] {
+        let (got, out) = effects_of(&d, name, &plugin(code));
+        assert_eq!((got, out.as_str()), (Some(1), reads_as(name, "env", &format!("{} (line 3)", call)).as_str()), "{}", name);
+    }
+    let (got, out) = effects_of(&d, "path", &plugin("pub fn dotenv_path() -> u8 { 1 }\npub fn hi() -> u8 { dotenv_path() }"));
+    assert_eq!((got, out), (Some(0), "path.qwer: effects: none\n".to_string()));
+}
+
+/// What the reading read as `effects: none` reads as what it does: a qualified path after a
+/// keyword (`return <..>::connect`, `if`, `while`, `match`), a type with its own generics
+/// (`<std::net::TcpStream<>>::`), an `impl` whose header has a const generic (`X<{ 1 }>`), and a
+/// name a `use` of the file's own path gives `include_str!` (`use self::g as h;`). A type a macro
+/// writes as an `impl`'s (`impl X for $t`) or a qualified path's (`<$t>::connect`) is read from
+/// the macro's call, `i!(std::net::TcpStream)`, at its line. rustc compiles each. A comparison
+/// (`a < b`), a turbofish of what a macro is given (`size_of::<$t>()`, `Key::<$h>::new`), an
+/// `impl` for a type a macro is given `u8`, and an `impl` for a tuple with a const generic read as
+/// nothing (src/confirm.rs rust_written, rust_use_names, unfollowed, FEEDBACK83.md Q-1305, found
+/// by the coverage tests; branch feedback82-85).
+#[test]
+fn a_qualified_path_after_a_keyword_or_with_generics_reads_as_its_type() {
+    let d = dir("fix7-read");
+    let net = "std::net::TcpStream::connect (line 3)";
+    let cases: Vec<(&str, &str, &str, &str)> = vec![
+        ("ret", "pub fn c(a: &str) -> bool { return <std::net::TcpStream>::connect(a).is_ok(); }", "net", net),
+        ("iff", "pub fn c(a: &str) -> u8 { if <std::net::TcpStream>::connect(a).is_ok() { 1 } else { 0 } }", "net", net),
+        ("whiles", "pub fn c(a: &str) { while <std::net::TcpStream>::connect(a).is_err() {} }", "net", net),
+        ("mat", "pub fn c(a: &str) -> u8 { match <std::net::TcpStream>::connect(a) { Ok(_) => 1, Err(_) => 0 } }", "net", net),
+        ("generics", "pub fn c(a: &str) -> bool { let r = <std::net::TcpStream<>>::connect(a); r.is_ok() }", "net", net),
+        ("constimpl", "trait X<const N: usize> { fn c(a: &str) -> Self; }\nimpl X<{ 1 }> for std::net::TcpStream { fn c(a: &str) -> Self { Self::connect(a).unwrap() } }", "net", "std::net::TcpStream (line 4)"),
+        ("selfinclude", "use std::include_str as g;\nuse self::g as h;\npub fn c() -> &'static str { h!(\"/etc/hosts\") }", "fs", "std::include_str! (line 5)"),
+        ("macimpl", "trait X { fn c(a: &str) -> Self; }\nmacro_rules! i { ($t:ty) => { impl X for $t { fn c(a: &str) -> Self { Self::connect(a).unwrap() } } } }\ni!(std::net::TcpStream);", "net", "std::net::TcpStream (line 5)"),
+        ("macimplfs", "trait X { fn c(a: &str) -> Self; }\nmacro_rules! i { ($t:ty) => { impl X for $t { fn c(a: &str) -> Self { Self::open(a).unwrap() } } } }\ni!(std::fs::File);", "fs", "Self::open (line 4), std::fs::File (line 5)"),
+        ("macqual", "macro_rules! c { ($t:ty) => { <$t>::connect(\"203.0.113.9:80\") } }\npub fn go() -> bool { c!(std::net::TcpStream).is_ok() }", "net", "std::net::TcpStream (line 4)"),
+    ];
+    for (name, code, effects, calls) in &cases {
+        assert!(rustc_compiles(&d, name, code), "{}: rustc does not compile it", name);
+        let (got, out) = effects_of(&d, name, &plugin(code));
+        // `h!` is `include_str!` by another name, which builds another file in too.
+        let built = if *name == "selfinclude" { "  but it builds another file into it (`h!`, an include macro by another name at line 5), which this reading does not see; under a quillo.confirmed it does not load\n" } else { "" };
+        assert_eq!((got, out.as_str()), (Some(1), format!("{}{}", reads_as(name, effects, calls), built).as_str()), "{}", name);
+    }
+    for (name, code) in [
+        ("lt", "pub fn lt(a: u8, b: u8) -> bool { a < b }\npub fn ret(a: u8) -> bool { return a < 1; }"),
+        ("turbofish", "macro_rules! s { ($t:ty) => { std::mem::size_of::<$t>() } }\npub fn n() -> usize { s!(u64) }\nmacro_rules! v { ($t:ty) => { Vec::<$t>::new() } }\npub fn w() -> Vec<std::time::Duration> { v!(std::time::Duration) }"),
+        ("macimplu8", "pub trait X { fn n() -> u8; }\nmacro_rules! i { ($t:ty) => { impl X for $t { fn n() -> u8 { 1 } } } }\ni!(u8);"),
+        ("consttuple", "pub trait X<const N: usize> { fn n() -> usize; }\nimpl X<{ 2 }> for (u8, u16) { fn n() -> usize { 2 } }"),
+    ] {
+        assert!(rustc_compiles(&d, name, code), "{}: rustc does not compile it", name);
+        assert_eq!(effects_of(&d, name, &plugin(code)), (Some(0), format!("{}.qwer: effects: none\n", name)), "{}", name);
+    }
+}
+
+/// Ordinary code is no longer refused under a hold: `$(#[$m:meta])*` that hands a struct its
+/// attributes, and a `#` in a macro's input (maud's `html!(div #main { .. })`); both are
+/// confirmed. Where no linker's list judges the build (`strict`) both are still refused, as either
+/// can make a `#[link]` (src/confirm.rs attribute_built_in, FEEDBACK83.md Q-1305, found by the
+/// coverage tests; branch feedback82-85).
+#[test]
+fn attribute_forwarding_and_a_hash_in_a_macros_input_are_confirmed() {
+    let d = dir("fix7-fine");
+    let cases = [
+        ("fwdmeta", "macro_rules! s { ($(#[$m:meta])* $n:ident) => { $(#[$m])* pub struct $n; } }\ns!(#[derive(Debug)] A);\npub fn hi() -> String { format!(\"{:?}\", A) }", "an attribute a macro is given (`#[$m]`), which can be `#[link(...)]`: a library the linker reads in", 3),
+        ("maud", "macro_rules! html { ($($t:tt)*) => { stringify!($($t)*) } }\npub fn hi() -> &'static str { html!(div #main { \"x\" }) }", "a `#` that starts no attribute, handed to a macro, which can make one of it, `#[link(...)]`: a library the linker reads in", 4),
+    ];
+    for (name, code, why, line) in cases {
+        assert!(rustc_compiles(&d, name, code), "{}: rustc does not compile it", name);
+        let (got, out) = confirm_plugin(&d, code);
+        assert_eq!(got, Some(0), "{}: {}", name, out);
+        assert!(read(&d.join("quillo.confirmed")).contains("[\"hi.qwer\"]\nsha256 = "), "{}", name);
+        let src = plugin(code);
+        assert_eq!(quillo::confirm::built_in_refused("hi.qwer", &src, true), Some(format!("hi.qwer builds another file into it ({} at line {}), which the SHA-256 its source is held to would not cover, so it does not load (take that library through a crate instead, and write each attribute out)", why, line)), "{}", name);
     }
 }
