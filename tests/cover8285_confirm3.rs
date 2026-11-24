@@ -1472,3 +1472,64 @@ fn only_the_linkers_own_line_says_it_lists_nothing() {
         assert_eq!(quillo::native::linker_lists_not(line), None, "{}", line);
     }
 }
+
+// Fix round 11
+
+/// A foreign block a macro writes is one: `extern $abi { fn dlopen(..); }` with `foreign!("C")`,
+/// `$k $abi { .. }` with `foreign!(extern "C")`, and `extern` handed in before a macro's group
+/// (`foreign!(extern "C" { .. })`) each read as every effect but db, at the `extern`'s line, where
+/// they read as `effects: none`. rustc compiles each. What is no foreign block still reads as
+/// nothing: a function of the file's own made for C (`pub extern "C" fn`, `extern $abi fn` in a
+/// macro), a pointer to one (`extern "C" fn() -> u8`), `extern crate core`, a word that holds
+/// `extern` (src/confirm.rs unfollowed, FEEDBACK83.md Q-1305, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn a_foreign_block_a_macro_writes_reads_as_every_effect() {
+    let d = dir("fix11-foreign");
+    let every = "http, fs, env, time, random, net, run";
+    let said = |line: u32| format!("a foreign block (`extern \"C\" {{ ... }}`), whose functions are not Rust's to read (line {})", line);
+    for (name, code, line) in [
+        ("literal", "macro_rules! foreign { ($abi:literal) => { extern $abi { fn dlopen(p: *const u8, f: i32) -> *mut u8; } }; }\nforeign!(\"C\");\npub fn n() -> u8 { 1 }", 3),
+        ("handed", "macro_rules! foreign { ($k:tt $abi:literal) => { $k $abi { fn dlopen(p: *const u8, f: i32) -> *mut u8; } }; }\nforeign!(extern \"C\");\npub fn n() -> u8 { 1 }", 4),
+        ("group", "macro_rules! foreign { ($($t:tt)*) => { $($t)* }; }\npub fn n() -> u8 { 1 }\nforeign!(extern \"C\" { fn dlopen(p: *const u8, f: i32) -> *mut u8; });", 5),
+    ] {
+        assert!(rustc_compiles(&d, name, code), "{}: rustc does not compile it", name);
+        let (got, out) = effects_of(&d, name, &plugin(code));
+        assert_eq!((got, out.as_str()), (Some(1), reads_as(name, every, &said(line)).as_str()), "{}", name);
+    }
+    for (name, code) in [
+        ("ownfn", "pub extern \"C\" fn n() -> u8 { 1 }"),
+        ("macrofn", "macro_rules! c { ($abi:literal) => { pub extern $abi fn n() -> u8 { 1 } }; }\nc!(\"C\");"),
+        ("pointer", "pub extern \"C\" fn g() -> u8 { 1 }\npub fn n() -> u8 { let f: extern \"C\" fn() -> u8 = g; f() }"),
+        ("crate", "extern crate core;\npub fn n() -> u8 { 1 }"),
+        ("word", "pub fn externally() -> u8 { 1 }\npub fn n() -> u8 { externally() }"),
+    ] {
+        assert!(rustc_compiles(&d, name, code), "{}: rustc does not compile it", name);
+        assert_eq!(effects_of(&d, name, &plugin(code)), (Some(0), format!("{}.qwer: effects: none\n", name)), "{}", name);
+    }
+}
+
+/// A crate that maps memory to run, runs programs, embeds an interpreter with the system at its
+/// call, or calls into the system's frameworks reads as every effect but db, at its dependency's
+/// line: memmap2, region, duct, mlua, core-foundation, objc2, pyo3, jni, each read as `effects:
+/// none` (src/confirm.rs RUST_SYSTEM_CRATES, FEEDBACK83.md Q-1305, found by the coverage tests;
+/// branch feedback82-85).
+#[test]
+fn a_crate_that_runs_code_or_calls_the_systems_frameworks_reads_as_every_effect() {
+    let d = dir("fix11-crates");
+    let every = "http, fs, env, time, random, net, run";
+    for (dep, krate) in [
+        ("memmap2 = \"0.9\"", "memmap2"),
+        ("region = \"3\"", "region"),
+        ("duct = \"0.13\"", "duct"),
+        ("mlua = { version = \"0.10\", features = [\"lua54\", \"vendored\"] }", "mlua"),
+        ("core-foundation = \"0.10\"", "core-foundation"),
+        ("objc2 = \"0.6\"", "objc2"),
+        ("pyo3 = \"0.23\"", "pyo3"),
+        ("jni = \"0.21\"", "jni"),
+    ] {
+        let src = format!("//! version: 1.0.0\n//! effects: none\n//! [dependencies]\n//! {}\npub fn n() -> u8 {{ 1 }}\n", dep);
+        let (got, out) = effects_of(&d, "c", &src);
+        assert_eq!((got, out.as_str()), (Some(1), reads_as("c", every, &format!("the crate {}, which reaches the system or loads code itself (line 4)", krate)).as_str()), "{}", dep);
+    }
+}

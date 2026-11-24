@@ -1311,7 +1311,48 @@ const RUST_CRATES: &[(&str, &str)] = &[
 /// `libc::system`, `nix::unistd::execv`, `libloading::Library::new`) are read as a foreign block's
 /// are, every effect but `db` (`scan_rust`); and every `-sys` crate, by its name (FEEDBACK83.md,
 /// Q-1305, found by the review of 0a3aeb9; branch feedback82-85). Each as `_` for `-`, lowercase.
-const RUST_SYSTEM_CRATES: &[&str] = &["libc", "nix", "rustix", "libloading", "dlopen", "dlopen2", "windows", "windows_sys", "winapi"];
+///
+/// And crates that map memory to run, run programs, embed an interpreter with the system at its
+/// call, or call into the system's frameworks: memmap2 (`map_anon` then `make_exec` ran bytes),
+/// region, duct (`cmd!`), mlua (`loadlib`, `os.execute`), core-foundation (`CFBundle` loads
+/// code), each read as `effects: none` (FEEDBACK83.md, Q-1305, found by the review of ce4f15d;
+/// branch feedback82-85). The reading is no proof: a crate not listed can do what these do.
+const RUST_SYSTEM_CRATES: &[&str] = &[
+    "libc",
+    "nix",
+    "rustix",
+    "libloading",
+    "dlopen",
+    "dlopen2",
+    "windows",
+    "windows_sys",
+    "winapi",
+    "memmap",
+    "memmap2",
+    "mmap_rs",
+    "region",
+    "duct",
+    "subprocess",
+    "xshell",
+    "cmd_lib",
+    "mlua",
+    "rlua",
+    "hlua",
+    "pyo3",
+    "jni",
+    "libffi",
+    "core_foundation",
+    "core_graphics",
+    "core_text",
+    "security_framework",
+    "objc",
+    "objc2",
+    "objc2_foundation",
+    "objc2_app_kit",
+    "cocoa",
+    "block",
+    "block2",
+];
 
 /// Crates that do what an effect names only where the file takes a feature of theirs
 /// (`feature:v4` in its dependency line) or calls one of theirs (any text of the code): `uuid`'s
@@ -2408,18 +2449,30 @@ fn unfollowed(code: &str) -> Option<(u32, &'static str)> {
     if let Some((at, _)) = code.match_indices("[<").find(|(at, _)| paste(*at)) {
         keep(at, "`[<...>]` (a name paste builds)");
     }
-    // `extern "C" {` (its text taken out: `extern "" {`) or `extern {`, not `extern crate` nor a
-    // function of the file's own made for C (`extern "C" fn`).
+    // `extern "C" {` (its text taken out: `extern "" {`) or `extern {`, and every other `extern`
+    // but `extern crate` and a function of the file's own made for C (`extern "C" fn`, `extern
+    // $abi fn`, a pointer to one, `extern "C" fn()`): one a macro writes, `extern $abi { .. }` with
+    // `foreign!("C")`, or one whose `extern` a macro is handed, `$k $abi { .. }` with
+    // `foreign!(extern "C")`, read as `effects: none`, and dlopen was called (FEEDBACK83.md,
+    // Q-1305, found by the review of ce4f15d; branch feedback82-85). Past an ABI, only `crate`,
+    // `fn` or a block can follow `extern`, so what is not `crate` nor `fn` is read as a block.
     for (at, _) in code.match_indices("extern") {
-        if at > 0 && rust_name_byte(b[at - 1]) {
+        if (at > 0 && rust_name_byte(b[at - 1])) || b.get(at + 6).is_some_and(|c| rust_name_byte(*c)) {
             continue;
         }
         let rest = code[at + 6..].trim_start();
         let rest = rest.strip_prefix("\"\"").unwrap_or(rest).trim_start();
-        if rest.starts_with('{') {
-            keep(at, "a foreign block (`extern \"C\" { ... }`), whose functions are not Rust's to read");
-            break;
+        // An ABI a macro is given, `extern $abi fn`.
+        let rest = match rest.strip_prefix('$') {
+            Some(r) if r.bytes().next().is_some_and(rust_name_byte) => r.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_').trim_start(),
+            _ => rest,
+        };
+        let word = |w: &str| rest.starts_with(w) && !rest.as_bytes().get(w.len()).is_some_and(|c| rust_name_byte(*c));
+        if word("crate") || word("fn") {
+            continue;
         }
+        keep(at, "a foreign block (`extern \"C\" { ... }`), whose functions are not Rust's to read");
+        break;
     }
     // A macro's `!`, not a name compared: `asm != 1` read as everything (FEEDBACK83.md, Q-1305,
     // found by the coverage tests of 3117dea; branch feedback82-85).
