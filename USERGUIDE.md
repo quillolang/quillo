@@ -11014,8 +11014,11 @@ Asking, and who answers:
   know can do what these do.
   A held or pinned plugin's library is read once, hashed, judged by what it loads (the C
   runtime's exact library names on Linux, `/usr/lib` and `/System` on macOS, no rpath, not
-  named as a system library) and opened as a private copy of those bytes; no other plugin's
-  library is judged. It is still a reading, not a proof: a crate can do what it does
+  named as a system library) and opened as a private copy of those bytes, one copy per
+  library a process opens, which every instance and reload shares; the copy is made where
+  the program cannot reach (on Linux a sealed memfd, else a private file; on macOS in the
+  user's own temporary folder where `TMPDIR` is the program's), else the plugin does not
+  load. No other plugin's library is judged. It is still a reading, not a proof: a crate can do what it does
   unseen (`libc::kill` reads as the `libc` crate, which the file's `crates` list confirms by
   name), and a proc macro that reads a file without telling rustc, or a dependency's own
   macro that writes assembly into a function inlined into the plugin (refused, as assembly,

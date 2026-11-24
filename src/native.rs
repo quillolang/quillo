@@ -2019,16 +2019,26 @@ fn loaded(lib: &Path) {
 /// this user's, that no one else may enter (FEEDBACK82.md, Q-1285, found in review; branch
 /// feedback82-85).
 fn private_dir() -> Result<PathBuf, String> {
+    let base = temp_base()?;
+    if let Some(r) = reached(&base, &program_reach()) {
+        return Err(format!("a pinned plugin is built apart, and the temporary folder {} is inside {}, which the program can reach", base.display(), r.display()));
+    }
+    private_in(&base)
+}
+
+/// The temporary folder of whoever starts Quillo, resolved: `/tmp` where `.env` set `TMPDIR`.
+fn temp_base() -> Result<PathBuf, String> {
     let from_file = ["TMPDIR", "TMP", "TEMP"].iter().any(|k| crate::dotenv::set_by_file(k));
     #[cfg(unix)]
     let base = if from_file { PathBuf::from("/tmp") } else { std::env::temp_dir() };
     #[cfg(not(unix))]
     let base = if from_file { return Err("a pinned plugin is built in the temporary folder of whoever starts Quillo, and .env set TMP or TEMP".into()) } else { std::env::temp_dir() };
-    let base = base.canonicalize().map_err(|e| format!("cannot use the temporary folder {}: {}", base.display(), e))?;
-    let reach = program_reach();
-    if let Some(r) = reached(&base, &reach) {
-        return Err(format!("a pinned plugin is built apart, and the temporary folder {} is inside {}, which the program can reach", base.display(), r.display()));
-    }
+    base.canonicalize().map_err(|e| format!("cannot use the temporary folder {}: {}", base.display(), e))
+}
+
+/// A new folder in `base` that only this process writes: a name no one can guess, made 0700, and
+/// checked after it is made to be a folder, no link, this user's, that no one else may enter.
+fn private_in(base: &Path) -> Result<PathBuf, String> {
     let dir = base.join(format!("quillo-pinned-{}", crate::service::new_id(16)));
     let mut made = std::fs::DirBuilder::new();
     #[cfg(unix)]
@@ -2046,6 +2056,41 @@ fn private_dir() -> Result<PathBuf, String> {
         }
     }
     Ok(dir)
+}
+
+/// A folder for the private copy of a library a hold or a pin opens (`private_file`), which the
+/// program cannot reach: in the temporary folder, or, where the program can reach that, in the
+/// user's own temporary folder macOS keeps (`confstr(_CS_DARWIN_USER_TEMP_DIR)`). A library that
+/// is not built has no build to put apart: it was refused with what is said of a pinned build's
+/// folder, where 0a3aeb9 loaded it (FEEDBACK83.md, Q-1305, found by the review of ce4f15d; branch
+/// feedback82-85). Where the program can reach both, refused, saying it is the copy's folder.
+fn copy_dir() -> Result<PathBuf, String> {
+    let reach = program_reach();
+    let mut reached_too = Vec::new();
+    for base in [temp_base().ok(), user_temp_dir()].into_iter().flatten() {
+        match reached(&base, &reach) {
+            None => return private_in(&base),
+            Some(r) => reached_too.push(format!("{} (inside {})", base.display(), r.display())),
+        }
+    }
+    Err(format!("a held or pinned library is opened as a private copy, in a folder the program cannot reach, and it can reach {}: it does not load", reached_too.join(" and ")))
+}
+
+/// The user's own temporary folder, where macOS keeps one apart from `TMPDIR` (`confstr`).
+fn user_temp_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = vec![0u8; 1024];
+        // SAFETY: confstr writes at most `len` bytes, NUL-ended, into the buffer given.
+        let n = unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if n == 0 || n > buf.len() {
+            return None;
+        }
+        buf.truncate(n - 1);
+        PathBuf::from(String::from_utf8(buf).ok()?).canonicalize().ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 /// The folders the program can reach, as `reached` takes them, each with whether it counts as
@@ -2143,68 +2188,100 @@ fn reached<'a>(dir: &Path, reach: &'a [(PathBuf, bool)]) -> Option<&'a PathBuf> 
     reach.iter().filter(|(r, at_root)| *at_root || r.parent().is_some()).map(|(r, _)| r).find(|r| crate::statics::holds(r, dir))
 }
 
-/// The files that hold the private copies of libraries opened (`private_library`), kept open for
-/// the life of the process: a copy's path (`/proc/self/fd/N`) names it while its library is
+/// The memfds that hold the private copies of libraries opened (`private_library`), kept open
+/// for the life of the process: a copy's path (`/proc/self/fd/N`) names it while its library is
 /// loaded, and a descriptor's number given back would name another file by the same path.
+#[cfg(target_os = "linux")]
 static KEPT: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
 
 /// `bytes`, a library already judged, put where only this process can change them, and the path
 /// the system's loader is to open it by: on Linux a memfd sealed against any change
-/// (`/proc/self/fd/N`); elsewhere a new file in `dir`, a private folder this process made
-/// (`private_dir`), or in a new one of its own, which goes once the library is loaded (`loaded`).
+/// (`/proc/self/fd/N`), else, and where the system refuses a memfd libraries may be mapped from
+/// (`vm.memfd_noexec = 2`: EACCES, found by the review of ce4f15d), a file in a private folder
+/// (`private_file`).
 fn private_library(bytes: &[u8], name: &str, dir: Option<&Path>) -> Result<PathBuf, String> {
     #[cfg(target_os = "linux")]
-    {
-        use std::io::Write;
-        use std::os::fd::FromRawFd;
-        let _ = dir;
-        let cname = std::ffi::CString::new(format!("quillo-{}", name.replace('\0', ""))).map_err(|e| e.to_string())?;
-        // MFD_EXEC (6.3 on), where `vm.memfd_noexec` makes a memfd one no library can be mapped
-        // from; an older kernel does not know it, and is asked again without it.
-        const MFD_EXEC: libc::c_uint = 0x0010;
-        // SAFETY: memfd_create takes a NUL-ended name and flags, and returns a new descriptor or -1.
-        let mut fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | MFD_EXEC) };
-        if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
-            // SAFETY: as above.
-            fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
-        }
-        if fd < 0 {
-            return Err(format!("cannot make a private copy of {}: {}", name, std::io::Error::last_os_error()));
-        }
-        // SAFETY: `fd` is a new descriptor of this process's own, owned here once.
-        let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
-        f.write_all(bytes).map_err(|e| format!("cannot make a private copy of {}: {}", name, e))?;
-        // SAFETY: fcntl on a descriptor of this process's own; the seals are flags, no pointer.
-        if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL) } != 0 {
-            return Err(format!("cannot seal the private copy of {}: {}", name, std::io::Error::last_os_error()));
-        }
-        KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(f);
-        Ok(PathBuf::from(format!("/proc/self/fd/{}", fd)))
+    if let Some(p) = memfd_library(bytes, name)? {
+        return Ok(p);
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let (dir, made) = match dir {
-            Some(d) => (d.to_path_buf(), false),
-            None => (private_dir()?, true),
-        };
-        let p = dir.join(name);
-        let mut o = std::fs::OpenOptions::new();
-        o.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-        if let Err(e) = o.open(&p).and_then(|mut f| std::io::Write::write_all(&mut f, bytes)) {
-            if made {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
-            return Err(format!("cannot write {}: {}", p.display(), e));
-        }
+    private_file(bytes, name, dir)
+}
+
+/// `private_library` in a sealed memfd, or None where the system will not make one a library can
+/// be mapped from (EACCES).
+#[cfg(target_os = "linux")]
+fn memfd_library(bytes: &[u8], name: &str) -> Result<Option<PathBuf>, String> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    let cname = std::ffi::CString::new(format!("quillo-{}", name.replace('\0', ""))).map_err(|e| e.to_string())?;
+    // MFD_EXEC (6.3 on), where `vm.memfd_noexec` makes a memfd one no library can be mapped
+    // from; an older kernel does not know it, and is asked again without it.
+    const MFD_EXEC: libc::c_uint = 0x0010;
+    // SAFETY: memfd_create takes a NUL-ended name and flags, and returns a new descriptor or -1.
+    let mut fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | MFD_EXEC) };
+    let err = std::io::Error::last_os_error().raw_os_error();
+    if fd < 0 && err == Some(libc::EACCES) {
+        return Ok(None);
+    }
+    if fd < 0 && err == Some(libc::EINVAL) {
+        // SAFETY: as above.
+        fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+    }
+    if fd < 0 {
+        return Err(format!("cannot make a private copy of {}: {}", name, std::io::Error::last_os_error()));
+    }
+    // SAFETY: `fd` is a new descriptor of this process's own, owned here once.
+    let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+    f.write_all(bytes).map_err(|e| format!("cannot make a private copy of {}: {}", name, e))?;
+    // SAFETY: fcntl on a descriptor of this process's own; the seals are flags, no pointer.
+    if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL) } != 0 {
+        return Err(format!("cannot seal the private copy of {}: {}", name, std::io::Error::last_os_error()));
+    }
+    KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(f);
+    Ok(Some(PathBuf::from(format!("/proc/self/fd/{}", fd))))
+}
+
+/// `private_library` as a new file (0600) in `dir`, a private folder this process made, or in a
+/// new one of its own where the program cannot reach (`copy_dir`), which goes once the library is
+/// loaded (`loaded`).
+fn private_file(bytes: &[u8], name: &str, dir: Option<&Path>) -> Result<PathBuf, String> {
+    let (dir, made) = match dir {
+        Some(d) => (d.to_path_buf(), false),
+        None => (copy_dir()?, true),
+    };
+    let p = dir.join(name);
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    if let Err(e) = o.open(&p).and_then(|mut f| std::io::Write::write_all(&mut f, bytes)) {
         if made {
-            PRIVATE_DIRS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((p.clone(), dir));
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        // Not used here: the copy itself is what is kept.
-        let _ = &KEPT;
-        Ok(p)
+        return Err(format!("cannot write {}: {}", p.display(), e));
     }
+    if made {
+        PRIVATE_DIRS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((p.clone(), dir));
+    }
+    Ok(p)
+}
+
+/// The private copy of each library a hold or a pin opened in this process, by the library's
+/// SHA-256: one copy per library, reused while it is loaded, as `BUILT_HERE` is for a pinned
+/// source. A new copy for each use loaded a confirmed or library-pinned plugin once per instance
+/// (`--instances 2`: two addresses of one static) and once per reload, its state lost and memory
+/// growing (FEEDBACK83.md, Q-1305, found by the review of ce4f15d; branch feedback82-85).
+static COPIES: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
+
+/// The copy of the library whose SHA-256 is `hash`, where one is loaded in this process.
+fn loaded_copy(hash: &str) -> Option<PathBuf> {
+    let copy = COPIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|m| m.get(hash).cloned())?;
+    libraries().lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&copy).then_some(copy)
+}
+
+/// The copy `copy` of the library whose SHA-256 is `hash`, to be reused (`loaded_copy`).
+fn keep_copy(hash: &str, copy: &Path) {
+    COPIES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new).insert(hash.to_string(), copy.to_path_buf());
 }
 
 /// The library at `lib` as it is to be opened where a hold or a pin by hash holds it: its bytes
@@ -2218,12 +2295,19 @@ fn load_copy(lib: &Path, accept: &dyn Fn(&str) -> Result<(), String>) -> Result<
     // Read as Quillo's own where it is in `.quillo` (`quillo_read`; FEEDBACK85.md, Q-1340, found by
     // the review of 9da2632; branch feedback82-85).
     let bytes = quillo_read(lib)?.ok_or_else(|| format!("cannot read {}: it is not there", lib.display()))?;
-    accept(&crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes)))?;
+    let hash = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
+    accept(&hash)?;
+    // The copy of these bytes already loaded, judged as it was made (`COPIES`).
+    if let Some(copy) = loaded_copy(&hash) {
+        return Ok(copy);
+    }
     if let Some(why) = loads_refused(&bytes) {
         return Err(format!("{} {}: it does not load", lib.display(), why));
     }
     let name = lib.file_name().map_or_else(|| "library".to_string(), |n| n.to_string_lossy().into_owned());
-    private_library(&bytes, &name, None)
+    let copy = private_library(&bytes, &name, None)?;
+    keep_copy(&hash, &copy);
+    Ok(copy)
 }
 
 /// Whether a layer of the policy pins the plugin `qwer` by a SHA-256 (its source's or its
@@ -2421,6 +2505,9 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         let _ = std::fs::remove_dir_all(&target);
         let _ = std::fs::remove_dir_all(&crate_dir);
         let lib = private_library(&built_bytes, &lib.file_name().map_or_else(|| "library".to_string(), |n| n.to_string_lossy().into_owned()), Some(&dir))?;
+        // The copy a later use of these bytes reuses: a confirmed plugin's reload reads them from
+        // `.quillo/native` (`load_copy`), and was loaded again, its state lost.
+        keep_copy(&want, &lib);
         BUILT_HERE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new).insert(hash.clone(), (lib.clone(), want));
         PRIVATE_DIRS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((lib.clone(), dir.clone()));
         Ok(lib)
@@ -2980,6 +3067,19 @@ pub fn loads_refused(bytes: &[u8]) -> Option<String> {
     }
 }
 
+/// The system's page size, which a loader maps a library's segments by.
+fn page_size() -> u64 {
+    #[cfg(unix)]
+    {
+        // SAFETY: sysconf takes a name and returns a number, -1 where it has none.
+        let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if n > 0 {
+            return n as u64;
+        }
+    }
+    4096
+}
+
 /// This machine's processor as Mach-O names it (`CPU_TYPE_ARM64`, `CPU_TYPE_X86_64`).
 fn host_cpu() -> Option<u32> {
     if cfg!(target_arch = "aarch64") {
@@ -3061,7 +3161,10 @@ fn runtime_soname(n: &str) -> bool {
         return true;
     }
     let plain = n.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_'));
-    plain && n.strip_prefix("ld-linux-").and_then(|r| r.split_once(".so.")).is_some_and(|(arch, v)| !arch.is_empty() && !arch.contains('.') && !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()))
+    // `ld-linux-<arch>.so.<n>`, and musl's `libc.musl-<arch>.so.1` and `ld-musl-<arch>.so.1`
+    // (Alpine), which the exact list left out (found by the review of ce4f15d).
+    let arch_so = |prefix: &str| n.strip_prefix(prefix).and_then(|r| r.split_once(".so.")).is_some_and(|(arch, v)| !arch.is_empty() && !arch.contains('.') && !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()));
+    plain && (arch_so("ld-linux-") || arch_so("libc.musl-") || arch_so("ld-musl-"))
 }
 
 /// Whether a library of the system's library folders has the file name `n` (a soname another
@@ -3086,18 +3189,32 @@ fn elf_loads(b: &[u8]) -> Option<String> {
     let (phoff, phentsize, phnum) = if wide { (num(32, 8), num(54, 2), num(56, 2)) } else { (num(28, 4), num(42, 2), num(44, 2)) };
     let (Some(phoff), Some(phentsize), Some(phnum)) = (phoff, phentsize, phnum) else { return unreadable() };
     let mut loads: Vec<(u64, u64, u64)> = Vec::new();
+    let mut spans: Vec<(u64, u64)> = Vec::new();
     let mut dynamic: Option<(u64, u64, u64)> = None;
     for i in 0..phnum {
         let Some(h) = i.checked_mul(phentsize).and_then(|x| phoff.checked_add(x)).and_then(|h| usize::try_from(h).ok()) else { return unreadable() };
         let Some(kind) = num(h, 4) else { return unreadable() };
-        let (offset, vaddr, filesz) = if wide { (num(h + 8, 8), num(h + 16, 8), num(h + 32, 8)) } else { (num(h + 4, 4), num(h + 8, 4), num(h + 16, 4)) };
-        let (Some(offset), Some(vaddr), Some(filesz)) = (offset, vaddr, filesz) else { return unreadable() };
+        let (offset, vaddr, filesz, memsz) = if wide { (num(h + 8, 8), num(h + 16, 8), num(h + 32, 8), num(h + 40, 8)) } else { (num(h + 4, 4), num(h + 8, 4), num(h + 16, 4), num(h + 20, 4)) };
+        let (Some(offset), Some(vaddr), Some(filesz), Some(memsz)) = (offset, vaddr, filesz, memsz) else { return unreadable() };
         match kind {
-            1 => loads.push((vaddr, offset, filesz)),
+            1 => {
+                loads.push((vaddr, offset, filesz));
+                // The pages its loader maps it to.
+                let page = page_size();
+                let Some(end) = vaddr.checked_add(memsz.max(filesz)).and_then(|e| e.checked_add(page - 1)) else { return unreadable() };
+                spans.push((vaddr / page * page, end / page * page));
+            }
             2 if dynamic.is_some() => return Some("has two dynamic tables (PT_DYNAMIC)".to_string()),
             2 => dynamic = Some((offset, vaddr, filesz)),
             _ => {}
         }
+    }
+    // No two loaded segments on one page: ld.so maps each over the one before it (MAP_FIXED), and
+    // an address read through the first was another segment's bytes (found by the review of
+    // ce4f15d).
+    spans.sort_unstable();
+    if spans.windows(2).any(|w| w[1].0 < w[0].1) {
+        return Some("has loaded segments (PT_LOAD) on the same pages, which its loader maps one over the other".to_string());
     }
     // Where an address of the loaded image is in the file, `len` bytes of it in one segment.
     let mapped = |va: u64, len: u64| -> Option<u64> { loads.iter().find(|(l_va, _, l_sz)| va >= *l_va && va.checked_add(len).is_some_and(|e| e <= l_va + l_sz)).map(|(l_va, l_off, _)| va - l_va + l_off) };
@@ -3125,11 +3242,17 @@ fn elf_loads(b: &[u8]) -> Option<String> {
     if !entries.iter().any(|(t, _)| STRINGS.contains(t)) {
         return None;
     }
-    let Some(strtab) = strtab.and_then(|v| mapped(v, 1)) else { return unreadable() };
+    let Some(strtab) = strtab.filter(|v| mapped(*v, 1).is_some()) else { return unreadable() };
+    // Each string read where its loader reads it: at `DT_STRTAB` plus its offset, an address,
+    // through the segment that holds it, to its NUL inside that segment. Before, it was read in the
+    // file at the string table's place plus its offset, where another segment's bytes could be.
     let string = |at: u64| -> Option<String> {
-        let s = b.get(usize::try_from(strtab.checked_add(at)?).ok()?..)?;
-        let end = s.iter().position(|c| *c == 0)?;
-        Some(String::from_utf8_lossy(&s[..end]).into_owned())
+        let va = strtab.checked_add(at)?;
+        let (l_va, l_off, l_sz) = loads.iter().find(|(l_va, _, l_sz)| va >= *l_va && va < l_va + l_sz)?;
+        let (start, end) = (usize::try_from(va - l_va + l_off).ok()?, usize::try_from(l_off.checked_add(*l_sz)?).ok()?);
+        let s = b.get(start..end.min(b.len()))?;
+        let nul = s.iter().position(|c| *c == 0)?;
+        Some(String::from_utf8_lossy(&s[..nul]).into_owned())
     };
     for (tag, val) in entries {
         if !STRINGS.contains(&tag) {

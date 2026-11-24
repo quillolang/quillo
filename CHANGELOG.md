@@ -374,7 +374,10 @@ What a program may notice:
   a held or pinned library is read once and loaded from a private copy of the bytes judged,
   ELF libraries are read where their loader reads them (exact C-runtime sonames, the dynamic
   table at its address), and an unpinned plugin is not judged where another is pinned (found
-  by the review of 0a3aeb9).
+  by the review of 0a3aeb9). A held or pinned library is copied once a process, shared by instances and
+  reloads (each loaded a copy of its own, its state reset), in a folder the program cannot
+  reach; musl's sonames are the C runtime's; an ELF library with overlapping segments is
+  refused and its names are read through the mapping (found by the review of ce4f15d).
 - **What `quillo.confirmed` does not confirm** is an error at its line, and so is a name used
   from another file and not taken, under one (see Security).
 - **`"""` and `'''`** say that text over several lines is a backtick string (FEEDBACK85.md,

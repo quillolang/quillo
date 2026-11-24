@@ -1700,3 +1700,183 @@ fn a_plugins_quillo_that_leads_above_its_folder_is_not_read() {
     assert!(out.contains(&format!("{} leads to {}, which holds {}, where the program writes", app.join("lib/.quillo").display(), app.display(), app.join("lib").display())), "{}", out);
     assert!(!out.contains("built here\n") && !out.contains("building "), "{}", out);
 }
+
+// Fix round 11 (F3)
+
+/// `quillo run args --port 0` in `cwd` with `vars`, its log in `log`, stopped when the guard is
+/// dropped, and its port.
+fn serve_vars(cwd: &Path, args: &[&str], vars: &[(&str, &str)], log: &Path) -> (Guard, u16) {
+    let file = std::fs::File::create(log).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .args(args)
+        .args(["--port", "0"])
+        .current_dir(cwd)
+        .env_remove("QUILLO_POLICY_PATH")
+        .env_remove("QUILLO_DB")
+        .env("QUILLO_SECRET", "test secret for the tests, 32 bytes or more")
+        .envs(vars.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(file)
+        .spawn()
+        .unwrap();
+    let mut g = Guard::new(child);
+    let port = port_in_log(&mut g.0, log, Duration::from_secs(600));
+    (g, port)
+}
+
+/// What `p` holds, or nothing.
+fn log_of(p: &Path) -> String {
+    std::fs::read_to_string(p).unwrap_or_default()
+}
+
+/// A plugin whose function answers the address of one static and a count kept in it.
+const COUNTER: &str = "//! version: 1.0.0\n//! effects: none\nstatic N: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);\npub fn addr() -> String { format!(\"{:p} {}\", &N, N.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1) }\n";
+
+/// Each answer's address and count.
+fn counted(body: &str) -> (String, i64) {
+    let (a, n) = body.trim().split_once(' ').unwrap_or_else(|| panic!("{}", body));
+    (a.to_string(), n.parse().unwrap_or_else(|_| panic!("{}", body)))
+}
+
+/// A plugin a quillo.confirmed holds, and one pinned by its library's own SHA-256, are each loaded
+/// once in a process, from one private copy: two instances answer with one static, its count goes
+/// on from one to the next, and four reloads (`--reload`, the main file edited) keep it, where each
+/// instance and each reload loaded a new copy, its count started again and memory grew
+/// (src/native.rs load_copy, COPIES, FEEDBACK83.md Q-1305, found by the coverage tests; branch
+/// feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_held_plugin_is_loaded_once_a_process_by_each_instance_and_reload() {
+    use sha2::Digest;
+    let d = Dir(support::temp_dir("cov8285r3-once").canonicalize().unwrap());
+    let (confirmed, pinned, tmp) = (d.0.join("confirmed"), d.0.join("pinned"), d.0.join("tmp"));
+    std::fs::create_dir_all(&tmp).unwrap();
+    for f in [&confirmed, &pinned] {
+        std::fs::create_dir_all(f).unwrap();
+        std::fs::write(f.join("cnt.qwer"), COUNTER).unwrap();
+        std::fs::write(f.join("main.qwe"), "import cnt.qwer use addr\nroute GET / = addr()\n").unwrap();
+    }
+    let (t, record, cache) = (tmp.display().to_string(), d.0.join("record").display().to_string(), r10_cache("once"));
+    let (code, out) = quillo_at(&confirmed, &["confirm", "--yes"], &[("QUILLO_BUILT_RECORD_DIR", &record)], &d.0.join("c.log"), 120);
+    assert_eq!(code, Some(0), "{}", out);
+    let (code, out) = quillo_at(&pinned, &["build", "main.qwe"], &[("QUILLO_NATIVE_CACHE", &cache)], &d.0.join("b.log"), 600);
+    assert_eq!(code, Some(0), "{}", out);
+    let lib = quillo::native::library_path(&pinned.join("cnt.qwer")).unwrap();
+    let hash: String = sha2::Sha256::digest(std::fs::read(&lib).unwrap()).iter().map(|b| format!("{:02x}", b)).collect();
+    let pin = d.0.join("pin.toml");
+    std::fs::write(&pin, format!("[plugins]\nallow = [\"cnt@sha256:{}\"]\n", hash)).unwrap();
+    let p = pin.display().to_string();
+    for (name, app, vars) in [("confirmed", &confirmed, vec![("TMPDIR", t.as_str()), ("QUILLO_BUILT_RECORD_DIR", record.as_str())]), ("pinned", &pinned, vec![("TMPDIR", t.as_str()), ("QUILLO_POLICY_PATH", p.as_str())])] {
+        // Two instances, one library.
+        let log = d.0.join(format!("{}-2.log", name));
+        let (g, port) = serve_vars(app, &["main.qwe", "--no-check", "--instances", "2"], &vars, &log);
+        let seen: Vec<(String, i64)> = (0..8).map(|_| counted(&send(port, "GET", "/", &[], "").body)).collect();
+        drop(g);
+        assert!(seen.iter().all(|(a, _)| *a == seen[0].0), "{}: two copies: {:?} {}", name, seen, log_of(&log));
+        assert_eq!(seen.iter().map(|(_, n)| *n).collect::<Vec<_>>(), (1..=8).collect::<Vec<_>>(), "{}", name);
+        // Four reloads, one library, its count kept.
+        let log = d.0.join(format!("{}-r.log", name));
+        let (g, port) = serve_vars(app, &["main.qwe", "--no-check", "--reload"], &vars, &log);
+        let (first, mut last) = counted(&send(port, "GET", "/", &[], "").body);
+        for i in 1..=4 {
+            std::fs::write(app.join("main.qwe"), format!("import cnt.qwer use addr\nroute GET / = addr()\n// edit {}\n", i)).unwrap();
+            let until = Instant::now() + Duration::from_secs(60);
+            while log_of(&log).matches("reloaded main.qwe").count() < i && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let (a, n) = counted(&send(port, "GET", "/", &[], "").body);
+            assert_eq!((a.as_str(), n), (first.as_str(), last + 1), "{}: reload {}: {}", name, i, log_of(&log));
+            last = n;
+        }
+        drop(g);
+        assert_eq!(log_of(&log).matches("reloaded main.qwe").count(), 4, "{}", log_of(&log));
+    }
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "a private copy was left");
+}
+
+/// A library pinned by its own SHA-256 loads where the temporary folder is inside what
+/// `--allow-path` gives the program: it is not built, and its private copy is made in the user's
+/// own temporary folder (macOS's `DARWIN_USER_TEMP_DIR`), which it cannot reach, where it was
+/// refused as a pinned build's folder would be. Where the program can reach that folder too, it is
+/// refused, saying it is the private copy's folder (src/native.rs copy_dir, user_temp_dir,
+/// FEEDBACK83.md Q-1305, found by the coverage tests; branch feedback82-85).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_library_pinned_by_its_hash_loads_where_the_temporary_folder_is_the_programs() {
+    use sha2::Digest;
+    let d = Dir(support::temp_dir("cov8285r3-copydir").canonicalize().unwrap());
+    let (app, tmp) = (d.0.join("app"), d.0.join("tmp"));
+    for f in [&app, &tmp] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    std::fs::write(app.join("hi.qwer"), "//! version: 1.0.0\n//! effects: none\npub fn hi() -> String { \"hi from the pinned library\".into() }\n").unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let cache = r10_cache("copydir");
+    let (code, out) = quillo_at(&app, &["build", "main.qwe"], &[("QUILLO_NATIVE_CACHE", &cache)], &d.0.join("b.log"), 600);
+    assert_eq!(code, Some(0), "{}", out);
+    let lib = quillo::native::library_path(&app.join("hi.qwer")).unwrap();
+    let hash: String = sha2::Sha256::digest(std::fs::read(&lib).unwrap()).iter().map(|b| format!("{:02x}", b)).collect();
+    let pin = d.0.join("pin.toml");
+    std::fs::write(&pin, format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash)).unwrap();
+    let (t, p, open) = (tmp.display().to_string(), pin.display().to_string(), d.0.display().to_string());
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--no-build", "--allow-path", &open], &[("TMPDIR", &t), ("QUILLO_POLICY_PATH", &p)], &d.0.join("r.log"), 60);
+    assert_eq!((code, out.ends_with("hi from the pinned library\n")), (Some(0), true), "{}", out);
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "a copy was made in the folder the program reaches");
+    // The user's own temporary folder too.
+    let user = String::from_utf8(Command::new("/usr/bin/getconf").arg("DARWIN_USER_TEMP_DIR").output().unwrap().stdout).unwrap().trim().to_string();
+    let user = PathBuf::from(&user).canonicalize().unwrap().display().to_string();
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--no-build", "--allow-path", &open, "--allow-path", &user], &[("TMPDIR", &t), ("QUILLO_POLICY_PATH", &p)], &d.0.join("r.log"), 60);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("a held or pinned library is opened as a private copy, in a folder the program cannot reach, and it can reach ") && out.contains(": it does not load") && !out.contains("hi from"), "{}", out);
+}
+
+/// An ELF image (64 bits, little-endian) of these loaded segments (`(p_offset, p_vaddr, size)`),
+/// a dynamic table of `dynamic` at `dyn_at` (in the file and in memory), and `bytes` put at file
+/// offsets, `len` bytes long.
+fn elf_of(loads: &[(u64, u64, u64)], dyn_at: u64, dynamic: &[(u64, u64)], bytes: &[(usize, &[u8])], len: usize) -> Vec<u8> {
+    let mut b = vec![0u8; len];
+    b[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    b[16..18].copy_from_slice(&3u16.to_le_bytes());
+    b[32..40].copy_from_slice(&64u64.to_le_bytes());
+    b[54..56].copy_from_slice(&56u16.to_le_bytes());
+    b[56..58].copy_from_slice(&((loads.len() + 1) as u16).to_le_bytes());
+    let dyn_size = (dynamic.len() as u64 + 1) * 16;
+    for (i, (kind, off, va, size)) in loads.iter().map(|(o, v, s)| (1u32, *o, *v, *s)).chain([(2u32, dyn_at, dyn_at, dyn_size)]).enumerate() {
+        let h = 64 + i * 56;
+        b[h..h + 4].copy_from_slice(&kind.to_le_bytes());
+        b[h + 8..h + 16].copy_from_slice(&off.to_le_bytes());
+        b[h + 16..h + 24].copy_from_slice(&va.to_le_bytes());
+        b[h + 32..h + 40].copy_from_slice(&size.to_le_bytes());
+        b[h + 40..h + 48].copy_from_slice(&size.to_le_bytes());
+    }
+    for (i, (t, v)) in dynamic.iter().enumerate() {
+        let at = dyn_at as usize + i * 16;
+        b[at..at + 8].copy_from_slice(&t.to_le_bytes());
+        b[at + 8..at + 16].copy_from_slice(&v.to_le_bytes());
+    }
+    for (at, x) in bytes {
+        b[*at..*at + x.len()].copy_from_slice(x);
+    }
+    b
+}
+
+/// What an ELF library needs is read as its loader reads it: musl's `libc.musl-x86_64.so.1` and
+/// `ld-musl-x86_64.so.1` are the C runtime's; two loaded segments on one page, which ld.so maps
+/// one over the other, are refused; and a needed name is read through the segment that holds its
+/// address, `libssl.so.3` there, not the `libc.so.6` the file has at the string table's place plus
+/// its offset (src/native.rs elf_loads, runtime_soname, FEEDBACK83.md Q-1305, found by the coverage
+/// tests; branch feedback82-85).
+#[test]
+fn an_elf_librarys_strings_are_read_where_its_loader_reads_them() {
+    let musl = b"\0libc.musl-x86_64.so.1\0ld-musl-x86_64.so.1\0";
+    let one = elf_of(&[(0, 0, 0x400)], 0x200, &[(1, 1), (1, 23), (5, 0x300)], &[(0x300, musl)], 0x400);
+    assert_eq!(quillo::native::loads_refused(&one), None);
+    let overlap = elf_of(&[(0, 0, 0x800), (0x800, 0x800, 0x800)], 0x200, &[(1, 1), (5, 0x300)], &[(0x300, b"\0libc.so.6\0")], 0x1000);
+    assert_eq!(quillo::native::loads_refused(&overlap), Some("has loaded segments (PT_LOAD) on the same pages, which its loader maps one over the other".to_string()));
+    // DT_STRTAB at 0x300 of the first segment; the name at 0x300 + 0xfd00 = 0x10000, an address of
+    // the second segment (file 0x1000), where the file itself has another name at 0x10000.
+    let far = elf_of(&[(0, 0, 0x1000), (0x1000, 0x10000, 0x100)], 0x200, &[(1, 0xfd00), (5, 0x300)], &[(0x300, b"\0"), (0x1000, b"libssl.so.3\0"), (0x10000, b"libc.so.6\0")], 0x10010);
+    assert_eq!(quillo::native::loads_refused(&far), Some("needs libssl.so.3, which is not the C runtime's".to_string()));
+}
