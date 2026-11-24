@@ -10957,9 +10957,18 @@ Asking, and who answers:
   dependency by anything but its version (`path`, `git`, `registry`), and a crate whose
   macros build files in (`rust-embed`, `include_dir`, `askama`, `sqlx` and the like). The
   file is read as Rust reads it, by its tokens: comments, every kind of string and Rust's
-  whitespace. It is still a reading, not a proof: a crate can do what it does unseen
-  (`libc::kill` reads as the `libc` crate, which the file's `crates` list confirms by name),
-  a registry crate's macro too.
+  whitespace, from where rustc starts (after a byte order mark and a `#!` first line that is
+  not `#![...]`); a dependency line's texts as TOML reads them (`'x'` as written; a `\`
+  escape or a text over lines is refused under a hold). Under a `quillo.confirmed` the build
+  itself is then judged by what the compiler read: a plugin is built apart, and if rustc's own
+  list of the files it read for the plugin (its dep-info) has any file but the plugin's
+  source and Quillo's glue, it does not load, at a start, a load, a `--watch` reload or
+  `quillo build`, and what was built is not kept (``./hi.qwer is held to its SHA-256, and
+  building it read /work/secret.txt, which that hash does not cover``). That catches what a
+  reading of the text misses, as a dependency's macro that includes a file
+  (`doc_comment::doctest!`). It is still a reading, not a proof: a crate can do what it does
+  unseen (`libc::kill` reads as the `libc` crate, which the file's `crates` list confirms by
+  name), and a proc macro that reads a file without telling rustc is not seen.
 
 Not held yet: [`--watch`](#options-of-quillo-run) does not read `quillo.confirmed` again
 when it changes (restart after `quillo confirm`); what a page loads and calls is only

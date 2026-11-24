@@ -58,6 +58,24 @@ fn ended(child: &mut std::process::Child, secs: u64) -> Option<i32> {
     }
 }
 
+/// Held while a test starts a process, and while the terminal test opens and closes its
+/// terminal's other end: a process another test started in between took that end with it, kept
+/// it open, and `quillo fix` printed with no error (seen once in a dozen runs, more with the
+/// plugin builds of the tests for the review of 152bc1b).
+static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `Command::spawn` while no other test opens a terminal.
+trait SpawnHeld {
+    fn spawn_held(&mut self) -> std::process::Child;
+}
+
+impl SpawnHeld for Command {
+    fn spawn_held(&mut self) -> std::process::Child {
+        let _one = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.spawn().unwrap()
+    }
+}
+
 /// The command `quillo` with `args` in `dir`, as every test here starts it.
 fn quillo_cmd(dir: &Path, program: &Path, args: &[&str]) -> Command {
     let mut c = Command::new(program);
@@ -80,7 +98,7 @@ fn quillo(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
 fn quillo_logged(dir: &Path, log: &Path, args: &[&str]) -> (Option<i32>, String) {
     let log = log.to_path_buf();
     let file = std::fs::File::create(&log).unwrap();
-    let mut child = quillo_cmd(dir, Path::new(env!("CARGO_BIN_EXE_quillo")), args).stdout(file.try_clone().unwrap()).stderr(file).spawn().unwrap();
+    let mut child = quillo_cmd(dir, Path::new(env!("CARGO_BIN_EXE_quillo")), args).stdout(file.try_clone().unwrap()).stderr(file).spawn_held();
     let code = ended(&mut child, 60);
     let out = read(&log);
     let _ = std::fs::remove_file(&log);
@@ -91,7 +109,7 @@ fn quillo_logged(dir: &Path, log: &Path, args: &[&str]) -> (Option<i32>, String)
 fn serve(dir: &Path, opts: &[&str]) -> (Guard, u16, PathBuf) {
     let log = dir.join("run.log");
     let file = std::fs::File::create(&log).unwrap();
-    let child = quillo_cmd(dir, Path::new(env!("CARGO_BIN_EXE_quillo")), &["run", "main.qwe", "--port", "0"]).args(opts).stdout(Stdio::null()).stderr(file).spawn().unwrap();
+    let child = quillo_cmd(dir, Path::new(env!("CARGO_BIN_EXE_quillo")), &["run", "main.qwe", "--port", "0"]).args(opts).stdout(Stdio::null()).stderr(file).spawn_held();
     let mut g = Guard::new(child);
     let port = port_in_log(&mut g.0, &log, Duration::from_secs(60));
     (g, port, log)
@@ -320,7 +338,7 @@ fn confirm_says_why_its_file_cannot_be_written() {
     let sh = format!("mkdir .quillo.confirmed.$$.part && echo $$ > pid.txt && exec '{}' confirm --yes", env!("CARGO_BIN_EXE_quillo"));
     let log = d.join("sh.log");
     let file = std::fs::File::create(&log).unwrap();
-    let mut child = quillo_cmd(&d, Path::new("/bin/sh"), &["-c", &sh]).stdout(file.try_clone().unwrap()).stderr(file).spawn().unwrap();
+    let mut child = quillo_cmd(&d, Path::new("/bin/sh"), &["-c", &sh]).stdout(file.try_clone().unwrap()).stderr(file).spawn_held();
     assert_eq!(ended(&mut child, 60), Some(1), "{}", read(&log));
     let pid = read(&d.join("pid.txt")).trim().to_string();
     let part = format!(".quillo.confirmed.{}.part", pid);
@@ -545,7 +563,7 @@ fn a_name_not_taken_stops_a_held_start_however_deep_its_program_is() {
     let d = dir("untaken-deep");
     let at = mounted_down(&d, 17);
     let log = d.join("run.log");
-    let child = quillo_cmd(&d, Path::new(env!("CARGO_BIN_EXE_quillo")), &["run", "main.qwe", "--port", "0", "--no-check"]).stdout(Stdio::null()).stderr(std::fs::File::create(&log).unwrap()).spawn().unwrap();
+    let child = quillo_cmd(&d, Path::new(env!("CARGO_BIN_EXE_quillo")), &["run", "main.qwe", "--port", "0", "--no-check"]).stdout(Stdio::null()).stderr(std::fs::File::create(&log).unwrap()).spawn_held();
     let mut g = Guard::new(child);
     let deadline = Instant::now() + Duration::from_secs(60);
     while !read(&log).contains("listening on") && g.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
@@ -584,14 +602,16 @@ fn fix_under_a_hold_writes_a_browser_librarys_line() {
     // Again, printing to a terminal whose other end is closed.
     write(&d, "lib/a.qwe", "component C() = <p>{Chart.version}</p>\n");
     let (mut master, mut slave) = (0, 0);
+    let one = SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // SAFETY: openpty fills in two descriptors; no names or settings are given.
     assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
     use std::os::fd::FromRawFd;
     // SAFETY: each descriptor is this test's, and owned once.
     let (m, s) = unsafe { (std::fs::File::from_raw_fd(master), std::fs::File::from_raw_fd(slave)) };
     drop(m);
+    drop(one);
     let log = d.join("fix.log");
-    let mut child = quillo_cmd(&d, Path::new(env!("CARGO_BIN_EXE_quillo")), &["fix", "main.qwe"]).stdout(s).stderr(std::fs::File::create(&log).unwrap()).spawn().unwrap();
+    let mut child = quillo_cmd(&d, Path::new(env!("CARGO_BIN_EXE_quillo")), &["fix", "main.qwe"]).stdout(s).stderr(std::fs::File::create(&log).unwrap()).spawn_held();
     assert_eq!(ended(&mut child, 60), Some(1), "{}", read(&log));
     assert!(read(&log).contains("failed printing to stdout: Input/output error (os error 5)"), "{}", read(&log));
     assert_eq!(read(&d.join("lib/a.qwe")), "client /assets/chart.js use Chart\n\ncomponent C() = <p>{Chart.version}</p>\n");
@@ -838,7 +858,7 @@ fn a_held_start_whose_files_pass_what_a_check_reads_does_not_start() {
     write(&d, ".env", "SECRET=hunter2\n");
     write(&d, "quillo.confirmed", "[\"main.qwe\"]\nfiles = [\".env\"]\n");
     let log = d.join("run.log");
-    let child = quillo_cmd(&d, Path::new(env!("CARGO_BIN_EXE_quillo")), &["run", "main.qwe", "--port", "0", "--no-check"]).stdout(Stdio::null()).stderr(std::fs::File::create(&log).unwrap()).spawn().unwrap();
+    let child = quillo_cmd(&d, Path::new(env!("CARGO_BIN_EXE_quillo")), &["run", "main.qwe", "--port", "0", "--no-check"]).stdout(Stdio::null()).stderr(std::fs::File::create(&log).unwrap()).spawn_held();
     let mut g = Guard::new(child);
     let deadline = Instant::now() + Duration::from_secs(120);
     while !read(&log).contains("listening on") && g.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
@@ -1245,4 +1265,142 @@ fn what_a_rust_file_calls_is_read_past_every_kind_of_string() {
         write(&d, &f, &format!("//! version: 1.0.0\n//! effects: none\n{}\n", code));
         assert_eq!(quillo(&d, &["confirm", "--effects", &f]), (Some(0), format!("{}: effects: none\n", f)), "{}", name);
     }
+}
+
+// ---- edge tests of the fixes the review of 152bc1b asked for ------------------------------------
+
+/// A plugin held to its SHA-256 is judged by what the compiler read as it built it: one whose
+/// tokens build nothing in, but whose dependency's macro does (`doc_comment::doctest!`, which
+/// expands to `include_str!`), is confirmed by `quillo confirm`, and then does not load, as a start,
+/// as `quillo build` and as a `--watch` load builds it: said with the file it read; its library
+/// is not kept nor recorded. A plugin that reads only itself builds and loads under the same hold
+/// (src/native.rs, FEEDBACK83.md Q-1305, found by the review of 152bc1b; branch feedback82-85).
+#[test]
+fn a_pinned_build_is_judged_by_what_the_compiler_read() {
+    // Only itself: built and loaded, and recorded.
+    let d = dir("read-by-rustc-plain");
+    write(&d, "hi.qwer", "//! version: 1.0.0\n//! effects: none\npub fn hi(name: String) -> String { serde_json::json!({ \"hi\": name }).to_string() }\n");
+    write(&d, "main.qwe", "import hi.qwer use hi\nroute GET / = hi(\"Ana\")\n");
+    assert_eq!(quillo(&d, &["confirm", "--yes"]).0, Some(0));
+    let (g, port, log) = serve(&d, &[]);
+    assert_eq!(send(port, "GET", "/", &[], "").body, "{\"hi\":\"Ana\"}", "{}", read(&log));
+    drop(g);
+    assert_eq!(read(&record_dir(&d).join("built.txt")).lines().count(), 1);
+    // A dependency's macro reads another file in: no word of it in the plugin.
+    let d = dir("read-by-rustc-doc");
+    let secret = d.join("secret.txt");
+    write(&d, "secret.txt", "not the plugin's\n");
+    let src = format!("//! version: 1.0.0\n//! effects: none\n//! [dependencies]\n//! doc-comment = \"0.3\"\ndoc_comment::doctest!({:?});\npub fn hi() -> String {{ \"hi\".into() }}\n", secret.display().to_string());
+    write(&d, "hi.qwer", &src);
+    write(&d, "main.qwe", "import hi.qwer use hi\nroute GET / = hi()\n");
+    let (code, out) = quillo(&d, &["confirm", "--yes"]);
+    assert_eq!(code, Some(0), "the tokens build nothing in: {}", out);
+    let real = secret.canonicalize().unwrap();
+    let why = format!("hi.qwer is held to its SHA-256, and building it read {}, which that hash does not cover: it does not load, and what was built is not kept", real.display());
+    let (code, out) = quillo(&d, &["run", "main.qwe", "--port", "0", "--no-check"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains(&why), "{}", out);
+    let (code, out) = quillo(&d, &["build", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains(&why), "{}", out);
+    let kept: Vec<String> = std::fs::read_dir(d.join(".quillo/native")).map(|r| r.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+    assert!(kept.iter().all(|f| !f.starts_with(&format!("{}hi", std::env::consts::DLL_PREFIX))), "{:?}", kept);
+    assert!(!read(&record_dir(&d).join("built.txt")).contains(&{
+        use sha2::Digest;
+        sha2::Sha256::digest(src.as_bytes()).iter().map(|x| format!("{:02x}", x)).collect::<String>()
+    }));
+    // Taken under --watch.
+    write(&d, "main.qwe", "route GET / = \"main\"\n");
+    let (g, port, log) = serve(&d, &["--watch", "--no-check"]);
+    assert_eq!(send(port, "GET", "/", &[], "").body, "main", "{}", read(&log));
+    write(&d, "main.qwe", "import hi.qwer use hi\nroute GET / = hi()\n");
+    assert!(log_has(&log, &why, 120), "{}", read(&log));
+    assert_eq!(send(port, "GET", "/", &[], "").body, "main");
+    drop(g);
+}
+
+/// The reading starts where rustc's does and reads each literal as rustc does: after a byte order
+/// mark, after a first line `#!...` that is no inner attribute (`#!/bin/sh "`), but not after
+/// `#![allow(unused)]`, `#! [..]` or `#!/* x */[..]`; an escape read up to its closing quote
+/// (`'\u{4______________1}'`). Each `mod helper;` after them is refused. A byte order mark
+/// elsewhere, a character and a string that do not end are refused too, said at their line;
+/// a file that starts with a mark or an attribute and builds nothing in is confirmed
+/// (src/confirm.rs, FEEDBACK83.md Q-1305, found by the review of 152bc1b; branch feedback82-85).
+#[test]
+fn the_reading_starts_and_reads_literals_as_rustc_does() {
+    let module = "`mod helper;`, a module in another file";
+    let refused: Vec<(&str, String, u32, &str)> = vec![
+        ("shebang", "#!/bin/sh \"\n//! version: 1.0.0\n//! effects: none\nmod helper;\npub const Q: char = '\"';".into(), 4, module),
+        ("shebangdoc", "#! //! not a comment rustc passes over\nmod helper;".into(), 2, module),
+        ("bom", "\u{FEFF}mod helper;".into(), 1, module),
+        ("underscores", "//! version: 1.0.0\n//! effects: none\npub const P: (char, char) = ('\\u{4______________1}','\"');\nmod helper;\npub const Q: &str = \"\";".into(), 4, module),
+        ("bomlater", "//! effects: none\npub fn a() {}\n\u{FEFF}pub fn b() {}".into(), 3, "a byte order mark past its first character, which rustc does not read as this reading does"),
+        ("charopen", "//! effects: none\npub const C: char = '\\u{41\n;".into(), 2, "a character that does not end as rustc reads one"),
+        // The `"` of `"hi"` below closes it, as rustc reads it, and the one after opens another.
+        ("stringopen", "//! effects: none\npub const S: &str = \"never closed;".into(), 3, "a string that does not end as rustc reads one"),
+        ("rawopen", "//! effects: none\npub const S: &str = r##\"closed by one hash\"#;".into(), 2, "a string that does not end as rustc reads one"),
+    ];
+    for (name, code, line, how) in &refused {
+        let d = dir(&format!("lex-{}", name));
+        write(&d, "hi.qwer", &format!("{}\npub fn hi() -> String {{ \"hi\".into() }}\n", code));
+        write(&d, "main.qwe", "import hi.qwer use hi\nroute GET / = hi()\n");
+        let (code, out) = quillo(&d, &["confirm", "--yes"]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.starts_with(&format!("quillo confirm: hi.qwer builds another file into it ({} at line {}), which its SHA-256 in quillo.confirmed would not cover", how, line)), "{}: {}", name, out);
+    }
+    let d = dir("lex-allowed");
+    let allowed = [
+        ("attribute", "#![allow(unused)]\nmod helper { }"),
+        ("attrspace", "#! [allow(unused)]\nmod helper { }"),
+        ("attrcomment", "#!/* x */[allow(unused)]\nmod helper { }"),
+        ("bomclean", "\u{FEFF}//! effects: none\npub const C: char = '\\u{1_F_6_0_0}';"),
+        ("escapes", "pub const C: (char, char, u8) = ('\\'', '\\\\', b'\\'');\npub const S: &str = \"mod helper; \\\" still\";"),
+    ];
+    let main: String = allowed.iter().map(|(n, _)| format!("import {}.qwer use hi as {}\n", n, n)).collect::<String>() + "route GET / = \"ok\"\n";
+    for (name, code) in allowed {
+        write(&d, &format!("{}.qwer", name), &format!("{}\npub fn hi() -> String {{ \"hi\".into() }}\n", code));
+    }
+    write(&d, "main.qwe", &main);
+    let (code, out) = quillo(&d, &["confirm", "--yes"]);
+    assert_eq!(code, Some(0), "{}", out);
+}
+
+/// A dependency line's texts are read as TOML reads them: a literal one (`'rust-embed'`) as it is
+/// written, so `package = 'rust-embed'` is refused under a hold and `package = 'reqwest'` read as
+/// reqwest (http), a feature in one too (`features = ['v4']`, random); a basic text with an
+/// escape and one over lines are refused, as what is not read; `version = '1'` is confirmed
+/// (src/confirm.rs, FEEDBACK83.md Q-1305, found by the review of 152bc1b; branch feedback82-85).
+#[test]
+fn a_dependency_lines_texts_are_read_as_toml_reads_them() {
+    let refused = [
+        ("embed", "e = { package = 'rust-embed', version = '8' }", "the dependency `e`, rust-embed, whose macros build files in"),
+        ("escape", "x = \"1\\u0030\"", "the dependency line `x = \"1\\u0030\"`, not read as a crate's name and version"),
+        ("escapekey", "x = { version = \"1\", package = \"r\\u0065qwest\" }", "the dependency line `x = { version = \"1\", package = \"r\\u0065qwest\" }`, not read as a crate's name and version"),
+        ("multiline", "x = \"\"\"1\"\"\"", "the dependency line `x = \"\"\"1\"\"\"`, not read as a crate's name and version"),
+        ("multiliteral", "x = '''1'''", "the dependency line `x = '''1'''`, not read as a crate's name and version"),
+    ];
+    for (name, dep, how) in refused {
+        let d = dir(&format!("toml-{}", name));
+        write(&d, "hi.qwer", &format!("//! version: 1.0.0\n//! effects: none\n//! [dependencies]\n//! {}\npub fn hi() -> String {{ \"hi\".into() }}\n", dep));
+        write(&d, "main.qwe", "import hi.qwer use hi\nroute GET / = hi()\n");
+        let (code, out) = quillo(&d, &["confirm", "--yes"]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.starts_with(&format!("quillo confirm: hi.qwer builds another file into it ({} at line 4)", how)), "{}: {}", name, out);
+    }
+    let d = dir("toml-read");
+    for (name, dep, want) in [
+        ("web", "web = { package = 'reqwest', version = '0.12' }", "web.qwer: effects: http\n  but it says `effects: none`, and calls the crate reqwest: "),
+        ("ids", "uuid = { version = '1', features = ['v4'] }", "ids.qwer: effects: random\n  but it says `effects: none`, and calls the crate uuid (feature:v4): "),
+    ] {
+        let f = format!("{}.qwer", name);
+        write(&d, &f, &format!("//! version: 1.0.0\n//! effects: none\n//! [dependencies]\n//! {}\npub fn hi() -> String {{ \"hi\".into() }}\n", dep));
+        let (code, out) = quillo(&d, &["confirm", "--effects", &f]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.starts_with(want), "{}: {}", name, out);
+    }
+    write(&d, "lit.qwer", "//! version: 1.0.0\n//! effects: none\n//! [dependencies]\n//! itoa = '1'\npub fn hi() -> String { \"hi\".into() }\n");
+    write(&d, "main.qwe", "import lit.qwer use hi\nroute GET / = hi()\n");
+    let (code, out) = quillo(&d, &["confirm", "--yes"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(read(&d.join("quillo.confirmed")).contains("crates = [\"itoa 1\"]"), "{}", read(&d.join("quillo.confirmed")));
 }

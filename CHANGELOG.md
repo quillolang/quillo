@@ -267,7 +267,11 @@ What a program may notice:
   `include_str!`, `include_bytes!` however written or named, `#[path]`, a `mod x;`, a `$m!`,
   a `path`, `git` or `registry` dependency, a crate that embeds files such as `rust-embed`)
   is refused, as that file is outside its SHA-256; without one, warned of. The file is read
-  by its tokens, as Rust reads it (found in review).
+  by its tokens, from where rustc starts (after a BOM and a `#!` line), and its dependency
+  lines as TOML reads them. Under a hold the build itself is judged by what rustc read: a
+  plugin whose dep-info lists any file but its source and Quillo's glue does not load and is
+  not kept (a dependency's macro that includes a file, `doc_comment::doctest!`); the bytes
+  built are checked against the confirmed SHA-256 (found in review).
 - **What `quillo.confirmed` does not confirm** is an error at its line, and so is a name used
   from another file and not taken, under one (see Security).
 - **`"""` and `'''`** say that text over several lines is a backtick string (FEEDBACK85.md,

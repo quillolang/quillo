@@ -2044,6 +2044,14 @@ fn path_cargo() -> PathBuf {
 fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
     let bytes = crate::error::read_file(qwer).map_err(|e| format!("cannot read {}: {}", qwer.display(), e))?;
     let hash = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
+    // The bytes built are the ones quillo.confirmed holds it to, read once here: the file was read
+    // apart where it was judged (`confirm::plugin_ok`), and one put in its place since was built
+    // (FEEDBACK83.md, Q-1305, found by the review of 152bc1b; branch feedback82-85).
+    if let Some(want) = crate::confirm::confirmed_sha(qwer) {
+        if want != hash {
+            return Err(format!("{} changed since it was read: its SHA-256 is {} now, not the one confirmed; it does not load", qwer.display(), hash));
+        }
+    }
     let src = String::from_utf8(bytes.clone()).map_err(|_| format!("{} is not UTF-8 text", qwer.display()))?;
     let version = crate::install::header_version(&src);
     crate::policy::get().plugin(&stem(qwer), version.as_deref(), std::slice::from_ref(&hash))?;
@@ -2109,6 +2117,16 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
             let errors: Vec<&str> = log.lines().filter(|l| !l.trim_start().starts_with("Compiling") && !l.trim_start().starts_with("Updating") && !l.trim_start().starts_with("Locking")).collect();
             return Err(format!("cannot build {}:\n{}", qwer.display(), errors.join("\n")));
         }
+        // Judged by what the compiler read: nothing but its source and Quillo's glue. Else its
+        // library is not kept, nor recorded, and the private folder goes (`result`).
+        if let Some(other) = read_in(&target, &crate_name, &crate_dir, &[crate_dir.join("lib.rs"), src_file.clone()])? {
+            return Err(format!(
+                "{} is held to its SHA-256, and building it read {}, which that hash does not cover: it does not load, and what was built is not kept (put that code in {})",
+                qwer.display(),
+                other.display(),
+                qwer.display()
+            ));
+        }
         let built = target.join("release").join(format!("{}{}.{}", std::env::consts::DLL_PREFIX, crate_name, std::env::consts::DLL_EXTENSION));
         let lib = dir.join(format!("{}{}-{}.{}", std::env::consts::DLL_PREFIX, lib_stem(qwer), &hash[..16], std::env::consts::DLL_EXTENSION));
         let built_bytes = std::fs::read(&built).map_err(|e| format!("cannot read {}: {}", built.display(), e))?;
@@ -2129,6 +2147,81 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
             Err(e)
         }
     }
+}
+
+/// The first file the compiler read to build the crate `crate_name` in `target` that is not one of
+/// `own`, if it read one: its dep-info, `release/deps/<crate_name>.d` (`-<hash>.d` but for a
+/// cdylib), each name in it from `crate_dir`, where cargo runs rustc, which rustc writes
+/// with every source file it read for the crate itself (an out-of-line module, `#[path]`,
+/// `include!`, `include_str!`, `include_bytes!`, and what a proc macro tells it it reads), not
+/// those of its dependencies, which cargo's own `.d` beside the library lists too. A list that is
+/// not there, or not one, refuses the build. A reading of the plugin's tokens says such a file
+/// before it is built (`confirm::builds_in`), but a hand-written lexer reads otherwise than rustc
+/// somewhere: a shebang line, a byte order mark, an escape read a few characters ahead each put
+/// it out of step, and a dependency's macro (`doc_comment::doctest!("x")`) includes a file with
+/// no word of it in the plugin. So a pinned build is judged where the compiler read
+/// (FEEDBACK83.md, Q-1305, found by the review of 152bc1b; branch feedback82-85). A proc macro that
+/// reads a file without telling rustc is not seen.
+fn read_in(target: &Path, crate_name: &str, crate_dir: &Path, own: &[PathBuf]) -> Result<Option<PathBuf>, String> {
+    let deps = target.join("release").join("deps");
+    let (alone, prefix) = (format!("{}.d", crate_name), format!("{}-", crate_name));
+    let mut lists = std::fs::read_dir(&deps)
+        .map_err(|e| format!("cannot read what the build of {} read ({}): {}", crate_name, deps.display(), e))?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n == alone || (n.starts_with(&prefix) && n.ends_with(".d"))));
+    let (Some(list), None) = (lists.next(), lists.next()) else {
+        return Err(format!("the compiler's list of what it read to build {} is not in {}, or is not one: it does not load", crate_name, deps.display()));
+    };
+    let text = std::fs::read_to_string(&list).map_err(|e| format!("cannot read {}: {}", list.display(), e))?;
+    let real = |p: &Path| {
+        let p = crate_dir.join(p);
+        p.canonicalize().unwrap_or(p)
+    };
+    let own: Vec<PathBuf> = own.iter().map(|p| real(p)).collect();
+    for line in text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
+        let names = make_names(line);
+        // `out: a b c` lists what `out` was made of; `a:` names `a` alone.
+        let read: &[String] = if names.len() > 1 { &names[1..] } else { &names[..] };
+        for r in read {
+            let p = real(Path::new(r));
+            if !own.contains(&p) {
+                return Ok(Some(p));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// A dep-info line's names, as rustc writes them: its target before its `:`, then each name it
+/// was made of; a space in a name is `\ `.
+fn make_names(line: &str) -> Vec<String> {
+    let mut out = vec![String::new()];
+    let mut chars = line.chars().peekable();
+    let mut target = true;
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&' ') => {
+                out.last_mut().unwrap().push(' ');
+                chars.next();
+            }
+            ':' if target && matches!(chars.peek(), None | Some(' ')) => {
+                target = false;
+                out.push(String::new());
+            }
+            ' ' => {
+                if !out.last().unwrap().is_empty() {
+                    out.push(String::new());
+                }
+            }
+            c => out.last_mut().unwrap().push(c),
+        }
+    }
+    out.retain(|n| !n.is_empty());
+    if target {
+        out.clear();
+    }
+    out
 }
 
 /// A Rust file `quillo.confirmed` holds to its SHA-256: only a library this machine built from those
@@ -2158,7 +2251,9 @@ fn build_confirmed(qwer: &Path, program: &Path) -> Result<(PathBuf, Parsed), Str
     let source = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
     let src = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8 text", qwer.display()))?;
     let lib = lib_path(qwer, &src);
-    let key = format!("{} {} {}-{}", source, lib_name(&lib), std::env::consts::ARCH, std::env::consts::OS);
+    // Recorded as judged by what the compiler read (`read_in`): one recorded before is built again
+    // once (FEEDBACK83.md, Q-1305, found by the review of 152bc1b; branch feedback82-85).
+    let key = format!("{} {} {}-{} read-judged", source, lib_name(&lib), std::env::consts::ARCH, std::env::consts::OS);
     let record = built_record(program);
     if lib.is_file() {
         // Opened by what was hashed, as a pinned build's is (`checked_lib`; found in review 2).
