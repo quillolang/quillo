@@ -268,3 +268,207 @@ fn on_mysql_a_taken_files_escapes_bit_strings_and_text_not_closed_are_read_as_my
     assert!(out.contains(&said), "{}", out);
     assert!(out.contains("mine: []\n"), "{}", out);
 }
+
+// Fix round 6
+
+/// A kit taken for `Badge`, whose `steal()` makes each call of `calls` (a function, its SQL and the
+/// values given after it, as written in Quillo, or none) and says what each gave, a line each.
+fn kit_given(calls: &[(&str, &str, &str)]) -> String {
+    let lines: Vec<String> = calls
+        .iter()
+        .map(|(f, sql, values)| if values.is_empty() { format!("    said({}({}))", f, lit(sql)) } else { format!("    said({}({}, {}))", f, lit(sql), values) })
+        .collect();
+    format!(
+        "component Badge() {{\n  return <b>b</b>\n}}\nfn steal() {{\n  let said = (r) => is_err(r) ? r.error : str(r)\n  return \"kit:\\n\" + join([\n{}\n  ], \"\\n\")\n}}\n",
+        lines.join(",\n")
+    )
+}
+
+const TAIL6: &str = "Run it from the main file's SQL, or from a migration the main file runs";
+
+/// What the hold says, after `db: `, when a taken file's SQL has the database run SQL from text.
+fn runs6(what: &str) -> String {
+    format!("{} has the database run SQL from text, or name a table from text, which is refused for kit/k.qwe's SQL where a quillo.confirmed holds the run: what it does is worked out as it runs, where no reading of the statement sees it, Quillo's own tables too. {}", what, TAIL6)
+}
+
+/// What the hold says when it refused the text PostgreSQL is sent, its values' places written `$1`.
+fn as_sent_pg(why: &str) -> String {
+    format!("db: as the server is sent it, its values' places written `$1`, `$2`, ...: {}", why)
+}
+
+/// What the hold says when a taken file's SQL names what holds other tables' data.
+fn reads6(what: &str) -> String {
+    format!("db: {} holds other tables' data or other statements' SQL, which is refused for kit/k.qwe's SQL where a quillo.confirmed holds the run. {}", what, TAIL6)
+}
+
+/// Under a quillo.confirmed on PostgreSQL a taken file's statement with values is judged as
+/// PostgreSQL is sent it too, each `:name`, `?1` and `?` written `$1`, `$2`, ...: `$:a`, `$?1` and
+/// `$?` are `$$1` as sent, a dollar quote the text as written has none of, and the
+/// `query_to_xml` that read Quillo's own table from outside the quotes PostgreSQL saw is refused,
+/// the message saying it was judged as sent; `$:a` before `-- execute` is a dollar quote not
+/// closed as sent. A `$1` before a dollar quote ends at its `$`, as PostgreSQL's lexer reads it, so
+/// the `query_to_xml` after the quote is no string's text (no value's place rewritten: said as
+/// written). Run: a `:a` inside a dollar quote and one after it, a value named for a unicode
+/// column, a `'$'` before a value. Quillo's own row is never read (src/db.rs
+/// taken_sent_refused, tokens, FEEDBACK83.md Q-1300, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn on_postgresql_a_taken_files_statement_is_judged_as_the_server_is_sent_it() {
+    let Some(pg) = support::postgres("cov8285db6f") else {
+        eprintln!("PostgreSQL is not installed: skipped");
+        return;
+    };
+    let url = pg.database("as_sent");
+    let d = dir("pgsent");
+    let xml = "query_to_xml('select x from _quil' || 'lo_mine', true, false, '')::text";
+    let named = format!("select $:a as a, $$ || {} || $$ as b -- $$\n, :a::text as c", xml);
+    let numbered = format!("select $?1 as a, $$ || {} || $$ as b -- $$\n, ?1::text as c", xml);
+    let plain = format!("select $? as a, $$ || {} || $$ as b -- $$\n, ?::text as c", xml);
+    let calls: Vec<(&str, &str, &str)> = vec![
+        ("db.query", &named, "{a: \"v\"}"),
+        ("db.query", &numbered, "\"v\""),
+        ("db.query", &plain, "\"v\", \"w\""),
+        ("db.query", "select 1 as one, $:a -- execute", "{a: \"v\"}"),
+        ("db.query", "select $1$x$ ' $x$, query_to_xml('select x from _quil' || 'lo_mine', true, false, '') as x -- '", "\"v\""),
+        ("db.query", "select $q$:a$q$ as s, :a::text as t", "{a: \"v\"}"),
+        ("db.query", "select :a::text as \"caf\u{e9}\"", "{a: \"\u{e9}\"}"),
+        ("db.query", "select '$' || :a::text as s", "{a: \"v\"}"),
+    ];
+    write(&d, "kit/k.qwe", &kit_given(&calls));
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\ndb.exec(\"create table if not exists _quillo_mine (x text)\")\ndb.exec(\"insert into _quillo_mine values ('quillo own row')\")\nprint(steal())\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    let xml_runs = runs6("the function query_to_xml");
+    let not_closed = format!("this statement has {}, which this reading cannot read for certain as the server would, and what it cannot read is refused for kit/k.qwe's SQL where a quillo.confirmed holds the run. {}", STRING_OPEN, TAIL6);
+    let want = [
+        "kit:".to_string(),
+        as_sent_pg(&xml_runs),
+        as_sent_pg(&xml_runs),
+        as_sent_pg(&xml_runs),
+        as_sent_pg(&not_closed),
+        format!("db: {}", xml_runs),
+        "[{ s: \":a\", t: \"v\" }]".to_string(),
+        "[{ caf\u{e9}: \"\u{e9}\" }]".to_string(),
+        "[{ s: \"$v\" }]".to_string(),
+    ];
+    assert!(out.contains(&format!("{}\n", want.join("\n"))), "{}", out);
+    assert!(!out.contains("quillo own row"), "{}", out);
+}
+
+/// Under a quillo.confirmed on MySQL (MariaDB) the `mysql` and `sys` schemas are refused to a
+/// taken file by every spelling of their name before a `.`: plain, quoted (`` `mysql` ``,
+/// `` `sys` ``), in other letters (`` `MYSQL`.`GLOBAL_PRIV` ``, its password hashes), with spaces
+/// before the `.`, and, as ANSI_QUOTES reads it, `"mysql"`; and a catalog holding other
+/// statements' SQL by the letters outside ASCII MariaDB takes for ASCII ones (`processlıst`,
+/// `` `ınformation_schema`.`processlıst` ``, `ınnodb_trx`), and information_schema's
+/// `optimizer_trace`. Run: `mysql` as a column's name, `'mysql.user'` as a string, a table of the
+/// program's own database named `` `mysql.user` `` (MariaDB's error), information_schema's tables
+/// of the `mysql` schema, and statements with `?2` and `:a` values, which MySQL is sent as `?`
+/// (src/db.rs text_run_in, alike, may_run_text, taken_sent_refused; FEEDBACK83.md Q-1300,
+/// found by the coverage tests; branch feedback82-85).
+#[test]
+fn on_mysql_the_mysql_and_sys_schemas_and_catalogs_are_refused_by_every_spelling() {
+    let Some(my) = support::mariadb("cov8285db6f") else {
+        eprintln!("MariaDB is not installed: skipped");
+        return;
+    };
+    let url = my.url("spellings");
+    let d = dir("myspell");
+    let mysql = reads6("the `mysql` schema");
+    let sys = reads6("the `sys` schema");
+    let calls: Vec<(&str, &str, &str, String)> = vec![
+        ("db.query", "select user, host from mysql.user limit 1", "", mysql.clone()),
+        ("db.query", "select user, host from `mysql`.user limit 1", "", mysql.clone()),
+        ("db.query", "select count(*) as n from `mysql`.`global_priv`", "", mysql.clone()),
+        ("db.query", "select count(*) as n from `MYSQL`.`GLOBAL_PRIV`", "", mysql.clone()),
+        ("db.query", "select count(*) as n from mysql.global_pr\u{130}v", "", mysql.clone()),
+        ("db.query", "select count(*) as n from `mysql` /* x */ . user", "", mysql.clone()),
+        ("db.query", "select user from \"mysql\".user", "", mysql.clone()),
+        ("db.query", "select count(*) as n from `sys`.`version`", "", sys.clone()),
+        ("db.query", "select * from `sys`.version", "", sys.clone()),
+        ("db.query", "select * from SYS.version", "", sys.clone()),
+        ("db.query", "select count(*) as n from information_schema.processl\u{131}st", "", reads6("the catalog processlist")),
+        ("db.query", "select count(*) as n from `\u{131}nformation_schema`.`processl\u{131}st`", "", reads6("the catalog processlist")),
+        ("db.query", "select count(*) as n from information_schema.\u{131}nnodb_trx", "", reads6("the catalog innodb_trx")),
+        ("db.query", "select * from information_schema.optimizer_trace", "", reads6("the catalog optimizer_trace")),
+        ("db.query", "select 1 as mysql", "", "[{ mysql: 1 }]".into()),
+        ("db.query", "select 'mysql.user' as s", "", "[{ s: \"mysql.user\" }]".into()),
+        ("db.query", "select count(*) as n from `mysql.user`", "", "db: Server error: `ERROR 1146 (42S02): Table 'spellings.mysql.user' doesn't exist'".into()),
+        ("db.query", "select count(*) > 0 as n from information_schema.tables where table_schema = 'mysql'", "", "[{ n: 1 }]".into()),
+        ("db.query", "select concat(?2, ?1, '\u{e9}') as s", "\"v\", \"w\"", "[{ s: \"wv\u{e9}\" }]".into()),
+        ("db.query", "select concat(:a, '-', :a) as s", "{a: \"v\"}", "[{ s: \"v-v\" }]".into()),
+    ];
+    let made: Vec<(&str, &str, &str)> = calls.iter().map(|(f, s, v, _)| (*f, *s, *v)).collect();
+    write(&d, "kit/k.qwe", &kit_given(&made));
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\nprint(steal())\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    let mut want: Vec<String> = vec!["kit:".into()];
+    want.extend(calls.iter().map(|(_, _, _, w)| w.clone()));
+    assert!(out.contains(&format!("{}\n", want.join("\n"))), "{}", out);
+}
+
+/// Under a quillo.confirmed on PostgreSQL a taken file's call of a function of the extensions
+/// shipped with PostgreSQL that runs SQL given as text or reaches a table by its name is refused,
+/// as tablefunc's and dblink's are, each given Quillo's own table's name worked out as it runs:
+/// xml2's `xpath_table`; pageinspect's `get_raw_page`, `bt_metap`, `bt_page_items`; pgstattuple's
+/// `pgstattuple` (in capitals, and quoted), `pgstattuple_approx` (schema-qualified) and
+/// `pgstatindex`; `pgrowlocks`; amcheck's `bt_index_check` and `verify_heapam`; pg_surgery's
+/// `heap_force_kill`, which would have killed Quillo's row; PostgreSQL's own `currtid2`. Run:
+/// xml2's `xpath_string` of a text, a column named `pgstat_n`, `get_raw_page(` in a string. Quillo's
+/// own row is there after (src/db.rs runs_text, looked_for; FEEDBACK83.md Q-1300, found by the
+/// coverage tests; branch feedback82-85).
+#[test]
+fn on_postgresql_the_extensions_functions_that_reach_a_table_by_text_are_refused() {
+    let Some(pg) = support::postgres("cov8285db6x") else {
+        eprintln!("PostgreSQL is not installed: skipped");
+        return;
+    };
+    let url = pg.database("extensions");
+    let d = dir("pgext");
+    let own = "'_quil' || 'lo_mine'";
+    let calls: Vec<(String, String)> = vec![
+        (format!("select k from xpath_table('x', 'x', {}, '/a', 'true') as t(k text, a text)", own), "xpath_table".into()),
+        (format!("select encode(get_raw_page({}, 0), 'escape') like '%quillo own row%' as leaked", own), "get_raw_page".into()),
+        (format!("select * from bt_metap({} || '_x')", own), "bt_metap".into()),
+        (format!("select * from bt_page_items({} || '_x', 1)", own), "bt_page_items".into()),
+        (format!("select tuple_count from PGSTATTUPLE({})", own), "pgstattuple".into()),
+        (format!("select tuple_count from \"pgstattuple\"({})", own), "pgstattuple".into()),
+        (format!("select * from public.pgstattuple_approx({})", own), "pgstattuple_approx".into()),
+        (format!("select * from pgstatindex({} || '_x')", own), "pgstatindex".into()),
+        (format!("select * from pgrowlocks({})", own), "pgrowlocks".into()),
+        (format!("select bt_index_check({} || '_x')", own), "bt_index_check".into()),
+        (format!("select * from verify_heapam({})", own), "verify_heapam".into()),
+        (format!("select heap_force_kill({}, array['(0,1)'::tid])", own), "heap_force_kill".into()),
+        (format!("select currtid2({}, '(0,1)') as t", own), "currtid2".into()),
+    ];
+    let ran: Vec<(&str, &str)> = vec![
+        ("select xpath_string('<a>x</a>', '/a') as s", "[{ s: \"x\" }]"),
+        ("select 1 as pgstat_n", "[{ pgstat_n: 1 }]"),
+        ("select 'get_raw_page(' as s", "[{ s: \"get_raw_page(\" }]"),
+    ];
+    let mut made: Vec<(&str, &str)> = calls.iter().map(|(s, _)| ("db.query", s.as_str())).collect();
+    made.extend(ran.iter().map(|(s, _)| ("db.query", *s)));
+    write(&d, "kit/k.qwe", &kit(&made));
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\nfor e in [\"xml2\", \"pageinspect\", \"pgstattuple\", \"pgrowlocks\", \"amcheck\", \"pg_surgery\"] {\n  db.exec(\"create extension if not exists \" + e)\n}\ndb.exec(\"create table if not exists _quillo_mine (x text)\")\ndb.exec(\"create index if not exists _quillo_mine_x on _quillo_mine (x)\")\ndb.exec(\"insert into _quillo_mine values ('quillo own row')\")\nprint(steal())\nprint(\"mine: \" + str(db.query(\"select x from _quillo_mine\")))\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    let mut want: Vec<String> = vec!["kit:".into()];
+    want.extend(calls.iter().map(|(_, f)| format!("db: {}", runs6(&format!("the function {}", f)))));
+    want.extend(ran.iter().map(|(_, w)| w.to_string()));
+    assert!(out.contains(&format!("{}\nmine: [{{ x: \"quillo own row\" }}]\n", want.join("\n"))), "{}", out);
+}

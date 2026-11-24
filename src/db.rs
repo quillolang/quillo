@@ -905,6 +905,39 @@ fn names_own(t: &[u8]) -> bool {
     false
 }
 
+/// A name with the letters outside ASCII that a database takes for ASCII ones (`names_own`'s: İ
+/// and ı as i, ſ as s, the Kelvin sign as k) written as those, or None for a name with none of
+/// them: MariaDB compares `information_schema`'s names in any letters, by which
+/// `information_schema.processlıst` read its processlist, and keeps a table's name in lower case
+/// (`mysql.global_prİv` is `mysql.global_priv`), so a catalog or a schema the hold refuses is
+/// judged by this name too (FEEDBACK83.md, Q-1300, found by the coverage tests of 3117dea; branch
+/// feedback82-85).
+fn alike(n: &[u8]) -> Option<Vec<u8>> {
+    if n.is_ascii() {
+        return None;
+    }
+    let mut changed = false;
+    let out: String = String::from_utf8_lossy(n)
+        .chars()
+        .map(|c| match c {
+            '\u{130}' | '\u{131}' => {
+                changed = true;
+                'i'
+            }
+            '\u{17f}' => {
+                changed = true;
+                's'
+            }
+            '\u{212a}' => {
+                changed = true;
+                'k'
+            }
+            c => c,
+        })
+        .collect();
+    changed.then(|| out.into_bytes())
+}
+
 /// How a server may read a text's strings (`own_table_named`), as its session says: PostgreSQL's
 /// plain strings with backslash escapes or not (`standard_conforming_strings`), MySQL's strings
 /// with backslash escapes or not (`NO_BACKSLASH_ESCAPES`) and `"..."` a string or a name
@@ -967,7 +1000,8 @@ fn read_own(r: Reading, t: &[u8], depth: u32) -> bool {
             continue;
         }
         // A string, and its kind: its prefix (`E`, `U&`, `N`, MySQL's `_utf8mb4`) read with it.
-        let word = if ident(c) && !c.is_ascii_digit() { t[i..].iter().position(|&c| !ident(c)).map_or(n, |k| i + k) } else { i };
+        // PostgreSQL's `$1` is a value's place, its number ending at a `$` (`tokens`).
+        let word = if ident(c) && !c.is_ascii_digit() && !(pg && c == b'$') { t[i..].iter().position(|&c| !ident(c)).map_or(n, |k| i + k) } else { i };
         let w = &t[i..word];
         let quote = t.get(word).copied();
         let unicode = pg && w.eq_ignore_ascii_case(b"u") && quote == Some(b'&') && matches!(t.get(word + 1), Some(b'\'' | b'"'));
@@ -1047,8 +1081,8 @@ fn read_own(r: Reading, t: &[u8], depth: u32) -> bool {
         // A word, a number, a placeholder, an operator.
         i = if word > i {
             word
-        } else if c.is_ascii_digit() || (my && ident(c)) {
-            t[i..].iter().position(|&c| !(ident(c) || c == b'.')).map_or(n, |k| i + k)
+        } else if c.is_ascii_digit() || (my && ident(c)) || (pg && c == b'$') {
+            t[i + 1..].iter().position(|&c| !((ident(c) && !(pg && c == b'$')) || c == b'.')).map_or(n, |k| i + 1 + k)
         } else {
             i + 1
         };
@@ -1387,7 +1421,11 @@ fn tokens(r: Reading, t: &[u8]) -> (Vec<Tk<'_>>, Option<&'static str>) {
             i = word;
         } else if c.is_ascii_digit() || (my && ident(c)) || c == b'$' {
             let start = i;
-            i = t[i + 1..].iter().position(|&c| !(ident(c) || c == b'.')).map_or(n, |k| i + 1 + k);
+            // PostgreSQL's number or value's place (`$1`) ends at a `$`, which begins a dollar
+            // quote after it (`$1$x$ ... $x$`), as its lexer reads it: read on as one word, the
+            // quote's text was this reading's SQL (FEEDBACK83.md, Q-1300, found trying to get round
+            // the fix of the coverage tests of 3117dea; branch feedback82-85).
+            i = t[i + 1..].iter().position(|&c| !((ident(c) && !(pg && c == b'$')) || c == b'.')).map_or(n, |k| i + 1 + k);
             out.push(Tk::Word(&t[start..i]));
         } else {
             out.push(match c {
@@ -1415,9 +1453,29 @@ fn tokens(r: Reading, t: &[u8]) -> (Vec<Tk<'_>>, Option<&'static str>) {
 /// for nothing made the
 /// extension tablefunc and read Quillo's own table through `crosstab('select ... _quil' || 'lo_mine')`
 /// (FEEDBACK83.md, Q-1300, found by review 6 of aebe60e; branch feedback82-85).
+///
+/// And by the same standard the functions of the extensions shipped with PostgreSQL 17 (its
+/// contrib modules, read from their `extension/*.sql`) that run SQL given as text or take a table
+/// by its name, as text or as a `regclass` a text is taken for, or by its number: xml2's
+/// `xpath_table`, which runs a query it puts together; pageinspect's (`get_raw_page`, `bt_metap`,
+/// `bt_page_items`, `bt_page_stats`, `bt_multi_page_stats`, `brin_page_items`, `gist_page_items`,
+/// `hash_bitmap_info`, `heap_page_item_attrs`, `tuple_data_split`), which read a table's pages,
+/// its rows and its indexes' values with them; pgstattuple's (`pgstattuple`,
+/// `pgstattuple_approx`, `pgstatindex`, `pgstatginindex`, `pgstathashindex`), pgrowlocks,
+/// amcheck's (`bt_index_check`, `bt_index_parent_check`, `verify_heapam`) and pg_surgery's
+/// (`heap_force_kill`, `heap_force_freeze`), which kill or freeze a table's rows; and PostgreSQL's
+/// own `currtid2`, a row of a table it names by text. `pg_relpages`, pg_visibility's,
+/// pg_freespacemap's, pg_prewarm's, pg_buffercache's and pg_walinspect's are named `pg_...`. A kit
+/// confirmed for nothing read Quillo's own table through `xpath_table`, `get_raw_page` and
+/// `pgstattuple`, each given `'_quil' || 'lo_mine'` (FEEDBACK83.md, Q-1300, found by the coverage
+/// tests of 3117dea; branch feedback82-85).
 fn runs_text(name: &[u8]) -> bool {
-    const NAMES: &[&[u8]] = &[b"ts_stat", b"ts_rewrite", b"to_regclass", b"connectby", b"set_config"];
-    const STARTS: &[&[u8]] = &[b"query_to_xml", b"cursor_to_xml", b"table_to_xml", b"schema_to_xml", b"database_to_xml", b"dblink", b"crosstab"];
+    const NAMES: &[&[u8]] = &[
+        b"ts_stat", b"ts_rewrite", b"to_regclass", b"connectby", b"set_config", b"xpath_table", b"get_raw_page", b"bt_metap", b"bt_page_items", b"bt_page_stats", b"bt_multi_page_stats",
+        b"brin_page_items", b"gist_page_items", b"hash_bitmap_info", b"heap_page_item_attrs", b"tuple_data_split", b"pgrowlocks", b"bt_index_check", b"bt_index_parent_check", b"verify_heapam",
+        b"heap_force_kill", b"heap_force_freeze", b"currtid2",
+    ];
+    const STARTS: &[&[u8]] = &[b"query_to_xml", b"cursor_to_xml", b"table_to_xml", b"schema_to_xml", b"database_to_xml", b"dblink", b"crosstab", b"pgstat"];
     NAMES.iter().any(|w| name.eq_ignore_ascii_case(w)) || starts_with_any(name, STARTS)
 }
 
@@ -1476,10 +1534,13 @@ fn reaches_files(name: &[u8]) -> bool {
 fn holds_others(name: &[u8]) -> bool {
     const NAMES: &[&[u8]] = &[
         b"pg_stats", b"pg_statistic", b"pg_stats_ext", b"pg_stats_ext_exprs", b"pg_statistic_ext_data", b"pg_prepared_statements", b"pg_stat_statements", b"pg_stat_statements_info", b"pg_stat_activity",
-        b"performance_schema", b"general_log", b"slow_log", b"processlist", b"innodb_trx",
+        b"performance_schema", b"general_log", b"slow_log", b"processlist", b"innodb_trx", b"optimizer_trace",
     ];
     // information_schema's `innodb_*` too, of which `innodb_trx` shows each transaction's statement
-    // (found by review 7 of 64df6c0).
+    // (found by review 7 of 64df6c0). And its `optimizer_trace`, the text of the last statement a
+    // connection traced, which a main file that turns tracing on leaves on a pooled connection
+    // (FEEDBACK83.md, Q-1300, found trying to get round the fix of the coverage tests of 3117dea;
+    // branch feedback82-85).
     NAMES.iter().any(|w| name.eq_ignore_ascii_case(w)) || starts_with_any(name, &[b"events_statements_", b"innodb_"])
 }
 
@@ -1502,7 +1563,7 @@ fn may_run_text(sql: &[u8]) -> bool {
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
     sql.split(|&c| !ident(c)).any(|w| {
         let w = &w[w.iter().position(|c| !c.is_ascii_digit()).unwrap_or(w.len())..];
-        !w.is_empty() && looked_for(w)
+        !w.is_empty() && (looked_for(w) || (!w.is_ascii() && alike(w).is_some_and(|a| looked_for(&a))))
     })
 }
 
@@ -1535,11 +1596,14 @@ fn looked_for(w: &[u8]) -> bool {
         b"do" | b"prepare" | b"execute" | b"call" | b"deallocate" | b"create" | b"alter" | b"copy" | b"load" | b"import" | b"begin" | b"if" | b"while" | b"loop" | b"repeat" | b"case" | b"declare" | b"leave"
         | b"iterate" | b"regclass" | b"oid" | b"outfile" | b"dumpfile" | b"sys" => true,
         b"ts_stat" | b"ts_rewrite" | b"to_regclass" | b"nextval" | b"setval" | b"currval" | b"connectby" => true,
+        // The extensions' of `runs_text`, by their names (`pgstat...` below).
+        b"xpath_table" | b"get_raw_page" | b"bt_metap" | b"bt_page_items" | b"bt_page_stats" | b"bt_multi_page_stats" | b"brin_page_items" | b"gist_page_items" | b"hash_bitmap_info"
+        | b"heap_page_item_attrs" | b"tuple_data_split" | b"pgrowlocks" | b"bt_index_check" | b"bt_index_parent_check" | b"verify_heapam" | b"heap_force_kill" | b"heap_force_freeze" | b"currtid2" => true,
         b"pg_read_file" | b"pg_read_binary_file" | b"pg_ls_dir" | b"pg_stat_file" | b"lo_import" | b"lo_export" | b"load_file" | b"pg_file_write" => true,
         b"pg_stats" | b"pg_statistic" | b"pg_stats_ext" | b"pg_stats_ext_exprs" | b"pg_statistic_ext_data" | b"pg_prepared_statements" | b"pg_stat_statements" | b"pg_stat_statements_info" | b"pg_stat_activity"
-        | b"performance_schema" | b"general_log" | b"slow_log" | b"processlist" | b"innodb_trx" => true,
+        | b"performance_schema" | b"general_log" | b"slow_log" | b"processlist" | b"innodb_trx" | b"optimizer_trace" => true,
         b"set_config" | b"mysql" => true,
-        _ if l.starts_with(b"pg_") || l.starts_with(b"innodb_") || regclass_fn(l) => true,
+        _ if l.starts_with(b"pg_") || l.starts_with(b"innodb_") || l.starts_with(b"pgstat") || regclass_fn(l) => true,
         _ => matches!(l[0], b'q' | b'c' | b't' | b's' | b'd' | b'e') && (runs_text(l) || holds_others(l)),
     }
 }
@@ -1560,6 +1624,11 @@ enum TextRun {
     Begins(Option<String>),
     /// It names one of PostgreSQL's own catalogs or functions (`pg_...`).
     Pg(String),
+    /// Its `drop`, or MySQL's `explain`, is of what this reading cannot place (None) or of what a
+    /// taken file's may not be of: said apart, as "begins with `drop`, ... may begin with ...
+    /// drop" said a word the list takes (FEEDBACK83.md, Q-1300, found by the coverage tests of
+    /// 3117dea; branch feedback82-85).
+    Of { head: &'static str, what: Option<String> },
 }
 
 /// What in `sql`, read as the server `d` reads it, has the database run SQL from text or name a
@@ -1643,6 +1712,10 @@ fn creates_ok(rest: &[Tk<'_>]) -> Result<(), Option<String>> {
             b"algorithm" if matches!(rest.get(k + 1), Some(Tk::Punct(b'='))) && word(rest.get(k + 2)).is_some() => k += 3,
             b"table" | b"index" | b"sequence" if !replace || w == b"table" => return Ok(()),
             b"view" => return Ok(()),
+            // MariaDB's `or replace` of an index or a sequence, which the list does not take: said
+            // whole, where "`create index` has the database run SQL" said a kind it takes
+            // (FEEDBACK83.md, Q-1300, found by the coverage tests of 3117dea; branch feedback82-85).
+            b"index" | b"sequence" => return Err(Some(format!("or replace {}", String::from_utf8_lossy(&w)))),
             other => return Err(Some(String::from_utf8_lossy(other).into_owned())),
         }
     }
@@ -1731,20 +1804,28 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
                 if my && (x.eq_ignore_ascii_case(b"outfile") || x.eq_ignore_ascii_case(b"dumpfile")) {
                     return Some(TextRun::Reaches(format!("`into {}`", String::from_utf8_lossy(x).to_ascii_lowercase())));
                 }
-                if my && x.eq_ignore_ascii_case(b"sys") && matches!(stmt.get(k + 1), Some(Tk::Punct(b'.'))) {
-                    return Some(TextRun::Reads("the `sys` schema".into()));
-                }
-                if my && x.eq_ignore_ascii_case(b"mysql") && matches!(stmt.get(k + 1), Some(Tk::Punct(b'.'))) {
-                    return Some(TextRun::Reads("the `mysql` schema".into()));
-                }
             }
-            // A name, quoted or not, each way for a `U&` one.
+            // A name, quoted or not, each way for a `U&` one, and as MariaDB takes the letters
+            // outside ASCII it takes for ASCII ones (`alike`).
             let (one, all): (&[u8], &[Vec<u8>]) = match t {
                 Tk::Word(x) => (x, &[]),
                 Tk::Names(all) => (&[], all),
                 _ => continue,
             };
-            let names = std::iter::once(one).filter(|n| !n.is_empty()).chain(all.iter().map(Vec::as_slice));
+            let folded: Vec<Vec<u8>> = std::iter::once(one).chain(all.iter().map(Vec::as_slice)).filter_map(alike).collect();
+            let names = std::iter::once(one).filter(|n| !n.is_empty()).chain(all.iter().map(Vec::as_slice)).chain(folded.iter().map(Vec::as_slice));
+            // MySQL's `mysql` and `sys` schemas, by any spelling of the name before a `.`: they were
+            // refused as a plain word alone, and `` `mysql`.`global_priv` `` (its password hashes),
+            // `` `sys`.version `` and, under ANSI_QUOTES, `"mysql".user` ran from a kit confirmed for
+            // nothing (FEEDBACK83.md, Q-1300, found by the coverage tests of 3117dea; branch
+            // feedback82-85).
+            if my && matches!(stmt.get(k + 1), Some(Tk::Punct(b'.'))) {
+                for schema in ["sys", "mysql"] {
+                    if names.clone().any(|n| n.eq_ignore_ascii_case(schema.as_bytes())) {
+                        return Some(TextRun::Reads(format!("the `{}` schema", schema)));
+                    }
+                }
+            }
             if let Some(n) = names.clone().find(|n| holds_others(n)) {
                 return Some(TextRun::Reads(format!("the catalog {}", String::from_utf8_lossy(n).to_ascii_lowercase())));
             }
@@ -1867,10 +1948,10 @@ fn head_refused(my: bool, stmt: &[Tk<'_>], h: usize) -> Option<TextRun> {
             }
             match ["table", "index", "view", "sequence"].iter().any(|w| is(k, w)) {
                 true => None,
-                false => Some(TextRun::Begins(Some(match stmt.get(k) {
-                    Some(Tk::Word(x)) => format!("drop {}", String::from_utf8_lossy(x).to_ascii_lowercase()),
-                    _ => "drop".into(),
-                }))),
+                false => Some(match stmt.get(k) {
+                    Some(Tk::Word(x)) => TextRun::Begins(Some(format!("drop {}", String::from_utf8_lossy(x).to_ascii_lowercase()))),
+                    _ => TextRun::Of { head: "drop", what: None },
+                }),
             }
         }
         // MySQL's `explain [format = x] [extended | partitions | analyze]`, then what it explains.
@@ -1885,9 +1966,16 @@ fn head_refused(my: bool, stmt: &[Tk<'_>], h: usize) -> Option<TextRun> {
                     break;
                 }
             }
+            // A query in brackets, `explain (select 1)`, as MariaDB takes it: it was refused as a
+            // statement beginning with `explain` (FEEDBACK83.md, Q-1300, found by the coverage tests
+            // of 3117dea; branch feedback82-85).
+            while matches!(stmt.get(k), Some(Tk::Punct(b'('))) {
+                k += 1;
+            }
             match stmt.get(k) {
                 Some(Tk::Word(_)) if !is(k, "explain") => head_refused(my, stmt, k),
-                _ => Some(TextRun::Begins(Some("explain".into()))),
+                Some(Tk::Word(_)) => Some(TextRun::Of { head: "explain", what: Some("`explain`".into()) }),
+                _ => Some(TextRun::Of { head: "explain", what: None }),
             }
         }
         other => Some(TextRun::Begins(Some(String::from_utf8_lossy(other).into_owned()))),
@@ -1899,17 +1987,46 @@ fn head_refused(my: bool, stmt: &[Tk<'_>], h: usize) -> Option<TextRun> {
 /// `/etc/hosts` as a table, found by review 7 of 64df6c0), and the options that name another place:
 /// `connection`, `file_name`, `table_type`, a MERGE table's `union`, `data directory` and `index
 /// directory` (FEEDBACK83.md, Q-1300; branch feedback82-85).
+///
+/// `engine` is a column's name, not the option, at the start of a column's definition (after the
+/// `(` or a `,` of a list, no `=` or string after it), in a list (before a `)` or a `,`), after `add`,
+/// `column`, `modify`, `change`, `drop`, `alter`, `after`, `select`, `distinct`, `by` or a `.`;
+/// and a statement's query (from its `select`) has no table options: `create table t (engine int)`
+/// was refused as "`engine = int`" (FEEDBACK83.md, Q-1300, found by the coverage tests of 3117dea;
+/// branch feedback82-85). A partition's `engine = ...`, inside the brackets of its list, is the
+/// option still, and changes the table's (MariaDB). The engine is a name or a string (`engine =
+/// 'memory'`, as MariaDB takes it), said in the refusal.
 fn table_options_refused(stmt: &[Tk<'_>]) -> Option<String> {
     let is = |t: Option<&Tk<'_>>, w: &str| matches!(t, Some(Tk::Word(x)) if x.eq_ignore_ascii_case(w.as_bytes()));
+    let mut depth = 0usize;
     for (k, t) in stmt.iter().enumerate() {
+        match t {
+            Tk::Punct(b'(') => depth += 1,
+            Tk::Punct(b')') => depth = depth.saturating_sub(1),
+            _ => {}
+        }
         let Tk::Word(x) = t else { continue };
+        if x.eq_ignore_ascii_case(b"select") {
+            break;
+        }
         let next = stmt.get(k + 1);
+        let before = k.checked_sub(1).and_then(|b| stmt.get(b));
         let valued = matches!(next, Some(Tk::Punct(b'=') | Tk::Str(_)));
-        if x.eq_ignore_ascii_case(b"engine") {
+        let column = (depth > 0 && matches!(before, Some(Tk::Punct(b'(' | b','))) && !valued)
+            || matches!(next, Some(Tk::Punct(b')' | b',')))
+            || matches!(before, Some(Tk::Punct(b'.')))
+            || ["add", "column", "modify", "change", "drop", "alter", "after", "distinct", "by"].iter().any(|w| is(before, w));
+        if x.eq_ignore_ascii_case(b"engine") && !column {
             let at = if matches!(next, Some(Tk::Punct(b'='))) { k + 2 } else { k + 1 };
             let name = match stmt.get(at) {
                 Some(Tk::Word(v)) => Some(v.to_ascii_lowercase()),
                 Some(Tk::Names(v)) => v.first().map(|v| v.to_ascii_lowercase()),
+                // A string's text, as written: one with a backslash or its quote twice in it is no
+                // name of the list.
+                Some(Tk::Str(v)) => Some(match v {
+                    [q @ (b'\'' | b'"'), body @ .., e] if e == q => body.to_ascii_lowercase(),
+                    v => v.to_ascii_lowercase(),
+                }),
                 _ => None,
             };
             match name {
@@ -1955,7 +2072,40 @@ fn own_tables_held(it: &Interp, on: Option<usize>, b: &Backend, sql: &str) -> Op
     if !STATEMENTS_TAKEN.get() {
         return None;
     }
-    taken_sql_refused(b.dialect(), sql, || crate::confirm::held_name(it.cur_file.as_deref()))
+    let (d, file) = (b.dialect(), || crate::confirm::held_name(it.cur_file.as_deref()));
+    // SQLite takes a name as its bytes (`own_table_named`), its values' places as written, and its
+    // authorizer holds what a statement does: its bytes alone are looked at, with no call more. Its
+    // way through `taken_sql_refused` cost a taken file's `db.one` some 40 instructions more, once
+    // that grew (measured, 200,000 `db.one` and `db.exec` of a taken file).
+    if d == crate::sql::Dialect::Sqlite {
+        return names_own(sql.as_bytes()).then(|| own_named_refusal(&file()));
+    }
+    let why = taken_sql_refused(d, sql, file);
+    if why.is_some() {
+        return why;
+    }
+    taken_sent_refused(d, sql, file)
+}
+
+/// `taken_sql_refused` of a taken file's statement, its text as written judged already
+/// (`own_tables_held`): the text its server is sent, where Quillo writes its values' places another way (`sql::Scan::native`: PostgreSQL's
+/// `$1` for `?`, `?1` and `:name`, MySQL's `?` for `?1` and `:name`), which is the one a statement
+/// with values runs as. Judged as written alone, `$:a` was `$` and a value to this reading and
+/// `$$1`, a dollar quote, to PostgreSQL: a kit confirmed for nothing read `_quillo_mine` with
+/// `select $:a as a, $$ || query_to_xml('select x from _quil' || 'lo_mine', ...)::text || $$ as b
+/// -- $$ ...`, whose `query_to_xml` this reading took for a string's text (FEEDBACK83.md, Q-1300,
+/// found by the coverage tests of 3117dea; branch feedback82-85). A script without values is sent
+/// as written (`simple_query`, `query_drop`); SQLite takes its values' places as written. Out of
+/// line, as `taken_sql_refused` is.
+#[inline(never)]
+fn taken_sent_refused(d: crate::sql::Dialect, sql: &str, file: impl Fn() -> String) -> Option<String> {
+    let scan = crate::sql::scan(d, sql);
+    let sent = scan.native();
+    if sent == sql {
+        return None;
+    }
+    let places = if d == crate::sql::Dialect::Postgres { "`$1`, `$2`, ..." } else { "`?`" };
+    taken_sql_refused(d, sent, file).map(|why| format!("as the server is sent it, its values' places written {}: {}", places, why))
 }
 
 /// `conn_ok` for a call on the connection `on` that runs no statement of its own first
@@ -1975,7 +2125,7 @@ fn program_conn(it: &Interp, on: Option<usize>) -> Result<(), String> {
 #[inline(never)]
 fn taken_sql_refused(d: crate::sql::Dialect, sql: &str, file: impl Fn() -> String) -> Option<String> {
     if own_table_named(Some(d), sql) {
-        return Some(format!("Quillo's own tables (_quillo_...) are refused for {}'s SQL where a quillo.confirmed holds the run: they hold what Quillo does (push subscriptions, jobs, tokens), and this statement names one", file()));
+        return Some(own_named_refusal(&file()));
     }
     // SQLite runs no SQL from text, and its authorizer holds what a statement does.
     if d == crate::sql::Dialect::Sqlite {
@@ -1998,6 +2148,15 @@ fn taken_sql_refused(d: crate::sql::Dialect, sql: &str, file: impl Fn() -> Strin
             tail
         ),
         TextRun::Pg(name) => format!("{} is one of PostgreSQL's own catalogs and functions (`pg_...`), which hold or reach other tables and statements, and is refused for {}'s SQL where a quillo.confirmed holds the run. {}", name, file(), tail),
+        TextRun::Of { head, what } => format!(
+            "`{}` of {} is refused for {}'s SQL where a quillo.confirmed holds the run: a taken file's `{}` is of {}. {}",
+            head,
+            what.unwrap_or_else(|| "what this reading cannot place".into()),
+            file(),
+            head,
+            if head == "drop" { "a table, an index, a view or a sequence, its kind named (`drop table t`)" } else { "a statement it may run: select, insert, update, delete, with, values, table or replace" },
+            tail
+        ),
         TextRun::Unsure(what) => format!(
             "this statement has {}, which this reading cannot read for certain as the server would, and what it cannot read is refused for {}'s SQL where a quillo.confirmed holds the run. {}",
             what,
@@ -2005,6 +2164,12 @@ fn taken_sql_refused(d: crate::sql::Dialect, sql: &str, file: impl Fn() -> Strin
             tail
         ),
     })
+}
+
+/// What the hold says of a taken file's (`file`) SQL that names one of Quillo's own tables.
+#[cold]
+fn own_named_refusal(file: &str) -> String {
+    format!("Quillo's own tables (_quillo_...) are refused for {}'s SQL where a quillo.confirmed holds the run: they hold what Quillo does (push subscriptions, jobs, tokens), and this statement names one", file)
 }
 
 thread_local! {
@@ -2171,11 +2336,44 @@ unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int
     // writes, not those its view reads (FEEDBACK83.md, Q-1300, found by the coverage tests of
     // 0038a97; branch feedback82-85).
     let reads = action == ffi::SQLITE_READ && own_name(a1);
-    if (writes || reads) && OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_TAKEN.get() {
+    // And what holds other tables' values: SQLite's statistics, which `analyze` writes (each
+    // index's sampled values in `sqlite_stat4`, `sqlite_stat3`'s before it, and the counts of
+    // `sqlite_stat1` and `sqlite_stat2`), and the pages of `dbstat` and `sqlite_dbpage`. A kit
+    // confirmed for nothing ran `analyze` and read Quillo's own tables' values (migration names,
+    // push endpoints, MCP token hashes) from `sqlite_stat4`. Its `analyze` is refused whole: the
+    // statistics it loads back as it ends are read through this, and `analyze` of one of
+    // Quillo's tables writes them (FEEDBACK83.md, Q-1300, found by the coverage tests of 3117dea;
+    // branch feedback82-85).
+    // By its first letter before its name is read: a column read of another table costs no more
+    // (measured, 100,000 `db.exec` of a taken file).
+    let mirrors = action == ffi::SQLITE_READ
+        && !a1.is_null()
+        && matches!(unsafe { *a1 } as u8 | 0x20, b's' | b'd')
+        && text(a1).is_some_and(|t| {
+            let t = t.to_bytes();
+            (t.len() == 12 && t[..11].eq_ignore_ascii_case(b"sqlite_stat") && matches!(t[11], b'1'..=b'4')) || t.eq_ignore_ascii_case(b"dbstat") || t.eq_ignore_ascii_case(b"sqlite_dbpage")
+        });
+    let analyze = action == ffi::SQLITE_ANALYZE;
+    // And a trigger of a taken file's, on any table: its statements run inside the statement that
+    // fires it, judged as that statement's code, the main file's too. A kit's temporary trigger on
+    // the main file's table copied `sqlite_stat4` into the kit's table as the main file's insert
+    // ran; a taken file's `create trigger` is refused on PostgreSQL and MySQL too (`creates_ok`)
+    // (FEEDBACK83.md, Q-1300, found trying to get round the fix of the coverage tests of 3117dea;
+    // branch feedback82-85).
+    let trigger = matches!(action, ffi::SQLITE_CREATE_TRIGGER | ffi::SQLITE_CREATE_TEMP_TRIGGER);
+    if (writes || reads || mirrors || analyze || trigger) && OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_TAKEN.get() {
         STATEMENTS_OF.with(|s| {
             if let Ok(mut s) = s.try_borrow_mut() {
-                let how = if writes { "written" } else { "read" };
-                s.refused = Some(format!("Quillo's own tables (_quillo_...) are not {} by a taken file's SQL where a quillo.confirmed holds the run", how));
+                s.refused = Some(if trigger && !writes {
+                    "a taken file's SQL makes no trigger where a quillo.confirmed holds the run: its statements would run inside other statements, the main file's too, as theirs".to_string()
+                } else if analyze {
+                    "`analyze` is not run by a taken file's SQL where a quillo.confirmed holds the run: the statistics it writes and reads back (sqlite_stat1, sqlite_stat4) hold every table's values, Quillo's own too".to_string()
+                } else if mirrors {
+                    format!("{} is not read by a taken file's SQL where a quillo.confirmed holds the run: it holds other tables' values, Quillo's own too", text(a1).map_or(String::new(), |t| t.to_string_lossy().to_ascii_lowercase()))
+                } else {
+                    let how = if writes { "written" } else { "read" };
+                    format!("Quillo's own tables (_quillo_...) are not {} by a taken file's SQL where a quillo.confirmed holds the run", how)
+                });
             }
         });
         return ffi::SQLITE_DENY;
@@ -2261,8 +2459,12 @@ pub(crate) const OPEN: &str = "it is the database the program has open";
 
 /// One more connection to the SQLite file `p` (FEEDBACK55.md, Q-702; branch feedback55).
 fn opened(p: &Path) {
-    // Looked at before the lock is taken: no call to the system under it.
+    // Looked at before the lock is taken: no call to the system under it. Kept by the system's
+    // form of its folder (`statics::sys_form_of`), whichever of a folder's two names realpath gave
+    // (`/System/Volumes/Data/private/...` or `/private/...`), as `closed` looks it up
+    // (FEEDBACK85.md, Q-1340, found by the coverage tests of 3117dea; branch feedback82-85).
     let Ok(real) = std::fs::canonicalize(p) else { return };
+    let real = crate::statics::sys_form_of(&real).into_owned();
     let id = std::fs::metadata(&real).ok().and_then(|m| crate::statics::id_of(&m));
     let folded = crate::builtins::fold_name(&real.to_string_lossy());
     let mut o = SQLITE_FILES.write().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2281,6 +2483,7 @@ fn opened(p: &Path) {
 /// (FEEDBACK55.md, Q-702; branch feedback55).
 fn closed(p: &Path) {
     let real = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let real = crate::statics::sys_form_of(&real).into_owned();
     let mut o = SQLITE_FILES.write().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(e) = o.files.get_mut(&real) else { return };
     e.2 -= 1;
@@ -5719,10 +5922,13 @@ fn shard_all(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // branch feedback82-85). Each shard's connection has the authorizer, as every one SQLite opens
     // under a hold has (`connect`). One look at the hold where none is.
     if crate::confirm::held() {
-        for i in list.iter() {
-            let refused = match backend_on(it, Some(*i)) {
+        for (k, i) in list.iter().enumerate() {
+            // A shard's connection's failure, said with its number as a shard's failure is below:
+            // a held run's said none (FEEDBACK83.md, Q-1300, found by the coverage tests of
+            // 3117dea; branch feedback82-85). The statement's refusal is the statement's.
+            let refused = match backend_on(it, Some(*i)).and_then(|b| conn_ok(it, Some(*i)).map(|_| b)) {
                 Ok(b) => own_tables_refused(it, Some(*i), &b, &sql),
-                Err(e) => Some(e),
+                Err(e) => return Ok(db_err(format!("shard {}: {}", k + 1, e))),
             };
             if let Some(e) = refused {
                 return Ok(db_err(e));

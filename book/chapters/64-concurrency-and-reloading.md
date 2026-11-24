@@ -1139,12 +1139,15 @@ for the site and the visitor.
   `to_regclass` or a cast to `regclass`, and a function that takes a table (`nextval`,
   `setval`, `has_table_privilege`, `row_security_active`, ...) given it by anything but a
   plain string such as `'kit_seq'`. A word inside a string, a comment or a quoted name
-  is not one. The refusal says to run it from the main file's SQL, or a migration the main
+  is not one. A statement with values is read as written and as its server is sent it, each
+  `?`, `?1` and `:name` written `$1` (PostgreSQL) or `?` (MySQL). The refusal says to run it from the main file's SQL, or a migration the main
   file runs; the main file's SQL, and a program without a `quillo.confirmed`, are not read
   this way. A function the program's own SQL made that runs SQL text can still be called
   from a taken file: it is the program's. So can one an extension the program installed
   adds, beyond `crosstab`, `connectby`, `ts_stat`, `ts_rewrite`, the `dblink` functions and
-  the `*_to_xml` ones, which are refused by their names, and so can a trigger the program
+  the `*_to_xml` ones, and the functions of PostgreSQL's own extensions that run a query or
+  reach a table by its name (xml2's `xpath_table`, pageinspect's, pgstattuple's,
+  `pgrowlocks`, amcheck's, pg_surgery's), which are refused by their names, and so can a trigger the program
   made that a taken file's write sets off. The reading fails closed: what it cannot read for
   certain is refused (MySQL's `/*!` comments, a `[` outside a string on MySQL/MariaDB, which
   `sql_mode=MSSQL` reads as a quoted name, a string left open, a statement inside an `IF`
@@ -1152,10 +1155,13 @@ for the site and the visitor.
   anything but a table, an index, a view or a sequence, SQL that reaches the server's files
   (`COPY`, `INTO OUTFILE`, `pg_read_file`, `LOAD`), and the catalogs that hold other tables'
   values or SQL text (`pg_stats`, `pg_prepared_statements`, `performance_schema`'s
-  statements, `sys.`, the process list, the `mysql` schema, and on PostgreSQL every
-  `pg_...` name). A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
-  `DELETE`, `WITH`, `VALUES`, `TABLE`, `REPLACE`, `EXPLAIN` of one of these, `CREATE` or
-  `ALTER` as above (a MySQL table's engine InnoDB, Aria, MyISAM or MEMORY), `DROP` of a table,
+  statements, the `sys` and `mysql` schemas by any spelling (quoted, and the letters outside
+  ASCII MariaDB takes for ASCII ones), the process list, `optimizer_trace`, and on PostgreSQL
+  every `pg_...` name). On SQLite a taken file runs no `ANALYZE`, makes no trigger, and reads
+  neither the statistics (`sqlite_stat1` to `sqlite_stat4`) nor `dbstat`. A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
+  `DELETE`, `WITH`, `VALUES`, `TABLE`, `REPLACE`, `EXPLAIN` of one of these (MySQL's in
+  brackets too), `CREATE` or `ALTER` as above (a MySQL table's engine InnoDB, Aria, MyISAM
+  or MEMORY, by name or string), `DROP` of a table,
   an index, a view or a sequence, or `TRUNCATE`; any other first word (`SET`, `GRANT`,
   `SHOW`, `INSTALL` and the rest) is refused, as is a character outside ASCII just before a
   `\` or a backtick. Tables of other databases the database user can read are not held.

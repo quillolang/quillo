@@ -177,13 +177,13 @@ fn on_postgresql_what_the_reader_cannot_place_is_refused_and_says_so() {
         ("db.exec", "create", runs(CREATE_UNPLACED)),
         ("db.exec", "create \"kit_t\" (x int)", runs(CREATE_UNPLACED)),
         ("db.exec", "create \"caf\u{e9}\" (x int)", runs(CREATE_UNPLACED)),
-        ("db.exec", "create or replace index kit_i on kits (x)", runs("`create index`")),
+        ("db.exec", "create or replace index kit_i on kits (x)", runs("`create or replace index`")),
         ("db.exec", "alter", runs(ALTER_UNPLACED)),
         ("db.exec", "alter \"kits\" add y int", runs(ALTER_UNPLACED)),
         ("db.exec", "with kit_w as (select 1) create table kit_x (x int)", runs(CREATE_INSIDE)),
         ("db.query", "select nextval('kit_seq'", runs("the function nextval given a table's name worked out as it runs")),
-        ("db.exec", "drop", begins("drop")),
-        ("db.exec", "drop \"kits\"", begins("drop")),
+        ("db.exec", "drop", of("drop", None)),
+        ("db.exec", "drop \"kits\"", of("drop", None)),
         ("db.exec", "drop materialized function kit_f()", begins("drop function")),
         ("db.exec", "explain (costs off) grant select on kits to public", begins("grant")),
         ("db.query", "explain (costs off) execute kit_s", runs("`execute`")),
@@ -222,13 +222,15 @@ fn on_postgresql_what_the_reader_cannot_place_is_refused_and_says_so() {
 
 /// Under a quillo.confirmed on MySQL (MariaDB) a taken file's statement the reader cannot place is
 /// refused and says so: a NUL; `alter online user`, `alter ignore` of a string and `alter online`
-/// alone; `explain` alone, of `explain`, and of `(select ...)`; `explain extended grant` and
+/// alone; `explain` alone and of `explain` (round 6: saying `explain` of what);
+/// `explain extended grant` and
 /// `explain format = json show` judged by the word after them; a table's engine by a quoted name
 /// (`` `connect` ``, `` `CONNECT` `` with its file) or by a string, or none after `engine`; `drop
 /// temporary function`, `drop` of a quoted name and alone; a `create` after `explain`. Run: `alter
 /// ignore table`, `alter online table` and `alter online ignore table`, whose columns are added;
-/// `explain format = json`, `explain extended` and `explain partitions` of a select; a table whose
-/// engine is `` `InnoDB` ``; `drop temporary table if exists`; a statement with a `;` at its end.
+/// `explain format = json`, `explain extended` and `explain partitions` of a select, and (round 6)
+/// `explain (select 1)`; a table whose engine is `` `InnoDB` ``; `drop temporary table if
+/// exists`; a statement with a `;` at its end.
 /// Nothing the kit was refused is made (src/db.rs text_run, text_run_in, head_refused,
 /// table_options_refused; FEEDBACK83.md Q-1300; coverage of feedback82-85; branch feedback82-85).
 #[test]
@@ -244,18 +246,17 @@ fn on_mysql_what_the_reader_cannot_place_is_refused_and_says_so() {
         ("db.exec", "alter online user root identified by 'x'", runs("`alter user`")),
         ("db.exec", "alter ignore 'kit_t' add y int", runs(ALTER_UNPLACED)),
         ("db.exec", "alter online", runs(ALTER_UNPLACED)),
-        ("db.query", "explain", begins("explain")),
-        ("db.query", "explain explain select 1", begins("explain")),
-        ("db.query", "explain (select 1)", begins("explain")),
+        ("db.query", "explain", of("explain", None)),
+        ("db.query", "explain explain select 1", of("explain", Some("`explain`"))),
         ("db.query", "explain extended grant select on kit_t to root", begins("grant")),
         ("db.query", "explain format = json show tables", begins("show")),
         ("db.exec", "create table kit_c (x int) engine = `connect`", reaches("`engine = connect`")),
         ("db.exec", "create table kit_c (x int) engine = `CONNECT` table_type = DOS file_name = '/etc/hosts'", reaches("`engine = connect`")),
-        ("db.exec", "create table kit_c (x int) engine = 'connect'", reaches("`engine = `")),
+        ("db.exec", "create table kit_c (x int) engine = 'connect'", reaches("`engine = connect`")),
         ("db.exec", "alter table kit_t engine", reaches("`engine = `")),
         ("db.exec", "drop temporary function kit_f", begins("drop function")),
-        ("db.exec", "drop `kit_t`", begins("drop")),
-        ("db.exec", "drop", begins("drop")),
+        ("db.exec", "drop `kit_t`", of("drop", None)),
+        ("db.exec", "drop", of("drop", None)),
         ("db.query", "explain create table kit_x (x int)", runs(CREATE_INSIDE)),
     ];
     let none = "{ changes: 0, last_id: null }";
@@ -267,6 +268,7 @@ fn on_mysql_what_the_reader_cannot_place_is_refused_and_says_so() {
         ("db.query", "explain partitions select * from kit_t", "[{ id: 1, select_type: \"SIMPLE\", table: \"kit_t\", partitions: null, type: \"ALL\", possible_keys: null, key: null, key_len: null, ref: null, rows: \"1\", Extra: \"\" }]"),
         ("db.exec", "create table if not exists kit_e (x int) engine = `InnoDB`", none),
         ("db.exec", "drop temporary table if exists kit_tmp", none),
+        ("db.query", "explain (select 1)", "[{ id: 1, select_type: \"SIMPLE\", table: null, type: null, possible_keys: null, key: null, key_len: null, ref: null, rows: null, Extra: \"No tables used\" }]"),
         ("db.query", "select 1 as one;", "[{ one: 1 }]"),
     ];
     let mut calls: Vec<(&str, &str)> = refused.iter().map(|(f, s, _)| (*f, *s)).collect();
@@ -415,7 +417,8 @@ fn a_connection_number_moved_onto_another_files_function_connection_is_refused_i
 // ---- shards.all ---------------------------------------------------------------------------------
 
 /// Under a quillo.confirmed `db.shards(...).all` with a shard whose database a function works out
-/// for each tenant says the error of that shard's connection, outside a tenant, before any shard
+/// for each tenant says the error of that shard's connection, with its number (round 6), outside a
+/// tenant, before any shard
 /// runs the statement: the first shard's insert writes no row. Without a quillo.confirmed the first
 /// shard runs it and the second's error is said with its number (src/db.rs shard_all; FEEDBACK83.md
 /// Q-1300; coverage of feedback82-85; branch feedback82-85).
@@ -433,11 +436,164 @@ fn shards_all_says_a_shards_error_before_any_shard_runs_where_a_run_is_held() {
     let no_tenant = "the database is one per tenant ({tenant} in its target), and this code runs for none: see tenant_from and with_tenant";
     let (code, out) = run(&d, &[]);
     assert_eq!(code, 0, "{}", out);
-    assert!(out.contains(&format!("all: err(\"db: {}\")\ncount: 2\n", no_tenant)), "{}", out);
+    assert!(out.contains(&format!("all: err(\"db: shard 2: {}\")\ncount: 2\n", no_tenant)), "{}", out);
     assert!(column(&d.join("data/a.db"), "select x from t").is_empty());
     std::fs::remove_file(d.join("quillo.confirmed")).unwrap();
     let (code, out) = run(&d, &[]);
     assert_eq!(code, 0, "{}", out);
     assert!(out.contains(&format!("all: err(\"db: shard 2: {}\")\n", no_tenant)), "{}", out);
     assert_eq!(column(&d.join("data/a.db"), "select x from t"), ["caf\u{e9}"]);
+}
+
+// Fix round 6
+
+/// What SQLite's authorizer says when it refuses a taken file's `analyze`.
+const ANALYZE: &str = "db: `analyze` is not run by a taken file's SQL where a quillo.confirmed holds the run: the statistics it writes and reads back (sqlite_stat1, sqlite_stat4) hold every table's values, Quillo's own too";
+
+/// What SQLite's authorizer says when it refuses a taken file's trigger.
+const TRIGGER: &str = "db: a taken file's SQL makes no trigger where a quillo.confirmed holds the run: its statements would run inside other statements, the main file's too, as theirs";
+
+/// What SQLite's authorizer says when it refuses a taken file's read of a table holding other
+/// tables' values.
+fn mirrors(table: &str) -> String {
+    format!("db: {} is not read by a taken file's SQL where a quillo.confirmed holds the run: it holds other tables' values, Quillo's own too", table)
+}
+
+/// What the hold says when a taken file's `drop` or MySQL's `explain` is of what it may not be of.
+fn of(head: &str, what: Option<&str>) -> String {
+    let may = if head == "drop" { "a table, an index, a view or a sequence, its kind named (`drop table t`)" } else { "a statement it may run: select, insert, update, delete, with, values, table or replace" };
+    format!("db: `{}` of {} is refused for kit/k.qwe's SQL where a quillo.confirmed holds the run: a taken file's `{}` is of {}. {}", head, what.unwrap_or("what this reading cannot place"), head, may, TAIL)
+}
+
+/// Under a quillo.confirmed on SQLite a taken file's `analyze` is refused, of every table, of one
+/// and of a schema, in any letters, and so are its reads of what holds other tables' values:
+/// `sqlite_stat1`, `sqlite_stat4` (its sampled index values: Quillo's own rows, which the main
+/// file's `analyze` put there), by a `count(*)`, by another spelling and through the main file's
+/// view of it, and `dbstat`, as a table and as a function; and its trigger, temporary or not, on the
+/// main file's table, whose statements would run as the main file's (a temporary one copied
+/// `sqlite_stat4` into the kit's table as the main file's insert ran). Run: the kit's query that SQLite plans by
+/// the statistics, `sqlite_master`'s names of them, a string `'sqlite_stat4'`, a unicode value. The
+/// main file reads them and runs `analyze` after. Without a quillo.confirmed the same kit runs
+/// `analyze` and reads `sqlite_stat4`, as in 0.8.10 (src/db.rs authorize, SQLITE_ANALYZE,
+/// SQLITE_READ, SQLITE_CREATE_TRIGGER; FEEDBACK83.md Q-1300, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn on_sqlite_a_taken_files_analyze_and_its_reads_of_the_statistics_are_refused() {
+    let d = dir("stat4");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    let refused: Vec<(&str, &str, String)> = vec![
+        ("db.exec", "analyze", ANALYZE.into()),
+        ("db.exec", "analyze kits", ANALYZE.into()),
+        ("db.exec", "ANALYZE main", ANALYZE.into()),
+        ("db.query", "select tbl, idx, stat from sqlite_stat1", mirrors("sqlite_stat1")),
+        ("db.query", "select idx, quote(sample) as s from sqlite_stat4", mirrors("sqlite_stat4")),
+        ("db.query", "select count(*) as n from main.SQLITE_STAT4", mirrors("sqlite_stat4")),
+        ("db.query", "select * from stats", mirrors("sqlite_stat4")),
+        ("db.query", "select name, pgsize from dbstat", mirrors("dbstat")),
+        ("db.query", "select count(*) as n from dbstat('main')", mirrors("dbstat")),
+        ("db.exec", "create temp trigger kit_tt after insert on kits begin insert into kit_copy select idx, quote(sample) from sqlite_stat4; end", TRIGGER.into()),
+        ("db.exec", "create trigger if not exists kit_t after insert on kits begin select 1; end", TRIGGER.into()),
+        ("db.exec", "CREATE TEMPORARY TRIGGER kit_t3 BEFORE DELETE ON kits BEGIN SELECT 'caf\u{e9}'; END", TRIGGER.into()),
+    ];
+    let ran: Vec<(&str, &str, &str)> = vec![
+        ("db.query", "select y from kits where y = 'k'", "[{ y: \"k\" }]"),
+        ("db.query", "select count(*) as n from sqlite_master where name like 'sqlite_stat%'", "[{ n: 2 }]"),
+        ("db.query", "select 'sqlite_stat4' as s", "[{ s: \"sqlite_stat4\" }]"),
+        ("db.query", "select y || '\u{e9}' as y from kits order by y", "[{ y: \"k\u{e9}\" }, { y: \"l\u{e9}\" }]"),
+    ];
+    let mut calls: Vec<(&str, &str)> = refused.iter().map(|(f, s, _)| (*f, *s)).collect();
+    calls.extend(ran.iter().map(|(f, s, _)| (*f, *s)));
+    write(&d, "kit/k.qwe", &kit(&calls));
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\ndb.open(\"data/app.db\")\ndb.exec(\"create table if not exists _quillo_mine (x text)\")\ndb.exec(\"create index if not exists _quillo_mine_x on _quillo_mine (x)\")\ndb.exec(\"insert into _quillo_mine values ('push endpoint caf\u{e9}'), ('mcp token hash')\")\ndb.exec(\"create table if not exists kits (y text)\")\ndb.exec(\"create index if not exists kits_y on kits (y)\")\ndb.exec(\"insert into kits values ('k'), ('l')\")\ndb.exec(\"analyze\")\ndb.exec(\"create view if not exists stats as select idx, quote(sample) as s from sqlite_stat4\")\nprint(steal())\nprint(\"main: \" + str(db.query(\"select count(*) > 0 as n from sqlite_stat4 where idx = 'kits_y'\")) + \" \" + str(db.exec(\"analyze\")))\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/app.db\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    let mut want = vec!["kit:".to_string()];
+    want.extend(refused.iter().map(|(_, _, w)| w.clone()));
+    want.extend(ran.iter().map(|(_, _, w)| w.to_string()));
+    assert!(out.contains(&format!("{}\nmain: [{{ n: 1 }}] {{ changes: 0, last_id: null }}\n", want.join("\n"))), "{}", out);
+    // Quillo's own rows, as `sqlite_stat4` keeps them (`quote(sample)`'s hex of "mcp token" and
+    // "push endpoint"), and as written.
+    assert!(!out.contains("6D637020746F6B656E") && !out.contains("7075736820656E64706F696E74") && !out.contains("token hash"), "{}", out);
+    // Unheld: as in 0.8.10.
+    std::fs::remove_file(d.join("data/app.db")).unwrap();
+    std::fs::remove_file(d.join("quillo.confirmed")).unwrap();
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(!out.contains("is not r") && out.contains("idx: \"_quillo_mine_x\""), "{}", out);
+}
+
+/// Under a quillo.confirmed on MySQL (MariaDB) a column named `engine` is no table option: a
+/// taken file's table with one first, one with it among others and keys on it (whole, and its
+/// first 3 characters), an index on it, a column added after it, its type changed, and a table made
+/// from a query of it are made. The option is judged as before by a name, a string (in other
+/// letters, and with a backslash), after a `,` of an `alter`, and as a partition's, which sets
+/// the table's; an `engine = ...` inside a column list is refused (MariaDB's syntax error). A
+/// string's engine of the list (`'memory'`, `"Aria"`) is made. `explain` of a query in brackets
+/// runs, one or two deep; of `(grant ...)` is judged by `grant`, of `(explain ...)` and of `()`
+/// refused, saying so; MariaDB's `create or replace` of an index and of a sequence are refused,
+/// saying `or replace` (src/db.rs table_options_refused, head_refused, creates_ok; FEEDBACK83.md
+/// Q-1300, found by the coverage tests; branch feedback82-85).
+#[test]
+fn on_mysql_a_column_named_engine_is_no_table_option_and_explain_takes_a_query_in_brackets() {
+    let Some(my) = support::mariadb("cov8285db7f") else {
+        eprintln!("MariaDB is not installed: skipped");
+        return;
+    };
+    let url = my.url("engine_column");
+    let d = dir("myengine");
+    let connect = reaches("`engine = connect`");
+    let refused: Vec<(&str, &str, String)> = vec![
+        ("db.exec", "create table kit_p (x int) partition by range (x) (partition p0 values less than (10) engine = connect)", connect.clone()),
+        ("db.exec", "alter table kit_e add column w int, engine connect", connect.clone()),
+        ("db.exec", "create table kit_c (x int) engine 'Connect'", connect.clone()),
+        ("db.exec", "create table kit_c (x int) engine = 'inno\\db'", reaches("`engine = inno\\db`")),
+        ("db.exec", "create table kit_c (x int, engine = connect)", connect.clone()),
+        ("db.exec", "create or replace index kit_ei on kit_e (engine)", runs("`create or replace index`")),
+        ("db.exec", "create or replace sequence kit_q", runs("`create or replace sequence`")),
+        ("db.query", "explain (grant select on kit_e to root)", begins("grant")),
+        ("db.query", "explain (explain select 1)", of("explain", Some("`explain`"))),
+        ("db.query", "explain ()", of("explain", None)),
+    ];
+    let none = "{ changes: 0, last_id: null }";
+    let plan = "[{ id: 1, select_type: \"SIMPLE\", table: null, type: null, possible_keys: null, key: null, key_len: null, ref: null, rows: null, Extra: \"No tables used\" }]";
+    let ran: Vec<(&str, &str, &str)> = vec![
+        ("db.exec", "create table kit_e (engine int, y varchar(9))", none),
+        ("db.exec", "create table kit_f (x int, engine varchar(9), key (engine), key kit_fk (engine(3)))", none),
+        ("db.exec", "create index kit_ei on kit_e (engine)", none),
+        ("db.exec", "alter table kit_e add column z int after engine", none),
+        ("db.exec", "alter table kit_e modify engine bigint", none),
+        ("db.exec", "create table kit_g as select engine, '\u{e9}' as e from kit_e", none),
+        ("db.exec", "create table kit_s (x int) engine 'memory'", none),
+        ("db.exec", "create table kit_a (x int) engine = \"Aria\"", none),
+        ("db.query", "explain (select 1)", plan),
+        ("db.query", "explain ((select 1))", plan),
+    ];
+    let mut calls: Vec<(&str, &str)> = refused.iter().map(|(f, s, _)| (*f, *s)).collect();
+    calls.extend(ran.iter().map(|(f, s, _)| (*f, *s)));
+    write(&d, "kit/k.qwe", &kit(&calls));
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\nprint(steal())\nprint(\"tables: \" + str(db.query(\"select table_name as t, engine as e from information_schema.tables where table_schema = database() order by 1\")))\nprint(\"cols: \" + str(db.query(\"select column_name as c, data_type as t from information_schema.columns where table_schema = database() and table_name = 'kit_e' order by ordinal_position\")))\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    let mut want = vec!["kit:".to_string()];
+    want.extend(refused.iter().map(|(_, _, w)| w.clone()));
+    want.extend(ran.iter().map(|(_, _, w)| w.to_string()));
+    assert!(out.contains(&format!("{}\n", want.join("\n"))), "{}", out);
+    assert!(
+        out.contains("tables: [{ t: \"kit_a\", e: \"Aria\" }, { t: \"kit_e\", e: \"InnoDB\" }, { t: \"kit_f\", e: \"InnoDB\" }, { t: \"kit_g\", e: \"InnoDB\" }, { t: \"kit_s\", e: \"MEMORY\" }]\n"),
+        "{}",
+        out
+    );
+    assert!(out.contains("cols: [{ c: \"engine\", t: \"bigint\" }, { c: \"z\", t: \"int\" }, { c: \"y\", t: \"varchar\" }]\n"), "{}", out);
 }

@@ -95,7 +95,16 @@ and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2
   PostgreSQL any `pg_` name; a function that takes a table (from `pg_proc`: `nextval`,
   `setval`, `has_table_privilege`, `row_security_active`, the `brin_*` ones and the rest) only
   with the name written as a string, not a column, a number (an oid) or a parameter; on
-  MariaDB a `[` outside strings, which `sql_mode=MSSQL` reads as a quoted name.
+  MariaDB a `[` outside strings, which `sql_mode=MSSQL` reads as a quoted name. A taken
+  file's statement is judged as its server is sent it too (a value's place written `$1`
+  after a `$` opened a dollar quote the reading never saw), the `mysql` and `sys` schemas
+  and the catalogs by every spelling (quoted, and the letters outside ASCII MariaDB takes for
+  ASCII ones), and PostgreSQL's own extensions' functions that reach a table by text by
+  name (`xpath_table`, pageinspect's, `pgstattuple`, amcheck's, pg_surgery's); on SQLite a
+  taken file runs no `ANALYZE`, makes no trigger and reads no statistics (`sqlite_stat4`
+  held Quillo's own rows' values). A column named `engine` is no table option, MySQL's
+  `explain (select ...)` runs, and the refusals say what they refuse (found by the coverage
+  tests of 3117dea).
 - **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
   of 2026-11-24): a name another file defines, used without taking it, is an error in
   `quillo check`, and the start refuses it with `--no-check` too, as the value under it
