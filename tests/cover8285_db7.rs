@@ -717,12 +717,16 @@ fn on_sqlite_a_taken_file_makes_no_virtual_table_over_dbstat() {
 /// window functions, JSON, dates, `like`/`ilike` with values, `alter table` (columns, a
 /// constraint, a rename), views, `explain`, sequences, a full-text table, `truncate`, unicode
 /// values; on SQLite, PostgreSQL and MySQL (MariaDB), each its own line. And SQLite's pragmas a
-/// kit may use: its reads (`table_info`, `foreign_keys`, `journal_mode`, `foreign_key_list`,
-/// `index_list`, `user_version`, `integrity_check`, `compile_options`, `database_list`) and its
-/// settings (`user_version = 3`, `synchronous`, `busy_timeout`, `foreign_keys = off`,
-/// `journal_mode = delete`) run; `pragma optimize`, which runs `analyze` here, is refused as
-/// `analyze` is (src/db.rs text_run, head_refused, creates_ok, table_options_refused, authorize;
-/// FEEDBACK83.md Q-1300, the review of a65644e; branch feedback82-85).
+/// kit may use to read (`table_info`, `table_xinfo`, `index_info`, `index_xinfo`, `table_list`,
+/// `foreign_keys`, `journal_mode` quoted too, `foreign_key_list`, `foreign_key_check`,
+/// `index_list`, `user_version` schema-qualified too, `integrity_check(5)`, `quick_check(t)`,
+/// `compile_options`, `database_list`, `function_list`, `data_version`, `schema_version`,
+/// `wal_checkpoint`, `pragma_index_list()`) run; `pragma optimize`, which runs `analyze` here, is
+/// refused as `analyze` is. Round 8: the settings this test ran (`user_version = 3`,
+/// `synchronous`, `busy_timeout`, `foreign_keys = off`, `journal_mode = delete`) are refused now,
+/// the decision of round 8, and are in the test after it (src/db.rs text_run, head_refused,
+/// creates_ok, table_options_refused, authorize; FEEDBACK83.md Q-1300, the review of a65644e;
+/// branch feedback82-85).
 #[test]
 fn the_sql_a_kit_ordinarily_writes_runs_under_a_hold_on_each_database() {
     let sqlite: Vec<(&str, &str, &str)> = vec![
@@ -780,11 +784,23 @@ fn the_sql_a_kit_ordinarily_writes_runs_under_a_hold_on_each_database() {
         ("db.query", "pragma integrity_check", ""),
         ("db.query", "pragma compile_options", ""),
         ("db.query", "pragma database_list", ""),
-        ("db.exec", "pragma user_version = 3", ""),
-        ("db.exec", "pragma synchronous = normal", ""),
-        ("db.exec", "pragma busy_timeout = 1000", ""),
-        ("db.exec", "pragma foreign_keys = off", ""),
-        ("db.exec", "pragma journal_mode = delete", ""),
+        // Round 8: more of the reads a kit may use (its settings are refused: see below).
+        ("db.query", "pragma table_xinfo(k_users)", ""),
+        ("db.query", "pragma index_info(k_users_lname)", ""),
+        ("db.query", "pragma index_xinfo(k_users_lname)", ""),
+        ("db.query", "pragma table_list", ""),
+        ("db.query", "pragma table_list(k_users)", ""),
+        ("db.query", "pragma foreign_key_check", ""),
+        ("db.query", "pragma foreign_key_check(k_posts)", ""),
+        ("db.query", "pragma integrity_check(5)", ""),
+        ("db.query", "pragma quick_check(k_users)", ""),
+        ("db.query", "pragma main.user_version", ""),
+        ("db.query", "pragma \"journal_mode\"", ""),
+        ("db.query", "select name from pragma_index_list('k_users')", ""),
+        ("db.query", "pragma function_list", ""),
+        ("db.query", "pragma data_version", ""),
+        ("db.query", "pragma schema_version", ""),
+        ("db.query", "pragma wal_checkpoint", ""),
     ];
     let pg: Vec<(&str, &str, &str)> = vec![
         ("db.exec", "create table if not exists k_users (id serial primary key, name text not null, email text unique, created timestamptz default now(), age int check (age >= 0), meta jsonb default '{}')", ""),
@@ -929,4 +945,97 @@ fn the_sql_a_kit_ordinarily_writes_runs_under_a_hold_on_each_database() {
         assert_eq!(code, 0, "{}", out);
         assert!(out.contains(&ran(calls, &[])), "{}: {}", name, out);
     }
+}
+
+// Fix round 8
+
+/// What the hold says when a taken file's SQL sets a SQLite pragma.
+fn sets(name: &str, value: &str) -> String {
+    format!("db: `pragma {} = {}` sets the database connection's or file's state, which every file's later statements see, and is refused for kit/k.qwe's SQL where a quillo.confirmed holds the run: a taken file's pragmas only read (`pragma {}`). {}", name, value, name, TAIL)
+}
+
+/// Under a quillo.confirmed on SQLite a taken file's pragma given a value is refused, as a `set`
+/// is on PostgreSQL and MySQL: every spelling (`= v`, the call form `(v)`, the name quoted, in
+/// capitals, `main.`), the settings of the shared connection and of the file (`journal_mode`,
+/// `query_only`, `schema_version`, `foreign_keys`, `user_version` given a unicode and an empty
+/// value, `cache_size` a negative one, `synchronous`, `busy_timeout`) and the pragmas that act
+/// given one (`wal_checkpoint(truncate)`, `optimize(0x10002)`), each named in the refusal. Its
+/// reads run (`table_info(t)`, `journal_mode`, `query_only`). The main file's own settings run,
+/// and none of the kit's reached the connection: its journal is WAL, its keys on, its
+/// `user_version` the main file's 7, and it writes (src/db.rs authorize, SQLITE_PRAGMA,
+/// pragma_reads; FEEDBACK83.md Q-1300, the coordinator's round 8; branch feedback82-85).
+#[test]
+fn on_sqlite_a_taken_files_pragma_settings_are_refused_and_its_reads_run() {
+    let d = dir("pragmas");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    let calls: Vec<(&str, &str, String)> = vec![
+        ("db.exec", "pragma journal_mode = delete", sets("journal_mode", "delete")),
+        ("db.exec", "pragma journal_mode(delete)", sets("journal_mode", "delete")),
+        ("db.exec", "pragma \"journal_mode\" = delete", sets("journal_mode", "delete")),
+        ("db.exec", "pragma main.journal_mode = delete", sets("journal_mode", "delete")),
+        ("db.exec", "pragma journal_mode = off", sets("journal_mode", "off")),
+        ("db.exec", "PRAGMA Query_Only = 1", sets("query_only", "1")),
+        ("db.exec", "pragma schema_version = 5", sets("schema_version", "5")),
+        ("db.exec", "pragma foreign_keys = off", sets("foreign_keys", "off")),
+        ("db.exec", "pragma user_version = 'caf\u{e9}'", sets("user_version", "caf\u{e9}")),
+        ("db.exec", "pragma user_version = ''", sets("user_version", "")),
+        ("db.exec", "pragma user_version = 3", sets("user_version", "3")),
+        ("db.exec", "pragma cache_size = -2000", sets("cache_size", "-2000")),
+        ("db.exec", "pragma synchronous = normal", sets("synchronous", "normal")),
+        ("db.exec", "pragma busy_timeout = 1000", sets("busy_timeout", "1000")),
+        ("db.exec", "pragma wal_checkpoint(truncate)", sets("wal_checkpoint", "truncate")),
+        ("db.exec", "pragma optimize(0x10002)", sets("optimize", "0x10002")),
+        ("db.query", "pragma table_info(kits)", "ran".into()),
+        ("db.query", "pragma journal_mode", "ran".into()),
+        ("db.query", "pragma query_only", "ran".into()),
+        ("db.exec", "insert into kits values ('k')", "ran".into()),
+    ];
+    let made: Vec<(&str, &str, &str)> = calls.iter().map(|(f, s, _)| (*f, *s, "")).collect();
+    write(&d, "kit/k.qwe", &kit_ran(&made));
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\ndb.open(\"data/app.db\")\ndb.exec(\"create table if not exists kits (x text)\")\nprint(\"main: \" + str(db.exec(\"pragma user_version = 7\")) + \" \" + str(db.query(\"pragma cache_size\")))\nprint(steal())\nprint(\"after: \" + str(db.query(\"pragma journal_mode\")) + str(db.query(\"pragma foreign_keys\")) + str(db.query(\"pragma user_version\")) + str(db.query(\"pragma query_only\")) + \" \" + str(db.query(\"select count(*) as n from kits\")))\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/app.db\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    let mut want = vec!["kit:".to_string()];
+    want.extend(calls.iter().map(|(_, _, w)| w.clone()));
+    assert!(out.contains("main: { changes: 0, last_id: null } [{ cache_size: -2000 }]\n"), "{}", out);
+    assert!(out.contains(&format!("{}\n", want.join("\n"))), "{}", out);
+    assert!(out.contains("after: [{ journal_mode: \"wal\" }][{ foreign_keys: 1 }][{ user_version: 7 }][{ query_only: 0 }] [{ n: 1 }]\n"), "{}", out);
+}
+
+/// Under a quillo.confirmed a taken file's SQLite migration that turns foreign keys off to rebuild
+/// a table, as SQLite's own steps do, is applied: Quillo turns them off around it and on again
+/// (migrate.rs), which the hold lets through while a migration runs, and the child's row stays.
+/// Its migration that sets another pragma (`user_version`) is refused, saying so after the
+/// migration's name, and `db.migrate` stops (src/db.rs authorize, migrate_as, MIGRATING;
+/// FEEDBACK83.md Q-1300, the coordinator's round 8; branch feedback82-85).
+#[test]
+fn a_taken_files_migration_turns_foreign_keys_off_as_quillo_does_and_sets_no_other_pragma() {
+    let d = dir("migpragma");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    write(
+        &d,
+        "kit/k.qwe",
+        "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  let k = db.connect(\"data/k.db\")\n  return \"kit: \" + str(k.migrate(\"kit/m\")) + \" \" + str(k.query(\"select p from child\")) + \" \" + str(k.query(\"pragma foreign_keys\"))\n}\n",
+    );
+    write(&d, "kit/m/001_a.sql", "create table parent (id integer primary key);\ncreate table child (id integer primary key, p int references parent(id) on delete cascade);\ninsert into parent values (1);\ninsert into child values (1, 1);\n");
+    write(&d, "kit/m/002_rebuild.sql", "pragma foreign_keys = off;\ncreate table parent2 (id integer primary key, name text default 'caf\u{e9}');\ninsert into parent2 (id) select id from parent;\ndrop table parent;\nalter table parent2 rename to parent;\npragma foreign_keys = on;\n");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\nprint(steal())\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/k.db\"]\nfiles = [\"kit/m/\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("kit: [\"001_a.sql\", \"002_rebuild.sql\"] [{ p: 1 }] [{ foreign_keys: 1 }]\n"), "{}", out);
+    // A migration that sets another pragma: refused, and the run stops.
+    std::fs::remove_file(d.join("data/k.db")).unwrap();
+    write(&d, "kit/m/003_v.sql", "pragma user_version = 9;\n");
+    let (code, out) = run(&d, &[]);
+    assert_ne!(code, 0, "{}", out);
+    assert!(out.contains(&format!("kit/k.qwe:6: db.migrate: migration 003_v.sql failed: {}\n", &sets("user_version", "9")["db: ".len()..])), "{}", out);
+    assert_eq!(column(&d.join("data/k.db"), "select name from sqlite_master where name = 'child'"), ["child"]);
 }

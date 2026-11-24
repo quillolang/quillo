@@ -108,7 +108,10 @@ and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2
   options, not by the word before it (`alter table after engine = csv` changed a table to
   CSV), and on SQLite a taken file makes no virtual table over `dbstat` (found by the review
   of a65644e); the SQL a kit ordinarily writes runs under a hold on SQLite, PostgreSQL and
-  MariaDB, as a test of 151 statements shows.
+  MariaDB, as a test of 151 statements shows. On SQLite a taken file's pragma that sets (`=
+  v`, `(v)`, quoted, `main.`) is refused and its reads run: a kit left the main file's
+  connection with its journal off and `query_only` on; Quillo's read-only transactions and
+  its foreign-keys turn in migrations set theirs as its own.
 - **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
   of 2026-11-24): a name another file defines, used without taking it, is an error in
   `quillo check`, and the start refuses it with `--no-check` too, as the value under it

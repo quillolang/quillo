@@ -11041,7 +11041,11 @@ for the site and the visitor.
   every `pg_...` name). On SQLite a taken file runs no `ANALYZE`, makes no trigger and no
   virtual table over `dbstat`, and reads neither the statistics (`sqlite_stat1` to
   `sqlite_stat4`) nor `dbstat` (a virtual table the main file made over `dbstat` is read by
-  its own name: page sizes, not values). A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
+  its own name: page sizes, not values). Its pragmas only read (`pragma table_info(t)`,
+  `pragma journal_mode`): one given a value (`pragma journal_mode = delete`, `pragma
+  foreign_keys(off)`) sets the shared connection or the file and is refused, as `SET` is on
+  PostgreSQL and MySQL; Quillo's own turn of foreign keys around a migration that asks for
+  it still happens. A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
   `DELETE`, `WITH`, `VALUES`, `TABLE`, `REPLACE`, `EXPLAIN` of one of these (MySQL's in
   brackets too), `CREATE` or `ALTER` as above (a MySQL table's engine InnoDB, Aria, MyISAM
   or MEMORY, by name or string, wherever the server takes a table's options: after its name,

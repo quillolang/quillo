@@ -2352,6 +2352,22 @@ fn statements_switch(it: &Interp, at: (usize, usize)) {
     }
 }
 
+/// Whether the pragma `name` given a value only reads, its value naming what it reads about: a
+/// table's or an index's columns, keys and indexes, the tables, and the checks of the file or of a
+/// table (`integrity_check(t)`, `quick_check(100)`) (`authorize`; FEEDBACK83.md, Q-1300; branch
+/// feedback82-85). Every other pragma given one sets, or acts (`wal_checkpoint(truncate)`,
+/// `incremental_vacuum(5)`, `optimize(0x10002)`).
+fn pragma_reads(name: Option<&std::ffi::CStr>) -> bool {
+    const READS: &[&[u8]] = &[b"table_info", b"table_xinfo", b"table_list", b"index_info", b"index_xinfo", b"index_list", b"foreign_key_list", b"foreign_key_check", b"integrity_check", b"quick_check"];
+    name.is_some_and(|n| READS.iter().any(|r| n.to_bytes().eq_ignore_ascii_case(r)))
+}
+
+thread_local! {
+    /// A migration runs on this thread (`migrate_as`), whose `foreign_keys` migrate.rs turns off
+    /// and on again around a file that asks for it (`authorize`).
+    static MIGRATING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// What SQLite asks of each statement of a connection Quillo opens, as it compiles it
 /// (`sqlite3_set_authorizer`): a file it attaches, by `ATTACH` or by `VACUUM INTO` (whose copy
 /// SQLite attaches, its name as a text, as it runs), is judged as `db.open`'s file is, by what the
@@ -2458,6 +2474,30 @@ unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int
                 // The schema written as text, under which any table can be renamed into one of
                 // Quillo's own with a name worked out in the SQL (found by the review of bc460fd).
                 Some(_) if named(b"writable_schema") && OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_TAKEN.get() => "SQLite's writable_schema is not turned on by a taken file's SQL where a quillo.confirmed holds the run",
+                // Any other pragma given a value by a taken file, `= v` or `(v)`, but those whose
+                // value names what they read (`pragma table_info(t)`): a setting of the program's
+                // shared connection or of its file (`query_only`, `foreign_keys`, `journal_mode`,
+                // `schema_version`, `user_version`, ...), which every file's later statements see,
+                // as a `set` on PostgreSQL and MySQL is (`head_refused`). SQLite gives the
+                // pragma's name and its value whatever their spelling (quoted, `main.`, a call);
+                // a pragma read with none runs, and so does a table-valued `pragma_x()`, which
+                // SQLite has only for pragmas that change nothing. Quillo's own turn of
+                // `foreign_keys` around a migration that asks for it (migrate.rs), which SQLite
+                // takes for none inside the migration's transaction, goes on (FEEDBACK83.md, Q-1300,
+                // the coordinator's round 8 after the review of a65644e; branch feedback82-85).
+                Some(v) if OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_TAKEN.get() && !pragma_reads(text(a1)) && !(named(b"foreign_keys") && MIGRATING.get()) => {
+                    let (name, value) = (text(a1).map_or(String::new(), |t| t.to_string_lossy().to_ascii_lowercase()), v.to_string_lossy().into_owned());
+                    let file = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| STATEMENTS_OF.with(|s| s.try_borrow().ok().map(|s| crate::confirm::held_name(s.file.as_deref()))))).ok().flatten().unwrap_or_else(|| "this file".into());
+                    STATEMENTS_OF.with(|s| {
+                        if let Ok(mut s) = s.try_borrow_mut() {
+                            s.refused = Some(format!(
+                                "`pragma {} = {}` sets the database connection's or file's state, which every file's later statements see, and is refused for {}'s SQL where a quillo.confirmed holds the run: a taken file's pragmas only read (`pragma {}`). Run it from the main file's SQL, or from a migration the main file runs",
+                                name, value, file, name
+                            ));
+                        }
+                    });
+                    return ffi::SQLITE_DENY;
+                }
                 _ => return ffi::SQLITE_OK,
             };
             STATEMENTS_OF.with(|s| {
@@ -4396,7 +4436,9 @@ fn migrate_as<T>(code: (Option<Arc<str>>, Arc<Path>), run: impl FnOnce() -> Resu
         was
     });
     STATEMENTS_AT.set((0, 0));
+    let migrating = MIGRATING.replace(true);
     let r = run();
+    MIGRATING.set(migrating);
     let refused = STATEMENTS_OF.with(|s| {
         let mut s = s.borrow_mut();
         (s.file, s.base) = (was.0, was.1);
@@ -5587,6 +5629,8 @@ struct QueryOnly<'a> {
 impl Drop for QueryOnly<'_> {
     fn drop(&mut self) {
         let c = self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Quillo's own setting, whatever file's code the transaction is (`authorize`).
+        let _own = OwnSql::enter();
         let _ = c.execute_batch(&format!("pragma query_only = {}", if self.was != 0 { 1 } else { 0 }));
     }
 }
@@ -5640,6 +5684,9 @@ pub(crate) fn attempt(
                     return Ok(None);
                 }
                 let was = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_row("pragma query_only", [], |row| row.get::<_, i64>(0));
+                // Quillo's own setting, as a taken file's `pragma query_only = on` is refused
+                // (`authorize`; FEEDBACK83.md, Q-1300; branch feedback82-85).
+                let _own = OwnSql::enter();
                 was.and_then(|was| run("pragma query_only = on").map(|()| Some(QueryOnly { conn: m, was })))
             }));
             let query_only = match begun {
