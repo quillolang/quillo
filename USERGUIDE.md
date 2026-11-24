@@ -10949,12 +10949,17 @@ Asking, and who answers:
   are spaced, and reads `include_str!`, `include_bytes!` and `include!` as `fs`. What it
   cannot follow it reads as every effect but `db`, and says where: a path a macro builds
   from its argument, a foreign block (`extern "C" { ... }`), `asm!`, a `use` nested more than
-  64 deep. A file that builds another into it (`include!`, `include_str!`,
-  `include_bytes!`, `#[path]`, an out-of-line `mod x;`) is refused under a `quillo.confirmed`,
-  by `quillo confirm`, `check`, `build` and the start, since the other file is outside its
-  SHA-256; without one, it is a warning. It is a reading of the text, not a proof: a crate
-  can do what it does unseen (`libc::kill` reads as the `libc` crate, which the file's
-  `crates` list confirms by name).
+  64 deep. A file that builds another into it is refused under a `quillo.confirmed`, by
+  `quillo confirm`, `check`, `build`, the start and a reload, since the other file is outside
+  its SHA-256; without one, it is a warning. That is `include!`, `include_str!` or
+  `include_bytes!` however it is written or named, `#[path]`, a `mod x;` that is not `mod x
+  { ... }` (one a macro writes too), a macro named by a macro's argument (`$m!`), a
+  dependency by anything but its version (`path`, `git`, `registry`), and a crate whose
+  macros build files in (`rust-embed`, `include_dir`, `askama`, `sqlx` and the like). The
+  file is read as Rust reads it, by its tokens: comments, every kind of string and Rust's
+  whitespace. It is still a reading, not a proof: a crate can do what it does unseen
+  (`libc::kill` reads as the `libc` crate, which the file's `crates` list confirms by name),
+  a registry crate's macro too.
 
 Not held yet: [`--watch`](#options-of-quillo-run) does not read `quillo.confirmed` again
 when it changes (restart after `quillo confirm`); what a page loads and calls is only

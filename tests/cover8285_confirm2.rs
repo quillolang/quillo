@@ -1080,3 +1080,169 @@ fn a_plugin_that_builds_another_file_into_it_is_refused_under_a_hold() {
     assert_eq!(code, Some(0), "{}", out);
     assert!(read(&d.join("quillo.confirmed")).contains("[\"hi.qwer\"]\nsha256 = "), "{}", read(&d.join("quillo.confirmed")));
 }
+
+// ---- edge tests of the fixes the review of a867750 asked for ------------------------------------
+
+/// A plugin that builds another file into it is refused under a quillo.confirmed however it is
+/// written, as the reading reads Rust's tokens: `mod helper;` with a comment or any of Rust's
+/// whitespace between its words, `mod $n;` in a macro, `mod` handed to a macro, `include!`,
+/// `include_str!` and `include_bytes!` with any delimiter, space or comment around their `!`, by a
+/// raw name or a name a `use` gives, `$m!`, paste's `[<...>]!`, and a dependency from a folder,
+/// from git, with another key, of a crate whose macros build files in, or one not read as a
+/// name and a version. `quillo confirm` writes nothing; with the hash written by hand, check, a
+/// start and `quillo build` refuse it, and so does a `--watch` load of the name a `use` gives
+/// (src/confirm.rs, FEEDBACK83.md Q-1305, found by the review of a867750; branch feedback82-85).
+#[test]
+fn a_plugin_that_builds_another_file_in_is_refused_however_it_is_written() {
+    use sha2::Digest;
+    let module = "`mod helper;`, a module in another file";
+    let mut cases: Vec<(String, String, String)> = vec![
+        ("comment".into(), "mod/**/helper;".into(), module.into()),
+        ("nested".into(), "mod /* a /* b */ c */ helper;".into(), module.into()),
+        ("macro".into(), "macro_rules! m { ($n:ident) => { mod $n; } }\nm!(helper);".into(), "`mod $n;`, a module in another file".into()),
+        ("handed".into(), "macro_rules! m { ($a:tt $b:ident) => { $a $b; } }\nm!(mod helper);".into(), "`mod helper` handed to a macro, which can make a module in another file of it".into()),
+        ("handedalone".into(), "macro_rules! m { ($a:tt) => { $a helper; } }\nm!(mod);".into(), "`mod` handed to a macro, which can make a module in another file of it".into()),
+        ("brace".into(), "include! {\"helper.rs\"}".into(), "`include!`".into()),
+        ("bracket".into(), "const T: &str = include_str! [\"/etc/hosts\"];".into(), "`include_str!`".into()),
+        ("formfeed".into(), "const T: &str = include_str!\u{0C}(\"/etc/hosts\");".into(), "`include_str!`".into()),
+        ("spaced".into(), "static B: &[u8] = include_bytes /* x */ ! (\"helper.rs\");".into(), "`include_bytes!`".into()),
+        ("raw".into(), "r#include!(\"helper.rs\");".into(), "`include!`".into()),
+        ("alias".into(), "use std::include_str as grab;\nconst T: &str = grab!(\"/etc/hosts\");".into(), "`grab!`, an include macro by another name".into()),
+        ("aliasgroup".into(), "use core::{include_bytes as g};\nstatic B: &[u8] = g!(\"helper.rs\");".into(), "`g!`, an include macro by another name".into()),
+        ("dollar".into(), "macro_rules! inc { ($m:ident) => { $m!(\"/etc/hosts\") } }\nconst T: &str = inc!(include_str);".into(), "`$m!`, a macro named by what a macro is given, which can be `include!`".into()),
+        ("paste".into(), "paste::paste! { const T: &str = [<include _str>]!(\"/etc/hosts\"); }".into(), "`[<...>]!`, a macro whose name paste builds, which can be `include!`".into()),
+    ];
+    for (name, ws) in [("vt", '\u{0B}'), ("ff", '\u{0C}'), ("tab", '\t'), ("nel", '\u{85}'), ("lrm", '\u{200E}'), ("rlm", '\u{200F}'), ("ls", '\u{2028}'), ("ps", '\u{2029}')] {
+        cases.push((format!("ws-{}", name), format!("mod{}helper;", ws), module.into()));
+    }
+    let deps = [
+        ("path", "helper = { path = \"helper\" }", "the dependency `helper` from a folder (`path`)"),
+        ("git", "helper = { git = \"https://example.invalid/helper.git\", branch = \"main\" }", "the dependency `helper` from git (`git`)"),
+        ("registry", "helper = { version = \"1\", registry = \"elsewhere\" }", "the dependency `helper` with `registry`, which can take its code from elsewhere"),
+        ("embed", "rust-embed = \"8\"", "the dependency `rust-embed`, rust-embed, whose macros build files in"),
+        ("renamed", "e = { package = \"rust-embed\", version = \"8\" }", "the dependency `e`, rust-embed, whose macros build files in"),
+        ("dotted", "helper.path = \"helper\"", "the dependency line `helper.path = \"helper\"`, not read as a crate's name and version"),
+        ("quoted", "\"helper\" = \"1\"", "the dependency line `\"helper\" = \"1\"`, not read as a crate's name and version"),
+    ];
+    for (name, dep, how) in deps {
+        cases.push((format!("dep-{}", name), format!("//! [dependencies]\n//! {}", dep), how.into()));
+    }
+    for (name, code, how) in &cases {
+        let d = dir(&format!("builds-in3-{}", name));
+        let (header, code) = match code.strip_prefix("//! [dependencies]\n") {
+            Some(dep) => (format!("//! version: 1.0.0\n//! effects: fs\n//! [dependencies]\n{}\n", dep), String::new()),
+            None => ("//! version: 1.0.0\n//! effects: fs\n".to_string(), code.clone()),
+        };
+        let src = format!("{}{}\npub fn hi() -> String {{ \"hi\".into() }}\n", header, code);
+        let line = if name.starts_with("dep-") { 4 } else if ["alias", "aliasgroup"].contains(&name.as_str()) { 4 } else { 3 };
+        let line = match name.as_str() {
+            "macro" => 3,
+            "handed" | "handedalone" => 4,
+            _ => line,
+        };
+        write(&d, "hi.qwer", &src);
+        write(&d, "main.qwe", "import hi.qwer use hi\nroute GET / = hi()\n");
+        let why = format!("hi.qwer builds another file into it ({} at line {}), which its SHA-256 in quillo.confirmed would not cover", how, line);
+        let (code, out) = quillo(&d, &["confirm", "--yes"]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.starts_with(&format!("quillo confirm: {}", why)) && out.ends_with("quillo confirm: nothing written\n"), "{}: {}", name, out);
+        assert!(!d.join("quillo.confirmed").exists(), "{}", name);
+        // Its hash written by hand: check, a start and `quillo build` refuse it.
+        let sha: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|x| format!("{:02x}", x)).collect();
+        write(&d, "quillo.confirmed", &format!("[\"main.qwe\"]\n\n[\"hi.qwer\"]\nsha256 = \"{}\"\n", sha));
+        let (code, out) = quillo(&d, &["check", "main.qwe"]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.contains(&format!("hi.qwer:{}: error: {}", line, why)), "{}: {}", name, out);
+        let (code, out) = quillo(&d, &["run", "main.qwe", "--port", "0", "--no-check"]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.contains(&format!("quillo: {}", why)), "{}: {}", name, out);
+        let (code, out) = quillo(&d, &["build", "main.qwe"]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.contains(&why) && out.contains(": nothing built"), "{}: {}", name, out);
+        // And a load under --watch, of the name a `use` gives (where the reading was another's).
+        if name == "alias" {
+            write(&d, "main.qwe", "route GET / = \"main\"\n");
+            let (g, port, log) = serve(&d, &["--watch", "--no-check", "--no-build"]);
+            assert_eq!(send(port, "GET", "/", &[], "").body, "main", "{}", read(&log));
+            write(&d, "main.qwe", "import hi.qwer use hi\nroute GET / = hi()\n");
+            assert!(log_has(&log, &why, 30), "{}", read(&log));
+            drop(g);
+        }
+    }
+}
+
+/// What builds nothing in stays confirmed: an inline `mod helper { }` (by a macro's name too),
+/// `mod helper;` in a comment and in each kind of string, a character and a lifetime beside such
+/// a text, a variable named `include` compared with `!=`, a macro with no `$m!`, and the
+/// dependencies the catalog's plugins have (src/confirm.rs, FEEDBACK83.md Q-1305, found by the review of a867750; branch feedback82-85).
+#[test]
+fn what_builds_nothing_in_is_confirmed_as_before() {
+    let d = dir("builds-in3-not");
+    let code = [
+        "mod helper { pub fn hi() -> String { \"hi\".into() } }",
+        "macro_rules! m { ($n:ident) => { mod $n { } } }\nm!(inner);",
+        "// mod helper; include!(\"x\")\n/* mod helper; /* include_str!(\"y\") */ */",
+        "const A: &str = \"mod helper; include!(\\\"x\\\")\";",
+        "const B: &[u8] = b\"mod helper;\";",
+        "const C: &core::ffi::CStr = c\"mod helper;\";",
+        "const D: &str = r##\"mod helper; \"# include!(\"##;",
+        "const E: &[u8] = br##\"mod helper;\"#\"##;",
+        "const F: &core::ffi::CStr = cr#\"mod helper; \\\"#;",
+        "const G: char = '\"';\nconst H: u8 = b'\\'';\nfn l<'a>(x: &'a str) -> &'a str { x }",
+        "fn n() -> bool { let include = 1; include != 2 }",
+        "macro_rules! twice { ($x:expr) => { $x + $x } }\nfn t() -> i64 { twice!(1) }",
+    ]
+    .join("\n");
+    let src = format!("//! version: 1.0.0\n//! effects: none\n//! [dependencies]\n//! serde_json = {{ version = \"1\", features = [\"preserve_order\"] }}\n//! ureq = \"2\"\n//! gix = {{ version = \"0.66\", default-features = false, features = [\"revision\"] }}\n{}\npub fn hi() -> String {{ helper::hi() }}\n", code);
+    write(&d, "hi.qwer", &src);
+    write(&d, "main.qwe", "import hi.qwer use hi\nroute GET / = hi()\n");
+    let (code, out) = quillo(&d, &["confirm", "--yes"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(read(&d.join("quillo.confirmed")).contains("[\"hi.qwer\"]\nsha256 = "), "{}", read(&d.join("quillo.confirmed")));
+}
+
+/// What a Rust file calls is read past every kind of string and character, whichever spaces are
+/// between a path's parts: a `std::fs::read_to_string` after `"\""`, `b"\""`, `c"\""`, `r"\"`,
+/// `r#"\"#`, `br#"\"#`, `cr#"\"#`, `r##"a"#b"##`, `'\''`, `b'\''`, `'"'` and a lifetime, and
+/// `std::fs::read_to_string` written with each of Rust's whitespace and a comment around its `::`,
+/// reads as fs. A qualified path (`<std::net::TcpStream>::connect`, `<std::net::TcpStream as
+/// Read>::`), a type's other name (`type T = std::net::TcpStream;`, `UdpSocket`) read as net;
+/// `$m!` as everything; `UNIX_EPOCH.elapsed()` as time. What takes nothing reads as nothing:
+/// `std::io::Result<()>` named, `a < b`, `Vec<u8>::new`, `UNIX_EPOCH` alone, the time of a file
+/// (src/confirm.rs, FEEDBACK83.md Q-1305, found by the review of a867750; branch feedback82-85).
+#[test]
+fn what_a_rust_file_calls_is_read_past_every_kind_of_string() {
+    let d = dir("rust-tokens");
+    let read = "pub fn r(p: String) -> String { std::fs::read_to_string(p).unwrap_or_default() }";
+    let mut cases: Vec<(String, String, &str, String)> = Vec::new();
+    for (i, lit) in ["\"\\\"\"", "b\"\\\"\"", "c\"\\\"\"", "r\"\\\"", "r#\"\\\"#", "br#\"\\\"#", "cr#\"\\\"#", "r##\"a\"#b\"##", "'\\''", "b'\\''", "'\"'"].iter().enumerate() {
+        cases.push((format!("lit{}", i), format!("pub const X{}: () = {{ let _ = {}; }};\n{}", i, lit, read), "fs", "std::fs::read_to_string (line 4)".into()));
+    }
+    cases.push(("lifetime".into(), format!("fn l<'a>(x: &'a str) -> &'a str {{ x }}\n{}", read), "fs", "std::fs::read_to_string (line 4)".into()));
+    for (name, ws) in [("vt", '\u{0B}'), ("ff", '\u{0C}'), ("nel", '\u{85}'), ("lrm", '\u{200E}'), ("rlm", '\u{200F}'), ("ls", '\u{2028}'), ("ps", '\u{2029}'), ("tab", '\t')] {
+        cases.push((format!("ws-{}", name), format!("pub fn r(p: String) -> String {{ std{w}::{w}fs /* x */ ::{w}read_to_string{w}(p).unwrap_or_default() }}", w = ws), "fs", "std::fs::read_to_string (line 3)".into()));
+    }
+    cases.push(("qualified".into(), "pub fn s() { let _ = <std::net::TcpStream>::connect(\"203.0.113.9:80\"); }".into(), "net", "std::net::TcpStream::connect (line 3)".into()));
+    cases.push(("qualifiedas".into(), "pub fn s(b: &mut [u8]) { let _ = <std::net::TcpStream as std::io::Read>::read; let _ = b; }".into(), "net", "std::net::TcpStream::read (line 3)".into()));
+    cases.push(("typenet".into(), "type T = std::net::TcpStream;\npub fn s() { let _ = T::connect(\"203.0.113.9:80\"); }".into(), "net", "std::net::TcpStream::connect (line 4)".into()));
+    cases.push(("typeudp".into(), "pub type U<'a> = std::net::UdpSocket;\npub fn s() { let _ = U::bind(\"0.0.0.0:0\"); }".into(), "net", "std::net::UdpSocket::bind (line 4)".into()));
+    cases.push(("dollar".into(), "macro_rules! go { ($m:ident) => { $m!(\"HOME\") } }\npub fn e() -> &'static str { go!(env) }".into(), "http, fs, env, time, random, net, run", "`$m!` (a macro named by what a macro is given) (line 3)".into()));
+    cases.push(("epoch".into(), "pub fn t() -> u64 { std::time::UNIX_EPOCH.elapsed().unwrap().as_secs() }".into(), "time", "std::time::UNIX_EPOCH.elapsed() (line 3)".into()));
+    for (name, code, effects, call) in &cases {
+        let f = format!("{}.qwer", name);
+        write(&d, &f, &format!("//! version: 1.0.0\n//! effects: none\n{}\n", code));
+        let (code, out) = quillo(&d, &["confirm", "--effects", &f]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.starts_with(&format!("{}: effects: {}\n  but it says `effects: none`, and calls {}: a reading of its text", f, effects, call)), "{}: {}", name, out);
+    }
+    for (name, code) in [
+        ("result", "type R = std::io::Result<()>;\npub fn r() -> R { Ok(()) }"),
+        ("less", "pub fn r(a: i64, b: i64) -> bool { a < b && b > a }"),
+        ("generic", "pub fn r() -> usize { let v: Vec<u8> = Vec::<u8>::new(); v.len() }"),
+        ("epochalone", "pub fn r(t: std::time::SystemTime) -> u64 { t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) }"),
+    ] {
+        let f = format!("{}.qwer", name);
+        write(&d, &f, &format!("//! version: 1.0.0\n//! effects: none\n{}\n", code));
+        assert_eq!(quillo(&d, &["confirm", "--effects", &f]), (Some(0), format!("{}: effects: none\n", f)), "{}", name);
+    }
+}

@@ -128,7 +128,7 @@ pub struct Block {
     /// the line of its `import`. The import is the grant (the user's decision of 2026-11-24), and
     /// said where the program's reach is said. Found only.
     pub grants: Vec<(u32, String)>,
-    /// A Rust file that builds another file into it, at its line, and how (`compiled_in`). Found
+    /// A Rust file that builds another file into it, at its line, and how (`builds_in`). Found
     /// only.
     pub compiles: Option<(u32, String)>,
 }
@@ -1213,6 +1213,11 @@ const RUST_CALLS: &[(&str, &str)] = &[
     ("env!", "env"),
     ("option_env!", "env"),
     ("SystemTime::now", "time"),
+    // The clock read by what a time has elapsed since: `UNIX_EPOCH.elapsed()` read as `effects:
+    // none` (FEEDBACK83.md, Q-1305, found by the review of a867750; branch feedback82-85).
+    // `UNIX_EPOCH` and `SystemTime` themselves read no clock: seven plugins of the catalog name
+    // them for a file's times, and are not read as time.
+    (".elapsed()", "time"),
     ("Instant::now", "time"),
     ("Utc::now", "time"),
     ("Local::now", "time"),
@@ -1337,33 +1342,118 @@ const RUST_NOT_FILES: &[&str] = &["Client::open", "Stemmer::create", "SnippetGen
 /// (FEEDBACK83.md, Q-1305, found by the review of 109f6b1; branch feedback82-85).
 const RUST_GLOBS: &[(&str, &str)] = &[("env", "env"), ("fs", "fs"), ("net", "net")];
 
-/// A Rust file's code with its comments taken out and each string's text out of it (`""` in its
-/// place), lines kept; and the strings, each with its line and where it stood in the code.
-fn rust_code(src: &str) -> (String, Vec<(u32, usize, String)>) {
+/// What a token of Rust is (`rust_tokens`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RKind {
+    Ident,
+    /// `r#name`: a name, never a keyword.
+    RawIdent,
+    Lifetime,
+    /// Any string: `"..."`, `b"..."`, `c"..."`, `r#"..."#`, `br#"..."#`, `cr#"..."#`.
+    Str,
+    /// `'x'`, `'\n'`, `b'x'`.
+    Char,
+    Number,
+    /// One character of punctuation.
+    Punct,
+}
+
+/// A token of a Rust file: what it is, its bytes (`at..end` of the source; for a string, `body`
+/// is its text between the quotes), the line it starts on, and what came before it since the
+/// last token: whether space or a comment did, and how many line breaks.
+#[derive(Clone, Copy, Debug)]
+struct RTok {
+    kind: RKind,
+    at: usize,
+    end: usize,
+    body: (usize, usize),
+    line: u32,
+    gap_lines: u32,
+    spaced: bool,
+}
+
+/// Rust's whitespace, its Pattern_White_Space, which separates tokens as `rustc` reads them: a
+/// reading that took only ASCII's read `mod\x0Bhelper;` and `mod\u{200E}helper;` as one word
+/// (FEEDBACK83.md, Q-1305, found by the review of a867750; branch feedback82-85).
+fn rust_space(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\u{0B}' | '\u{0C}' | '\r' | ' ' | '\u{85}' | '\u{200E}' | '\u{200F}' | '\u{2028}' | '\u{2029}')
+}
+
+/// A character a Rust name may have: ASCII's letters, digits and `_`, and any other that is not
+/// Rust's whitespace (a name may be Unicode; one that is not a letter does not build).
+fn rust_name_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || (!c.is_ascii() && !rust_space(c))
+}
+
+/// Where the string that starts at `i` of `src` ends, where its text is, and its line breaks, if
+/// one starts there: `"`, `b"`, `c"`, and raw `r"`, `r#"`, `br#"`, `cr#"` with any number of `#`.
+/// One that does not end runs to the end of the file, as rustc reads it (it does not build).
+fn rust_string_at(src: &str, i: usize) -> Option<(usize, (usize, usize))> {
     let b = src.as_bytes();
-    let mut code = String::with_capacity(src.len());
-    let mut strings = Vec::new();
+    let mut j = i;
+    if matches!(b.get(j), Some(b'b' | b'c')) {
+        j += 1;
+    }
+    let raw = b.get(j) == Some(&b'r');
+    if raw {
+        j += 1;
+    }
+    if !raw && j == i + 1 && b.get(j) != Some(&b'"') {
+        return None;
+    }
+    let hashes = if raw { b[j..].iter().take_while(|x| **x == b'#').count() } else { 0 };
+    j += hashes;
+    if b.get(j) != Some(&b'"') {
+        return None;
+    }
+    let body = j + 1;
+    if raw {
+        let close: String = std::iter::once('"').chain(std::iter::repeat_n('#', hashes)).collect();
+        let end = src[body..].find(&close).map_or(b.len(), |n| body + n);
+        return Some(((end + close.len()).min(b.len()), (body, end)));
+    }
+    let mut k = body;
+    while k < b.len() && b[k] != b'"' {
+        k += if b[k] == b'\\' { 2 } else { 1 };
+    }
+    let k = k.min(b.len());
+    Some(((k + 1).min(b.len()), (body, k)))
+}
+
+/// A Rust file as its tokens, as rustc reads them: comments (`//`, `/* */` nested) and Rust's
+/// whitespace separate tokens and are not one; strings of every kind and characters are one token
+/// each, a lifetime is not a character. What the reading of a Rust file finds, its effects and
+/// the files it builds into it, is read from these. Before, the text was read as it is written,
+/// so `mod/**/helper;` read as `modhelper;`, an unknown string's kind (`cr#"\"#`) hid the code
+/// after it, and a whitespace not ASCII's joined two words (FEEDBACK83.md, Q-1305, found by the
+/// review of a867750; branch feedback82-85). Each byte is read once.
+fn rust_tokens(src: &str) -> Vec<RTok> {
+    let b = src.as_bytes();
+    let mut out: Vec<RTok> = Vec::with_capacity(src.len() / 4);
     let (mut i, mut line) = (0usize, 1u32);
-    let mut start = 0;
-    let flush = |code: &mut String, from: usize, to: usize| code.push_str(&src[from..to]);
+    let (mut gap_lines, mut spaced) = (0u32, false);
+    let newlines = |from: usize, to: usize| src.as_bytes()[from..to].iter().filter(|x| **x == b'\n').count() as u32;
     while i < b.len() {
         let c = b[i];
-        if c == b'\n' {
-            line += 1;
-            i += 1;
+        let ch = if c < 0x80 { c as char } else { src[i..].chars().next().unwrap_or(' ') };
+        if rust_space(ch) {
+            if ch == '\n' {
+                line += 1;
+                gap_lines += 1;
+            }
+            spaced = true;
+            i += ch.len_utf8();
             continue;
         }
         if c == b'/' && b.get(i + 1) == Some(&b'/') {
-            flush(&mut code, start, i);
             while i < b.len() && b[i] != b'\n' {
                 i += 1;
             }
-            start = i;
+            spaced = true;
             continue;
         }
         if c == b'/' && b.get(i + 1) == Some(&b'*') {
-            flush(&mut code, start, i);
-            let mut depth = 0;
+            let mut depth = 0u32;
             while i < b.len() {
                 if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
                     depth += 1;
@@ -1377,81 +1467,191 @@ fn rust_code(src: &str) -> (String, Vec<(u32, usize, String)>) {
                 } else {
                     if b[i] == b'\n' {
                         line += 1;
-                        code.push('\n');
+                        gap_lines += 1;
                     }
                     i += 1;
                 }
             }
-            start = i;
+            spaced = true;
             continue;
         }
-        // A raw string: `r"..."`, `r#"..."#`, `br"..."`.
-        let ident_before = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
-        if c == b'r' && !ident_before || (c == b'b' && b.get(i + 1) == Some(&b'r') && !ident_before) {
-            let mut j = i + if c == b'b' { 2 } else { 1 };
-            let mut hashes = 0;
-            while b.get(j) == Some(&b'#') {
-                hashes += 1;
+        let at = i;
+        let mut body = (i, i);
+        let kind;
+        if let Some((end, inside)) = matches!(c, b'"' | b'b' | b'c' | b'r').then(|| rust_string_at(src, i)).flatten() {
+            kind = RKind::Str;
+            body = inside;
+            i = end;
+        } else if let Some(end) = (c == b'\'' || (c == b'b' && b.get(i + 1) == Some(&b'\''))).then(|| rust_char_at(src, if c == b'b' { i + 1 } else { i })).flatten() {
+            kind = RKind::Char;
+            i = end;
+        } else if c == b'\'' {
+            let next = src[i + 1..].chars().next();
+            if next.is_some_and(|n| rust_name_char(n) && !n.is_ascii_digit()) {
+                kind = RKind::Lifetime;
+                i = rust_name_end(src, i + 1);
+            } else {
+                kind = RKind::Punct;
+                i += 1;
+            }
+        } else if c == b'r' && b.get(i + 1) == Some(&b'#') && src[i + 2..].chars().next().is_some_and(|n| rust_name_char(n) && !n.is_ascii_digit()) {
+            kind = RKind::RawIdent;
+            i = rust_name_end(src, i + 2);
+        } else if c.is_ascii_digit() {
+            kind = RKind::Number;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || (b[i] == b'.' && b.get(i + 1).is_some_and(|d| d.is_ascii_digit()))) {
+                i += 1;
+            }
+        } else if rust_name_char(ch) {
+            kind = RKind::Ident;
+            i = rust_name_end(src, i);
+        } else {
+            kind = RKind::Punct;
+            i += ch.len_utf8();
+        }
+        out.push(RTok { kind, at, end: i, body, line, gap_lines, spaced });
+        if kind == RKind::Str || kind == RKind::Char {
+            line += newlines(at, i);
+        }
+        gap_lines = 0;
+        spaced = false;
+    }
+    out
+}
+
+/// Where the character that starts at the quote `q` of `src` ends, if one does: `'x'`, `'\n'`,
+/// `'\u{1F600}'` (an escape closes within a few characters); not a lifetime, `'a`.
+fn rust_char_at(src: &str, q: usize) -> Option<usize> {
+    let b = src.as_bytes();
+    let next = src.get(q + 1..)?.chars().next()?;
+    if next == '\\' {
+        return b.get(q + 3..)?.iter().take(11).position(|x| *x == b'\'').map(|n| q + 3 + n + 1);
+    }
+    let a = q + 1 + next.len_utf8();
+    (b.get(a) == Some(&b'\'')).then_some(a + 1)
+}
+
+/// Where the name that goes on at `i` of `src` ends: ASCII's bytes a byte at a time, any other
+/// character as one.
+fn rust_name_end(src: &str, mut i: usize) -> usize {
+    let b = src.as_bytes();
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_alphanumeric() || c == b'_' {
+            i += 1;
+        } else if c >= 0x80 {
+            match src[i..].chars().next() {
+                Some(n) if rust_name_char(n) => i += n.len_utf8(),
+                _ => break,
+            }
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// The text of token `t` of `src`: a raw name as the name (`r#fs` as `fs`).
+fn rust_tok<'a>(src: &'a str, t: &RTok) -> &'a str {
+    match t.kind {
+        RKind::RawIdent => &src[t.at + 2..t.end],
+        _ => &src[t.at..t.end],
+    }
+}
+
+/// A Rust file's code as the reading looks through it, written from its tokens (`rust_tokens`):
+/// each string as `""` and each character as `' '`, comments out; no space where a path, a call
+/// or a macro is written as one (`std :: fs`, `read (p)`, `include_str ! (`, `p . exists ( )`), one
+/// elsewhere; a line break taken out of a path or a call put back at the next break, so each call
+/// keeps its line; `<std::net::TcpStream>::connect` and `<T as Trait>::f` as a path into
+/// `std::net::TcpStream` and `T` (a qualified path read as `effects: none`). And the strings, each
+/// with its line and where it stands in the code (FEEDBACK83.md, Q-1305, found by the review of
+/// a867750; branch feedback82-85).
+fn rust_code(src: &str) -> (String, Vec<(u32, usize, String)>) {
+    rust_written(src, &rust_tokens(src))
+}
+
+fn rust_written(src: &str, toks: &[RTok]) -> (String, Vec<(u32, usize, String)>) {
+    let mut code = String::with_capacity(src.len());
+    let mut strings = Vec::new();
+    let mut owed = 0u32;
+    let punct = |k: usize, p: char| toks.get(k).is_some_and(|t| t.kind == RKind::Punct && src.as_bytes()[t.at] == p as u8);
+    let word = |k: usize| toks.get(k).is_some_and(|t| matches!(t.kind, RKind::Ident | RKind::RawIdent));
+    // `::`, its two colons with nothing between: `k` its first.
+    let colons = |k: usize| punct(k, ':') && punct(k + 1, ':') && !toks[k + 1].spaced;
+    let pathy = |k: usize| (word(k) && toks.get(k).is_some_and(|t| rust_tok(src, t) != "as")) || punct(k, ':');
+    // A qualified path at `<`, `<P>::` or `<P as Q>::`: where its path ends, and where the `::`
+    // after its `>` starts.
+    let qualified = |k: usize| -> Option<(usize, usize)> {
+        let mut j = k + 1;
+        while pathy(j) {
+            j += 1;
+        }
+        let path_end = j;
+        if path_end == k + 1 {
+            return None;
+        }
+        if toks.get(j).is_some_and(|t| t.kind == RKind::Ident && rust_tok(src, t) == "as") {
+            j += 1;
+            while pathy(j) {
                 j += 1;
             }
-            if b.get(j) == Some(&b'"') {
-                flush(&mut code, start, j);
-                let close: String = std::iter::once('"').chain(std::iter::repeat_n('#', hashes)).collect();
-                let body_start = j + 1;
-                let end = src[body_start..].find(&close).map_or(b.len(), |n| body_start + n);
-                let text = &src[body_start..end];
-                strings.push((line, code.len(), text.to_string()));
-                line += text.matches('\n').count() as u32;
+        }
+        (punct(j, '>') && punct(j + 1, ':') && punct(j + 2, ':')).then_some((path_end, j + 1))
+    };
+    let mut k = 0;
+    let mut skip_to: Option<(usize, usize)> = None;
+    while k < toks.len() {
+        let t = &toks[k];
+        if let Some((path_end, resume)) = skip_to {
+            if k == path_end {
+                k = resume;
+                skip_to = None;
+                continue;
+            }
+        }
+        // The gap before it: none where the tokens are read as one, else a space or its breaks.
+        if k == 0 {
+            code.extend(std::iter::repeat_n('\n', t.gap_lines as usize));
+        } else if t.spaced || t.gap_lines > 0 {
+            let p = &toks[k - 1];
+            // Each a punctuation's character, or none.
+            let one = |x: &RTok| if x.kind == RKind::Punct { src.as_bytes()[x.at] } else { 0 };
+            let (pc, tc) = (one(p), one(t));
+            let joined = colons(k) || (k >= 2 && colons(k - 2)) || pc == b'.' || tc == b'.' || (tc == b'(' && (word(k - 1) || pc == b'!')) || (tc == b'!' && word(k - 1)) || (pc == b'!' && matches!(tc, b'(' | b'[' | b'{')) || (pc == b'(' && tc == b')');
+            if joined {
+                owed += t.gap_lines;
+            } else if t.gap_lines + owed > 0 {
+                code.extend(std::iter::repeat_n('\n', (t.gap_lines + owed) as usize));
+                owed = 0;
+            } else {
+                code.push(' ');
+            }
+        }
+        // `<` where a value starts, not after a name, `>` or `)` (`Vec<u8>`, `f()<x`).
+        let starts = k == 0 || !(word(k - 1) || punct(k - 1, '>') || punct(k - 1, ')') || punct(k - 1, ']'));
+        if punct(k, '<') && skip_to.is_none() && starts {
+            if let Some(q) = qualified(k) {
+                skip_to = Some(q);
+                k += 1;
+                continue;
+            }
+        }
+        match t.kind {
+            RKind::Str => {
+                strings.push((t.line, code.len(), src[t.body.0..t.body.1].to_string()));
                 code.push_str("\"\"");
-                code.extend(std::iter::repeat_n('\n', text.matches('\n').count()));
-                i = (end + close.len()).min(b.len());
-                start = i;
-                continue;
+                code.extend(std::iter::repeat_n('\n', src[t.at..t.end].matches('\n').count()));
             }
+            RKind::Char => code.push_str("' '"),
+            _ => code.push_str(rust_tok(src, t)),
         }
-        if c == b'"' {
-            flush(&mut code, start, i);
-            let mut j = i + 1;
-            while j < b.len() && b[j] != b'"' {
-                j += if b[j] == b'\\' { 2 } else { 1 };
-            }
-            let j = j.min(b.len());
-            // As written, its escapes kept: what is looked for in it is an address or a name.
-            let text = src.get(i + 1..j).unwrap_or("").to_string();
-            strings.push((line, code.len(), text.clone()));
-            let n = text.matches('\n').count() as u32;
-            line += n;
-            code.push_str("\"\"");
-            code.extend(std::iter::repeat_n('\n', n as usize));
-            i = (j + 1).min(b.len());
-            start = i;
-            continue;
-        }
-        if c == b'\'' {
-            // A character, not a lifetime: `'x'`, `'\n'`, `'"'`.
-            let next = src[i + 1..].chars().next();
-            let after = next.map(|ch| i + 1 + ch.len_utf8());
-            if next == Some('\\') {
-                let end = src.get(i + 3..).and_then(|r| r.find('\'')).map_or(b.len(), |n| i + 3 + n + 1);
-                flush(&mut code, start, i);
-                code.push_str("' '");
-                i = end;
-                start = i;
-                continue;
-            }
-            if let Some(a) = after.filter(|a| b.get(*a) == Some(&b'\'')) {
-                flush(&mut code, start, i);
-                code.push_str("' '");
-                i = a + 1;
-                start = i;
-                continue;
-            }
-        }
-        i += 1;
+        k += 1;
     }
-    flush(&mut code, start.min(b.len()), b.len());
+    code.extend(std::iter::repeat_n('\n', owed as usize));
     (code, strings)
 }
+
 
 /// A byte of a Rust name: ASCII's, and any byte of a character past it (a name may be Unicode).
 fn rust_name_byte(c: u8) -> bool {
@@ -1556,7 +1756,7 @@ struct RustUses {
 fn rust_use_names(code: &str) -> RustUses {
     let b = code.as_bytes();
     let mut out = RustUses { names: Vec::new(), spans: Vec::new(), leaves: Vec::new(), too_deep: None };
-    for kw in ["use", "extern crate"] {
+    for kw in ["use", "extern crate", "type"] {
         let mut from = 0;
         while let Some(at) = code[from..].find(kw).map(|a| a + from) {
             from = at + kw.len();
@@ -1568,7 +1768,23 @@ fn rust_use_names(code: &str) -> RustUses {
             out.spans.push((at, end));
             let toks = rust_use_tokens(&code[from..end]);
             let mut i = 0;
-            if kw == "use" {
+            if kw == "type" {
+                // A type's other name is one a `use` gives: `type T = std::net::TcpStream;` then
+                // `T::connect(a)` read as `effects: none` (FEEDBACK83.md, Q-1305, found by the review
+                // of a867750; branch feedback82-85). Its generics passed over, its path read up to
+                // its own (`std::io::Result<()>` as `std::io::Result`).
+                let decl = &code[from..end];
+                if let (Some(name), Some(eq)) = (toks.first().filter(|n| n.bytes().next().is_some_and(rust_name_byte)), decl.find('=')) {
+                    let rhs = decl[eq + 1..].trim_start();
+                    let rhs_at = from + eq + 1 + (decl[eq + 1..].len() - rhs.len());
+                    let path: String = rhs.trim_start_matches("::").chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':' || !c.is_ascii()).collect();
+                    let path = path.trim_end_matches(':').to_string();
+                    if !path.is_empty() {
+                        out.names.push((name.to_string(), path.clone(), true));
+                        out.leaves.push((path, rhs_at));
+                    }
+                }
+            } else if kw == "use" {
                 let mut deep = false;
                 rust_use_tree(&toks, &mut i, &[], &mut out.names, &mut out.leaves, code.as_ptr() as usize, 0, &mut deep);
                 if deep && out.too_deep.is_none() {
@@ -1815,7 +2031,11 @@ fn unfollowed(code: &str) -> Option<(u32, &'static str)> {
         let after = at + 1 + n;
         if n > 0 && &code[at + 1..after] != "crate" && code[after..].starts_with("::") && b.get(after + 2).is_some_and(|x| rust_name_byte(*x)) {
             keep(at, "`$x::` (a path a macro builds from what it is given)");
-            break;
+        }
+        // A macro by the name a macro is given, `$m!("HOME")` made `env!` by `go!(env)`
+        // (FEEDBACK83.md, Q-1305, found by the review of a867750; branch feedback82-85).
+        if n > 0 && code[after..].starts_with('!') && !code[after..].starts_with("!=") {
+            keep(at, "`$m!` (a macro named by what a macro is given)");
         }
     }
     if let Some(at) = code.find("::$") {
@@ -2033,7 +2253,8 @@ fn scan_rust(bytes: &[u8]) -> Block {
             }
         }
     }
-    let (code, strings) = rust_code(&src);
+    let toks = rust_tokens(&src);
+    let (code, strings) = rust_written(&src, &toks);
     // A crate taken under another name, `h = { package = "reqwest" }`: read as the crate it is, by
     // its line and in the code (FEEDBACK83.md, Q-1305, found by the coverage tests; branch
     // feedback82-85).
@@ -2101,58 +2322,186 @@ fn scan_rust(bytes: &[u8]) -> Block {
             b.notes.push((first.2, format!("says `effects: {}`, and calls {}: a reading of its text, not a proof (a crate can do what it does unseen)", b.effects.clone().unwrap_or_default(), shown.join(", "))));
         }
     }
-    // Another file built into it, which neither the reading nor its SHA-256 sees (`compiled_in`).
-    b.compiles = compiled_in(&code);
+    // Another file built into it, which neither the reading nor its SHA-256 sees (`builds_in`).
+    b.compiles = builds_in_toks(&src, &toks);
     b
 }
 
 /// What is said of a Rust file that builds another file into it where nothing holds the run:
-/// that the reading does not see it, and that a hold would refuse it (`compiled_in`).
+/// that the reading does not see it, and that a hold would refuse it (`builds_in`).
 fn compiled_in_said(b: &Block) -> Option<String> {
     b.compiles.as_ref().map(|(line, how)| format!("builds another file into it ({} at line {}), which this reading does not see; under a {} it does not load", how, line, FILE))
 }
 
-/// Where the Rust file whose code is `code` (`rust_spelled`'s) builds another file into it, and
-/// how: an out-of-line module (`mod h;`, with `#[path = "helper.rs"]` or not), `include!`,
-/// `include_str!` or `include_bytes!`. A plugin is built as `#[path = "x.qwer"] mod user;`, so
-/// each compiles a file that neither the reading nor the SHA-256 that quillo.confirmed pins (nor
-/// the built library's key) covers: a changed `helper.rs` built a different library under the
-/// confirmed hash. No plugin of the catalog does, so under a quillo.confirmed such a file is
-/// refused, at `quillo confirm`, as the program starts and as it loads (`plugin_ok`)
-/// (FEEDBACK83.md, Q-1305, found by the review of 109f6b1; branch feedback82-85).
-fn compiled_in(code: &str) -> Option<(u32, String)> {
-    let b = code.as_bytes();
-    let word_at = |at: usize, len: usize| (at == 0 || !rust_name_byte(b[at - 1])) && !b.get(at + len).is_some_and(|x| rust_name_byte(*x));
-    let mut found: Option<(usize, String)> = None;
-    for (at, _) in code.match_indices("mod") {
-        if !word_at(at, 3) || !b.get(at + 3).is_some_and(|x| x.is_ascii_whitespace()) {
-            continue;
-        }
-        let rest = code[at + 3..].trim_start();
-        let n = rest.bytes().take_while(|x| rust_name_byte(*x)).count();
-        if n > 0 && rest[n..].trim_start().starts_with(';') {
-            found = Some((at, format!("`mod {};`, a module in another file", &rest[..n])));
+/// The macros that build a file into the code they are in.
+const RUST_INCLUDES: &[&str] = &["include", "include_str", "include_bytes"];
+
+/// Crates whose macros build files into the code they are in as it is built (templates, assets,
+/// migrations, a grammar), which the SHA-256 pinned for the plugin does not cover. No plugin of the
+/// catalog takes one.
+const RUST_FILE_CRATES: &[&str] = &["rust-embed", "rust_embed", "include_dir", "include-flate", "include_flate", "askama", "rinja", "sailfish", "sqlx", "pest_derive", "diesel_migrations", "refinery", "static-files", "static_files"];
+
+/// The keys a plugin's dependency may give: what crates.io's crate of that version is built with.
+/// Another (`path`, `git`, `branch`, `registry`, ...) takes the crate's code from elsewhere.
+const RUST_DEP_KEYS: &[&str] = &["version", "features", "default-features", "default_features", "optional", "package"];
+
+/// Where the Rust file `src` builds another file into it, and how, read from its tokens
+/// (`rust_tokens`): a module in another file, `mod helper;` (with `#[path = "helper.rs"]` or not,
+/// in a `macro_rules!` body too, `mod $n;`), and `mod` handed to a macro, which can make one;
+/// `include!`, `include_str!` and `include_bytes!`, with any delimiter and any space or comment
+/// around their `!`, by any name a `use` gives them (`use std::include_str as grab;`); a macro whose
+/// name is what a macro is given (`$m!`) or one paste builds (`[<...>]!`), which can be any of
+/// these; and a dependency whose code is not crates.io's crate of its version (`path`, `git`, or a
+/// key other than `RUST_DEP_KEYS`), or a crate whose macros build files in (`RUST_FILE_CRATES`). A
+/// plugin is built as `#[path = "x.qwer"] mod user;`, so each compiles code that neither the
+/// reading nor the SHA-256 that quillo.confirmed pins (nor the built library's key) covers. One
+/// reading for all that asks: `quillo confirm`, `quillo check`, a start, a load, a `--watch`
+/// reload and `quillo build`. Before, these were read from the text, and `mod/**/helper;`,
+/// `mod\x0Bhelper;`, `include! {"x"}`, `include_str! [..]`, `m!(helper)` with `mod $n;`, `$m!` and a
+/// `path` dependency each got to the build, and the name `grab` was read at a start but not as
+/// the file loaded (FEEDBACK83.md, Q-1305, found by the review of a867750; branch feedback82-85).
+fn builds_in(src: &str) -> Option<(u32, String)> {
+    builds_in_toks(src, &rust_tokens(src))
+}
+
+/// `builds_in`, of the file `src` whose tokens (`rust_tokens`) are `toks`.
+fn builds_in_toks(src: &str, toks: &[RTok]) -> Option<(u32, String)> {
+    let text = |k: usize| toks.get(k).map(|t| rust_tok(src, t));
+    let is = |k: usize, kind: RKind, s: &str| toks.get(k).is_some_and(|t| t.kind == kind && rust_tok(src, t) == s);
+    let punct = |k: usize, s: &str| toks.get(k).is_some_and(|t| t.kind == RKind::Punct && src.as_bytes()[t.at] == s.as_bytes()[0]);
+    let name = |k: usize| toks.get(k).is_some_and(|t| matches!(t.kind, RKind::Ident | RKind::RawIdent));
+    // The names `use`s give the macros that include: only where the file names one, as a `use`
+    // that gives one names it.
+    let uses = if src.contains("include") { rust_use_names(&rust_joined(&rust_written(src, toks).0)).names } else { Vec::new() };
+    let includes: HashSet<&str> = RUST_INCLUDES.iter().copied().chain(uses.iter().filter(|(_, full, _)| full.rsplit("::").next().is_some_and(|l| RUST_INCLUDES.contains(&l))).map(|(n, _, _)| n.as_str())).collect();
+    let mut found: Option<(u32, String)> = None;
+    for k in 0..toks.len() {
+        let t = &toks[k];
+        let why = if is(k, RKind::Ident, "mod") {
+            let n = if punct(k + 1, "$") { k + 2 } else { k + 1 };
+            let written = format!("mod {}{}", if n == k + 2 { "$" } else { "" }, text(n).unwrap_or(""));
+            match (name(n), punct(n + 1, "{"), punct(n + 1, ";")) {
+                (true, true, _) => None,
+                (true, false, true) => Some(format!("`{};`, a module in another file", written)),
+                (true, false, false) => Some(format!("`{}` handed to a macro, which can make a module in another file of it", written)),
+                (false, _, _) => Some("`mod` handed to a macro, which can make a module in another file of it".to_string()),
+            }
+        } else if punct(k, "!") && !punct(k + 1, "=") && k > 0 {
+            if name(k - 1) && includes.contains(text(k - 1).unwrap_or("")) {
+                let n = text(k - 1).unwrap_or("");
+                Some(if RUST_INCLUDES.contains(&n) { format!("`{}!`", n) } else { format!("`{}!`, an include macro by another name", n) })
+            } else if name(k - 1) && k >= 2 && punct(k - 2, "$") {
+                Some(format!("`${}!`, a macro named by what a macro is given, which can be `include!`", text(k - 1).unwrap_or("")))
+            } else if punct(k - 1, "]") && k >= 2 && punct(k - 2, ">") {
+                Some("`[<...>]!`, a macro whose name paste builds, which can be `include!`".to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            found = Some((t.line, why));
             break;
         }
     }
-    for m in ["include!", "include_str!", "include_bytes!"] {
-        if let Some((at, _)) = code.match_indices(m).find(|(at, _)| (*at == 0 || !rust_name_byte(b[at - 1])) && b.get(at + m.len()).is_some_and(|x| matches!(x, b'(' | b'[' | b'{'))) {
-            if found.as_ref().is_none_or(|(f, _)| at < *f) {
-                found = Some((at, format!("`{}`", m)));
+    // Its dependencies, by the line of each (`native::parse` builds with these).
+    let mut in_deps = false;
+    for (n, rest) in crate::native::header_lines(src, true) {
+        let line = rest.trim();
+        if line.starts_with('[') {
+            in_deps = line == "[dependencies]";
+            continue;
+        }
+        if !in_deps || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(why) = dep_built_elsewhere(line) {
+            let at = n as u32 + 1;
+            if found.as_ref().is_none_or(|(l, _)| at < *l) {
+                found = Some((at, why));
             }
+            break;
         }
     }
-    found.map(|(at, how)| (line_at(&line_starts(code), at), how))
+    found
 }
 
-/// `compiled_in` of a Rust file's bytes.
-fn builds_in(bytes: &[u8]) -> Option<(u32, String)> {
-    let (code, _) = rust_code(&String::from_utf8_lossy(bytes));
-    compiled_in(&rust_joined(&code))
+/// Why a plugin's dependency line `line` (`name = "1"`, `name = { version = "1", ... }`) builds code
+/// that is not crates.io's crate of its version, if it does: a key that takes it from elsewhere, a
+/// crate whose macros build files in, or a line not of those two kinds, which is not read further.
+fn dep_built_elsewhere(line: &str) -> Option<String> {
+    let (key, value) = line.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() || !key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+        return Some(format!("the dependency line `{}`, not read as a crate's name and version", line));
+    }
+    if let Some(c) = RUST_FILE_CRATES.iter().find(|c| key == **c || value.contains(&format!("\"{}\"", c))) {
+        return Some(format!("the dependency `{}`, {}, whose macros build files in", key, c));
+    }
+    let value = value.trim();
+    // A version alone: one plain text, nothing after it but a comment.
+    if let Some(rest) = value.strip_prefix('"') {
+        let end = rest.find('"')?;
+        let after = rest[end + 1..].trim();
+        return (rest[..end].contains('\\') || !(after.is_empty() || after.starts_with('#'))).then(|| format!("the dependency line `{}`, not read as a crate's name and version", line));
+    }
+    let Some(table) = value.strip_prefix('{') else { return Some(format!("the dependency line `{}`, not read as a crate's name and version", line)) };
+    // The keys of its table, each before its `=`, outside texts and lists.
+    let (mut depth, mut quote, mut start, mut closed) = (0i32, None::<u8>, 0usize, false);
+    let mut keys: Vec<&str> = Vec::new();
+    let tb = table.as_bytes();
+    let mut i = 0;
+    let mut want_key = true;
+    while i < tb.len() {
+        let c = tb[i];
+        match quote {
+            Some(q) => {
+                if c == b'\\' && q == b'"' {
+                    i += 1;
+                } else if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                b'"' | b'\'' => quote = Some(c),
+                b'[' => depth += 1,
+                b']' => depth -= 1,
+                b'{' => return Some(format!("the dependency line `{}`, not read as a crate's name and version", line)),
+                b'=' if depth == 0 && want_key => {
+                    keys.push(table[start..i].trim());
+                    want_key = false;
+                }
+                b',' if depth == 0 => {
+                    start = i + 1;
+                    want_key = true;
+                }
+                b'}' if depth == 0 => {
+                    closed = true;
+                    let after = table[i + 1..].trim();
+                    if !(after.is_empty() || after.starts_with('#')) {
+                        return Some(format!("the dependency line `{}`, not read as a crate's name and version", line));
+                    }
+                    break;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    if !closed {
+        return Some(format!("the dependency line `{}`, not read as a crate's name and version", line));
+    }
+    match keys.iter().find(|k| !RUST_DEP_KEYS.contains(k)) {
+        Some(k) if *k == "path" => Some(format!("the dependency `{}` from a folder (`path`)", key)),
+        Some(k) if *k == "git" => Some(format!("the dependency `{}` from git (`git`)", key)),
+        Some(k) => Some(format!("the dependency `{}` with `{}`, which can take its code from elsewhere", key, k)),
+        None => None,
+    }
 }
 
 /// Why the Rust file `name` may not be confirmed or load where a quillo.confirmed holds the run,
-/// if it may not: it builds another file into it (`compiled_in`).
+/// if it may not: it builds another file into it (`builds_in`).
 fn compiled_in_refused(name: &str, b: &Block) -> Option<String> {
     let (line, how) = b.compiles.as_ref()?;
     Some(format!("{} builds another file into it ({} at line {}), which its SHA-256 in {} would not cover: a change there would build another plugin under the one confirmed, so it is not confirmed and does not load under a {} (put that code in {})", escaped(name), how, line, FILE, FILE, escaped(name)))
@@ -3175,10 +3524,10 @@ pub fn plugin_ok(qwer: &Path) -> Result<(), String> {
     let have = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
     let want = h.by_name.get(&rel).and_then(|i| h.blocks[*i as usize].sha256.as_deref());
     let shown = escaped(&rel);
-    // Nor one that builds another file into it, whatever its hash (`compiled_in`; FEEDBACK83.md,
+    // Nor one that builds another file into it, whatever its hash (`builds_in`; FEEDBACK83.md,
     // Q-1305, found by the review of 109f6b1; branch feedback82-85): read where it loads, as a
     // `--watch` reload takes it.
-    if let Some(why) = compiled_in_refused(&rel, &Block { compiles: builds_in(&bytes), ..Default::default() }) {
+    if let Some(why) = compiled_in_refused(&rel, &Block { compiles: builds_in(&String::from_utf8_lossy(&bytes)), ..Default::default() }) {
         return Err(why);
     }
     match want {
@@ -3300,7 +3649,7 @@ pub fn at_start_in(main: &Path, dir: &Path, ask: bool) -> Result<(), i32> {
         eprintln!("quillo: {}", plugin_message(&conf, m, &full));
         return Err(1);
     }
-    // Nor one that builds another file into it (`compiled_in`; FEEDBACK83.md, Q-1305, found by
+    // Nor one that builds another file into it (`builds_in`; FEEDBACK83.md, Q-1305, found by
     // the review of 109f6b1; branch feedback82-85).
     if let Some(why) = found.files.iter().find_map(|(f, b)| compiled_in_refused(f, b)) {
         eprintln!("quillo: {}", why);
@@ -3319,7 +3668,7 @@ pub fn rust_confirmed(main: &Path, files: &[PathBuf]) -> Result<bool, String> {
         let name = rel_name(&dir, f);
         let bytes = crate::error::read_file(f).map_err(|e| format!("{}: {}", f.display(), e))?;
         let have = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
-        if let Some(why) = compiled_in_refused(&name, &Block { compiles: builds_in(&bytes), ..Default::default() }) {
+        if let Some(why) = compiled_in_refused(&name, &Block { compiles: builds_in(&String::from_utf8_lossy(&bytes)), ..Default::default() }) {
             return Err(format!("{}: nothing built", why));
         }
         if conf.get(&name).and_then(|b| b.sha256.as_deref()) != Some(have.as_str()) {
@@ -3444,7 +3793,7 @@ pub fn for_check(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>
                     out.push(Diagnostic { file: shown(file), line: *line, severity: Severity::Warning, message: escaped(g).into_owned() });
                 }
             }
-            // A Rust file that builds another file into it (`compiled_in`; FEEDBACK83.md, Q-1305,
+            // A Rust file that builds another file into it (`builds_in`; FEEDBACK83.md, Q-1305,
             // found by the review of 109f6b1; branch feedback82-85).
             for (file, b) in &found.files {
                 if let Some(why) = compiled_in_refused(file, b) {
@@ -3537,7 +3886,7 @@ pub fn main(args: &[String]) -> i32 {
         return 0;
     }
     // A Rust file that builds another file into it is not confirmed: nothing is written
-    // (`compiled_in`; FEEDBACK83.md, Q-1305, found by the review of 109f6b1; branch feedback82-85).
+    // (`builds_in`; FEEDBACK83.md, Q-1305, found by the review of 109f6b1; branch feedback82-85).
     let refused: Vec<String> = found.files.iter().filter_map(|(f, b)| compiled_in_refused(f, b)).collect();
     if !refused.is_empty() {
         for why in &refused {

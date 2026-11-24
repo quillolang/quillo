@@ -257,8 +257,10 @@ What a program may notice:
   `include_str!` and the like as `fs`; what it cannot follow (a path a macro builds, a
   foreign block, `asm!`, a `use` nested past 64) reads as every effect but `db` (Q-1305).
   Under a `quillo.confirmed` a Rust file that builds another into it (`include!`,
-  `include_str!`, `include_bytes!`, `#[path]`, an out-of-line `mod x;`) is refused, as that
-  file is outside its SHA-256; without one, warned of (found in review).
+  `include_str!`, `include_bytes!` however written or named, `#[path]`, a `mod x;`, a `$m!`,
+  a `path`, `git` or `registry` dependency, a crate that embeds files such as `rust-embed`)
+  is refused, as that file is outside its SHA-256; without one, warned of. The file is read
+  by its tokens, as Rust reads it (found in review).
 - **What `quillo.confirmed` does not confirm** is an error at its line, and so is a name used
   from another file and not taken, under one (see Security).
 - **`"""` and `'''`** say that text over several lines is a backtick string (FEEDBACK85.md,
