@@ -700,12 +700,13 @@ fn a_source_pin_never_loads_a_prebuilt_library() {
     let (code, out) = quillo(&d, &["run", "main.qwe", "--no-check", "--policy", "src.toml"], &[]);
     assert_eq!(code, Some(1), "{}", out);
     assert!(out.contains("so only a library built here from that source may load") && !out.contains("cannot load"), "{}", out);
-    // Pinned by the library's own hash, the prebuilt one is the one allowed: it is loaded (and,
-    // being no library, fails to load as one).
+    // Pinned by the library's own hash, the prebuilt one is the one allowed: it is the one opened
+    // (and, being no library, is refused as one before the system's loader is given it: since
+    // fcac7a3 what a held library loads is judged first, `native::loads_refused`).
     std::fs::write(d.join("lib.toml"), format!("[plugins]\nallow = [\"hi@sha256:{}\"]\nbuild = false\n", library)).unwrap();
     let (code, out) = quillo(&d, &["run", "main.qwe", "--no-check", "--policy", "lib.toml"], &[]);
     assert_eq!(code, Some(1), "{}", out);
-    assert!(out.contains("cannot load") && !out.contains("not in the plugins"), "{}", out);
+    assert!(out.contains("is not a library this system loads: it does not load") && !out.contains("not in the plugins"), "{}", out);
     // One layer by the source, another by the library: refused, nothing loaded.
     std::fs::write(d.join("only-src.toml"), format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", source)).unwrap();
     let (code, out) = quillo(&d, &["run", "main.qwe", "--no-check", "--policy", "only-src.toml", "--policy", "lib.toml"], &[]);

@@ -1862,6 +1862,23 @@ fn open(path: &Path, count: usize) -> Result<Arc<Lib>, String> {
         return Ok(l.clone());
     }
     let bad = |e: libloading::Error| format!("cannot load {}: {}", path.display(), e);
+    // Where a quillo.confirmed or a pin by hash holds it, nor a library that has the system's
+    // loader load another than the system's (`loads_refused`): a library pinned by its own
+    // SHA-256 loads others by their install names (FEEDBACK83.md, Q-1305, found by the review of
+    // a86f326; branch feedback82-85). Judged here, where the system's loader is to open the file,
+    // its bytes read just before: a library already loaded (another instance's, whose private
+    // folder is gone once it is mapped) was judged as it was loaded, and was read again where it
+    // no longer is, which refused every second instance of a pinned plugin (FEEDBACK83.md,
+    // Q-1305, found by tests/cover8285_run.rs after fcac7a3; branch feedback82-85).
+    if crate::confirm::held() || crate::policy::get().pins_by_hash() {
+        let why = match std::fs::read(path) {
+            Ok(bytes) => loads_refused(&bytes),
+            Err(e) => Some(format!("cannot be read ({})", e)),
+        };
+        if let Some(why) = why {
+            return Err(format!("{} {}: it does not load", path.display(), why));
+        }
+    }
     // SAFETY: the library is one Quillo made, with the functions below.
     unsafe {
         let lib = libloading::Library::new(path).map_err(bad)?;
@@ -2298,7 +2315,7 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         // Nor a library that has the system's loader load another one than the system's
         // (`loads_refused`): what was linked is judged, and what the library loads by name too.
         if let Some(why) = loads_refused(&built_bytes) {
-            return Err(format!("{} is held to its SHA-256, and its library {}, which that hash does not cover: it does not load, and what was built is not kept (link only the system's libraries)", qwer.display(), why));
+            return Err(format!("{} is held to its SHA-256, and the library built from it {}: it does not load, and what was built is not kept (link only the system's libraries)", qwer.display(), why));
         }
         write(&lib, &built_bytes)?;
         let want = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&built_bytes));
@@ -2823,7 +2840,7 @@ pub fn linker_lists_not(log: &str) -> Option<&str> {
 /// Public so it is tested on every system.
 pub fn loads_refused(bytes: &[u8]) -> Option<String> {
     let at = |o: usize, n: usize| bytes.get(o..o.checked_add(n)?);
-    let unreadable = || Some("cannot be read as a library".to_string());
+    let unreadable = || Some(NOT_A_LIBRARY.to_string());
     match at(0, 4) {
         Some([0xcf, 0xfa, 0xed, 0xfe]) | Some([0xce, 0xfa, 0xed, 0xfe]) => macho_loads(bytes),
         Some([0xca, 0xfe, 0xba, 0xbe]) | Some([0xca, 0xfe, 0xba, 0xbf]) => {
@@ -2850,10 +2867,13 @@ pub fn loads_refused(bytes: &[u8]) -> Option<String> {
     }
 }
 
+/// What `loads_refused` says of bytes that are no library this system loads, or not one it reads.
+const NOT_A_LIBRARY: &str = "is not a library this system loads";
+
 /// `loads_refused` of one Mach-O image (little-endian, 32 or 64 bits).
 fn macho_loads(b: &[u8]) -> Option<String> {
     let u32_at = |o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]));
-    let unreadable = || Some("cannot be read as a library".to_string());
+    let unreadable = || Some(NOT_A_LIBRARY.to_string());
     let header = if b.first() == Some(&0xcf) { 32 } else { 28 };
     let Some(ncmds) = u32_at(16) else { return unreadable() };
     let mut off = header;
@@ -2891,7 +2911,7 @@ fn macho_loads(b: &[u8]) -> Option<String> {
 
 /// `loads_refused` of an ELF image (32 or 64 bits, either byte order).
 fn elf_loads(b: &[u8]) -> Option<String> {
-    let unreadable = || Some("cannot be read as a library".to_string());
+    let unreadable = || Some(NOT_A_LIBRARY.to_string());
     let (wide, big) = (b.get(4) == Some(&2), b.get(5) == Some(&2));
     let num = |o: usize, n: usize| -> Option<u64> {
         let s = b.get(o..o.checked_add(n)?)?;
@@ -3235,20 +3255,6 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
         loaded(&lib_path);
         let by = it.cur_file.as_deref().map_or_else(|| format!("line {}", line), |f| format!("{}:{}", Path::new(f).strip_prefix(&*it.base_dir).map_or_else(|_| f.to_string(), |r| r.display().to_string()), line));
         return Err(Ctrl::Error(Box::new(crate::error::QuilloError::new(format!("{} (the `use` at {})", msg, by), *l).in_file(&qwer.display().to_string()))));
-    }
-    // Where a quillo.confirmed or a pin by hash holds it, nor a library that has the system's
-    // loader load another than the system's (`loads_refused`): a library pinned by its own
-    // SHA-256 loads others by their install names, which that hash does not cover (FEEDBACK83.md,
-    // Q-1305, found by the review of a86f326; branch feedback82-85).
-    if crate::confirm::held() || crate::policy::get().pins_by_hash() {
-        let why = match std::fs::read(&lib_path) {
-            Ok(bytes) => loads_refused(&bytes),
-            Err(e) => Some(format!("cannot be read ({})", e)),
-        };
-        if let Some(why) = why {
-            loaded(&lib_path);
-            return Err(Ctrl::Error(Box::new(crate::error::QuilloError::new(format!("{} is held to its SHA-256, and its library {} {}, which that hash does not cover: it does not load", qwer.display(), lib_path.display(), why), line))));
-        }
     }
     let lib = open(&lib_path, parsed.exports.len()).map_err(|e| {
         loaded(&lib_path);

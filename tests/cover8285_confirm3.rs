@@ -1252,8 +1252,9 @@ fn what_a_library_loads_is_the_systems_alone() {
     assert_eq!(quillo::native::loads_refused(&elf(&["/opt/x/libc.so.6"], None)), Some("needs /opt/x/libc.so.6, which is not the C runtime's".to_string()));
     assert_eq!(quillo::native::loads_refused(&elf(&["libc.so.6"], Some("$ORIGIN/../lib"))), Some("has a DT_RUNPATH ($ORIGIN/../lib), where the loader looks for libraries".to_string()));
     if cfg!(any(target_os = "macos", target_os = "linux")) {
-        assert_eq!(quillo::native::loads_refused(b"not a library"), Some("cannot be read as a library".to_string()));
-        assert_eq!(quillo::native::loads_refused(&macho(&[sys])[..40]), Some("cannot be read as a library".to_string()));
+        // Said by what it is (after fcac7a3, which said it could not be read as one).
+        assert_eq!(quillo::native::loads_refused(b"not a library"), Some("is not a library this system loads".to_string()));
+        assert_eq!(quillo::native::loads_refused(&macho(&[sys])[..40]), Some("is not a library this system loads".to_string()));
     }
 }
 
@@ -1317,6 +1318,8 @@ fn a_library_pinned_by_its_hash_that_loads_another_by_its_install_name_does_not_
     let code = ended(&mut child, 120);
     let out = read(&log);
     assert_eq!(code, Some(1), "{}", out);
-    assert!(out.contains("hi.qwer is held to its SHA-256, and its library ") && out.contains(&format!(" loads {} by its install name, which is not the system's (/usr/lib, /System/Library), which that hash does not cover: it does not load", rt.display())), "{}", out);
+    // Its hash covers the library itself: what is said is what it loads (after fcac7a3, which said
+    // that hash did not cover it).
+    assert!(out.contains(&format!("{} loads {} by its install name, which is not the system's (/usr/lib, /System/Library): it does not load", lib.file_name().unwrap().to_string_lossy(), rt.display())), "{}", out);
     assert!(!out.contains("31337"), "{}", out);
 }
