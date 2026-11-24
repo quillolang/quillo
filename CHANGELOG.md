@@ -293,7 +293,12 @@ What a program may notice:
   plugins, `plugins.lock`, the session key) are its own files: `write_file`, `delete_file`,
   `save_upload` and the save options refuse them by any name, as they refuse `main.qwe`
   (found by the review of b7f7c26; an upload path a visitor steers could plant a library for
-  the next start). Deleting a folder no longer removes a link the program's code,
+  the next start), and by where they really lead (found by the review of 0284f7c): a
+  `.quillo` that is a link (`.quillo -> qstore`, or one out of the folder into an
+  `--allow-path` folder, as an upload's name reached), a link inside one, a hard link or a
+  bind mount of one; a link in it to the program's folder or above is no folder of Quillo's.
+  Deleting a folder that holds a link to a folder above the program says so; on macOS
+  `.quıllo` (dotless ı) is another name, as APFS compares names. Deleting a folder no longer removes a link the program's code,
   `--env-file` or its database is used through, works on trees of any depth, and judges a
   FIFO beside a journal's name without waiting on it; `files()` no longer hangs on one.
 - **`read_file`, `write_file` and `delete_file`'s refusal of a path outside the folder** ends
@@ -346,7 +351,13 @@ What a program may notice:
   library built or pinned by its own SHA-256 loads only the system's libraries (its install
   names and DT_NEEDED), and the reach check runs both ways, the toolchain trusted for its
   `lib/rustlib` only (found by the review of a86f326: a framework named by a path past 1024
-  bytes, lld's list written with `..` removed by text, a library loaded by its install name).
+  bytes, lld's list written with `..` removed by text, a library loaded by its install name). A crate
+  that reaches the system or loads code itself (`libc`, `nix`, `rustix`, `libloading`,
+  `dlopen`, any `-sys` crate) reads as every effect but `db` (`libc::dlopen` read as `none`);
+  a held or pinned library is read once and loaded from a private copy of the bytes judged,
+  ELF libraries are read where their loader reads them (exact C-runtime sonames, the dynamic
+  table at its address), and an unpinned plugin is not judged where another is pinned (found
+  by the review of 0a3aeb9).
 - **What `quillo.confirmed` does not confirm** is an error at its line, and so is a name used
   from another file and not taken, under one (see Security).
 - **`"""` and `'''`** say that text over several lines is a backtick string (FEEDBACK85.md,

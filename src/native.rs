@@ -1862,23 +1862,9 @@ fn open(path: &Path, count: usize) -> Result<Arc<Lib>, String> {
         return Ok(l.clone());
     }
     let bad = |e: libloading::Error| format!("cannot load {}: {}", path.display(), e);
-    // Where a quillo.confirmed or a pin by hash holds it, nor a library that has the system's
-    // loader load another than the system's (`loads_refused`): a library pinned by its own
-    // SHA-256 loads others by their install names (FEEDBACK83.md, Q-1305, found by the review of
-    // a86f326; branch feedback82-85). Judged here, where the system's loader is to open the file,
-    // its bytes read just before: a library already loaded (another instance's, whose private
-    // folder is gone once it is mapped) was judged as it was loaded, and was read again where it
-    // no longer is, which refused every second instance of a pinned plugin (FEEDBACK83.md,
-    // Q-1305, found by tests/cover8285_run.rs after fcac7a3; branch feedback82-85).
-    if crate::confirm::held() || crate::policy::get().pins_by_hash() {
-        let why = match std::fs::read(path) {
-            Ok(bytes) => loads_refused(&bytes),
-            Err(e) => Some(format!("cannot be read ({})", e)),
-        };
-        if let Some(why) = why {
-            return Err(format!("{} {}: it does not load", path.display(), why));
-        }
-    }
+    // What a held or pinned library loads was judged on the bytes of its private copy, the file
+    // opened here (`load_copy`); another plugin's is not judged (FEEDBACK83.md, Q-1305, found by
+    // the review of 0a3aeb9; branch feedback82-85).
     // SAFETY: the library is one Quillo made, with the functions below.
     unsafe {
         let lib = libloading::Library::new(path).map_err(bad)?;
@@ -2103,32 +2089,93 @@ fn reached<'a>(dir: &Path, reach: &'a [(PathBuf, bool)]) -> Option<&'a PathBuf> 
     reach.iter().filter(|(r, at_root)| *at_root || r.parent().is_some()).map(|(r, _)| r).find(|r| crate::statics::holds(r, dir))
 }
 
-/// The library to open, as checked: on Linux, by a descriptor opened on the file whose bytes were
-/// hashed (`/proc/self/fd/N`, kept open), so no file put in its place is opened; elsewhere, by its
-/// path in the private folder, hashed again just before.
-fn checked_lib(lib: &Path, want: &str) -> Result<PathBuf, String> {
+/// The files that hold the private copies of libraries opened (`private_library`), kept open for
+/// the life of the process: a copy's path (`/proc/self/fd/N`) names it while its library is
+/// loaded, and a descriptor's number given back would name another file by the same path.
+static KEPT: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
+
+/// `bytes`, a library already judged, put where only this process can change them, and the path
+/// the system's loader is to open it by: on Linux a memfd sealed against any change
+/// (`/proc/self/fd/N`); elsewhere a new file in `dir`, a private folder this process made
+/// (`private_dir`), or in a new one of its own, which goes once the library is loaded (`loaded`).
+fn private_library(bytes: &[u8], name: &str, dir: Option<&Path>) -> Result<PathBuf, String> {
     #[cfg(target_os = "linux")]
     {
-        use std::io::Read;
-        use std::os::fd::AsRawFd;
-        let mut f = std::fs::File::open(lib).map_err(|e| format!("cannot open {}: {}", lib.display(), e))?;
-        let mut bytes = Vec::new();
-        f.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        if crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes)) != want {
-            return Err(format!("{} changed after it was built", lib.display()));
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        let _ = dir;
+        let cname = std::ffi::CString::new(format!("quillo-{}", name.replace('\0', ""))).map_err(|e| e.to_string())?;
+        // MFD_EXEC (6.3 on), where `vm.memfd_noexec` makes a memfd one no library can be mapped
+        // from; an older kernel does not know it, and is asked again without it.
+        const MFD_EXEC: libc::c_uint = 0x0010;
+        // SAFETY: memfd_create takes a NUL-ended name and flags, and returns a new descriptor or -1.
+        let mut fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | MFD_EXEC) };
+        if fd < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+            // SAFETY: as above.
+            fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
         }
-        let at = PathBuf::from(format!("/proc/self/fd/{}", f.as_raw_fd()));
-        static KEPT: Mutex<Vec<std::fs::File>> = Mutex::new(Vec::new());
+        if fd < 0 {
+            return Err(format!("cannot make a private copy of {}: {}", name, std::io::Error::last_os_error()));
+        }
+        // SAFETY: `fd` is a new descriptor of this process's own, owned here once.
+        let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+        f.write_all(bytes).map_err(|e| format!("cannot make a private copy of {}: {}", name, e))?;
+        // SAFETY: fcntl on a descriptor of this process's own; the seals are flags, no pointer.
+        if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE | libc::F_SEAL_SEAL) } != 0 {
+            return Err(format!("cannot seal the private copy of {}: {}", name, std::io::Error::last_os_error()));
+        }
         KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(f);
-        Ok(at)
+        Ok(PathBuf::from(format!("/proc/self/fd/{}", fd)))
     }
     #[cfg(not(target_os = "linux"))]
     {
-        if file_hash(lib)? != want {
-            return Err(format!("{} changed after it was built", lib.display()));
+        let (dir, made) = match dir {
+            Some(d) => (d.to_path_buf(), false),
+            None => (private_dir()?, true),
+        };
+        let p = dir.join(name);
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+        if let Err(e) = o.open(&p).and_then(|mut f| std::io::Write::write_all(&mut f, bytes)) {
+            if made {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            return Err(format!("cannot write {}: {}", p.display(), e));
         }
-        Ok(lib.to_path_buf())
+        if made {
+            PRIVATE_DIRS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((p.clone(), dir));
+        }
+        // Not used here: the copy itself is what is kept.
+        let _ = &KEPT;
+        Ok(p)
     }
+}
+
+/// The library at `lib` as it is to be opened where a hold or a pin by hash holds it: its bytes
+/// read once; their SHA-256 given to `accept`, which says whether that library may load; judged by
+/// what it loads (`loads_refused`); and copied where only this process can change them
+/// (`private_library`), that copy the one opened. Before, a library in `.quillo/native` was read
+/// for its hash, read again to be judged and opened a third time by its path, and another one put
+/// there between was the one loaded; and every library was judged where any layer pinned any
+/// plugin by hash (FEEDBACK83.md, Q-1305, found by the review of 0a3aeb9; branch feedback82-85).
+fn load_copy(lib: &Path, accept: &dyn Fn(&str) -> Result<(), String>) -> Result<PathBuf, String> {
+    let bytes = std::fs::read(lib).map_err(|e| format!("cannot read {}: {}", lib.display(), e))?;
+    accept(&crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes)))?;
+    if let Some(why) = loads_refused(&bytes) {
+        return Err(format!("{} {}: it does not load", lib.display(), why));
+    }
+    let name = lib.file_name().map_or_else(|| "library".to_string(), |n| n.to_string_lossy().into_owned());
+    private_library(&bytes, &name, None)
+}
+
+/// Whether a layer of the policy pins the plugin `qwer` by a SHA-256 (its source's or its
+/// library's): only such a plugin's library, or one a quillo.confirmed holds, is judged by what it
+/// loads (`load_copy`), never another's (found by the review of 0a3aeb9).
+fn pinned_by_hash(qwer: &Path) -> bool {
+    let name = stem(qwer);
+    crate::policy::get().plugins.iter().any(|(_, allow)| allow.iter().any(|a| a.split_once('@').is_some_and(|(n, v)| n == name && v.starts_with("sha256:"))))
 }
 
 /// `cargo` on the PATH, never `$CARGO`, and that PATH not one `.env` gave.
@@ -2239,9 +2286,6 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         // review of e181c7e; branch feedback82-85).
         // In the target, among what the linker may write (`link_args_refused` judges its name).
         let list = target.join("linked.list");
-        if let Some(line) = NO_LINK_LIST.get() {
-            return Err(no_link_list(qwer, line));
-        }
         let out = cmd
             .args(["rustc", "--release", "--lib", "--message-format=short", "--manifest-path"])
             .arg(crate_dir.join("Cargo.toml"))
@@ -2253,12 +2297,10 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
             .map_err(|e| format!("cannot build {}: cargo did not run ({})", qwer.display(), e))?;
         if !out.status.success() {
             let log = String::from_utf8_lossy(&out.stderr);
-            // A linker that does not list what it reads (`judged_args`): said so, once a run, and
-            // the build is refused (FEEDBACK83.md, Q-1305, found by the review of a86f326; branch
-            // feedback82-85).
+            // A linker that does not list what it reads (`judged_args`): said so, and the build is
+            // refused (FEEDBACK83.md, Q-1305, found by the review of a86f326; branch feedback82-85).
             if let Some(line) = linker_lists_not(&log).filter(|_| cfg!(target_os = "linux")) {
-                let line = NO_LINK_LIST.get_or_init(|| line.trim().to_string());
-                return Err(no_link_list(qwer, line));
+                return Err(no_link_list(qwer, line.trim()));
             }
             let errors: Vec<&str> = log.lines().filter(|l| !l.trim_start().starts_with("Compiling") && !l.trim_start().starts_with("Updating") && !l.trim_start().starts_with("Locking")).collect();
             return Err(format!("cannot build {}:\n{}", qwer.display(), errors.join("\n")));
@@ -2317,12 +2359,12 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         if let Some(why) = loads_refused(&built_bytes) {
             return Err(format!("{} is held to its SHA-256, and the library built from it {}: it does not load, and what was built is not kept (link only the system's libraries)", qwer.display(), why));
         }
-        write(&lib, &built_bytes)?;
         let want = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&built_bytes));
-        // Its crate and target go; the library is opened by what was checked.
+        // Its crate and target go; the library is opened as the bytes judged, a private copy only
+        // this process can change (`private_library`; found by the review of 0a3aeb9).
         let _ = std::fs::remove_dir_all(&target);
         let _ = std::fs::remove_dir_all(&crate_dir);
-        let lib = checked_lib(&lib, &want)?;
+        let lib = private_library(&built_bytes, &lib.file_name().map_or_else(|| "library".to_string(), |n| n.to_string_lossy().into_owned()), Some(&dir))?;
         BUILT_HERE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new).insert(hash.clone(), (lib.clone(), want));
         PRIVATE_DIRS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((lib.clone(), dir.clone()));
         Ok(lib)
@@ -2373,10 +2415,6 @@ fn read_in(target: &Path, crate_name: &str, crate_dir: &Path, own: &[PathBuf]) -
     }
     Ok(None)
 }
-
-/// The line of a failed build that said its linker does not take `--dependency-file`
-/// (`linker_lists_not`): no pinned build is tried again in this run.
-static NO_LINK_LIST: OnceLock<String> = OnceLock::new();
 
 /// What is said where the linker does not list what it reads.
 fn no_link_list(qwer: &Path, line: &str) -> String {
@@ -2822,8 +2860,19 @@ pub fn link_args_refused(printed: &str, crate_dir: &Path, may_read: &dyn Fn(&Pat
 /// Whether a failed pinned build's log says its linker does not take `--dependency-file` (GNU ld
 /// before binutils 2.35: RHEL 8, Ubuntu 20.04, Amazon Linux 2), which judging it needs: the line
 /// that says so (FEEDBACK83.md, Q-1305, found by the review of a86f326; branch feedback82-85).
+/// Only the linker's own line: one that starts with its name (`/usr/bin/ld:`, `ld.lld:`,
+/// `mold:`), after rustc's `= note:`, and says the option is not known. A line of a plugin's
+/// `compile_error!` or a build script's warning that held those words refused every later pinned
+/// build of the run (found by the review of 0a3aeb9); nor is what is found remembered past its build.
 pub fn linker_lists_not(log: &str) -> Option<&str> {
-    log.lines().find(|l| l.contains("--dependency-file") && ["unrecognized", "unknown", "invalid", "unsupported"].iter().any(|w| l.contains(w)))
+    log.lines().find(|l| {
+        let t = l.trim_start();
+        let t = t.strip_prefix("= note:").unwrap_or(t).trim_start();
+        let Some((who, what)) = t.split_once(": ") else { return false };
+        let name = who.rsplit('/').next().unwrap_or(who);
+        let linker = matches!(name, "ld" | "ld.bfd" | "ld.gold" | "ld.lld" | "lld" | "rust-lld" | "mold" | "ld.mold") || (name.ends_with("-ld") && !name.contains(' '));
+        linker && what.contains("--dependency-file") && ["unrecognized option", "unrecognised option", "unknown option", "unknown argument", "unknown command line option"].iter().any(|w| what.contains(w))
+    })
 }
 
 /// Why the library `bytes` may not load where a hold or a pin by hash holds it, if it may not: what
@@ -2850,16 +2899,24 @@ pub fn loads_refused(bytes: &[u8]) -> Option<String> {
             if n == 0 || n > 64 {
                 return unreadable();
             }
+            // Each slice judged, and one for this machine, the one dyld loads, there (found by
+            // the review of 0a3aeb9).
+            let mut mine = false;
             for i in 0..n as usize {
                 let e = 8 + i * if wide { 32 } else { 20 };
-                let (off, size) = if wide { (be(e + 8, 8), be(e + 16, 8)) } else { (be(e + 8, 4), be(e + 12, 4)) };
-                let (Some(off), Some(size)) = (off, size) else { return unreadable() };
+                let (cpu, off, size) = if wide { (be(e, 4), be(e + 8, 8), be(e + 16, 8)) } else { (be(e, 4), be(e + 8, 4), be(e + 12, 4)) };
+                let (Some(cpu), Some(off), Some(size)) = (cpu, off, size) else { return unreadable() };
                 let Some(slice) = usize::try_from(off).ok().zip(usize::try_from(size).ok()).and_then(|(o, s)| at(o, s)) else { return unreadable() };
+                mine |= Some(cpu as u32) == host_cpu();
                 if let Some(why) = macho_loads(slice) {
                     return Some(why);
                 }
             }
-            None
+            if mine || host_cpu().is_none() {
+                None
+            } else {
+                Some("has no slice for this machine's processor".to_string())
+            }
         }
         Some([0x7f, b'E', b'L', b'F']) => elf_loads(bytes),
         _ if cfg!(any(target_os = "macos", target_os = "linux")) => unreadable(),
@@ -2867,20 +2924,40 @@ pub fn loads_refused(bytes: &[u8]) -> Option<String> {
     }
 }
 
+/// This machine's processor as Mach-O names it (`CPU_TYPE_ARM64`, `CPU_TYPE_X86_64`).
+fn host_cpu() -> Option<u32> {
+    if cfg!(target_arch = "aarch64") {
+        Some(0x0100_000c)
+    } else if cfg!(target_arch = "x86_64") {
+        Some(0x0100_0007)
+    } else {
+        None
+    }
+}
+
 /// What `loads_refused` says of bytes that are no library this system loads, or not one it reads.
 const NOT_A_LIBRARY: &str = "is not a library this system loads";
 
-/// `loads_refused` of one Mach-O image (little-endian, 32 or 64 bits).
+/// `loads_refused` of one Mach-O image (little-endian, 32 or 64 bits), its load commands read as
+/// dyld reads them: `ncmds` of them inside `sizeofcmds`, each inside the file. And its own install
+/// name (`LC_ID_DYLIB`) may be no system library's: dyld takes a library loaded once for every
+/// later load of its install name, and one named `/usr/lib/libqprobe.dylib` stood for that library
+/// to a library loaded after it (FEEDBACK83.md, Q-1305, found by the review of 0a3aeb9; branch
+/// feedback82-85).
 fn macho_loads(b: &[u8]) -> Option<String> {
     let u32_at = |o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]));
     let unreadable = || Some(NOT_A_LIBRARY.to_string());
     let header = if b.first() == Some(&0xcf) { 32 } else { 28 };
-    let Some(ncmds) = u32_at(16) else { return unreadable() };
+    let (Some(ncmds), Some(sizeofcmds)) = (u32_at(16), u32_at(20)) else { return unreadable() };
+    let cmds_end = header + sizeofcmds as usize;
+    if cmds_end > b.len() {
+        return unreadable();
+    }
     let mut off = header;
     for _ in 0..ncmds {
         let (Some(cmd), Some(size)) = (u32_at(off), u32_at(off + 4)) else { return unreadable() };
         let size = size as usize;
-        if size < 8 || off + size > b.len() {
+        if size < 8 || off + size > cmds_end {
             return unreadable();
         }
         let name = |name_at: usize| -> Option<String> {
@@ -2889,13 +2966,20 @@ fn macho_loads(b: &[u8]) -> Option<String> {
             let end = s.iter().position(|c| *c == 0).unwrap_or(s.len());
             Some(String::from_utf8_lossy(&s[..end]).into_owned())
         };
+        let system = |n: &str| (n.starts_with("/usr/lib/") || n.starts_with("/System/")) && !n.split('/').any(|c| c == "..");
         match cmd {
             // LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LAZY_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB
             0xc | 0x8000_0018 | 0x8000_001f | 0x20 | 0x8000_0023 => {
                 let Some(n) = name(8) else { return unreadable() };
-                let system = (n.starts_with("/usr/lib/") || n.starts_with("/System/Library/")) && !n.split('/').any(|c| c == "..");
-                if !system {
+                if !(system(&n) && (n.starts_with("/usr/lib/") || n.starts_with("/System/Library/"))) {
                     return Some(format!("loads {} by its install name, which is not the system's (/usr/lib, /System/Library)", crate::confirm::escaped(&n)));
+                }
+            }
+            // LC_ID_DYLIB
+            0xd => {
+                let Some(n) = name(8) else { return unreadable() };
+                if n.starts_with("/usr/lib/") || n.starts_with("/System/") {
+                    return Some(format!("names itself {} (its LC_ID_DYLIB), a system library's install name, for which it would stand to what loads after it", crate::confirm::escaped(&n)));
                 }
             }
             // LC_RPATH
@@ -2909,7 +2993,32 @@ fn macho_loads(b: &[u8]) -> Option<String> {
     None
 }
 
-/// `loads_refused` of an ELF image (32 or 64 bits, either byte order).
+/// Whether `n` is the exact soname of one of the C runtime's libraries, which a Rust library needs
+/// (glibc's libc, libm, libdl, libpthread, librt, libutil, libgcc_s, its dynamic loader
+/// `ld-linux-<arch>.so.<n>`, musl's `libc.so`): no `$` (which glibc expands, `$ORIGIN` into a path
+/// from the working folder) and no `/` can be in one. Before, a name was taken by its part before
+/// `.so`, and `libc.so$ORIGIN` passed (FEEDBACK83.md, Q-1305, found by the review of 0a3aeb9;
+/// branch feedback82-85).
+fn runtime_soname(n: &str) -> bool {
+    const EXACT: &[&str] = &["libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1", "libutil.so.1", "libgcc_s.so.1", "libc.so", "ld-linux.so.2", "ld64.so.1", "ld64.so.2"];
+    if EXACT.contains(&n) {
+        return true;
+    }
+    let plain = n.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'_'));
+    plain && n.strip_prefix("ld-linux-").and_then(|r| r.split_once(".so.")).is_some_and(|(arch, v)| !arch.is_empty() && !arch.contains('.') && !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// Whether a library of the system's library folders has the file name `n` (a soname another
+/// library would be loaded by).
+fn system_soname(n: &str) -> bool {
+    !n.is_empty() && !n.contains('/') && ["/usr/lib", "/lib", "/usr/lib64", "/lib64", "/usr/lib/x86_64-linux-gnu", "/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/lib/aarch64-linux-gnu"].iter().any(|d| Path::new(d).join(n).exists())
+}
+
+/// `loads_refused` of an ELF image (32 or 64 bits, either byte order), read where its loader
+/// reads it: the dynamic table at its `p_vaddr`, mapped to the file through the loaded
+/// segments (`PT_LOAD`), which must be where its `p_offset` says too, and its strings through
+/// the segment that holds `DT_STRTAB`. Before, the table was read at `p_offset`, where ld.so does
+/// not look (FEEDBACK83.md, Q-1305, found by the review of 0a3aeb9; branch feedback82-85).
 fn elf_loads(b: &[u8]) -> Option<String> {
     let unreadable = || Some(NOT_A_LIBRARY.to_string());
     let (wide, big) = (b.get(4) == Some(&2), b.get(5) == Some(&2));
@@ -2921,24 +3030,31 @@ fn elf_loads(b: &[u8]) -> Option<String> {
     let (phoff, phentsize, phnum) = if wide { (num(32, 8), num(54, 2), num(56, 2)) } else { (num(28, 4), num(42, 2), num(44, 2)) };
     let (Some(phoff), Some(phentsize), Some(phnum)) = (phoff, phentsize, phnum) else { return unreadable() };
     let mut loads: Vec<(u64, u64, u64)> = Vec::new();
-    let mut dynamic: Option<(u64, u64)> = None;
+    let mut dynamic: Option<(u64, u64, u64)> = None;
     for i in 0..phnum {
-        let h = (phoff + i * phentsize) as usize;
+        let Some(h) = i.checked_mul(phentsize).and_then(|x| phoff.checked_add(x)).and_then(|h| usize::try_from(h).ok()) else { return unreadable() };
         let Some(kind) = num(h, 4) else { return unreadable() };
         let (offset, vaddr, filesz) = if wide { (num(h + 8, 8), num(h + 16, 8), num(h + 32, 8)) } else { (num(h + 4, 4), num(h + 8, 4), num(h + 16, 4)) };
         let (Some(offset), Some(vaddr), Some(filesz)) = (offset, vaddr, filesz) else { return unreadable() };
         match kind {
             1 => loads.push((vaddr, offset, filesz)),
-            2 => dynamic = Some((offset, filesz)),
+            2 if dynamic.is_some() => return Some("has two dynamic tables (PT_DYNAMIC)".to_string()),
+            2 => dynamic = Some((offset, vaddr, filesz)),
             _ => {}
         }
     }
-    let Some((dyn_off, dyn_size)) = dynamic else { return None };
-    let entry = 2 * word;
+    // Where an address of the loaded image is in the file, `len` bytes of it in one segment.
+    let mapped = |va: u64, len: u64| -> Option<u64> { loads.iter().find(|(l_va, _, l_sz)| va >= *l_va && va.checked_add(len).is_some_and(|e| e <= l_va + l_sz)).map(|(l_va, l_off, _)| va - l_va + l_off) };
+    let Some((dyn_off, dyn_va, dyn_size)) = dynamic else { return None };
+    match mapped(dyn_va, dyn_size) {
+        Some(at) if at == dyn_off => {}
+        _ => return Some("has a dynamic table (PT_DYNAMIC) whose place in the file is not where its loader reads it".to_string()),
+    }
+    let entry = 2 * word as u64;
     let mut entries: Vec<(u64, u64)> = Vec::new();
     let mut strtab = None;
     let mut o = dyn_off;
-    while o + entry as u64 <= dyn_off + dyn_size {
+    while o + entry <= dyn_off + dyn_size {
         let (Some(tag), Some(val)) = (num(o as usize, word), num(o as usize + word, word)) else { return unreadable() };
         if tag == 0 {
             break;
@@ -2947,28 +3063,27 @@ fn elf_loads(b: &[u8]) -> Option<String> {
             strtab = Some(val);
         }
         entries.push((tag, val));
-        o += entry as u64;
+        o += entry;
     }
-    let Some(strtab) = strtab.and_then(|v| loads.iter().find(|(va, _, sz)| v >= *va && v < va + sz).map(|(va, off, _)| v - va + off)) else {
-        return if entries.iter().any(|(t, _)| *t == 1) { unreadable() } else { None };
-    };
+    const STRINGS: &[u64] = &[1, 14, 15, 29, 0x7fff_fffd, 0x7fff_ffff];
+    if !entries.iter().any(|(t, _)| STRINGS.contains(t)) {
+        return None;
+    }
+    let Some(strtab) = strtab.and_then(|v| mapped(v, 1)) else { return unreadable() };
     let string = |at: u64| -> Option<String> {
-        let s = b.get((strtab + at) as usize..)?;
+        let s = b.get(usize::try_from(strtab.checked_add(at)?).ok()?..)?;
         let end = s.iter().position(|c| *c == 0)?;
         Some(String::from_utf8_lossy(&s[..end]).into_owned())
     };
-    const RUNTIME: &[&str] = &["libc", "libm", "libdl", "libpthread", "librt", "libutil", "libgcc_s"];
     for (tag, val) in entries {
-        if !matches!(tag, 1 | 15 | 29 | 0x7fff_fffd | 0x7fff_ffff) {
+        if !STRINGS.contains(&tag) {
             continue;
         }
         let Some(n) = string(val) else { return unreadable() };
         match tag {
-            1 => {
-                let stem = n.split(".so").next().unwrap_or(&n);
-                if n.contains('/') || !(RUNTIME.contains(&stem) || n.starts_with("ld-linux") || n.starts_with("ld64.so") || n.starts_with("libc.musl-")) {
-                    return Some(format!("needs {}, which is not the C runtime's", crate::confirm::escaped(&n)));
-                }
+            1 if !runtime_soname(&n) => return Some(format!("needs {}, which is not the C runtime's", crate::confirm::escaped(&n))),
+            14 if runtime_soname(&n) || n.contains('/') || n.contains('$') || system_soname(&n) => {
+                return Some(format!("names itself {} (its DT_SONAME), a system library's name, for which it would stand to what loads after it", crate::confirm::escaped(&n)));
             }
             15 | 29 => return Some(format!("has a {} ({}), where the loader looks for libraries", if tag == 15 { "DT_RPATH" } else { "DT_RUNPATH" }, crate::confirm::escaped(&n))),
             0x7fff_fffd | 0x7fff_ffff => return Some(format!("has a {} ({})", if tag == 0x7fff_fffd { "DT_AUXILIARY" } else { "DT_FILTER" }, crate::confirm::escaped(&n))),
@@ -3121,9 +3236,11 @@ fn build_confirmed(qwer: &Path, program: &Path) -> Result<(PathBuf, Parsed), Str
     let key = format!("{} {} {}-{} read-asm-link-load-judged", source, lib_name(&lib), std::env::consts::ARCH, std::env::consts::OS);
     let record = built_record(program);
     if lib.is_file() {
-        // Opened by what was hashed, as a pinned build's is (`checked_lib`; found in review 2).
+        // Opened as what was hashed and judged, a private copy of it (`load_copy`; found in review
+        // 2, and by the review of 0a3aeb9: it was opened by its path three times).
         if let Some(want) = record.as_ref().and_then(|r| record_get(r, &key)) {
-            if let Ok(checked) = checked_lib(&lib, &want) {
+            let same = |h: &str| if h == want { Ok(()) } else { Err(format!("{} is not the library built here", lib.display())) };
+            if let Ok(checked) = load_copy(&lib, &same) {
                 return Ok((checked, parse(src.strip_prefix('\u{FEFF}').unwrap_or(&src))));
             }
         }
@@ -3247,6 +3364,18 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
     // with the version that runs now).
     let built = it.unlocked(move || if confirmed { build_confirmed(&path, &program) } else { build_with(&path, here) });
     let (lib_path, parsed) = built.map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?;
+    // A library pinned by its own SHA-256 (in `.quillo/native`) is opened as a private copy of the
+    // bytes whose hash the policy allows, judged by what they load (`load_copy`): its file read
+    // once, never again by its path. A source pin's and a confirmed one's are such copies already
+    // (`build_private`, `build_confirmed`) (FEEDBACK83.md, Q-1305, found by the review of 0a3aeb9;
+    // branch feedback82-85).
+    let lib_path = if !here && !confirmed && pinned_by_hash(qwer) {
+        let (name, version) = (stem(qwer), crate::error::read_text(qwer).ok().and_then(|t| crate::install::header_version(&t)));
+        let allowed = |h: &str| crate::policy::get().plugin(&name, version.as_deref(), &[h.to_string()]);
+        load_copy(&lib_path, &allowed).map_err(|e| Ctrl::Error(Box::new(crate::error::QuilloError::new(e, line))))?
+    } else {
+        lib_path
+    };
     // Not loaded with a function's effects wider than its file's, as `quillo check` says
     // (FEEDBACK85.md, Q-1344; branch feedback82-85). Said once, at the plugin's own line, with the
     // `use` that took it as where: it was `./hi.qwer:1: hi.qwer:4:`, the use's line given to the

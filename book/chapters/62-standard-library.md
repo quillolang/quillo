@@ -470,7 +470,10 @@ path is judged where it really leads, with its links followed:
   policy's `[fs] paths`, a link, and the path the program is started by.
 - The program's own files are refused by any name: its sources, `.env`, the database it has
   open, and its `.quillo` folders (beside its main file and beside each plugin: built
-  plugins, their lock, its keys) *(since 0.8.11: `.quillo` was writable)*.
+  plugins, their lock, its keys) *(since 0.8.11: `.quillo` was writable)*, wherever they
+  lead: a `.quillo` that is a link, and the folders its links lead to, are refused by any
+  name. Names are compared as the file system compares them: on macOS in any case, so
+  `.QUILLO` is `.quillo` but `.quıllo` is not.
 - `delete_file` of a folder is refused when the folder holds one of the program's own files,
   a link to one, or a database it has open, judged by the files themselves; a folder in it that cannot be
   read is an error, and nothing is deleted *(since 0.8.11: what could be deleted was)*.

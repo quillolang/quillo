@@ -8121,7 +8121,10 @@ path is judged where it really leads, with its links followed:
   policy's `[fs] paths`, a link, and the path the program is started by.
 - The program's own files are refused by any name: its sources, `.env`, the database it has
   open, and its `.quillo` folders (beside its main file and beside each plugin: built
-  plugins, their lock, its keys) *(since 0.8.11: `.quillo` was writable)*.
+  plugins, their lock, its keys) *(since 0.8.11: `.quillo` was writable)*, wherever they
+  lead: a `.quillo` that is a link, and the folders its links lead to, are refused by any
+  name. Names are compared as the file system compares them: on macOS in any case, so
+  `.QUILLO` is `.quillo` but `.quıllo` is not.
 - `delete_file` of a folder is refused when the folder holds one of the program's own files,
   a link to one, or a database it has open, judged by the files themselves; a folder in it that cannot be
   read is an error, and nothing is deleted *(since 0.8.11: what could be deleted was)*.
@@ -10999,7 +11002,12 @@ Asking, and who answers:
   `/System/Library`; Linux: the C runtime's). A Linux linker without `--dependency-file`
   (binutils before 2.35) refuses the build: use lld. A pinned source's dependencies are not
   locked: each fresh build takes the newest release their version allows, and their build
-  scripts and macros run as cargo runs them. It is still a reading, not a proof: a crate can do what it does
+  scripts and macros run as cargo runs them. A crate that reaches the system or loads code itself (`libc`,
+  `nix`, `rustix`, `libloading`, `dlopen`, any `-sys` crate) reads as every effect but `db`.
+  A held or pinned plugin's library is read once, hashed, judged by what it loads (the C
+  runtime's exact library names on Linux, `/usr/lib` and `/System` on macOS, no rpath, not
+  named as a system library) and opened as a private copy of those bytes; no other plugin's
+  library is judged. It is still a reading, not a proof: a crate can do what it does
   unseen (`libc::kill` reads as the `libc` crate, which the file's `crates` list confirms by
   name), and a proc macro that reads a file without telling rustc, or a dependency's own
   macro that writes assembly into a function inlined into the plugin (refused, as assembly,

@@ -1323,3 +1323,152 @@ fn a_library_pinned_by_its_hash_that_loads_another_by_its_install_name_does_not_
     assert!(out.contains(&format!("{} loads {} by its install name, which is not the system's (/usr/lib, /System/Library): it does not load", lib.file_name().unwrap().to_string_lossy(), rt.display())), "{}", out);
     assert!(!out.contains("31337"), "{}", out);
 }
+
+// Fix round 10
+
+/// A plugin that takes a crate that reaches the system or loads code itself (libc, nix, rustix,
+/// libloading, dlopen2, windows-sys, any `-sys` crate), by its name or as a `package`, reads as
+/// every effect but db, at its dependency's line: `libc::dlopen(p)`, `libc::system(c)` and
+/// `libloading::Library::new(p)` read as `effects: none`. A crate whose name only starts so
+/// (`libcx`) or holds `sys` (`sysinfo`, read as fs) is not one (src/confirm.rs scan_rust,
+/// RUST_SYSTEM_CRATES, FEEDBACK83.md Q-1305, found by the coverage tests; branch feedback82-85).
+#[test]
+fn a_crate_that_reaches_the_system_itself_reads_as_every_effect() {
+    let d = dir("fix10-system");
+    let every = "http, fs, env, time, random, net, run";
+    let head = |dep: &str| format!("//! version: 1.0.0\n//! effects: none\n//! [dependencies]\n//! {}\n", dep);
+    for (name, dep, krate, code) in [
+        ("dl", "libc = \"0.2\"", "libc", "pub fn load(p: &str) -> i64 { let c = std::ffi::CString::new(p).unwrap(); let h = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW) }; if h.is_null() { 0 } else { 1 } }"),
+        ("sys", "libc = \"0.2\"", "libc", "pub fn run(p: &str) -> i64 { let c = std::ffi::CString::new(p).unwrap(); unsafe { libc::system(c.as_ptr()) as i64 } }"),
+        ("loading", "libloading = \"0.8\"", "libloading", "pub fn load(p: &str) -> i64 { match unsafe { libloading::Library::new(p) } { Ok(l) => { std::mem::forget(l); 1 } Err(_) => 0 } }"),
+        ("nix", "nix = { version = \"0.29\", features = [\"process\"] }", "nix", "pub fn n() -> u8 { 1 }"),
+        ("rustix", "rustix = \"0.38\"", "rustix", "pub fn n() -> u8 { 1 }"),
+        ("dlopen2", "dlopen2 = \"0.7\"", "dlopen2", "pub fn n() -> u8 { 1 }"),
+        ("winsys", "windows-sys = \"0.59\"", "windows-sys", "pub fn n() -> u8 { 1 }"),
+        ("zstdsys", "zstd-sys = \"2\"", "zstd-sys", "pub fn n() -> u8 { 1 }"),
+        ("renamed", "c = { package = \"libc\", version = \"0.2\" }", "libc", "pub fn n() -> u8 { 1 }"),
+    ] {
+        let (code_, out) = effects_of(&d, name, &format!("{}{}\n", head(dep), code));
+        assert_eq!((code_, out.as_str()), (Some(1), reads_as(name, every, &format!("the crate {}, which reaches the system or loads code itself (line 4)", krate)).as_str()), "{}", name);
+    }
+    for (name, dep, said) in [("libcx", "libcx = \"1\"", "libcx.qwer: effects: none\n"), ("sysinfo", "sysinfo = \"0.30\"", "sysinfo.qwer: effects: fs\n")] {
+        let (_, out) = effects_of(&d, name, &format!("{}pub fn n() -> u8 {{ 1 }}\n", head(dep)));
+        assert!(out.starts_with(said), "{}: {}", name, out);
+    }
+}
+
+/// An ELF image (64 bits, little-endian) whose dynamic table needs `needed` and names itself
+/// `soname`; `shift` moves the table's `p_vaddr` from where its `p_offset` is, and `far` puts
+/// `DT_STRTAB` past every loaded segment.
+fn elf_image(needed: &[&str], soname: Option<&str>, shift: u64, far: bool) -> Vec<u8> {
+    let mut strtab = vec![0u8];
+    let mut offs = Vec::new();
+    for n in needed.iter().chain(soname.iter()) {
+        offs.push(strtab.len() as u64);
+        strtab.extend_from_slice(n.as_bytes());
+        strtab.push(0);
+    }
+    let str_at = 64 + 2 * 56;
+    let dyn_at = (str_at + strtab.len() + 7) & !7;
+    let mut dynamic = Vec::new();
+    let mut entry = |t: u64, v: u64| {
+        dynamic.extend_from_slice(&t.to_le_bytes());
+        dynamic.extend_from_slice(&v.to_le_bytes());
+    };
+    for o in &offs[..needed.len()] {
+        entry(1, *o);
+    }
+    if soname.is_some() {
+        entry(14, offs[needed.len()]);
+    }
+    entry(5, if far { 1 << 40 } else { str_at as u64 });
+    entry(0, 0);
+    let total = dyn_at + dynamic.len();
+    let mut b = vec![0u8; 64];
+    b[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    b[16..18].copy_from_slice(&3u16.to_le_bytes());
+    b[32..40].copy_from_slice(&64u64.to_le_bytes());
+    b[54..56].copy_from_slice(&56u16.to_le_bytes());
+    b[56..58].copy_from_slice(&2u16.to_le_bytes());
+    for (kind, off, va, size) in [(1u32, 0u64, 0u64, total as u64), (2, dyn_at as u64, dyn_at as u64 + shift, dynamic.len() as u64)] {
+        let mut h = vec![0u8; 56];
+        h[..4].copy_from_slice(&kind.to_le_bytes());
+        h[8..16].copy_from_slice(&off.to_le_bytes());
+        h[16..24].copy_from_slice(&va.to_le_bytes());
+        h[32..40].copy_from_slice(&size.to_le_bytes());
+        b.extend(h);
+    }
+    b.extend(strtab);
+    b.resize(dyn_at, 0);
+    b.extend(dynamic);
+    b
+}
+
+/// What an ELF library needs is the C runtime's by its exact soname: `libc.so.6`, `ld-linux-
+/// x86-64.so.2`, `libgcc_s.so.1` pass; `libc.so$ORIGIN` (which glibc expands into a path from the
+/// working folder), `libc.so.7`, `libcx.so.6`, `ld-linux-x86-64.so.2$x` do not. Its dynamic table
+/// is read where the loader reads it, at its `p_vaddr`: one whose `p_offset` is elsewhere, or whose
+/// strings are past every loaded segment, is refused. A library that names itself a system
+/// library (`DT_SONAME` `libc.so.6`, a path) is refused, one of its own name passes. And Mach-O: a
+/// library whose own install name is a system library's (`LC_ID_DYLIB` `/usr/lib/libqprobe.dylib`)
+/// is refused, its load commands are read inside `sizeofcmds`, and a fat one with no slice for this
+/// machine is refused (src/native.rs elf_loads, macho_loads, runtime_soname, FEEDBACK83.md
+/// Q-1305, found by the coverage tests; branch feedback82-85).
+#[test]
+fn a_library_is_read_where_its_loader_reads_it() {
+    let refused = |b: &[u8]| quillo::native::loads_refused(b);
+    assert_eq!(refused(&elf_image(&["libc.so.6", "ld-linux-x86-64.so.2", "libgcc_s.so.1", "libpthread.so.0"], Some("libquillo_hi_pinned.so"), 0, false)), None);
+    for n in ["libc.so$ORIGIN", "libc.so.7", "libcx.so.6", "ld-linux-x86-64.so.2$x", "ld-linux-.so.2", "../libc.so.6"] {
+        assert_eq!(refused(&elf_image(&[n], None, 0, false)), Some(format!("needs {}, which is not the C runtime's", n)), "{}", n);
+    }
+    for n in ["libc.so.6", "/opt/x/libq.so", "lib$ORIGIN.so"] {
+        assert!(refused(&elf_image(&["libc.so.6"], Some(n), 0, false)).is_some_and(|w| w.starts_with(&format!("names itself {} (its DT_SONAME), a system library's name", n))), "{}", n);
+    }
+    assert_eq!(refused(&elf_image(&["libc.so.6"], None, 8, false)), Some("has a dynamic table (PT_DYNAMIC) whose place in the file is not where its loader reads it".to_string()));
+    assert_eq!(refused(&elf_image(&["libc.so.6"], None, 0, true)), Some("is not a library this system loads".to_string()));
+    let sys = (0xc, "/usr/lib/libSystem.B.dylib");
+    assert_eq!(refused(&macho(&[(0xd, "libquillo_hi_pinned.dylib"), sys])), None);
+    assert!(refused(&macho(&[(0xd, "/usr/lib/libqprobe.dylib"), sys])).is_some_and(|w| w.starts_with("names itself /usr/lib/libqprobe.dylib (its LC_ID_DYLIB), a system library's install name")));
+    // `sizeofcmds` one short of its commands: read as dyld reads them, past it is no command.
+    let mut short = macho(&[sys]);
+    let size = u32::from_le_bytes(short[20..24].try_into().unwrap()) - 1;
+    short[20..24].copy_from_slice(&size.to_le_bytes());
+    assert_eq!(refused(&short), Some("is not a library this system loads".to_string()));
+    // A fat library with one slice, for another processor than this machine's.
+    let slice = macho(&[sys]);
+    let other: u32 = if cfg!(target_arch = "aarch64") { 0x0100_0007 } else { 0x0100_000c };
+    let mut fat = vec![0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 1];
+    for v in [other, 0, 64, slice.len() as u32, 3] {
+        fat.extend_from_slice(&v.to_be_bytes());
+    }
+    fat.resize(64, 0);
+    fat.extend(&slice);
+    if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
+        assert_eq!(refused(&fat), Some("has no slice for this machine's processor".to_string()));
+    }
+}
+
+/// A failed build's log is taken to say its linker lists nothing only by the linker's own line
+/// (`/usr/bin/ld: unrecognized option '--dependency-file=..'`, `ld.lld: error: unknown argument ..`,
+/// `mold: fatal: unknown command line option: ..`); a line of a plugin's `compile_error!` or a build
+/// script's warning with the same words is not (src/native.rs linker_lists_not, FEEDBACK83.md
+/// Q-1305, found by the coverage tests; branch feedback82-85).
+#[test]
+fn only_the_linkers_own_line_says_it_lists_nothing() {
+    for line in [
+        "  = note: /usr/bin/ld: unrecognized option '--dependency-file=/t/linked.list'",
+        "ld.lld: error: unknown argument '--dependency-file=/t/x'",
+        "          /usr/bin/x86_64-linux-gnu-ld: unrecognized option '--dependency-file=/t/x'",
+        "mold: fatal: unknown command line option: --dependency-file=/t/x",
+    ] {
+        assert!(quillo::native::linker_lists_not(line).is_some(), "{}", line);
+    }
+    for line in [
+        "error: unknown option --dependency-file",
+        "error: ld: unrecognized option '--dependency-file=/t/x'",
+        "warning: x@0.1.0: unknown option --dependency-file",
+        "  = note: cc: unknown option --dependency-file",
+    ] {
+        assert_eq!(quillo::native::linker_lists_not(line), None, "{}", line);
+    }
+}

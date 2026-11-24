@@ -1268,3 +1268,124 @@ fn a_dotless_i_is_another_name_on_macos() {
     assert_eq!((code, out.as_str()), (Some(0), format!("false\nerr(\"write_file: will not write .QUILLO/plugins.lock: {}\")\n", OWN_QUILLO).as_str()));
     assert!(app.join(".qu\u{131}llo/notes.txt").exists() && !app.join(".quillo/plugins.lock").exists());
 }
+
+// Fix round 10 (F3)
+
+/// A plugin's native build cache of its own, in cargo's temporary folder for tests.
+fn r10_cache(name: &str) -> String {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("run3-r10-{}", name)).display().to_string()
+}
+
+/// A plugin no layer pins by hash, which links a library of the program's own folder
+/// (`#[link(name = "qzs")]` with `-L`), loads whether or not another plugin is pinned by hash:
+/// `allow = ["zs"]` and `allow = ["zs", "other@sha256:.."]` alike. Since fcac7a3 the second was
+/// refused by what its library loads, judged wherever any layer pinned any plugin by hash
+/// (src/native.rs use_file, load_copy, pinned_by_hash, FEEDBACK83.md Q-1305, found by the coverage
+/// tests; branch feedback82-85).
+#[cfg(target_os = "macos")]
+#[test]
+fn an_unpinned_plugin_is_not_judged_where_another_is_pinned_by_hash() {
+    let d = Dir(support::temp_dir("cov8285r3-unpinned").canonicalize().unwrap());
+    let (app, lib, tmp) = (d.0.join("app"), d.0.join("lib"), d.0.join("tmp"));
+    for f in [&app, &lib, &tmp] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    std::fs::write(lib.join("q.c"), "int qzs(void) { return 7; }\n").unwrap();
+    let dylib = lib.join("libqzs.dylib");
+    let ok = Command::new("cc").args(["-dynamiclib", "-o"]).arg(&dylib).arg(lib.join("q.c")).arg("-install_name").arg(&dylib).stdin(Stdio::null()).status().unwrap();
+    assert!(ok.success());
+    std::fs::write(app.join("zs.qwer"), "//! version: 1.0.0\n//! effects: none\n#[link(name = \"qzs\")]\nextern \"C\" { fn qzs() -> i32; }\npub fn hi() -> String { unsafe { qzs() }.to_string() }\n").unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"zs.qwer\"\nprint(hi())\n").unwrap();
+    let (flags, cache, t) = (format!("-L {}", lib.display()), r10_cache("unpinned"), tmp.display().to_string());
+    for (policy, allow) in [("nopin.toml", "[\"zs\"]".to_string()), ("pin.toml", format!("[\"zs\", \"other@sha256:{}\"]", "2d".repeat(32)))] {
+        std::fs::write(app.join(policy), format!("[plugins]\nallow = {}\n", allow)).unwrap();
+        let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--policy", policy], &[("RUSTFLAGS", &flags), ("QUILLO_NATIVE_CACHE", &cache), ("TMPDIR", &t)], &d.0.join("run.log"), 600);
+        assert_eq!((code, out.ends_with("7\n")), (Some(0), true), "{}: {}", policy, out);
+    }
+}
+
+/// A library pinned by its own SHA-256 (a provider's `QUILLO_POLICY_PATH` layer) is opened as a
+/// private copy of the bytes whose hash is pinned, read once: while another process swaps it in
+/// `.quillo/native` over and over with a library whose constructor writes a file, every start
+/// loads the pinned one or is refused, and the other never runs. Before, the library was hashed,
+/// read again to be judged and opened by its path a third time (src/native.rs load_copy,
+/// private_library, FEEDBACK83.md Q-1305, found by the coverage tests; branch feedback82-85).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_library_pinned_by_its_hash_is_opened_as_the_bytes_whose_hash_is_pinned() {
+    use sha2::Digest;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let d = Dir(support::temp_dir("cov8285r3-libswap").canonicalize().unwrap());
+    let (app, tmp) = (d.0.join("app"), d.0.join("tmp"));
+    for f in [&app, &tmp] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    std::fs::write(app.join("hi.qwer"), "//! version: 1.0.0\n//! effects: none\npub fn hi() -> String { \"hi from A\".into() }\n").unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let (cache, t) = (r10_cache("libswap"), tmp.display().to_string());
+    let (code, out) = quillo_at(&app, &["build", "main.qwe"], &[("QUILLO_NATIVE_CACHE", &cache)], &d.0.join("build.log"), 600);
+    assert_eq!(code, Some(0), "{}", out);
+    let lib = quillo::native::library_path(&app.join("hi.qwer")).unwrap();
+    let a = std::fs::read(&lib).unwrap();
+    std::fs::write(d.0.join("a.lib"), &a).unwrap();
+    let ran = d.0.join("RAN");
+    std::fs::write(d.0.join("b.c"), format!("#include <stdio.h>\n__attribute__((constructor)) static void b(void) {{ FILE *f = fopen({:?}, \"w\"); if (f) fclose(f); }}\n", ran.display().to_string())).unwrap();
+    let ok = Command::new("cc").args(["-dynamiclib", "-o"]).arg(d.0.join("b.lib")).arg(d.0.join("b.c")).stdin(Stdio::null()).status().unwrap();
+    assert!(ok.success());
+    let hash: String = sha2::Sha256::digest(&a).iter().map(|b| format!("{:02x}", b)).collect();
+    let pin = d.0.join("pin.toml");
+    std::fs::write(&pin, format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash)).unwrap();
+    let p = pin.display().to_string();
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let swapper = {
+        let (stop, d0, lib) = (stop.clone(), d.0.clone(), lib.clone());
+        std::thread::spawn(move || {
+            let next = lib.with_extension("next");
+            while !stop.load(Ordering::Relaxed) {
+                for src in ["a.lib", "b.lib"] {
+                    let _ = std::fs::remove_file(&next);
+                    if std::fs::hard_link(d0.join(src), &next).is_ok() {
+                        let _ = std::fs::rename(&next, &lib);
+                    }
+                }
+            }
+        })
+    };
+    let mut loaded = 0;
+    for _ in 0..150 {
+        let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--no-build"], &[("QUILLO_POLICY_PATH", &p), ("TMPDIR", &t)], &d.0.join("run.log"), 60);
+        assert!(!ran.exists(), "the other library ran: {}", out);
+        if code == Some(0) {
+            assert!(out.ends_with("hi from A\n"), "{}", out);
+            loaded += 1;
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    swapper.join().unwrap();
+    std::fs::write(&lib, &a).unwrap();
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--no-build"], &[("QUILLO_POLICY_PATH", &p), ("TMPDIR", &t)], &d.0.join("run.log"), 60);
+    assert_eq!((code, out.ends_with("hi from A\n")), (Some(0), true), "{} (loaded {} of 150 while swapped)", out, loaded);
+    assert!(!ran.exists());
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "a private copy was left");
+}
+
+/// A link in a `.quillo` that leads to the program's folder or one above it (`native -> /`,
+/// `sites -> ..`) is no folder of Quillo's own: taken as one, it had every write of the program
+/// refused, and the whole disk looked at once a second. An ordinary file is written; what is in
+/// `.quillo` itself stays the program's (src/builtins.rs quillo_guard, FEEDBACK85.md Q-1340,
+/// found fixing the review of 0284f7c; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn a_link_in_quillo_to_a_folder_above_the_program_is_no_folder_of_quillos() {
+    let d = Dir(support::temp_dir("cov8285r3-quillo-up").canonicalize().unwrap());
+    let app = d.0.join("app");
+    std::fs::create_dir_all(app.join(".quillo")).unwrap();
+    std::fs::write(app.join(".quillo/plugins.lock"), "lock").unwrap();
+    std::os::unix::fs::symlink("/", app.join(".quillo/native")).unwrap();
+    std::os::unix::fs::symlink("..", app.join(".quillo/sites")).unwrap();
+    std::fs::write(app.join("main.qwe"), "print(write_file(\"notes.txt\", \"ok\") | is_err)\nprint(write_file(\"data/n.txt\", \"ok\") | is_err)\nprint(write_file(\".quillo/plugins.lock\", \"x\"))\n").unwrap();
+    let started = Instant::now();
+    let (code, out) = quillo_at(&app, &["run", "main.qwe"], &[], &d.0.join("a.log"), 60);
+    assert_eq!((code, out.as_str()), (Some(0), format!("false\nfalse\nerr(\"write_file: will not write .quillo/plugins.lock: {}\")\n", OWN_QUILLO).as_str()));
+    assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+}

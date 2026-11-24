@@ -1307,6 +1307,12 @@ const RUST_CRATES: &[(&str, &str)] = &[
     ("icalendar", "random"),
 ];
 
+/// Crates that reach the system or load code themselves: their calls (`libc::dlopen`,
+/// `libc::system`, `nix::unistd::execv`, `libloading::Library::new`) are read as a foreign block's
+/// are, every effect but `db` (`scan_rust`); and every `-sys` crate, by its name (FEEDBACK83.md,
+/// Q-1305, found by the review of 0a3aeb9; branch feedback82-85). Each as `_` for `-`, lowercase.
+const RUST_SYSTEM_CRATES: &[&str] = &["libc", "nix", "rustix", "libloading", "dlopen", "dlopen2", "windows", "windows_sys", "winapi"];
+
 /// Crates that do what an effect names only where the file takes a feature of theirs
 /// (`feature:v4` in its dependency line) or calls one of theirs (any text of the code): `uuid`'s
 /// v4 and v7, `bcrypt::hash`'s salt (FEEDBACK83.md, Q-1305; branch feedback82-85).
@@ -2643,13 +2649,29 @@ fn scan_rust(bytes: &[u8]) -> Block {
         }
     }
     let code = spelled;
+    // The line of each dependency, by the name it is taken under (`native::parse` builds with these).
+    let dep_lines: Vec<(String, u32)> = crate::native::header_lines(&src, true).into_iter().filter_map(|(n, rest)| rest.split_once('=').map(|(k, _)| (k.trim().to_string(), n as u32 + 1))).collect();
     for c in b.crates.keys() {
-        let name = c.split(' ').next().unwrap_or("");
-        let package = parsed.deps.lines().filter_map(|l| l.split_once('=')).find(|(n, _)| n.trim() == name).map(|(n, spec)| crate_of(n.trim(), spec));
-        let name = package.as_deref().unwrap_or(name);
+        let taken = c.split(' ').next().unwrap_or("");
+        let package = parsed.deps.lines().filter_map(|l| l.split_once('=')).find(|(n, _)| n.trim() == taken).map(|(n, spec)| crate_of(n.trim(), spec));
+        let name = package.as_deref().unwrap_or(taken);
         for (_, effect) in RUST_CRATES.iter().filter(|(k, _)| *k == name) {
             mask |= effect_bit(effect);
             calls.push((*effect, format!("the crate {}", name), 0));
+        }
+        // A crate that reaches the system or loads code itself (`RUST_SYSTEM_CRATES`, a `-sys`
+        // crate): what its calls do the reading cannot follow, as a foreign block's, so it is every
+        // effect but `db`, at its dependency's line. `libc::dlopen(p)`, `libc::system(c)` and
+        // `libloading::Library::new(p)` read as `effects: none`, and a held plugin that said so
+        // dlopened another file, whose constructor ran (FEEDBACK83.md, Q-1305, found by the review
+        // of 0a3aeb9; branch feedback82-85).
+        let norm = name.to_ascii_lowercase().replace('-', "_");
+        if RUST_SYSTEM_CRATES.contains(&norm.as_str()) || norm.ends_with("_sys") {
+            let line = dep_lines.iter().find(|(k, _)| k == taken).map_or(0, |(_, l)| *l);
+            for e in effect_names(every_rust_effect()) {
+                mask |= effect_bit(e);
+                calls.push((e, format!("the crate {}, which reaches the system or loads code itself", name), line));
+            }
         }
     }
     // A crate's feature or call that does it (FEEDBACK83.md, Q-1305; branch feedback82-85).

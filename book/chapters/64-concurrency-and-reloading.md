@@ -1122,7 +1122,12 @@ Asking, and who answers:
   `/System/Library`; Linux: the C runtime's). A Linux linker without `--dependency-file`
   (binutils before 2.35) refuses the build: use lld. A pinned source's dependencies are not
   locked: each fresh build takes the newest release their version allows, and their build
-  scripts and macros run as cargo runs them. It is still a reading, not a proof: a crate can do what it does
+  scripts and macros run as cargo runs them. A crate that reaches the system or loads code itself (`libc`,
+  `nix`, `rustix`, `libloading`, `dlopen`, any `-sys` crate) reads as every effect but `db`.
+  A held or pinned plugin's library is read once, hashed, judged by what it loads (the C
+  runtime's exact library names on Linux, `/usr/lib` and `/System` on macOS, no rpath, not
+  named as a system library) and opened as a private copy of those bytes; no other plugin's
+  library is judged. It is still a reading, not a proof: a crate can do what it does
   unseen (`libc::kill` reads as the `libc` crate, which the file's `crates` list confirms by
   name), and a proc macro that reads a file without telling rustc, or a dependency's own
   macro that writes assembly into a function inlined into the plugin (refused, as assembly,
