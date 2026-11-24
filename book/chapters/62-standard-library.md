@@ -474,7 +474,10 @@ path is judged where it really leads, with its links followed:
   the program's own `.quillo` folders lead (a `.quillo` that is a link, to what is there or
   not yet), nor open a database there. Quillo reads nothing in it through a link below it,
   or from a file with a second hard link, and a `.quillo` that leads to the program's folder
-  or above stops the start. Names are compared as the file system compares them: on macOS
+  or above stops the start. The `.quillo` folders of every program the process runs, mounted
+  ones and services too, are refused to all of them, and `file()` and `files()` answer 404
+  for anything in one or where one leads. Names are compared as the file system compares
+  them: on macOS
   and Windows in any ASCII case, so `.QUILLO` is `.quillo` but `.quıllo` is not. Writing a
   file onto a folder fails as the system says; only `delete_file` judges what a folder
   holds.

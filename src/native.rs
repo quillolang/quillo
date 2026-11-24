@@ -1677,7 +1677,21 @@ fn quillo_read(p: &Path) -> Result<Option<Vec<u8>>, String> {
     match crate::statics::read_below(&root, &rel) {
         Ok(b) => Ok(Some(b)),
         Err(crate::statics::Below::Missing) => Ok(None),
-        Err(crate::statics::Below::Refused(why)) => Err(why),
+        Err(crate::statics::Below::Refused(why) | crate::statics::Below::Unreadable(why)) => Err(why),
+    }
+}
+
+/// Why `p`, kept in a `.quillo`, may not be read as Quillo's own however its bytes are: a link, a
+/// file of two names, a `.quillo` that leads above its folder. What cannot be read for another
+/// reason (no permission) is the reader's to say, as before (`not_as_built`'s "cannot read").
+fn planted(p: &Path) -> Option<String> {
+    let (root, rel) = crate::statics::quillo_split(p)?;
+    if let Some(why) = crate::builtins::quillo_not_its_own(&root) {
+        return Some(why);
+    }
+    match crate::statics::open_below(&root, &rel) {
+        Err(crate::statics::Below::Refused(why)) => Some(why),
+        _ => None,
     }
 }
 
@@ -1725,6 +1739,8 @@ fn lib_there(lib: &Path) -> Result<bool, String> {
             Ok(_) => Ok(true),
             Err(crate::statics::Below::Missing) => Ok(false),
             Err(crate::statics::Below::Refused(why)) => Err(why),
+            // There, though not readable: judged by what reads it (`not_as_built`).
+            Err(crate::statics::Below::Unreadable(_)) => Ok(true),
         },
         None => Ok(lib.is_file()),
     }
@@ -1899,7 +1915,7 @@ fn build_with(qwer: &Path, here: bool) -> Result<(PathBuf, Parsed), String> {
         if !lib_there(lib).map_err(|why| format!("will not load the library of {}: {}", qwer.display(), why))? {
             return Ok(false);
         }
-        if let Err(why) = quillo_read(&lock_file(lib)) {
+        if let Some(why) = planted(&lock_file(lib)) {
             return Err(format!("will not load the library of {}: {}", qwer.display(), why));
         }
         if !has_lock(lib) && !no_build() && !REBUILD_UNLOCKED.with(|r| r.get()) {

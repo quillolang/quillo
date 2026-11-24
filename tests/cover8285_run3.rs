@@ -1219,7 +1219,13 @@ fn an_upload_cannot_reach_a_quillo_folder_linked_out_of_the_program() {
     std::fs::write(app.join("main.qwe"), "route POST /u {\n  let r = save_upload(request.files.doc, request.form.to)\n  return is_err(r) ? r.error : \"saved\"\n}\n").unwrap();
     let (g, port) = serve_at(&app, &["main.qwe", "--allow-path", "../data"], &d.0.join("a.log"));
     let origin = format!("http://localhost:{}", port);
-    for to in [".quillo/plugins.lock", ".quillo/native/libhi-1.dylib", ".QUILLO/native/libhi-2.dylib"] {
+    // `.QUILLO` is `.quillo` where names are compared in any case (macOS, Windows); on Linux it is
+    // another folder, and an upload there is a file like others (found by CI on 18de67d).
+    let mut tos = vec![".quillo/plugins.lock", ".quillo/native/libhi-1.dylib"];
+    if cfg!(any(target_os = "macos", windows)) {
+        tos.push(".QUILLO/native/libhi-2.dylib");
+    }
+    for to in tos {
         let body = format!("--B\r\nContent-Disposition: form-data; name=\"to\"\r\n\r\n{}\r\n--B\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"e.txt\"\r\nContent-Type: text/plain\r\n\r\nEVIL\r\n--B--\r\n", to);
         let a = send(port, "POST", "/u", &[("Content-Type", "multipart/form-data; boundary=B"), ("Origin", &origin), ("Sec-Fetch-Site", "same-origin")], &body);
         assert_eq!(a.body, format!("save_upload: will not write {}: {}; save uploads under a folder of their own, such as uploads/", to, OWN_QUILLO), "{}", to);
@@ -1446,8 +1452,10 @@ fn a_quillo_is_judged_by_its_name_and_where_it_resolves_however_much_is_in_one()
 
 /// A write does not wait on what a `.quillo` holds: with 100,000 files in `.quillo/sites`, a write
 /// stopped for a quarter of a second once a second while round 9's guard read the folder to its
-/// end. 20,000 writes, none held (src/builtins.rs own_target, FEEDBACK85.md Q-1340, found by the
-/// review of 9da2632; branch feedback82-85)
+/// end. 20,000 writes, the longest compared with the longest where `.quillo` is empty, on the same
+/// machine: a fixed bound failed on CI's Linux runner in debug, whose writes are slow enough on
+/// their own (found by CI on 18de67d) (src/builtins.rs own_target, FEEDBACK85.md Q-1340, found by
+/// the review of 9da2632; branch feedback82-85)
 #[cfg(unix)]
 #[test]
 fn a_write_does_not_wait_on_what_a_quillo_holds() {
@@ -1455,16 +1463,22 @@ fn a_write_does_not_wait_on_what_a_quillo_holds() {
     let app = d.0.join("app");
     std::fs::create_dir_all(app.join(".quillo/sites")).unwrap();
     std::fs::create_dir_all(app.join("out")).unwrap();
+    std::fs::write(
+        app.join("main.qwe"),
+        "let worst = 0\nlet last = now()\nfor i in range(0, 20000) {\n  let _w = write_file(\"out/a.txt\", \"x\")\n  let t = now()\n  if t - last > worst {\n    worst = t - last\n  }\n  last = t\n}\nprint(worst)\n",
+    )
+    .unwrap();
+    let worst = || -> u64 {
+        let (code, out) = quillo_at(&app, &["run", "main.qwe"], &[], &d.0.join("a.log"), 600);
+        assert_eq!(code, Some(0), "{}", out);
+        out.trim().parse().unwrap()
+    };
+    let empty = worst();
     for i in 0..100_000 {
         std::fs::write(app.join(format!(".quillo/sites/s{}.json", i)), "{}").unwrap();
     }
-    std::fs::write(
-        app.join("main.qwe"),
-        "let worst = 0\nlet last = now()\nfor i in range(0, 20000) {\n  let _w = write_file(\"out/a.txt\", \"x\")\n  let t = now()\n  if t - last > worst {\n    worst = t - last\n  }\n  last = t\n}\nprint(worst < 150)\n",
-    )
-    .unwrap();
-    let (code, out) = quillo_at(&app, &["run", "main.qwe"], &[], &d.0.join("a.log"), 120);
-    assert_eq!((code, out.as_str()), (Some(0), "true\n"));
+    let full = worst();
+    assert!(full <= empty * 5 + 100, "the longest write {} ms with a full .quillo, {} ms with an empty one", full, empty);
 }
 
 /// A `.quillo` that is a link to what is not there yet (`qstore`, `../data/qstore`) leads there
@@ -1952,6 +1966,116 @@ fn a_plugin_with_a_byte_order_mark_under_a_source_pin_builds_no_dependency_from_
     assert_eq!(code, Some(1), "{}", out);
     assert!(out.contains("builds another file into it (the dependency `evil2` from a folder (`path`) at line 4)") && !out.contains("building ") && !out.contains("4242"), "{}", out);
     assert!(!d.0.join("MARKER").exists(), "the dependency was built: {}", out);
+}
+
+// Fix round 11
+
+/// A mounted program's or a service's `.quillo` that is a link is the process's, kept from the
+/// main program's writes as the main program's own is: with `shop/.quillo -> qs` (and
+/// `svc/.quillo -> qs2`), the main program wrote `shop/qs/plugins.lock` and a library into
+/// `shop/qs/native`, which loaded at the next start, and deleted `shop/qs` (src/builtins.rs
+/// note_quillo_folder and quillo_roots, FEEDBACK85.md Q-1340, found by the final review of
+/// a6cee54; branch feedback82-85)
+#[cfg(target_os = "macos")]
+#[test]
+fn a_mounted_programs_or_services_quillo_is_the_processs() {
+    let Some((d, app, profile)) = sandboxed_app("cov8285r3-quillo-mount") else { return };
+    for f in ["shop/qs/native", "svc/qs2/native"] {
+        std::fs::create_dir_all(app.join(f)).unwrap();
+    }
+    for f in ["shop/qs/plugins.lock", "svc/qs2/plugins.lock"] {
+        std::fs::write(app.join(f), "lock").unwrap();
+    }
+    std::os::unix::fs::symlink("qs", app.join("shop/.quillo")).unwrap();
+    std::os::unix::fs::symlink("qs2", app.join("svc/.quillo")).unwrap();
+    std::fs::write(app.join("shop/app.qwe"), "route GET / = \"shop\"\n").unwrap();
+    std::fs::write(app.join("svc/b.qwe"), "server fn hello() {\n  return \"b\"\n}\n").unwrap();
+    let writes = ["shop/qs/plugins.lock", "shop/qs/native/libhi-1.dylib", "svc/qs2/plugins.lock", "svc/qs2/native/libb-1.dylib"];
+    let deletes = ["shop/qs", "svc/qs2/native"];
+    let mut main = String::from("mount /shop = \"shop/app.qwe\"\nservice /b = \"svc/b.qwe\"\nroute GET / = \"main\"\n");
+    for w in writes {
+        main.push_str(&format!("print(write_file(\"{}\", \"EVIL\"))\n", w));
+    }
+    for p in deletes {
+        main.push_str(&format!("print(delete_file(\"{}\"))\n", p));
+    }
+    main.push_str("print(write_file(\"shop/notes.txt\", \"ok\") | is_err)\nexit(0)\n");
+    std::fs::write(app.join("main.qwe"), &main).unwrap();
+    let mut want = String::new();
+    for w in writes {
+        want.push_str(&format!("err(\"write_file: will not write {}: {}\")\n", w, OWN_QUILLO));
+    }
+    for p in deletes {
+        want.push_str(&format!("err(\"delete_file: will not delete {}: {}\")\n", p, OWN_QUILLO));
+    }
+    want.push_str("false\n");
+    let (code, out) = sandboxed_at(&app, &profile, &["run", "main.qwe", "--port", "0"], &[], &d.0.join("a.log"), 60);
+    assert!(out.contains(&want), "{:?}: {}", code, out);
+    for f in ["shop/qs/plugins.lock", "svc/qs2/plugins.lock"] {
+        assert_eq!(std::fs::read_to_string(app.join(f)).unwrap(), "lock", "{}", f);
+    }
+    assert!(!app.join("shop/qs/native/libhi-1.dylib").exists() && !app.join("svc/qs2/native/libb-1.dylib").exists());
+}
+
+/// An upload by the name a visitor gave cannot reach a mounted program's `.quillo` that is a link:
+/// `shop/qs/plugins.lock` and a library in `shop/qs/native` were "saved", and the library's
+/// constructor ran at the next start (src/builtins.rs own_target, FEEDBACK85.md Q-1340, found by
+/// the final review of a6cee54; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn an_upload_cannot_reach_a_mounted_programs_quillo() {
+    let d = Dir(support::temp_dir("cov8285r3-quillo-mount-up").canonicalize().unwrap());
+    let app = d.0.join("app");
+    std::fs::create_dir_all(app.join("shop/qs/native")).unwrap();
+    std::fs::write(app.join("shop/qs/plugins.lock"), "lock").unwrap();
+    std::os::unix::fs::symlink("qs", app.join("shop/.quillo")).unwrap();
+    std::fs::write(app.join("shop/app.qwe"), "route GET / = \"shop\"\n").unwrap();
+    std::fs::write(app.join("main.qwe"), "mount /shop = \"shop/app.qwe\"\nroute POST /u {\n  let r = save_upload(request.files.doc, request.form.to)\n  return is_err(r) ? r.error : \"saved\"\n}\n").unwrap();
+    let (g, port) = serve_at(&app, &["main.qwe"], &d.0.join("a.log"));
+    let origin = format!("http://localhost:{}", port);
+    for to in ["shop/qs/plugins.lock", "shop/qs/native/libhi-1.dylib"] {
+        let body = format!("--B\r\nContent-Disposition: form-data; name=\"to\"\r\n\r\n{}\r\n--B\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"e.txt\"\r\nContent-Type: text/plain\r\n\r\nEVIL\r\n--B--\r\n", to);
+        let a = send(port, "POST", "/u", &[("Content-Type", "multipart/form-data; boundary=B"), ("Origin", &origin), ("Sec-Fetch-Site", "same-origin")], &body);
+        assert_eq!(a.body, format!("save_upload: will not write {}: {}; save uploads under a folder of their own, such as uploads/", to, OWN_QUILLO), "{}", to);
+    }
+    assert_eq!(send(port, "GET", "/shop/", &[], "").body, "shop");
+    drop(g);
+    assert_eq!(std::fs::read_to_string(app.join("shop/qs/plugins.lock")).unwrap(), "lock");
+    assert_eq!(std::fs::read_dir(app.join("shop/qs/native")).unwrap().count(), 0);
+}
+
+/// `files()` and `file()` keep to themselves what is under where a `.quillo` leads, as dot names
+/// are kept: with `.quillo -> qstore`, `files(".", p)` served `/qstore/plugins.lock`, a site's
+/// cookie jar and a library's name, and so through `public/q -> ../qstore`; `file()` of a
+/// visitor's path too. `read_file` of the program's own choosing reads it, and another file is
+/// served (src/builtins.rs quillo_hidden and hidden_target, FEEDBACK85.md Q-1340, found by the
+/// final review of a6cee54; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn files_keeps_what_is_under_a_quillo_to_itself() {
+    let d = Dir(support::temp_dir("cov8285r3-quillo-serve").canonicalize().unwrap());
+    let app = d.0.join("app");
+    for f in ["qstore/sites", "qstore/native", "public"] {
+        std::fs::create_dir_all(app.join(f)).unwrap();
+    }
+    for (f, text) in [("qstore/plugins.lock", "lock"), ("qstore/sites/shop.json", "{}"), ("qstore/app-cookies.json", "{}"), ("qstore/native/libhi-1.dylib", "lib"), ("x.txt", "x")] {
+        std::fs::write(app.join(f), text).unwrap();
+    }
+    std::os::unix::fs::symlink("qstore", app.join(".quillo")).unwrap();
+    std::os::unix::fs::symlink("../qstore", app.join("public/q")).unwrap();
+    std::fs::write(
+        app.join("main.qwe"),
+        "route GET /all/*p = files(\".\", p)\nroute GET /pub/*p = files(\"public\", p)\nroute GET /f/*p = file(p)\nroute GET /r = read_file(\"qstore/plugins.lock\")\n",
+    )
+    .unwrap();
+    let (g, port) = serve_at(&app, &["main.qwe"], &d.0.join("a.log"));
+    for path in ["/all/qstore/plugins.lock", "/all/qstore/sites/shop.json", "/all/qstore/app-cookies.json", "/all/qstore/native/libhi-1.dylib", "/all/QSTORE/plugins.lock", "/pub/q/plugins.lock", "/f/qstore/plugins.lock", "/f/.quillo/plugins.lock", "/f/public/q/plugins.lock"] {
+        assert_eq!(send(port, "GET", path, &[], "").status, 404, "{}", path);
+    }
+    assert_eq!(send(port, "GET", "/all/x.txt", &[], "").body, "x");
+    assert_eq!(send(port, "GET", "/f/x.txt", &[], "").body, "x");
+    assert_eq!(send(port, "GET", "/r", &[], "").body, "lock");
+    drop(g);
 }
 
 // Fix round 13 (F3)

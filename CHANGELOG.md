@@ -312,7 +312,11 @@ What a program may notice:
   program's folder or above stops the start; Quillo reads its libraries, `plugins.lock`, the
   session key and cookie jars through no link below `.quillo` and only from a file with one
   name. Writing onto a folder fails as the system says; only `delete_file` judges what a
-  folder holds. Deleting a folder no longer removes a link the program's code,
+  folder holds. The `.quillo` folders are those of every program the process runs, a
+  mounted one's and a service's too (the main program wrote a mounted program's `.quillo`
+  through its link, and a planted library's constructor ran at the next start), and `file()`
+  and `files()` serve nothing in a `.quillo` or where one leads (found by the final review of
+  a6cee54). Deleting a folder no longer removes a link the program's code,
   `--env-file` or its database is used through, works on trees of any depth, and judges a
   FIFO beside a journal's name without waiting on it; `files()` no longer hangs on one.
 - **`read_file`, `write_file` and `delete_file`'s refusal of a path outside the folder** ends

@@ -105,7 +105,7 @@ pub(crate) fn keep_secret(data: &Path) -> Result<(), String> {
     let kept = match meta {
         Ok(m) if m.is_file() => match crate::statics::read_below(data, Path::new(".quillo-secret")) {
             Ok(b) => String::from_utf8(b).ok().map(|s| s.trim().to_string()).filter(|s| s.len() >= 32),
-            Err(crate::statics::Below::Missing) => None,
+            Err(crate::statics::Below::Missing | crate::statics::Below::Unreadable(_)) => None,
             Err(crate::statics::Below::Refused(why)) => return Err(format!("{}: remove it, and a key is made there", why)),
         },
         _ => None,

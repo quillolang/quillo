@@ -462,10 +462,21 @@ pub fn rel_in<'a>(p: &'a Path, root: &Path) -> Option<std::borrow::Cow<'a, Path>
 pub fn long_form(p: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
+        use std::os::unix::ffi::OsStrExt;
         let p = sys_form_of(p);
-        if let Some((long, short)) = firmlinks().iter().find(|(_, short)| p.starts_with(short)) {
-            let rest = p.strip_prefix(short).unwrap_or(Path::new(""));
-            return if rest.as_os_str().is_empty() { long.clone() } else { long.join(rest) };
+        // By the bytes of each short name: `Path::starts_with` took each name apart, seventeen
+        // times for each write (`builtins::own_target`'s database names; found measuring the
+        // final review of a6cee54, FEEDBACK85.md Q-1340; branch feedback82-85).
+        let b = p.as_os_str().as_bytes();
+        let at = |short: &Path| {
+            let s = short.as_os_str().as_bytes();
+            b.starts_with(s) && (b.len() == s.len() || b[s.len()] == b'/')
+        };
+        if let Some((long, short)) = firmlinks().iter().find(|(_, short)| at(short)) {
+            let rest = &b[short.as_os_str().len()..];
+            let mut out = long.as_os_str().to_owned();
+            out.push(std::ffi::OsStr::from_bytes(rest));
+            return PathBuf::from(out);
         }
         p.into_owned()
     }
@@ -526,7 +537,19 @@ pub fn quillo_part(p: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        p.as_os_str().as_bytes().split(|&b| b == b'/').any(|part| part.len() == 7 && if cfg!(target_os = "macos") { part.eq_ignore_ascii_case(b".quillo") } else { part == b".quillo" })
+        let b = p.as_os_str().as_bytes();
+        // A part starts at the beginning or after a `/`; only one that begins with `.` is looked at.
+        let mut at = 0;
+        while at + 7 <= b.len() {
+            if b[at] == b'.' && (at == 0 || b[at - 1] == b'/') && (at + 7 == b.len() || b[at + 7] == b'/') {
+                let part = &b[at..at + 7];
+                if if cfg!(target_os = "macos") { part.eq_ignore_ascii_case(b".quillo") } else { part == b".quillo" } {
+                    return true;
+                }
+            }
+            at += 1;
+        }
+        false
     }
     #[cfg(not(unix))]
     {
@@ -544,10 +567,14 @@ pub fn quillo_part(p: &Path) -> bool {
 /// though the program could write where it leads (FEEDBACK85.md, Q-1340, found by the review of
 /// 9da2632; branch feedback82-85).
 pub enum Below {
-    /// Not there.
+    /// Not there, or nothing of Quillo's there: what is in its place is no folder where one goes,
+    /// or no file of bytes where a file goes (the caller makes its own anew, and says the system's
+    /// word if it cannot).
     Missing,
-    /// There, and not Quillo's to read: why.
+    /// There, and not Quillo's to read: a link, or a file of two names. Why.
     Refused(String),
+    /// There, and not read: the system's word (no permission, a failing disk).
+    Unreadable(String),
 }
 
 /// See `Below`.
@@ -558,10 +585,18 @@ pub fn open_below(root: &Path, rel: &Path) -> Result<std::fs::File, Below> {
         use std::os::fd::FromRawFd;
         use std::os::unix::ffi::OsStrExt;
         let shown = || root.join(rel).display().to_string();
+        // What a part is, where the system would not open it as asked: looked at, so a link is
+        // said to be one, and a file where a folder goes (`ENOTDIR`, Linux's word for a link opened
+        // as a folder too) or another thing is nothing of Quillo's there; any other word is the
+        // system's (found by CI on 18de67d: a file `.quillo` was "a link", and an unreadable
+        // library lost "cannot read"; FEEDBACK85.md, Q-1340; branch feedback82-85).
         let fail = |e: std::io::Error, part: &Path| match e.raw_os_error() {
             Some(libc::ENOENT) => Below::Missing,
-            Some(libc::ELOOP) | Some(libc::ENOTDIR) => Below::Refused(format!("{} is a link in {}, which Quillo does not follow there", part.display(), root.display())),
-            _ => Below::Refused(format!("{}: {}", shown(), e)),
+            Some(libc::ELOOP) | Some(libc::ENOTDIR) | Some(libc::EMLINK) => match std::fs::symlink_metadata(root.join(part)) {
+                Ok(m) if m.file_type().is_symlink() && part != root => Below::Refused(format!("{} is a link in {}, which Quillo does not follow there", part.display(), root.display())),
+                _ => Below::Missing,
+            },
+            _ => Below::Unreadable(format!("cannot read {}: {}", shown(), e)),
         };
         let c = |p: &std::ffi::OsStr| CString::new(p.as_bytes()).map_err(|_| Below::Refused(format!("{}: a NUL in its name", shown())));
         // SAFETY: a NUL-ended path; the descriptor, if any, is closed below or owned by the File.
@@ -595,9 +630,9 @@ pub fn open_below(root: &Path, rel: &Path) -> Result<std::fs::File, Below> {
         }
         // SAFETY: the descriptor opened last, owned by the File from here.
         let f = unsafe { std::fs::File::from_raw_fd(fd) };
-        let m = f.metadata().map_err(|e| Below::Refused(format!("{}: {}", shown(), e)))?;
+        let m = f.metadata().map_err(|e| Below::Unreadable(format!("cannot read {}: {}", shown(), e)))?;
         if !m.is_file() {
-            return Err(Below::Refused(format!("{} is no file of bytes", shown())));
+            return Err(Below::Missing);
         }
         if std::os::unix::fs::MetadataExt::nlink(&m) > 1 {
             return Err(Below::Refused(format!("{} has another name too (a hard link), which Quillo does not read there", shown())));
@@ -606,7 +641,7 @@ pub fn open_below(root: &Path, rel: &Path) -> Result<std::fs::File, Below> {
     }
     #[cfg(not(unix))]
     {
-        std::fs::File::open(root.join(rel)).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { Below::Missing } else { Below::Refused(e.to_string()) })
+        std::fs::File::open(root.join(rel)).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { Below::Missing } else { Below::Unreadable(format!("cannot read {}: {}", root.join(rel).display(), e)) })
     }
 }
 
@@ -614,7 +649,7 @@ pub fn open_below(root: &Path, rel: &Path) -> Result<std::fs::File, Below> {
 pub fn read_below(root: &Path, rel: &Path) -> Result<Vec<u8>, Below> {
     let mut f = open_below(root, rel)?;
     let mut out = Vec::new();
-    std::io::Read::read_to_end(&mut f, &mut out).map_err(|e| Below::Refused(format!("{}: {}", root.join(rel).display(), e)))?;
+    std::io::Read::read_to_end(&mut f, &mut out).map_err(|e| Below::Unreadable(format!("cannot read {}: {}", root.join(rel).display(), e)))?;
     Ok(out)
 }
 
