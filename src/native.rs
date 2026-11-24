@@ -2105,6 +2105,11 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
                 cmd.env(k, v);
             }
         }
+        // Where cargo keeps what it builds on the way, its build dir, set here, in the private
+        // folder: cargo 1.100 keeps it apart from the target, and a crate's dep-info is no longer
+        // in `release/deps` (`read_in`). Set, not taken from whoever starts Quillo (FEEDBACK83.md,
+        // Q-1305, found by CI run 45354741594 on Rust 1.100; branch feedback82-85).
+        cmd.env("CARGO_BUILD_BUILD_DIR", target.join("build"));
         let out = cmd
             .args(["build", "--release", "--message-format=short", "--manifest-path"])
             .arg(crate_dir.join("Cargo.toml"))
@@ -2163,15 +2168,9 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
 /// (FEEDBACK83.md, Q-1305, found by the review of 152bc1b; branch feedback82-85). A proc macro that
 /// reads a file without telling rustc is not seen.
 fn read_in(target: &Path, crate_name: &str, crate_dir: &Path, own: &[PathBuf]) -> Result<Option<PathBuf>, String> {
-    let deps = target.join("release").join("deps");
-    let (alone, prefix) = (format!("{}.d", crate_name), format!("{}-", crate_name));
-    let mut lists = std::fs::read_dir(&deps)
-        .map_err(|e| format!("cannot read what the build of {} read ({}): {}", crate_name, deps.display(), e))?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n == alone || (n.starts_with(&prefix) && n.ends_with(".d"))));
-    let (Some(list), None) = (lists.next(), lists.next()) else {
-        return Err(format!("the compiler's list of what it read to build {} is not in {}, or is not one: it does not load", crate_name, deps.display()));
+    let lists = dep_info_of(target, crate_name);
+    let [list] = lists.as_slice() else {
+        return Err(format!("the compiler's list of what it read to build {} is not in {}, or is not one ({} found): it does not load", crate_name, target.display(), lists.len()));
     };
     let text = std::fs::read_to_string(&list).map_err(|e| format!("cannot read {}: {}", list.display(), e))?;
     // Each name as rustc wrote it, a relative one from the crate's folder as rustc reads it, and
@@ -2191,6 +2190,33 @@ fn read_in(target: &Path, crate_name: &str, crate_dir: &Path, own: &[PathBuf]) -
         }
     }
     Ok(None)
+}
+
+/// The dep-info files rustc wrote for the crate `crate_name` built in `target`, the build dir
+/// being `target/build` (`build_private`): `<crate>.d` (`<crate>-<hash>.d` but for a cdylib) in
+/// `release/deps` as cargo up to 1.99 lays it out, or in `release/build/<crate>/<hash>/out` as
+/// 1.100 does, and in `release/deps` of the target itself, for a cargo that has no build dir.
+/// Never cargo's own `.d` beside the library in `release/`, which lists the dependencies' files
+/// too. Looked for a few folders deep (FEEDBACK83.md, Q-1305, found by CI run 45354741594 on Rust
+/// 1.100; branch feedback82-85).
+fn dep_info_of(target: &Path, crate_name: &str) -> Vec<PathBuf> {
+    let (alone, prefix) = (format!("{}.d", crate_name), format!("{}-", crate_name));
+    let ours = |p: &Path| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n == alone || (n.starts_with(&prefix) && n.ends_with(".d")));
+    let mut found = Vec::new();
+    let mut todo = vec![(target.join("build").join("release"), 0u32)];
+    while let Some((dir, depth)) = todo.pop() {
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let (p, kind) = (e.path(), e.file_type().ok());
+            if kind.is_some_and(|k| k.is_dir()) && depth < 4 {
+                todo.push((p, depth + 1));
+            } else if kind.is_some_and(|k| k.is_file()) && ours(&p) {
+                found.push(p);
+            }
+        }
+    }
+    let flat = target.join("release").join("deps");
+    found.extend(std::fs::read_dir(&flat).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_file() && ours(p)));
+    found
 }
 
 /// A dep-info line's names, as rustc writes them: its target before its `:`, then each name it
@@ -2761,6 +2787,41 @@ mod tests {
         // No list, or two: refused.
         std::fs::write(deps.join("quillo_hi_pinned-abc.d"), "").unwrap();
         assert!(read_in(&dir.join("target"), "quillo_hi_pinned", &crate_dir, &own).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The crate's own dep-info is found as each cargo lays its build dir out: `release/deps` up to
+    /// 1.99, `release/build/<crate>/<hash>/out` from 1.100; never cargo's own `.d` beside the
+    /// library, nor a dependency's; two are refused (FEEDBACK83.md, Q-1305, found by CI run
+    /// 45354741594 on Rust 1.100; branch feedback82-85).
+    #[test]
+    fn dep_info_is_found_as_each_cargo_lays_it_out() {
+        let dir = std::env::temp_dir().join(format!("quillo-depinfo-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = dir.join("target");
+        let put = |rel: &str| {
+            let p = target.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, "").unwrap();
+            p
+        };
+        // Cargo's own, beside the library, and a dependency's: neither.
+        put("release/libquillo_hi_pinned.d");
+        put("build/release/build/serde_json/0123456789abcdef/out/serde_json-0123456789abcdef.d");
+        put("build/release/deps/serde_json-0123456789abcdef.d");
+        assert!(dep_info_of(&target, "quillo_hi_pinned").is_empty());
+        assert!(read_in(&target, "quillo_hi_pinned", &dir, &[]).is_err());
+        // 1.99, a build dir set.
+        let old = put("build/release/deps/quillo_hi_pinned.d");
+        assert_eq!(dep_info_of(&target, "quillo_hi_pinned"), vec![old.clone()]);
+        std::fs::remove_file(&old).unwrap();
+        // 1.100.
+        let new = put("build/release/build/quillo_hi_pinned/4684cd1d2bcf5e8f/out/quillo_hi_pinned.d");
+        assert_eq!(dep_info_of(&target, "quillo_hi_pinned"), vec![new.clone()]);
+        assert_eq!(read_in(&target, "quillo_hi_pinned", &dir, &[]).unwrap(), None);
+        // Two: refused.
+        put("build/release/build/quillo_hi_pinned/fedcba9876543210/out/quillo_hi_pinned.d");
+        assert!(read_in(&target, "quillo_hi_pinned", &dir, &[]).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
