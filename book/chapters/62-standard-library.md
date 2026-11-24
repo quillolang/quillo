@@ -468,12 +468,16 @@ path is judged where it really leads, with its links followed:
 - A folder is judged as itself, whatever its name *(since 0.8.11)*: on macOS
   `/System/Volumes/Data/Users/x` is `/Users/x`, and either name works in `--allow-path`, a
   policy's `[fs] paths`, a link, and the path the program is started by.
-- The program's own files are refused by any name: its sources, `.env`, the database it has
-  open, and its `.quillo` folders (beside its main file and beside each plugin: built
-  plugins, their lock, its keys) *(since 0.8.11: `.quillo` was writable)*, wherever they
-  lead: a `.quillo` that is a link, and the folders its links lead to, are refused by any
-  name. Names are compared as the file system compares them: on macOS in any case, so
-  `.QUILLO` is `.quillo` but `.quıllo` is not.
+- The program's own files are refused by any name: its sources, `.env` and the database it
+  has open. `.quillo` is Quillo's *(since 0.8.11: it was writable)*: no part of a program may
+  write, delete, upload or save to a path with a `.quillo` in it, anywhere, or under where
+  the program's own `.quillo` folders lead (a `.quillo` that is a link, to what is there or
+  not yet), nor open a database there. Quillo reads nothing in it through a link below it,
+  or from a file with a second hard link, and a `.quillo` that leads to the program's folder
+  or above stops the start. Names are compared as the file system compares them: on macOS
+  and Windows in any ASCII case, so `.QUILLO` is `.quillo` but `.quıllo` is not. Writing a
+  file onto a folder fails as the system says; only `delete_file` judges what a folder
+  holds.
 - `delete_file` of a folder is refused when the folder holds one of the program's own files,
   a link to one, or a database it has open, judged by the files themselves; a folder in it that cannot be
   read is an error, and nothing is deleted *(since 0.8.11: what could be deleted was)*.

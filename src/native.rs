@@ -1572,29 +1572,78 @@ fn file_hash(p: &Path) -> Result<String, String> {
     Ok(crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes)))
 }
 
+/// A file Quillo keeps in a `.quillo` folder (a library, `plugins.lock`), read as its own: below
+/// the `.quillo` (as it leads), no link followed and no second hard link (`statics::open_below`).
+/// `Ok(None)` where it is not there; an error naming it and why where it is there but not Quillo's
+/// to read: a `native` that is a link to a folder the program writes, or a library hard-linked
+/// from one, had another library loaded under the lock's name (FEEDBACK85.md, Q-1340, found by
+/// the review of 9da2632; branch feedback82-85). A path in no `.quillo` is read as it is.
+fn quillo_read(p: &Path) -> Result<Option<Vec<u8>>, String> {
+    let Some((root, rel)) = crate::statics::quillo_split(p) else {
+        return match std::fs::read(p) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("cannot read {}: {}", p.display(), e)),
+        };
+    };
+    // Nor from a `.quillo` that leads to the folder it is in, or above, where the program writes.
+    if let Some(why) = crate::builtins::quillo_not_its_own(&root) {
+        return Err(why);
+    }
+    match crate::statics::read_below(&root, &rel) {
+        Ok(b) => Ok(Some(b)),
+        Err(crate::statics::Below::Missing) => Ok(None),
+        Err(crate::statics::Below::Refused(why)) => Err(why),
+    }
+}
+
+/// `file_hash` of a file Quillo keeps, read as `quillo_read` reads it.
+fn quillo_hash(p: &Path) -> Result<Option<String>, String> {
+    Ok(quillo_read(p)?.map(|b| crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&b))))
+}
+
 fn lib_name(lib: &Path) -> String {
     lib.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// Why `lib` is not the library its lock says was built, if it is not.
+/// Why `lib` is not the library its lock says was built, if it is not. Both read as Quillo's own
+/// (`quillo_read`).
 fn not_as_built(lib: &Path) -> Option<String> {
     let name = lib_name(lib);
-    let lock = std::fs::read_to_string(lock_file(lib)).unwrap_or_default();
+    let lock = match quillo_read(&lock_file(lib)) {
+        Ok(b) => String::from_utf8(b.unwrap_or_default()).unwrap_or_default(),
+        Err(why) => return Some(why),
+    };
     let Some(want) = lock.lines().find_map(|l| l.strip_prefix(&format!("{} ", name))) else {
         return Some(format!("{} has no line in .quillo/plugins.lock", name));
     };
-    match file_hash(lib) {
-        Ok(h) if h == want.trim() => None,
-        Ok(_) => Some(format!("{} is not the library that was built (its SHA-256 differs from .quillo/plugins.lock's)", name)),
+    match quillo_hash(lib) {
+        Ok(Some(h)) if h == want.trim() => None,
+        Ok(Some(_)) => Some(format!("{} is not the library that was built (its SHA-256 differs from .quillo/plugins.lock's)", name)),
+        Ok(None) => Some(format!("{} is not there", lib.display())),
         Err(e) => Some(e),
     }
 }
 
 /// Whether the folder has a lock at all: one built before there were locks has none, and its
 /// libraries load as they did, with a warning, unless `--no-build` says to load only what a lock
-/// names.
+/// names. One that is there but not Quillo's to read (a link, a second hard link) is there: what
+/// it is not is said where it is read (`not_as_built`).
 fn has_lock(lib: &Path) -> bool {
-    lock_file(lib).is_file()
+    !matches!(quillo_read(&lock_file(lib)), Ok(None))
+}
+
+/// Whether the library `lib` is there as Quillo's own (`quillo_read`), or why it may not load.
+fn lib_there(lib: &Path) -> Result<bool, String> {
+    match crate::statics::quillo_split(lib) {
+        Some((root, _)) if crate::builtins::quillo_not_its_own(&root).is_some() => Err(crate::builtins::quillo_not_its_own(&root).unwrap_or_default()),
+        Some((root, rel)) => match crate::statics::open_below(&root, &rel) {
+            Ok(_) => Ok(true),
+            Err(crate::statics::Below::Missing) => Ok(false),
+            Err(crate::statics::Below::Refused(why)) => Err(why),
+        },
+        None => Ok(lib.is_file()),
+    }
 }
 
 /// One process at a time changes a folder's lock (`--split` starts several that build).
@@ -1650,7 +1699,8 @@ pub fn prebuild(files: &[PathBuf]) {
         }
         let Ok(src) = crate::error::read_text(f) else { continue };
         let lib = lib_path(f, &src);
-        if !lib.is_file() || (has_lock(&lib) && not_as_built(&lib).is_some()) {
+        // One there but not Quillo's to read is left to its `use`, which says why.
+        if lib_there(&lib).is_ok_and(|there| !there || (has_lock(&lib) && not_as_built(&lib).is_some())) {
             todo.push((f.clone(), src));
         }
     }
@@ -1747,8 +1797,12 @@ fn build_with(qwer: &Path, here: bool) -> Result<(PathBuf, Parsed), String> {
     // Built, and the library that was built: loaded (Q-477).
     // Asked twice, before the build lock and under it: said once, the second time.
     let as_built = |lib: &Path, say: bool| -> Result<bool, String> {
-        if !lib.is_file() {
+        // There but not Quillo's to read: refused, naming it, not built again through the link.
+        if !lib_there(lib).map_err(|why| format!("will not load the library of {}: {}", qwer.display(), why))? {
             return Ok(false);
+        }
+        if let Err(why) = quillo_read(&lock_file(lib)) {
+            return Err(format!("will not load the library of {}: {}", qwer.display(), why));
         }
         if !has_lock(lib) && !no_build() && !REBUILD_UNLOCKED.with(|r| r.get()) {
             static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1907,7 +1961,7 @@ fn plugin_check(qwer: &Path) -> Result<bool, String> {
     // bytes as they are), and the library built from it, by the name `build` would load
     // (FEEDBACK82.md, Q-1285; branch feedback82-85).
     let source = crate::error::read_file(qwer).map(|b| crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&b))).unwrap_or_default();
-    let library = crate::error::read_source(qwer).ok().map(|src| lib_path(qwer, &src)).filter(|l| l.is_file()).and_then(|l| file_hash(&l).ok());
+    let library = crate::error::read_source(qwer).ok().map(|src| lib_path(qwer, &src)).and_then(|l| quillo_hash(&l).ok().flatten());
     if let Some(l) = &library {
         if p.plugin(&name, version.as_deref(), std::slice::from_ref(l)).is_ok() {
             return Ok(false);
@@ -2161,7 +2215,9 @@ fn private_library(bytes: &[u8], name: &str, dir: Option<&Path>) -> Result<PathB
 /// there between was the one loaded; and every library was judged where any layer pinned any
 /// plugin by hash (FEEDBACK83.md, Q-1305, found by the review of 0a3aeb9; branch feedback82-85).
 fn load_copy(lib: &Path, accept: &dyn Fn(&str) -> Result<(), String>) -> Result<PathBuf, String> {
-    let bytes = std::fs::read(lib).map_err(|e| format!("cannot read {}: {}", lib.display(), e))?;
+    // Read as Quillo's own where it is in `.quillo` (`quillo_read`; FEEDBACK85.md, Q-1340, found by
+    // the review of 9da2632; branch feedback82-85).
+    let bytes = quillo_read(lib)?.ok_or_else(|| format!("cannot read {}: it is not there", lib.display()))?;
     accept(&crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes)))?;
     if let Some(why) = loads_refused(&bytes) {
         return Err(format!("{} {}: it does not load", lib.display(), why));
@@ -3214,7 +3270,7 @@ fn library_pin_met(qwer: &Path) -> bool {
         return false;
     }
     let name = stem(qwer);
-    let Some(have) = library_path(qwer).filter(|l| l.is_file()).and_then(|l| file_hash(&l).ok()) else { return false };
+    let Some(have) = library_path(qwer).and_then(|l| quillo_hash(&l).ok().flatten()) else { return false };
     // Only the host's layers: the program's own quillo.policy, or a --policy its developer gives,
     // is in the repository's hands, and named the library it brought along (found in review 3).
     let host = |f: &Path| p.files.iter().zip(p.kinds.iter()).any(|(lf, k)| lf == f && k.is_providers());
@@ -3235,7 +3291,7 @@ fn build_confirmed(qwer: &Path, program: &Path) -> Result<(PathBuf, Parsed), Str
     // `loads_refused`; found by the review of a86f326).
     let key = format!("{} {} {}-{} read-asm-link-load-judged", source, lib_name(&lib), std::env::consts::ARCH, std::env::consts::OS);
     let record = built_record(program);
-    if lib.is_file() {
+    if lib_there(&lib).unwrap_or(false) {
         // Opened as what was hashed and judged, a private copy of it (`load_copy`; found in review
         // 2, and by the review of 0a3aeb9: it was opened by its path three times).
         if let Some(want) = record.as_ref().and_then(|r| record_get(r, &key)) {
@@ -3384,6 +3440,13 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
         loaded(&lib_path);
         let by = it.cur_file.as_deref().map_or_else(|| format!("line {}", line), |f| format!("{}:{}", Path::new(f).strip_prefix(&*it.base_dir).map_or_else(|_| f.to_string(), |r| r.display().to_string()), line));
         return Err(Ctrl::Error(Box::new(crate::error::QuilloError::new(format!("{} (the `use` at {})", msg, by), *l).in_file(&qwer.display().to_string()))));
+    }
+    // Opened where it was judged: a library in `.quillo` reached through no link, of one name
+    // (`lib_there`), looked at again as it is opened (FEEDBACK85.md, Q-1340, found by the review of
+    // 9da2632; branch feedback82-85).
+    if let Err(why) = lib_there(&lib_path) {
+        loaded(&lib_path);
+        return Err(Ctrl::Error(Box::new(crate::error::QuilloError::new(format!("will not load the library of {}: {}", qwer.display(), why), line))));
     }
     let lib = open(&lib_path, parsed.exports.len()).map_err(|e| {
         loaded(&lib_path);

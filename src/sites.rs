@@ -93,7 +93,10 @@ fn jar(it: &Interp, name: &str) -> Vec<(String, String)> {
     if let Some(j) = all.get(name) {
         return j.clone();
     }
-    let read: Vec<(String, String)> = std::fs::read(jar_file(it, name)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    // Read as Quillo's own (`statics::open_below`): no link below `.quillo`, of one name only
+    // (FEEDBACK85.md, Q-1340, found by the review of 9da2632; branch feedback82-85).
+    let file = jar_file(it, name);
+    let read: Vec<(String, String)> = crate::statics::quillo_split(&file).and_then(|(root, rel)| crate::statics::read_below(&root, &rel).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     all.insert(name.to_string(), read.clone());
     read
 }

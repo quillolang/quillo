@@ -659,7 +659,14 @@ impl Jar {
     /// `path`, `domain` and `until`.
     fn read(file: &Path) -> Jar {
         let mut jar = Jar::default();
-        let Ok(text) = std::fs::read_to_string(file) else { return jar };
+        // Read as Quillo's own where it is kept in `.quillo` (`statics::open_below`): no link below
+        // it, of one name only (FEEDBACK85.md, Q-1340, found by the review of 9da2632; branch
+        // feedback82-85).
+        let read = match crate::statics::quillo_split(file) {
+            Some((root, rel)) => crate::statics::read_below(&root, &rel).ok().and_then(|b| String::from_utf8(b).ok()),
+            None => std::fs::read_to_string(file).ok(),
+        };
+        let Some(text) = read else { return jar };
         let Ok(serde_json::Value::Object(m)) = serde_json::from_str::<serde_json::Value>(&text) else { return jar };
         for (key, c) in m {
             let (Some(v), Some(p)) = (c["value"].as_str(), c["path"].as_str()) else { continue };

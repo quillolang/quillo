@@ -304,7 +304,15 @@ What a program may notice:
   `--allow-path` folder, as an upload's name reached), a link inside one, a hard link or a
   bind mount of one; a link in it to the program's folder or above is no folder of Quillo's.
   Deleting a folder that holds a link to a folder above the program says so; on macOS
-  `.quıllo` (dotless ı) is another name, as APFS compares names. Deleting a folder no longer removes a link the program's code,
+  `.quıllo` (dotless ı) is another name, as APFS compares names. Then simpler and wider (found by the
+  review of 9da2632: past its 4,096-entry walk the guard let everything through): a path
+  with a `.quillo` part (any ASCII case on macOS and Windows), or one under where the
+  program's own `.quillo` folders lead (a link, a link to what is not there yet), is refused
+  to `write_file`, `delete_file`, uploads, saves and `db.open`; a `.quillo` that leads to the
+  program's folder or above stops the start; Quillo reads its libraries, `plugins.lock`, the
+  session key and cookie jars through no link below `.quillo` and only from a file with one
+  name. Writing onto a folder fails as the system says; only `delete_file` judges what a
+  folder holds. Deleting a folder no longer removes a link the program's code,
   `--env-file` or its database is used through, works on trees of any depth, and judges a
   FIFO beside a journal's name without waiting on it; `files()` no longer hangs on one.
 - **`read_file`, `write_file` and `delete_file`'s refusal of a path outside the folder** ends

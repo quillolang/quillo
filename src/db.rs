@@ -2952,6 +2952,14 @@ fn open_backend_as(it: &mut Interp, target: &str, make: bool, tenant: bool) -> R
     } else {
         it.base_dir.join(target).display().to_string()
     };
+    // A database file is never one of Quillo's own in `.quillo` (its session key, its plugins'
+    // libraries and lock): db.open, db.connect, db.system and a tenant's file are judged as a
+    // write is (FEEDBACK85.md, Q-1340, found by the review of 9da2632; branch feedback82-85).
+    if target != ":memory:" {
+        if let Some(why) = crate::builtins::quillo_refused(it, Path::new(&full)) {
+            return Err(why);
+        }
+    }
     connect(&full).map(kept).map_err(|e| e.to_string())
 }
 

@@ -516,6 +516,119 @@ pub fn holds_any(root: &Path, paths: impl IntoIterator<Item = PathBuf>) -> bool 
     false
 }
 
+// ---- what Quillo keeps beside a program: `.quillo` ----------------------------------------------
+
+/// Whether a part of `p` is named `.quillo` as the file system compares names: in any ASCII case
+/// on macOS and Windows (where `.quillo.` and `.quillo ` are it too), exactly elsewhere. Read by its
+/// bytes, with no allocation: a write asks it of each path it judges (FEEDBACK85.md, Q-1340, found
+/// by the review of 9da2632; branch feedback82-85).
+pub fn quillo_part(p: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        p.as_os_str().as_bytes().split(|&b| b == b'/').any(|part| part.len() == 7 && if cfg!(target_os = "macos") { part.eq_ignore_ascii_case(b".quillo") } else { part == b".quillo" })
+    }
+    #[cfg(not(unix))]
+    {
+        p.components().any(|c| {
+            let n = c.as_os_str().to_string_lossy();
+            n.trim_end_matches(['.', ' ']).eq_ignore_ascii_case(".quillo")
+        })
+    }
+}
+
+/// Why `rel` under the folder `root` cannot be read as Quillo's own, or the file: `root` as it
+/// leads (a `.quillo` that is a link is followed), each part below it opened without following a
+/// link (`openat` with `O_NOFOLLOW`), and the file a file of bytes with one name (`st_nlink` 1),
+/// opened without waiting. A link or a second hard link planted in `.quillo` gives nothing then,
+/// though the program could write where it leads (FEEDBACK85.md, Q-1340, found by the review of
+/// 9da2632; branch feedback82-85).
+pub enum Below {
+    /// Not there.
+    Missing,
+    /// There, and not Quillo's to read: why.
+    Refused(String),
+}
+
+/// See `Below`.
+pub fn open_below(root: &Path, rel: &Path) -> Result<std::fs::File, Below> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let shown = || root.join(rel).display().to_string();
+        let fail = |e: std::io::Error, part: &Path| match e.raw_os_error() {
+            Some(libc::ENOENT) => Below::Missing,
+            Some(libc::ELOOP) | Some(libc::ENOTDIR) => Below::Refused(format!("{} is a link in {}, which Quillo does not follow there", part.display(), root.display())),
+            _ => Below::Refused(format!("{}: {}", shown(), e)),
+        };
+        let c = |p: &std::ffi::OsStr| CString::new(p.as_bytes()).map_err(|_| Below::Refused(format!("{}: a NUL in its name", shown())));
+        // SAFETY: a NUL-ended path; the descriptor, if any, is closed below or owned by the File.
+        let mut fd = unsafe { libc::open(c(root.as_os_str())?.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(fail(std::io::Error::last_os_error(), root));
+        }
+        let parts: Vec<&std::ffi::OsStr> = rel.iter().collect();
+        let mut at = PathBuf::new();
+        for (i, part) in parts.iter().enumerate() {
+            at.push(part);
+            let last = i + 1 == parts.len();
+            let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | if last { libc::O_NONBLOCK } else { libc::O_DIRECTORY };
+            let name = match c(part) {
+                Ok(n) => n,
+                Err(e) => {
+                    // SAFETY: the descriptor opened above, closed once.
+                    unsafe { libc::close(fd) };
+                    return Err(e);
+                }
+            };
+            // SAFETY: a descriptor of a folder open here and a NUL-ended name.
+            let next = unsafe { libc::openat(fd, name.as_ptr(), flags) };
+            let e = std::io::Error::last_os_error();
+            // SAFETY: as above.
+            unsafe { libc::close(fd) };
+            if next < 0 {
+                return Err(fail(e, &at));
+            }
+            fd = next;
+        }
+        // SAFETY: the descriptor opened last, owned by the File from here.
+        let f = unsafe { std::fs::File::from_raw_fd(fd) };
+        let m = f.metadata().map_err(|e| Below::Refused(format!("{}: {}", shown(), e)))?;
+        if !m.is_file() {
+            return Err(Below::Refused(format!("{} is no file of bytes", shown())));
+        }
+        if std::os::unix::fs::MetadataExt::nlink(&m) > 1 {
+            return Err(Below::Refused(format!("{} has another name too (a hard link), which Quillo does not read there", shown())));
+        }
+        Ok(f)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::File::open(root.join(rel)).map_err(|e| if e.kind() == std::io::ErrorKind::NotFound { Below::Missing } else { Below::Refused(e.to_string()) })
+    }
+}
+
+/// The whole of `rel` under `root`, read as `open_below` opens it.
+pub fn read_below(root: &Path, rel: &Path) -> Result<Vec<u8>, Below> {
+    let mut f = open_below(root, rel)?;
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(&mut f, &mut out).map_err(|e| Below::Refused(format!("{}: {}", root.join(rel).display(), e)))?;
+    Ok(out)
+}
+
+/// Where a path Quillo keeps in a `.quillo` folder (`a/.quillo/native/lib.dylib`) is read from:
+/// the `.quillo` folder (its last part of that name) and what follows it, for `open_below`. None
+/// for a path with no such part.
+pub fn quillo_split(p: &Path) -> Option<(PathBuf, PathBuf)> {
+    let parts: Vec<std::path::Component> = p.components().collect();
+    let i = parts.iter().rposition(|c| c.as_os_str() == ".quillo")?;
+    let root: PathBuf = parts[..=i].iter().collect();
+    let rel: PathBuf = parts[i + 1..].iter().collect();
+    (!rel.as_os_str().is_empty()).then_some((root, rel))
+}
+
 /// Up to `len` bytes of the file from `start`, read where they are: never more, whatever the file
 /// has grown to (FEEDBACK55.md, Q-701; branch feedback55).
 /// Whether the first bytes of `f` are still `seen`'s, its place in the file kept: a file written

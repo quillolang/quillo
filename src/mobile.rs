@@ -99,8 +99,15 @@ pub(crate) fn keep_secret(data: &Path) -> Result<(), String> {
     if meta.as_ref().is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(format!("{} is a link: remove it, and a key is made there", file.display()));
     }
+    // Read as Quillo's own: no link on the way below the folder, and of one name only, as a key
+    // hard-linked from a file the program writes was the program's to choose (FEEDBACK85.md,
+    // Q-1340, found by the review of 9da2632; branch feedback82-85).
     let kept = match meta {
-        Ok(m) if m.is_file() => std::fs::read_to_string(&file).ok().map(|s| s.trim().to_string()).filter(|s| s.len() >= 32),
+        Ok(m) if m.is_file() => match crate::statics::read_below(data, Path::new(".quillo-secret")) {
+            Ok(b) => String::from_utf8(b).ok().map(|s| s.trim().to_string()).filter(|s| s.len() >= 32),
+            Err(crate::statics::Below::Missing) => None,
+            Err(crate::statics::Below::Refused(why)) => return Err(format!("{}: remove it, and a key is made there", why)),
+        },
         _ => None,
     };
     let secret = match kept {

@@ -890,9 +890,17 @@ fn mcp(file: &str, flags: &[String]) -> i32 {
     // stdin is the client's from the start: `stdin`, `read_line` and `exit` are refused as in any
     // program that serves, at the top level too, where one would take the client's first message.
     quillo::value::SERVING.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Err(e) = quillo::builtins::quillo_layout_dir(base) {
+        eprintln!("quillo: {}", e);
+        return 1;
+    }
     let mut interp = Interp::new(base);
     if let Err(e) = interp.load_file(path) {
         eprintln!("quillo: {:#}", e);
+        return 1;
+    }
+    if let Err(e) = quillo::builtins::quillo_layout(&interp) {
+        eprintln!("quillo: {}", e);
         return 1;
     }
     // What a builtin's error says is hidden from the client, as from a visitor, and logged.
@@ -1565,7 +1573,13 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     interp.base = o.base.clone().unwrap_or_default();
     interp.is_service = o.as_service;
     let loaded = match checked.and_then(|tools| {
-        let (r, read) = quillo::error::noting_reads(|| interp.load_file(path).map_err(|e| format!("{:#}", e)));
+        // And laid out so Quillo's own files are not the program's to write: a `.quillo` that leads
+        // to the program's folder or above stops the start (FEEDBACK85.md, Q-1340, found by the
+        // review of 9da2632; branch feedback82-85).
+        let (r, read) = quillo::error::noting_reads(|| {
+            let r = quillo::builtins::quillo_layout_dir(base).and_then(|_| interp.load_file(path).map_err(|e| format!("{:#}", e)));
+            r.and_then(|_| quillo::builtins::quillo_layout(&interp))
+        });
         tried.extend(read);
         r.map(|_| tools)
     }) {
@@ -1944,6 +1958,12 @@ fn before_the_program(file: &str, o: &RunOptions) -> Result<(), i32> {
     // Not when --watch is refused below (with --instances): nothing is made for a run that does not
     // start.
     let refused = o.instances > 1;
+    // A `.quillo` that leads to the program's folder or above stops the start before anything is
+    // kept there (FEEDBACK85.md, Q-1340, found by the review of 9da2632; branch feedback82-85).
+    if let Err(why) = quillo::builtins::quillo_layout_dir(Path::new(file).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."))) {
+        eprintln!("quillo: {}", why);
+        return Err(1);
+    }
     if o.watch && !refused && std::env::var("QUILLO_SECRET").map_or(true, |s| s.is_empty()) {
         let kept = Path::new(file).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).join(".quillo");
         match quillo::embed::keep_secret(&kept) {
