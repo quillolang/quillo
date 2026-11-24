@@ -336,7 +336,11 @@ pub fn untaken_at_load(main: &Path) -> Result<(), String> {
         return Ok(());
     }
     let files = a.untaken.iter().map(|d| d.file.as_str()).collect::<HashSet<_>>().len();
-    let lines: Vec<String> = a.untaken.iter().map(|d| format!("  {}", d)).collect();
+    let mut lines: Vec<String> = a.untaken.iter().map(|d| format!("  {}", d)).collect();
+    // Once each: a service's file is read by each check of the service (FEEDBACK83.md, Q-1300,
+    // found by the review of 109f6b1; branch feedback82-85).
+    let mut once = HashSet::new();
+    lines.retain(|l| once.insert(l.clone()));
     Err(format!(
         "a quillo.confirmed holds the program, and {} {} a name another file defines without taking it, so that it would reach what that file was confirmed for: the program is not started\n{}",
         if files == 1 { "1 of its files".to_string() } else { format!("{} of its files", files) },
@@ -2698,7 +2702,9 @@ fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: Hash
     }
     // A mounted program's types are its own.
     let outer_records = RECORDS.with(|r| std::mem::take(&mut *r.borrow_mut()));
-    let mut a = check_source_in(src, file, base_dir, overrides, opts);
+    // The outermost check notes every file it reads or tries, its mounted programs' and services'
+    // too, which their own checks read (`NAMES_READ`).
+    let (mut a, tried) = if outermost { crate::error::noting_reads(|| check_source_in(src, file, base_dir, overrides, opts)) } else { (check_source_in(src, file, base_dir, overrides, opts), Vec::new()) };
     // Past its budget, a check ends with one error in place of what it said, which a walk cut
     // short cannot be sure of (FEEDBACK75.md, Q-1053; branch feedback75). The tables are given
     // back at once, not kept until the thread's next check.
@@ -2720,9 +2726,16 @@ fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: Hash
         if over {
             a.unread.insert(0, (a.diagnostics[0].clone(), "make the code the check could not read through simpler, or split it".to_string()));
         }
+        // Each file it read or tried, as it was then: `a.files` alone left out a mounted program's
+        // and a service's, which their own checks read, so under `--watch --no-check` a mounted
+        // program's kit changed to call its main file's `reader(".env")` untaken was not read
+        // again, and served the `.env` (FEEDBACK83.md, Q-1300, found by the review of 109f6b1;
+        // branch feedback82-85). A file tried and not there is noted too: made later, it is read.
         if HELD.with(|h| h.replace(false)) && a.untaken.is_empty() && a.unread.is_empty() {
-            let files = a.files.iter().map(String::as_str).chain([file]);
-            *NAMES_READ.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((crate::modules::key(Path::new(file)), stamps(files)));
+            let mut files: Vec<String> = a.files.iter().cloned().chain([file.to_string()]).chain(tried.iter().map(|p| p.display().to_string())).collect();
+            files.sort();
+            files.dedup();
+            *NAMES_READ.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((crate::modules::key(Path::new(file)), stamps(files.iter().map(String::as_str))));
         }
     }
     // What AI clients are told of the program, its main file's `//!` block among it, past what a

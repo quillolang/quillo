@@ -726,14 +726,14 @@ fn what_a_use_tree_takes_is_read_however_it_is_written() {
     let d = dir("rust-use-trees");
     let read = "pub fn r() -> String { read_to_string(\"/etc/hosts\").unwrap_or_default() }";
     let cases: Vec<(&str, String, &str, &str)> = vec![
-        ("nested", format!("use std::{{io, fs::{{self, *}}}};\n{}", read), "fs", "std::fs::* (line 3)"),
+        ("nested", format!("use std::{{io, fs::{{self, *}}}};\n{}", read), "fs", "std::fs (line 3)"),
         ("selfas", "use std::{fs::{self as f}};\npub fn r() { f::hard_link(\"/a\", \"/b\").ok(); }".into(), "fs", "std::fs::hard_link (line 4)"),
         ("renamed", "use std::{env::{var as v}};\npub fn r() -> String { v(\"K\").unwrap_or_default() }".into(), "env", "std::env::var (line 4)"),
         ("envglob", "use std::{env::{*}};\npub fn r() -> String { var(\"K\").unwrap_or_default() }".into(), "env", "std::env::* (line 3)"),
         ("envalone", "use std::env::*;\npub fn r() -> String { var(\"K\").unwrap_or_default() }".into(), "env", "std::env::* (line 3)"),
         ("process", "use std::{process::*};\npub fn r() { Command::new(\"ls\"); }".into(), "run", "Command::new (line 4)"),
         ("tokio", "use tokio::process::*;\npub fn r() { Command::new(\"ls\"); }".into(), "run", "Command::new (line 4)"),
-        ("alias", format!("use std::fs as ü;\nuse ü::*;\n{}", read), "fs", "std::fs::* (line 4)"),
+        ("alias", format!("use std::fs as ü;\nuse ü::*;\n{}", read), "fs", "std::fs (line 3)"),
         ("named", format!("extern crate std as s;\nuse s::fs::read_to_string;\n{}", read), "fs", "s::fs::read_to_string (line 4), std::fs::read_to_string (line 5)"),
         ("unlisted", "use std::fs;\npub fn r() { fs::hard_link(\"/a\", \"/b\").ok(); }".into(), "fs", "fs::hard_link (line 4)"),
         ("file", "use std::{fs::File};\npub fn r() { File::options().write(true).open(\"/x\").ok(); }".into(), "fs", "fs::File (line 3)"),
@@ -758,7 +758,7 @@ fn what_a_use_tree_takes_is_read_however_it_is_written() {
     write(&d, "main.qwe", "import nested.qwer use r\nroute GET / = r()\n");
     let (code, out) = quillo(&d, &["check", "main.qwe"]);
     assert_eq!(code, Some(0), "{}", out);
-    assert!(out.contains("nested.qwer:3: warning: nested.qwer says `effects: none`, and calls std::fs::* (line 3)"), "{}", out);
+    assert!(out.contains("nested.qwer:3: warning: nested.qwer says `effects: none`, and calls std::fs (line 3)"), "{}", out);
 }
 
 /// `depth` programs mounted one in another, the last answering "deepest", nothing taken wrong,
@@ -850,4 +850,233 @@ fn a_held_start_whose_files_pass_what_a_check_reads_does_not_start() {
     drop(g);
     let said = read(&log);
     assert!(said.contains("the program is not started\n  main.qwe:4: error: cannot read kit.qwe: the program's files come to more than 32 MiB together\n  a check reads 32 MiB of a program's files together: make them smaller, or take fewer (`quillo check` says the same)\n"), "{}", said);
+}
+
+// ---- edge tests of the fixes the review of 109f6b1 asked for ------------------------------------
+
+/// Under `--watch --no-check`, a reload reads again the names of a mounted program's and a
+/// service's files: a kit of either changed to call its main file's `reader(".env")` untaken is
+/// refused as the program loads again ("still serving the previous version"), and the page keeps
+/// what it served; the `.env` is never in it. The record that let a start skip reading again
+/// named only the main program's files (src/check.rs, FEEDBACK83.md Q-1300, found by the review
+/// of 109f6b1; branch feedback82-85).
+#[test]
+fn a_reload_reads_again_what_a_mounted_program_or_a_service_takes() {
+    for (name, main, file, program) in [
+        ("mount", "mount /m = \"m/main.qwe\"\nroute GET / = \"top\"\n", "m", "import kit.qwe use go\nlet reader = read_file\nroute GET / = go()\n"),
+        ("service", "service billing = \"svc/billing.qwe\"\nroute GET /m/ = billing.data()\n", "svc", "import kit.qwe use go\nlet reader = read_file\nserver fn data() {\n  return go()\n}\n"),
+    ] {
+        let d = dir(&format!("reload-{}", name));
+        write(&d, "main.qwe", main);
+        let program_file = if name == "mount" { "main.qwe" } else { "billing.qwe" };
+        write(&d, &format!("{}/{}", file, program_file), program);
+        write(&d, &format!("{}/kit.qwe", file), "fn go() {\n  return \"fine\"\n}\n");
+        write(&d, &format!("{}/.env", file), "SECRET=hunter2\n");
+        write(&d, "quillo.confirmed", &format!("[\"main.qwe\"]\n\n[\"{}/{}\"]\nfiles = [\".env\"]\n", file, program_file));
+        let (g, port, log) = serve(&d, &["--watch", "--no-check"]);
+        assert_eq!(send(port, "GET", "/m/", &[], "").body, "fine", "{}: {}", name, read(&log));
+        write(&d, &format!("{}/kit.qwe", file), "fn go() {\n  return str(reader(\".env\"))\n}\n");
+        assert!(log_has(&log, "quillo: still serving the previous version\n", 30), "{}: {}", name, read(&log));
+        let said = read(&log);
+        assert!(said.contains(&format!("the program is not started\n  ./{}/kit.qwe:2: error: `reader` comes from {}, which this file does not take", file, program_file)), "{}: {}", name, said);
+        assert_eq!(said.matches(&format!("./{}/kit.qwe:2: error", file)).count(), 1, "said once: {}", said);
+        assert_eq!(send(port, "GET", "/m/", &[], "").body, "fine", "{}", name);
+        drop(g);
+    }
+}
+
+/// What a name a `use` gives stands for is read wherever the name is used, after `::` too: `std::fs`
+/// taken as `q` in a module and used as `a::q::`, taken as `s` and used through `self::`, `super::`
+/// and `crate::`, a module's name taken again (`use self::m::store as q;`), `std::net::TcpStream` and
+/// `std::env` taken in a module, a raw name (`r#fs`), each read as what it takes; a path a macro builds
+/// from what it is given, a foreign block and `asm!` read as everything, said once. What takes
+/// nothing still reads as nothing: `$crate::`, `$f::<T>`, a function made for C, a type of std::net,
+/// a qualified path in brackets (src/confirm.rs, FEEDBACK83.md Q-1305, found by the review of 109f6b1; branch feedback82-85).
+#[test]
+fn what_a_name_a_use_gives_stands_for_is_read_wherever_it_is_used() {
+    let d = dir("rust-names-used");
+    let all = "http, fs, env, time, random, net, run";
+    let cases: Vec<(&str, &str, &str, &str)> = vec![
+        ("reexport", "mod a { pub use std::fs as q; }\npub fn r(p: String) -> String { a::q::read_to_string(p).unwrap_or_default() }", "fs", "std::fs (line 3)"),
+        ("selfpath", "use std::fs as s;\npub fn r(p: String) -> String { self::s::read_to_string(p).unwrap_or_default() }", "fs", "std::fs (line 3)"),
+        ("superpath", "use std::fs as s;\nmod inner { pub fn r(p: String) -> String { super::s::read_to_string(p).unwrap_or_default() } }", "fs", "std::fs (line 3)"),
+        ("cratepath", "use std::fs as s;\npub fn r(p: String) -> String { crate::s::read_to_string(p).unwrap_or_default() }", "fs", "std::fs (line 3)"),
+        ("again", "mod m { pub use std::fs as store; }\nuse self::m::store as q;\npub fn r(p: String) -> String { q::read_to_string(p).unwrap_or_default() }", "fs", "std::fs (line 3)"),
+        ("tcp", "mod a { pub use std::net::TcpStream as T; }\npub fn r(c: String) -> i64 { a::T::connect(c).map(|_| 0).unwrap_or(1) }", "net", "std::net::TcpStream (line 3)"),
+        ("env", "mod a { pub use std::env as e; }\npub fn r(c: String) -> String { a::e::var(c).unwrap_or_default() }", "env", "std::env (line 3)"),
+        ("raw", "use std::r#fs as q;\npub fn r(p: String) -> String { q::read_to_string(p).unwrap_or_default() }", "fs", "std::fs::read_to_string (line 4)"),
+        ("rawglob", "use std::{r#fs::*};\npub fn r(p: String) -> String { read_to_string(p).unwrap_or_default() }", "fs", "std::fs::* (line 3)"),
+        ("macro", "macro_rules! m { ($x:ident) => { std::$x::read_to_string } }\npub fn r(p: String) -> String { m!(fs)(p).unwrap_or_default() }", all, "`::$x` (a path a macro builds from what it is given) (line 3)"),
+        ("macrohead", "macro_rules! m { ($x:ident) => { $x::read_to_string } }\npub fn r(p: String) -> String { m!(fs)(p).unwrap_or_default() }", all, "`$x::` (a path a macro builds from what it is given) (line 3)"),
+        ("foreign", "extern \"C\" { fn system(c: *const u8) -> i32; }\npub fn r() -> i64 { unsafe { system(std::ptr::null()) as i64 } }", all, "a foreign block (`extern \"C\" { ... }`), whose functions are not Rust's to read (line 3)"),
+        ("asm", "pub fn r() { unsafe { core::arch::asm!(\"nop\") } }", all, "`asm!`, code that is not Rust's to read (line 3)"),
+    ];
+    for (name, code, effects, call) in &cases {
+        let f = format!("{}.qwer", name);
+        write(&d, &f, &format!("//! version: 1.0.0\n//! effects: none\n{}\n", code));
+        let (code, out) = quillo(&d, &["confirm", "--effects", &f]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert_eq!(out, format!("{}: effects: {}\n  but it says `effects: none`, and calls {}: a reading of its text, not a proof (a crate can do what it does unseen)\n", f, effects, call), "{}", name);
+    }
+    for (name, code) in [
+        ("cratemacro", "macro_rules! m { () => { $crate::r() } }\npub fn r() -> u8 { 1 }"),
+        ("turbofish", "macro_rules! m { ($f:ident) => { $f::<u8>() } }\npub fn r() -> u8 { 1 }"),
+        ("forc", "pub extern \"C\" fn r() -> u8 { 1 }"),
+        ("ipaddr", "use std::net::IpAddr;\npub fn r(s: String) -> bool { s.parse::<IpAddr>().is_ok() }"),
+        ("qualified", "pub fn r(a: [u8; 4]) -> u8 { a[<usize as Default>::default()] }"),
+        ("unicode", "mod ü { pub fn r() -> u8 { 1 } }\npub fn r() -> u8 { ü::r() }"),
+    ] {
+        let f = format!("{}.qwer", name);
+        write(&d, &f, &format!("//! version: 1.0.0\n//! effects: none\n{}\n", code));
+        assert_eq!(quillo(&d, &["confirm", "--effects", &f]), (Some(0), format!("{}: effects: none\n", f)), "{}", name);
+    }
+}
+
+/// A `use` tree is read 64 groups deep: `use std::{{...{fs::*}...}};` 64 deep reads as fs, 65 deep
+/// as everything, said at its line; 300,000 deep is read the same way, not brought down by its
+/// depth, by `quillo confirm --effects`, `quillo check` and a held start (src/confirm.rs, FEEDBACK83.md Q-1305, found by the review of 109f6b1; branch feedback82-85).
+#[test]
+fn a_use_tree_deeper_than_it_is_read_reads_as_everything() {
+    let d = dir("rust-use-deep");
+    let nested = |n: usize| format!("//! version: 1.0.0\n//! effects: none\nuse std::{}fs::*{};\npub fn r() -> String {{ read_to_string(\"/etc/hosts\").unwrap_or_default() }}\n", "{".repeat(n), "}".repeat(n));
+    write(&d, "d64.qwer", &nested(64));
+    let (code, out) = quillo(&d, &["confirm", "--effects", "d64.qwer"]);
+    assert_eq!((code, out.lines().next()), (Some(1), Some("d64.qwer: effects: fs")), "{}", out);
+    write(&d, "d65.qwer", &nested(65));
+    let (code, out) = quillo(&d, &["confirm", "--effects", "d65.qwer"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.starts_with("d65.qwer: effects: http, fs, env, time, random, net, run\n  but it says `effects: none`, and calls a `use` nested more than 64 deep, which is not read (line 3): "), "{}", out);
+    write(&d, "deep.qwer", &format!("//! version: 1.0.0\n//! effects: none\nuse std::{};\npub fn r() -> i64 {{ 0 }}\n", "{".repeat(300_000)));
+    let (code, out) = quillo(&d, &["confirm", "--effects", "deep.qwer"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.starts_with("deep.qwer: effects: http, fs, env, time, random, net, run\n"), "{}", out);
+    // Under a hold: check says it is not confirmed, and the start stops on that, each standing.
+    write(&d, "main.qwe", "import deep.qwer use r\nroute GET / = str(r())\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("deep.qwer:3: warning: deep.qwer says `effects: none`, and calls a `use` nested more than 64 deep") && out.contains("deep.qwer: error: deep.qwer is not confirmed"), "{}", out);
+    let (code, out) = quillo(&d, &["run", "main.qwe", "--port", "0", "--no-check"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("deep.qwer is not confirmed"), "{}", out);
+}
+
+/// A hostile Rust file is read in time in proportion to its size: for each kind (a path of 250,000
+/// `fs::`, 40,000 `use`s each giving a name, groups 300,000 deep, runs of spaces, `a :: ` joined,
+/// `.open(` after a builder, strings, `$x::y`, distinct calls, `use` with no `;`), reading 1 MB once
+/// takes less than five times as long as reading 64 KB sixteen times, the same work in
+/// proportion (sixteen times as long as the square), each the best of three rounds taken in turn:
+/// compared, not timed, so a slower or busier machine passes as a faster one does. And `quillo
+/// confirm --effects` reads the 1 MB ones (src/confirm.rs, FEEDBACK83.md Q-1305, found by the review of 109f6b1; branch feedback82-85).
+#[test]
+fn a_hostile_rust_file_is_read_in_time_in_proportion_to_its_size() {
+    let make = |kind: &str, size: usize| -> String {
+        let mut body = String::with_capacity(size + 64);
+        let mut i = 0usize;
+        while body.len() < size {
+            match kind {
+                "fs" => body.push_str("fs::"),
+                "uses" => body.push_str(&format!("use std::io::Read as r{};\n", i)),
+                "deep" => body.push('{'),
+                "spaces" => body.push(' '),
+                "colons" => body.push_str("a :: "),
+                "open" => body.push_str("Builder.open(x)"),
+                "strings" => body.push_str("\"a\" "),
+                "dollar" => body.push_str("$x::y "),
+                "calls" => body.push_str(&format!("std::fs::a{}(p);\n", i)),
+                _ => body.push_str("use "),
+            }
+            i += 1;
+        }
+        let body = if kind == "deep" { format!("use std::{};", body) } else { body };
+        format!("//! version: 1.0.0\n//! effects: none\npub fn f() -> i64 {{ {} 0 }}\n", body)
+    };
+    let timed = |f: &dyn Fn()| {
+        let t = Instant::now();
+        f();
+        t.elapsed()
+    };
+    for kind in ["fs", "uses", "deep", "spaces", "colons", "open", "strings", "dollar", "calls", "usekw"] {
+        let (small, large) = (make(kind, 64 << 10), make(kind, 1 << 20));
+        let (mut t_small, mut t_large) = (Duration::MAX, Duration::MAX);
+        for _ in 0..3 {
+            t_small = t_small.min(timed(&|| {
+                for _ in 0..16 {
+                    quillo::confirm::rust_effects(&small);
+                }
+            }));
+            t_large = t_large.min(timed(&|| {
+                quillo::confirm::rust_effects(&large);
+            }));
+        }
+        let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
+        eprintln!("{}: 64 KB sixteen times in {:?}, 1 MB in {:?} ({:.2} times)", kind, t_small, t_large, ratio);
+        assert!(ratio < 5.0, "{}: 64 KB sixteen times in {:?}, 1 MB in {:?} ({:.2} times)", kind, t_small, t_large, ratio);
+    }
+    let d = dir("rust-hostile");
+    write(&d, "fs.qwer", &make("fs", 1 << 20));
+    write(&d, "uses.qwer", &make("uses", 1 << 20));
+    let (code, out) = quillo(&d, &["confirm", "--effects", "fs.qwer", "uses.qwer"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.starts_with("fs.qwer: effects: fs\n") && out.contains("\nuses.qwer: effects: none\n"), "{}", &out[..out.len().min(400)]);
+}
+
+/// Under a quillo.confirmed a Rust file that builds another file into it is refused, as its
+/// SHA-256 does not cover that file: `#[path = "helper.rs"] mod helper;`, `mod helper;`, `mod ü;`,
+/// `include!`, `include_str!`, `include_bytes!`. `quillo confirm` writes nothing and says why;
+/// with its hash confirmed by hand, `quillo check` says it at its line, a start does not start,
+/// `quillo build` builds nothing, and taken under `--watch` it does not load; with no hold,
+/// `quillo confirm --effects` says it. An inline `mod helper { ... }` and the words in a comment
+/// or a text are not refused (src/confirm.rs, FEEDBACK83.md Q-1305, found by the review of 109f6b1; branch feedback82-85).
+#[test]
+fn a_plugin_that_builds_another_file_into_it_is_refused_under_a_hold() {
+    use sha2::Digest;
+    let cases = [
+        ("pathmod", "#[path = \"helper.rs\"]\nmod helper;", "`mod helper;`, a module in another file", 4),
+        ("plainmod", "mod helper;", "`mod helper;`, a module in another file", 3),
+        ("unicode", "pub mod ü ;", "`mod ü;`, a module in another file", 3),
+        ("include", "include!(\"helper.rs\");", "`include!`", 3),
+        ("text", "const T: &str = include_str! (\"helper.txt\");", "`include_str!`", 3),
+        ("bytes", "static B: &[u8] = include_bytes!(\"helper.bin\");", "`include_bytes!`", 3),
+    ];
+    for (name, code, how, line) in cases {
+        let d = dir(&format!("builds-in-{}", name));
+        let src = format!("//! version: 1.0.0\n//! effects: fs\n{}\npub fn hi() -> String {{ \"hi\".into() }}\n", code);
+        write(&d, "hi.qwer", &src);
+        write(&d, "helper.rs", "pub fn hi() -> String { \"helper\".into() }\n");
+        write(&d, "main.qwe", "route GET / = \"main\"\n");
+        let why = format!("hi.qwer builds another file into it ({} at line {}), which its SHA-256 in quillo.confirmed would not cover: a change there would build another plugin under the one confirmed, so it is not confirmed and does not load under a quillo.confirmed (put that code in hi.qwer)", how, line);
+        // No hold: said by the reading.
+        let (code, out) = quillo(&d, &["confirm", "--effects", "hi.qwer"]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.contains(&format!("  but it builds another file into it ({} at line {}), which this reading does not see; under a quillo.confirmed it does not load\n", how, line)), "{}: {}", name, out);
+        // Taken under --watch, its hash confirmed by hand: not loaded, nothing built.
+        let sha: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|x| format!("{:02x}", x)).collect();
+        write(&d, "quillo.confirmed", &format!("[\"main.qwe\"]\n\n[\"hi.qwer\"]\nsha256 = \"{}\"\n", sha));
+        let (g, port, log) = serve(&d, &["--watch", "--no-check", "--no-build"]);
+        assert_eq!(send(port, "GET", "/", &[], "").body, "main", "{}: {}", name, read(&log));
+        write(&d, "main.qwe", "import hi.qwer use hi\nroute GET / = hi()\n");
+        assert!(log_has(&log, &why, 30), "{}: {}", name, read(&log));
+        drop(g);
+        let (code, out) = quillo(&d, &["check", "main.qwe"]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.contains(&format!("hi.qwer:{}: error: {}", line, why)), "{}: {}", name, out);
+        let (code, out) = quillo(&d, &["run", "main.qwe", "--port", "0", "--no-check"]);
+        assert_eq!((code, out.trim()), (Some(1), format!("quillo: {}", why).as_str()), "{}", name);
+        let (code, out) = quillo(&d, &["build", "main.qwe"]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.contains(&format!("{}: nothing built", why)), "{}: {}", name, out);
+        // `quillo confirm` writes nothing.
+        std::fs::remove_file(d.join("quillo.confirmed")).unwrap();
+        let (code, out) = quillo(&d, &["confirm", "--yes"]);
+        assert_eq!((code, out.as_str()), (Some(1), format!("quillo confirm: {}\nquillo confirm: nothing written\n", why).as_str()), "{}", name);
+        assert!(!d.join("quillo.confirmed").exists(), "{}", name);
+    }
+    // Inline, or only words: confirmed as before.
+    let d = dir("builds-in-not");
+    write(&d, "hi.qwer", "//! version: 1.0.0\n//! effects: none\n// mod helper; include!(\"x\")\nmod helper { pub fn hi() -> String { \"mod h; include_str!()\".into() } }\npub fn hi() -> String { helper::hi() }\n");
+    write(&d, "main.qwe", "import hi.qwer use hi\nroute GET / = hi()\n");
+    let (code, out) = quillo(&d, &["confirm", "--yes"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(read(&d.join("quillo.confirmed")).contains("[\"hi.qwer\"]\nsha256 = "), "{}", read(&d.join("quillo.confirmed")));
 }

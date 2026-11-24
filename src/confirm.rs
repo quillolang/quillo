@@ -128,6 +128,9 @@ pub struct Block {
     /// the line of its `import`. The import is the grant (the user's decision of 2026-11-24), and
     /// said where the program's reach is said. Found only.
     pub grants: Vec<(u32, String)>,
+    /// A Rust file that builds another file into it, at its line, and how (`compiled_in`). Found
+    /// only.
+    pub compiles: Option<(u32, String)>,
 }
 
 impl Block {
@@ -1323,8 +1326,11 @@ const RUST_NOT_FILES: &[&str] = &["Client::open", "Stemmer::create", "SnippetGen
 /// tokio::fs::*;`) brings in to be called bare, `var("KEY")`, where the reading knows them only by
 /// the module's name (`env::var`, `fs::`): by the last part of the module's path, its effect. A
 /// glob of a module named `process` lets `Command::new` start a program (`rust_read`)
-/// (FEEDBACK83.md, Q-1305, found by the coverage tests of 0038a97; branch feedback82-85).
-const RUST_GLOBS: &[(&str, &str)] = &[("env", "env"), ("fs", "fs")];
+/// (FEEDBACK83.md, Q-1305, found by the coverage tests of 0038a97; branch feedback82-85). And the
+/// module itself taken under another name, which is then used where no `use` is read
+/// (`mod a { pub use std::env as e; }`, `a::e::var(k)`); a module of networking too
+/// (FEEDBACK83.md, Q-1305, found by the review of 109f6b1; branch feedback82-85).
+const RUST_GLOBS: &[(&str, &str)] = &[("env", "env"), ("fs", "fs"), ("net", "net")];
 
 /// A Rust file's code with its comments taken out and each string's text out of it (`""` in its
 /// place), lines kept; and the strings, each with its line and where it stood in the code.
@@ -1449,7 +1455,11 @@ fn rust_name_byte(c: u8) -> bool {
 
 /// `code` (`rust_code`'s) with each path written as one, `std :: fs :: read` as `std::fs::read`,
 /// and no space between a name (or a macro's `!`) and its `(`, `read (p)` as `read(p)`; a line
-/// break taken out is put back at the end of its line, so each call keeps its line.
+/// break taken out is put back at the end of its line, so each call keeps its line. A raw name is
+/// written as the name it is, `r#fs` as `fs`: `use std::r#fs as q;` read as `effects: none`. A
+/// run of spaces is read once: a character at a time, each read the rest of its run again, and a
+/// file of spaces took time as its size squared (FEEDBACK83.md, Q-1305, found by the review of
+/// 109f6b1; branch feedback82-85).
 fn rust_joined(code: &str) -> String {
     let b = code.as_bytes();
     let space = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r');
@@ -1470,6 +1480,11 @@ fn rust_joined(code: &str) -> String {
             }
             continue;
         }
+        // `rust_code` took raw strings out, so an `r#` before a name is a raw name.
+        if c == b'r' && b.get(i + 1) == Some(&b'#') && b.get(i + 2).is_some_and(|n| rust_name_byte(*n)) && !(i > 0 && rust_name_byte(b[i - 1])) {
+            i += 2;
+            continue;
+        }
         if space(c) {
             let j = i + b[i..].iter().take_while(|x| space(**x)).count();
             // And between a macro's name and its `!`, which Rust allows: `include_str !("/etc/hosts")`
@@ -1482,29 +1497,60 @@ fn rust_joined(code: &str) -> String {
                 i = j;
                 continue;
             }
-        }
-        if c == b'\n' {
-            out.extend(std::iter::repeat_n(b'\n', owed));
-            owed = 0;
+            for &x in &b[i..j] {
+                if x == b'\n' {
+                    out.extend(std::iter::repeat_n(b'\n', owed));
+                    owed = 0;
+                }
+                out.push(x);
+            }
+            i = j;
+            continue;
         }
         out.push(c);
         i += 1;
     }
     out.extend(std::iter::repeat_n(b'\n', owed));
-    // Only ASCII spaces were taken out, and line breaks put in between characters.
+    // Only ASCII spaces and `r#` were taken out, and line breaks put in between characters.
     String::from_utf8(out).unwrap_or_else(|_| code.to_string())
+}
+
+/// Where each line of `text` starts after the first: a place's line, found in time as its log.
+fn line_starts(text: &str) -> Vec<usize> {
+    text.bytes().enumerate().filter(|(_, b)| *b == b'\n').map(|(i, _)| i).collect()
+}
+
+/// The line of the place `at`, by `line_starts`.
+fn line_at(starts: &[usize], at: usize) -> u32 {
+    starts.partition_point(|n| *n < at) as u32 + 1
+}
+
+/// How many `{` deep a `use` tree is read: past it, the file is read as doing everything, with a
+/// note. Each was read a level deeper on the stack, and a file of `use std::{{{{...` brought
+/// `quillo check`, `quillo confirm` and a held start down (FEEDBACK83.md, Q-1305, found by the
+/// review of 109f6b1; branch feedback82-85).
+const USE_DEPTH: u32 = 64;
+
+/// What `rust_use_names` reads of a file's `use` declarations: the names (`(name, path, as)`),
+/// where each declaration is, the path each name and glob takes with where it is, and where a
+/// tree is deeper than `USE_DEPTH`.
+struct RustUses {
+    names: Vec<(String, String, bool)>,
+    spans: Vec<(usize, usize)>,
+    leaves: Vec<(String, usize)>,
+    too_deep: Option<usize>,
 }
 
 /// The names `use` declarations (and `extern crate x as y`) in `code` give: each name, the path
 /// it stands for, and whether it is another name for it (`as`); where each declaration is; and the
 /// path each name and glob of them takes, as it would be written alone (`use std::{fs::*,
 /// net::TcpStream};`: `std::fs::*` and `std::net::TcpStream`), each with where it is. A name of
-/// the file's own (`crate::`, `self::`, `super::`) is read where it is written.
+/// the file's own (`crate::`, `self::`, `super::`) is read where it is written. Each declaration
+/// is read once: a `use` found inside one is not read again from it, which read the rest of the
+/// file each time.
 fn rust_use_names(code: &str) -> RustUses {
     let b = code.as_bytes();
-    let mut names = Vec::new();
-    let mut spans = Vec::new();
-    let mut leaves = Vec::new();
+    let mut out = RustUses { names: Vec::new(), spans: Vec::new(), leaves: Vec::new(), too_deep: None };
     for kw in ["use", "extern crate"] {
         let mut from = 0;
         while let Some(at) = code[from..].find(kw).map(|a| a + from) {
@@ -1514,48 +1560,76 @@ fn rust_use_names(code: &str) -> RustUses {
                 continue;
             }
             let Some(end) = code[from..].find(';').map(|e| e + from) else { break };
-            spans.push((at, end));
+            out.spans.push((at, end));
             let toks = rust_use_tokens(&code[from..end]);
             let mut i = 0;
             if kw == "use" {
-                rust_use_tree(&toks, &mut i, &[], &mut names, &mut leaves, code.as_ptr() as usize);
+                let mut deep = false;
+                rust_use_tree(&toks, &mut i, &[], &mut out.names, &mut out.leaves, code.as_ptr() as usize, 0, &mut deep);
+                if deep && out.too_deep.is_none() {
+                    out.too_deep = Some(at);
+                }
             } else if let [name, rest @ ..] = toks.as_slice() {
                 if let ["as", alias] = rest {
-                    names.push((alias.to_string(), name.to_string(), true));
+                    out.names.push((alias.to_string(), name.to_string(), true));
                 }
             }
+            from = end;
         }
     }
-    names.retain(|(n, full, _)| n != "_" && *n != *full && !["crate", "self", "super"].iter().any(|s| full.split("::").next() == Some(*s)));
+    out.spans.sort_unstable();
+    out.names.retain(|(n, full, _)| n != "_" && *n != *full && !["crate", "self", "super"].iter().any(|s| full.split("::").next() == Some(*s)));
     // A path that starts at a name another `use` gives is the path that name stands for: `use
     // std::fs as f; use f::read_to_string;` and `use std::fs as f; use f::*;`, then a bare
     // `read_to_string(p)`, read as `effects: none` (FEEDBACK83.md, Q-1305, found by the coverage
-    // tests of 0038a97; branch feedback82-85).
-    for k in 0..names.len() {
-        let full = rust_resolved(&names[k].1, &names, Some(k));
-        names[k].1 = full;
+    // tests of 0038a97; branch feedback82-85). Each name looked up, not looked for among them
+    // all: 20,000 `use`s took seconds (FEEDBACK83.md, Q-1305, found by the review of 109f6b1;
+    // branch feedback82-85).
+    let by = RustNames::of(&out.names);
+    let resolved: Vec<String> = (0..out.names.len()).map(|k| by.resolved(&out.names[k].1, &out.names, Some(k))).collect();
+    for (n, full) in out.names.iter_mut().zip(resolved) {
+        n.1 = full;
     }
-    for leaf in leaves.iter_mut() {
-        leaf.0 = rust_resolved(&leaf.0, &names, None);
+    let by = RustNames::of(&out.names);
+    for leaf in out.leaves.iter_mut() {
+        leaf.0 = by.resolved(&leaf.0, &out.names, None);
     }
-    (names, spans, leaves)
+    out
 }
 
-/// What `rust_use_names` reads of a file's `use` declarations.
-type RustUses = (Vec<(String, String, bool)>, Vec<(usize, usize)>, Vec<(String, usize)>);
+/// The names `use`s give, by name: for each, the first two that stand for a path that does not
+/// start with that name (the second for a name's own path, which `own` passes over).
+struct RustNames(HashMap<String, [Option<usize>; 2]>);
 
-/// `path` (`f::read_to_string`), its first part another name of `names` gives (but the one at
-/// `own`), written as the path that name stands for (`std::fs::read_to_string`), as far as eight
-/// such names lead.
-fn rust_resolved(path: &str, names: &[(String, String, bool)], own: Option<usize>) -> String {
-    let mut p = path.to_string();
-    for _ in 0..8 {
-        let first = p.split("::").next().unwrap_or("").to_string();
-        let by = names.iter().enumerate().find(|(k, (n, full, _))| Some(*k) != own && *n == first && full.split("::").next() != Some(first.as_str()));
-        let Some((_, (_, full, _))) = by else { break };
-        p = format!("{}{}", full, &p[first.len()..]);
+impl RustNames {
+    fn of(names: &[(String, String, bool)]) -> RustNames {
+        let mut by: HashMap<String, [Option<usize>; 2]> = HashMap::new();
+        for (k, (n, full, _)) in names.iter().enumerate() {
+            if full.split("::").next() == Some(n.as_str()) {
+                continue;
+            }
+            let e = by.entry(n.clone()).or_default();
+            if e[0].is_none() {
+                e[0] = Some(k);
+            } else if e[1].is_none() {
+                e[1] = Some(k);
+            }
+        }
+        RustNames(by)
     }
-    p
+
+    /// `path` (`f::read_to_string`), its first part another name of `names` gives (but the one at
+    /// `own`), written as the path that name stands for (`std::fs::read_to_string`), as far as
+    /// eight such names lead.
+    fn resolved(&self, path: &str, names: &[(String, String, bool)], own: Option<usize>) -> String {
+        let mut p = path.to_string();
+        for _ in 0..8 {
+            let first = p.split("::").next().unwrap_or("");
+            let Some(k) = self.0.get(first).and_then(|[a, b]| a.filter(|k| Some(*k) != own).or(b.filter(|k| Some(*k) != own))) else { break };
+            p = format!("{}{}", names[k].1, &p[first.len()..]);
+        }
+        p
+    }
 }
 
 fn rust_use_tokens(s: &str) -> Vec<&str> {
@@ -1586,8 +1660,14 @@ fn rust_use_tokens(s: &str) -> Vec<&str> {
 /// `std::io::*`), each with where it is in the code that starts at `origin`. Before, a glob in a
 /// group (`use std::{fs::*};`, `use std::{fs::{*}};`) was passed over, and nothing read what it, or
 /// a name in a group (`use std::{fs::File};`), took (FEEDBACK83.md, Q-1305, found by the coverage
-/// tests of 0038a97; branch feedback82-85).
-fn rust_use_tree(toks: &[&str], i: &mut usize, prefix: &[String], out: &mut Vec<(String, String, bool)>, leaves: &mut Vec<(String, usize)>, origin: usize) {
+/// tests of 0038a97; branch feedback82-85). `depth`: how many groups deep it is; past
+/// `USE_DEPTH`, `deep` is set and nothing more of it is read.
+#[allow(clippy::too_many_arguments)]
+fn rust_use_tree(toks: &[&str], i: &mut usize, prefix: &[String], out: &mut Vec<(String, String, bool)>, leaves: &mut Vec<(String, usize)>, origin: usize, depth: u32, deep: &mut bool) {
+    if depth > USE_DEPTH {
+        *deep = true;
+        return;
+    }
     let mut path = prefix.to_vec();
     let offset = |t: &str| (t.as_ptr() as usize).saturating_sub(origin);
     while let Some(t) = toks.get(*i).copied() {
@@ -1604,7 +1684,7 @@ fn rust_use_tree(toks: &[&str], i: &mut usize, prefix: &[String], out: &mut Vec<
                 *i += 1;
                 while toks.get(*i).is_some_and(|t| *t != "}") {
                     let at = *i;
-                    rust_use_tree(toks, i, &path, out, leaves, origin);
+                    rust_use_tree(toks, i, &path, out, leaves, origin, depth + 1, deep);
                     if toks.get(*i) == Some(&",") {
                         *i += 1;
                     } else if *i == at {
@@ -1639,6 +1719,14 @@ fn rust_use_tree(toks: &[&str], i: &mut usize, prefix: &[String], out: &mut Vec<
     }
 }
 
+/// What the reading of a file's `use`s gives `rust_read`: the code as it is spelled, the path each
+/// name and glob takes with its line, and the line of a tree too deep to read.
+struct RustSpelled {
+    code: String,
+    leaves: Vec<(String, u32)>,
+    too_deep: Option<u32>,
+}
+
 /// `code` as the reading looks through it: `rust_joined`, and each name a `use` gives another
 /// written as what it names, so `use std::fs as g; g::write(p)` is read as `std::fs::write(p)`
 /// and `use std::net::UdpSocket as U; U::bind(a)` as `std::net::UdpSocket::bind(a)`; a name
@@ -1646,15 +1734,33 @@ fn rust_use_tree(toks: &[&str], i: &mut usize, prefix: &[String], out: &mut Vec<
 /// dependency line gives a crate (`h = { package = "reqwest" }`). Before, each of these spellings
 /// read as `effects: none` (FEEDBACK83.md, Q-1305, found by the coverage tests; branch
 /// feedback82-85). And the path each name and glob of the file's `use`s takes, each with its line
-/// (`rust_use_names`).
-fn rust_spelled(code: &str, deps: &[(String, String)]) -> (String, Vec<(String, u32)>) {
+/// (`rust_use_names`). Each word is looked up among the names, and among the declarations by
+/// where it is: looked for through them all, a file of 40,000 `use`s took 14 s (FEEDBACK83.md,
+/// Q-1305, found by the review of 109f6b1; branch feedback82-85).
+fn rust_spelled(code: &str, deps: &[(String, String)]) -> RustSpelled {
     let joined = rust_joined(code);
-    let (mut names, spans, leaves) = rust_use_names(&joined);
-    let leaves: Vec<(String, u32)> = leaves.into_iter().map(|(p, at)| (p, joined.get(..at).map_or(0, |b| b.matches('\n').count()) as u32 + 1)).collect();
+    let RustUses { mut names, spans, leaves, too_deep } = rust_use_names(&joined);
+    let starts = line_starts(&joined);
+    let leaves: Vec<(String, u32)> = leaves.into_iter().map(|(p, at)| (p, line_at(&starts, at))).collect();
+    let too_deep = too_deep.map(|at| line_at(&starts, at));
     names.extend(deps.iter().map(|(n, p)| (n.clone(), p.clone(), true)));
     if names.is_empty() {
-        return (joined, leaves);
+        return RustSpelled { code: joined, leaves, too_deep };
     }
+    // For each name, the first entry for it and the first that is another name for its path.
+    let mut by: HashMap<&str, (usize, Option<usize>)> = HashMap::new();
+    for (k, (n, _, other)) in names.iter().enumerate() {
+        let e = by.entry(n.as_str()).or_insert((k, None));
+        if *other && e.1.is_none() {
+            e.1 = Some(k);
+        }
+    }
+    // Whether `i` is inside a declaration: the furthest end of those that start before it.
+    let mut furthest = Vec::with_capacity(spans.len());
+    for (_, e) in &spans {
+        furthest.push(furthest.last().map_or(*e, |f: &usize| (*f).max(*e)));
+    }
+    let in_use = |i: usize| spans.partition_point(|(s, _)| *s <= i).checked_sub(1).is_some_and(|k| furthest[k] > i);
     let b = joined.as_bytes();
     let mut out = String::with_capacity(joined.len() + 64);
     let (mut i, mut last) = (0, 0);
@@ -1668,16 +1774,81 @@ fn rust_spelled(code: &str, deps: &[(String, String)]) -> (String, Vec<(String, 
         let path = b.get(end) == Some(&b':') && b.get(end + 1) == Some(&b':');
         let called = b.get(end) == Some(&b'(');
         let mac = b.get(end) == Some(&b'!') && b.get(end + 1) != Some(&b'=');
-        let taken = names.iter().find(|(n, _, other)| n == word && (called || (*other && (path || mac))));
-        if let Some((_, full, _)) = taken.filter(|_| !spans.iter().any(|(s, e)| (*s..*e).contains(&i)) && !joined[..i].ends_with("fn ")) {
+        let taken = by.get(word).and_then(|(first, other)| if called { Some(*first) } else if path || mac { *other } else { None });
+        if let Some(k) = taken.filter(|_| !in_use(i) && !joined[..i].ends_with("fn ")) {
             out.push_str(&joined[last..i]);
-            out.push_str(full);
+            out.push_str(&names[k].1);
             last = end;
         }
         i = end;
     }
     out.push_str(&joined[last..]);
-    (out, leaves)
+    RustSpelled { code: out, leaves, too_deep }
+}
+
+/// The effects a Rust plugin can have, for a file whose reading cannot follow what it does: all a
+/// plugin's `//! effects:` line names but `db`, which is Quillo's own.
+fn every_rust_effect() -> Effects {
+    crate::ast::ALL_EFFECTS & !effect_bit("db")
+}
+
+/// Where `code` (`rust_spelled`'s) has what a reading cannot follow, its line and how it is
+/// written: a path a macro builds from what it is given, `std::$x::read_to_string` made by
+/// `m!(fs)` (`$x::name`, `::$x`, not `$crate::` nor `$f::<T>`), `concat_idents!` or paste's
+/// `[<...>]`; and code that is not Rust's to read, a foreign block (`extern "C" { fn system(..);
+/// }`) or `asm!`. No plugin of the catalog has one.
+fn unfollowed(code: &str) -> Option<(u32, &'static str)> {
+    let b = code.as_bytes();
+    let mut found: Option<(usize, &'static str)> = None;
+    let mut keep = |at: usize, how: &'static str| {
+        if found.is_none_or(|(f, _)| at < f) {
+            found = Some((at, how));
+        }
+    };
+    for (at, _) in code.match_indices('$') {
+        let n = b[at + 1..].iter().take_while(|x| rust_name_byte(**x)).count();
+        let after = at + 1 + n;
+        if n > 0 && &code[at + 1..after] != "crate" && code[after..].starts_with("::") && b.get(after + 2).is_some_and(|x| rust_name_byte(*x)) {
+            keep(at, "`$x::` (a path a macro builds from what it is given)");
+            break;
+        }
+    }
+    if let Some(at) = code.find("::$") {
+        keep(at, "`::$x` (a path a macro builds from what it is given)");
+    }
+    if let Some(at) = code.find("concat_idents!") {
+        keep(at, "`concat_idents!` (a name a macro builds)");
+    }
+    // Not a qualified path in brackets, `a[<T as Trait>::N]`.
+    let paste = |at: usize| {
+        let mut end = code.len().min(at + 128);
+        while !code.is_char_boundary(end) {
+            end -= 1;
+        }
+        b.get(at + 2).is_some_and(|x| rust_name_byte(*x)) && !code[at..end].split('>').next().is_some_and(|seg| seg.contains(" as "))
+    };
+    if let Some((at, _)) = code.match_indices("[<").find(|(at, _)| paste(*at)) {
+        keep(at, "`[<...>]` (a name paste builds)");
+    }
+    // `extern "C" {` (its text taken out: `extern "" {`) or `extern {`, not `extern crate` nor a
+    // function of the file's own made for C (`extern "C" fn`).
+    for (at, _) in code.match_indices("extern") {
+        if at > 0 && rust_name_byte(b[at - 1]) {
+            continue;
+        }
+        let rest = code[at + 6..].trim_start();
+        let rest = rest.strip_prefix("\"\"").unwrap_or(rest).trim_start();
+        if rest.starts_with('{') {
+            keep(at, "a foreign block (`extern \"C\" { ... }`), whose functions are not Rust's to read");
+            break;
+        }
+    }
+    for m in ["asm!", "global_asm!", "naked_asm!"] {
+        if let Some((at, _)) = code.match_indices(m).find(|(at, _)| *at == 0 || !rust_name_byte(b[at - 1])) {
+            keep(at, "`asm!`, code that is not Rust's to read");
+        }
+    }
+    found.map(|(at, how)| (line_at(&line_starts(code), at), how))
 }
 
 /// What the reading of `code` (`rust_code`'s, a file's code) finds it does: the code as
@@ -1690,23 +1861,49 @@ fn rust_spelled(code: &str, deps: &[(String, String)]) -> (String, Vec<(String, 
 /// branch feedback82-85). A glob of a crate itself (`use std::*;`) gives modules, not functions,
 /// so what it takes is read where they are named (`fs::hard_link(a, b)`, `env::var(k)`, `use
 /// fs::*;`), and nothing at it.
+///
+/// And each name a `use` gives is read as what it stands for wherever it is used: `mod a { pub
+/// use std::fs as q; }` then `a::q::read_to_string(p)`, `use std::fs as s;` then
+/// `self::s::read_to_string(p)`, `mod a { pub use std::env as e; }` then `a::e::var(k)`, each
+/// read as `effects: none`, as a name after `::` is not spelled again: `std::fs` taken under any
+/// name is read as fs, `std::net::TcpStream` as net, a module `RUST_GLOBS` names as it has it.
+/// What cannot be followed is read as doing everything (`every_rust_effect`), said as what it
+/// calls: a path a macro builds and a foreign block (`unfollowed`), and a `use` tree deeper than
+/// `USE_DEPTH`
+/// (FEEDBACK83.md, Q-1305, found by the review of 109f6b1; branch feedback82-85). The leaves are
+/// read together, as one text, a line each.
 fn rust_read(code: &str, deps: &[(String, String)]) -> (String, Effects, Vec<(&'static str, String, u32)>) {
-    let (spelled, leaves) = rust_spelled(code, deps);
+    let RustSpelled { code: spelled, leaves, too_deep } = rust_spelled(code, deps);
     let starts_programs = spelled.contains("std::process") || spelled.contains("process::Command") || leaves.iter().any(|(p, _)| p.ends_with("::*") && p.split("::").any(|s| s == "process"));
     let (mut mask, mut calls) = effects_in(&spelled, starts_programs);
     let elsewhere = mask;
-    for (path, line) in &leaves {
-        let mut taken = effects_in(path, starts_programs).0;
-        if let Some(module) = path.strip_suffix("::*") {
-            for (_, effect) in RUST_GLOBS.iter().filter(|(m, _)| module.rsplit("::").next() == Some(*m)) {
-                taken |= effect_bit(effect);
-            }
+    let mut more: Vec<(&'static str, String, u32)> = Vec::new();
+    // Each leaf a line: a glob as it is (`std::fs::*`), a name as a path into it (`std::fs::`).
+    let text: String = leaves.iter().map(|(p, _)| if p.ends_with("::*") { format!("{}\n", p) } else { format!("{}::\n", p) }).collect();
+    for (effect, _, line) in effects_in(&text, starts_programs).1 {
+        if let Some((p, l)) = leaves.get(line as usize - 1) {
+            more.push((effect, p.clone(), *l));
         }
-        for effect in effect_names(taken & !elsewhere) {
-            if !calls.iter().any(|(e, c, _)| *e == effect && c == path) {
-                mask |= effect_bit(effect);
-                calls.push((effect, path.clone(), *line));
-            }
+    }
+    for (p, l) in &leaves {
+        let module = p.strip_suffix("::*").unwrap_or(p);
+        for (_, effect) in RUST_GLOBS.iter().filter(|(m, _)| module.rsplit("::").next() == Some(*m)) {
+            more.push((*effect, p.clone(), *l));
+        }
+    }
+    let cannot = |what: String, line: u32| effect_names(every_rust_effect()).into_iter().map(move |e| (e, what.clone(), line));
+    if let Some((line, how)) = unfollowed(&spelled) {
+        more.extend(cannot(how.to_string(), line));
+    }
+    if let Some(line) = too_deep {
+        more.extend(cannot(format!("a `use` nested more than {} deep, which is not read", USE_DEPTH), line));
+    }
+    // The first of each effect the code read finds nowhere else.
+    more.sort_by_key(|c| c.2);
+    for (effect, call, line) in more {
+        if elsewhere & effect_bit(effect) == 0 && mask & effect_bit(effect) == 0 {
+            mask |= effect_bit(effect);
+            calls.push((effect, call, line));
         }
     }
     calls.sort_by_key(|c| c.2);
@@ -1721,17 +1918,39 @@ pub fn rust_effects(src: &str) -> (Effects, Vec<(&'static str, String, u32)>) {
     (mask, calls)
 }
 
+/// How much of a call's name `effects_in` says, either side of what it found: a longer one is
+/// a hostile file's (`fs::fs::fs::...`), which took time as its size squared (FEEDBACK83.md,
+/// Q-1305, found by the review of 109f6b1; branch feedback82-85).
+const CALL_NAME: usize = 96;
+
 fn effects_in(code: &str, starts_programs: bool) -> (Effects, Vec<(&'static str, String, u32)>) {
     let mut found = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut mask: Effects = 0;
     let tb = code.as_bytes();
+    let starts = line_starts(code);
     // Each pattern looked for once through the whole text, its line counted only where it is
     // found: looked for line by line, a 53 KB plugin cost `quillo check` 0.6% of the site's check
     // (found measuring review 1's fixes).
     for (pat, effect) in RUST_CALLS {
         let mut from = 0;
+        // For `.open(`: the start of the statement each is in, and the last `Builder` before it,
+        // read as the matches come, in order, each part of the text once.
+        let (mut stmt, mut builder, mut read_to) = (0usize, None::<usize>, 0usize);
+        // Where the name of the last call this pattern counted ends: one found inside it is part
+        // of that call (`fs::` in `std::fs::read`), counted already.
+        let mut counted_to = 0usize;
         while let Some(at) = code[from..].find(pat).map(|a| a + from) {
             from = at + pat.len();
+            if *pat == ".open(" {
+                if let Some(k) = code[read_to..at].rfind([';', '{', '}']) {
+                    stmt = read_to + k + 1;
+                }
+                if let Some(k) = code[read_to..at].rfind("Builder") {
+                    builder = Some(read_to + k);
+                }
+                read_to = at;
+            }
             // A name of its own, not the end of another (`my_fs::read`); `Command::new` is a
             // program started only where the file takes it from `std::process` (clap's reads
             // arguments: B.4).
@@ -1757,25 +1976,26 @@ fn effects_in(code: &str, starts_programs: bool) -> (Effects, Vec<(&'static str,
             if word && code[..at].ends_with("fn ") {
                 continue;
             }
-            if *pat == ".open(" {
-                let stmt = code[..at].rfind([';', '{', '}']).map_or(0, |i| i + 1);
-                if tb.get(from) == Some(&b')') || !code[stmt..at].contains("Builder") {
-                    continue;
-                }
+            if *pat == ".open(" && (tb.get(from) == Some(&b')') || !builder.is_some_and(|k| k >= stmt)) {
+                continue;
+            }
+            if at < counted_to {
+                continue;
             }
             let ident = |c: &u8| c.is_ascii_alphanumeric() || *c == b'_' || *c == b':';
-            let s = at - code[..at].bytes().rev().take_while(ident).count();
+            let s = at - code[..at].bytes().rev().take(CALL_NAME).take_while(ident).count();
             // A pattern that ends at its `(` names the call without what it is given
             // (`redis::Client::open`, not `redis::Client::open(url`).
-            let e = if pat.ends_with(['(', ')']) { from } else { from + code[from..].bytes().take_while(ident).count() };
-            let call = code[s..e].trim_end_matches(['(', ':']).to_string();
+            let e = if pat.ends_with(['(', ')']) { from } else { from + code[from..].bytes().take(CALL_NAME).take_while(ident).count() };
+            let call = code[s..e].trim_end_matches(['(', ':']);
             if pat.starts_with("::") && RUST_NOT_FILES.iter().any(|n| call == *n || call.strip_suffix(n).is_some_and(|p| p.ends_with("::"))) {
                 continue;
             }
             mask |= effect_bit(effect);
-            if !found.iter().any(|(_, c, _): &(&str, String, u32)| *c == call) {
-                let line = code[..at].bytes().filter(|b| *b == b'\n').count() as u32 + 1;
-                found.push((*effect, call, line));
+            counted_to = e;
+            if !seen.contains(call) {
+                seen.insert(call.to_string());
+                found.push((*effect, call.to_string(), line_at(&starts, at)));
             }
         }
     }
@@ -1869,11 +2089,68 @@ fn scan_rust(bytes: &[u8]) -> Block {
     if let Some(said) = parsed.effects {
         let left: Vec<&(&str, String, u32)> = calls.iter().filter(|(e, _, _)| said & effect_bit(e) == 0).collect();
         if let Some(first) = left.iter().find(|c| c.2 > 0).or(left.first()) {
-            let shown: Vec<String> = left.iter().map(|(_, c, l)| if *l > 0 { format!("{} (line {})", c, l) } else { c.clone() }).collect();
+            let mut shown: Vec<String> = left.iter().map(|(_, c, l)| if *l > 0 { format!("{} (line {})", c, l) } else { c.clone() }).collect();
+            // Once each: what cannot be followed is each effect's (`rust_read`).
+            let mut once = HashSet::new();
+            shown.retain(|c| once.insert(c.clone()));
             b.notes.push((first.2, format!("says `effects: {}`, and calls {}: a reading of its text, not a proof (a crate can do what it does unseen)", b.effects.clone().unwrap_or_default(), shown.join(", "))));
         }
     }
+    // Another file built into it, which neither the reading nor its SHA-256 sees (`compiled_in`).
+    b.compiles = compiled_in(&code);
     b
+}
+
+/// What is said of a Rust file that builds another file into it where nothing holds the run:
+/// that the reading does not see it, and that a hold would refuse it (`compiled_in`).
+fn compiled_in_said(b: &Block) -> Option<String> {
+    b.compiles.as_ref().map(|(line, how)| format!("builds another file into it ({} at line {}), which this reading does not see; under a {} it does not load", how, line, FILE))
+}
+
+/// Where the Rust file whose code is `code` (`rust_spelled`'s) builds another file into it, and
+/// how: an out-of-line module (`mod h;`, with `#[path = "helper.rs"]` or not), `include!`,
+/// `include_str!` or `include_bytes!`. A plugin is built as `#[path = "x.qwer"] mod user;`, so
+/// each compiles a file that neither the reading nor the SHA-256 that quillo.confirmed pins (nor
+/// the built library's key) covers: a changed `helper.rs` built a different library under the
+/// confirmed hash. No plugin of the catalog does, so under a quillo.confirmed such a file is
+/// refused, at `quillo confirm`, as the program starts and as it loads (`plugin_ok`)
+/// (FEEDBACK83.md, Q-1305, found by the review of 109f6b1; branch feedback82-85).
+fn compiled_in(code: &str) -> Option<(u32, String)> {
+    let b = code.as_bytes();
+    let word_at = |at: usize, len: usize| (at == 0 || !rust_name_byte(b[at - 1])) && !b.get(at + len).is_some_and(|x| rust_name_byte(*x));
+    let mut found: Option<(usize, String)> = None;
+    for (at, _) in code.match_indices("mod") {
+        if !word_at(at, 3) || !b.get(at + 3).is_some_and(|x| x.is_ascii_whitespace()) {
+            continue;
+        }
+        let rest = code[at + 3..].trim_start();
+        let n = rest.bytes().take_while(|x| rust_name_byte(*x)).count();
+        if n > 0 && rest[n..].trim_start().starts_with(';') {
+            found = Some((at, format!("`mod {};`, a module in another file", &rest[..n])));
+            break;
+        }
+    }
+    for m in ["include!", "include_str!", "include_bytes!"] {
+        if let Some((at, _)) = code.match_indices(m).find(|(at, _)| (*at == 0 || !rust_name_byte(b[at - 1])) && b.get(at + m.len()).is_some_and(|x| matches!(x, b'(' | b'[' | b'{'))) {
+            if found.as_ref().is_none_or(|(f, _)| at < *f) {
+                found = Some((at, format!("`{}`", m)));
+            }
+        }
+    }
+    found.map(|(at, how)| (line_at(&line_starts(code), at), how))
+}
+
+/// `compiled_in` of a Rust file's bytes.
+fn builds_in(bytes: &[u8]) -> Option<(u32, String)> {
+    let (code, _) = rust_code(&String::from_utf8_lossy(bytes));
+    compiled_in(&rust_joined(&code))
+}
+
+/// Why the Rust file `name` may not be confirmed or load where a quillo.confirmed holds the run,
+/// if it may not: it builds another file into it (`compiled_in`).
+fn compiled_in_refused(name: &str, b: &Block) -> Option<String> {
+    let (line, how) = b.compiles.as_ref()?;
+    Some(format!("{} builds another file into it ({} at line {}), which its SHA-256 in {} would not cover: a change there would build another plugin under the one confirmed, so it is not confirmed and does not load under a {} (put that code in {})", escaped(name), how, line, FILE, FILE, escaped(name)))
 }
 
 // ---- quillo.confirmed --------------------------------------------------------------------------
@@ -2893,6 +3170,12 @@ pub fn plugin_ok(qwer: &Path) -> Result<(), String> {
     let have = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
     let want = h.by_name.get(&rel).and_then(|i| h.blocks[*i as usize].sha256.as_deref());
     let shown = escaped(&rel);
+    // Nor one that builds another file into it, whatever its hash (`compiled_in`; FEEDBACK83.md,
+    // Q-1305, found by the review of 109f6b1; branch feedback82-85): read where it loads, as a
+    // `--watch` reload takes it.
+    if let Some(why) = compiled_in_refused(&rel, &Block { compiles: builds_in(&bytes), ..Default::default() }) {
+        return Err(why);
+    }
     match want {
         Some(w) if w == have => Ok(()),
         Some(_) => Err(format!("{} is not the file confirmed: its SHA-256 is {} now; Rust cannot be held to a list, so it does not load (`quillo confirm` shows it)", shown, have)),
@@ -3012,6 +3295,12 @@ pub fn at_start_in(main: &Path, dir: &Path, ask: bool) -> Result<(), i32> {
         eprintln!("quillo: {}", plugin_message(&conf, m, &full));
         return Err(1);
     }
+    // Nor one that builds another file into it (`compiled_in`; FEEDBACK83.md, Q-1305, found by
+    // the review of 109f6b1; branch feedback82-85).
+    if let Some(why) = found.files.iter().find_map(|(f, b)| compiled_in_refused(f, b)) {
+        eprintln!("quillo: {}", why);
+        return Err(1);
+    }
     hold(&dir, main, &conf, &found);
     Ok(())
 }
@@ -3025,6 +3314,9 @@ pub fn rust_confirmed(main: &Path, files: &[PathBuf]) -> Result<bool, String> {
         let name = rel_name(&dir, f);
         let bytes = crate::error::read_file(f).map_err(|e| format!("{}: {}", f.display(), e))?;
         let have = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&bytes));
+        if let Some(why) = compiled_in_refused(&name, &Block { compiles: builds_in(&bytes), ..Default::default() }) {
+            return Err(format!("{}: nothing built", why));
+        }
         if conf.get(&name).and_then(|b| b.sha256.as_deref()) != Some(have.as_str()) {
             let m = Missing { file: name, kind: "sha256", item: have, lines: Vec::new() };
             return Err(format!("{}: nothing built", plugin_message(&conf, &m, f)));
@@ -3147,6 +3439,13 @@ pub fn for_check(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>
                     out.push(Diagnostic { file: shown(file), line: *line, severity: Severity::Warning, message: escaped(g).into_owned() });
                 }
             }
+            // A Rust file that builds another file into it (`compiled_in`; FEEDBACK83.md, Q-1305,
+            // found by the review of 109f6b1; branch feedback82-85).
+            for (file, b) in &found.files {
+                if let Some(why) = compiled_in_refused(file, b) {
+                    out.push(Diagnostic { file: shown(file), line: b.compiles.as_ref().map_or(0, |c| c.0), severity: Severity::Error, message: why });
+                }
+            }
             let left = missing(&found, conf);
             for m in &left {
                 let message = if m.kind == "sha256" {
@@ -3164,6 +3463,11 @@ pub fn for_check(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>
             }
         }
         None => {
+            for (file, b) in &found.files {
+                if let Some(said) = compiled_in_said(b) {
+                    out.push(Diagnostic { file: shown(file), line: b.compiles.as_ref().map_or(0, |c| c.0), severity: Severity::Warning, message: format!("{} {}", escaped(file), said) });
+                }
+            }
             if let Some(layer) = layer {
                 let (stop, line) = provider_line(&layer, &format!("{} has none", path.display()));
                 out.push(Diagnostic { file: main.display().to_string(), line: 0, severity: if stop { Severity::Error } else { Severity::Warning }, message: line });
@@ -3226,6 +3530,16 @@ pub fn main(args: &[String]) -> i32 {
     if list {
         print!("{}", whole_listing(&found));
         return 0;
+    }
+    // A Rust file that builds another file into it is not confirmed: nothing is written
+    // (`compiled_in`; FEEDBACK83.md, Q-1305, found by the review of 109f6b1; branch feedback82-85).
+    let refused: Vec<String> = found.files.iter().filter_map(|(f, b)| compiled_in_refused(f, b)).collect();
+    if !refused.is_empty() {
+        for why in &refused {
+            eprintln!("quillo confirm: {}", why);
+        }
+        eprintln!("quillo confirm: nothing written");
+        return 1;
     }
     let path = dir.join(FILE);
     let conf = match read(&path) {
@@ -3365,8 +3679,8 @@ fn effects_command(files: &[String]) -> i32 {
         let b = scan_rust(&bytes);
         let proposed = if b.found_effects == 0 { "none".to_string() } else { effect_names(b.found_effects).join(", ") };
         println!("{}: effects: {}", f, proposed);
-        for (_, n) in &b.notes {
-            println!("  but it {}", escaped(n));
+        for n in b.notes.iter().map(|(_, n)| n.clone()).chain(compiled_in_said(&b)) {
+            println!("  but it {}", escaped(&n));
             code = code.max(1);
         }
     }

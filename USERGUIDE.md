@@ -10944,10 +10944,17 @@ Asking, and who answers:
 - `quillo confirm --effects tools.rs` reads a Rust file for what it does (the standard
   library's file, network, process, clock and random calls, the crates that do them) and
   proposes its `//! effects:` line, saying where the file's own leaves something out. It
-  follows the names the file gives them (`use std::fs as disk`, `extern crate reqwest as
-  web`, a dependency's `package = "reqwest"`), however `::` and `!` are spaced, and reads
-  `include_str!`, `include_bytes!` and `include!` as `fs`. It is a reading of the text, not
-  a proof: a crate can do what it does unseen.
+  follows the names the file gives them (`use std::fs as disk`, `use std::{fs::*}`, `r#fs`,
+  `extern crate reqwest as web`, a dependency's `package = "reqwest"`), however `::` and `!`
+  are spaced, and reads `include_str!`, `include_bytes!` and `include!` as `fs`. What it
+  cannot follow it reads as every effect but `db`, and says where: a path a macro builds
+  from its argument, a foreign block (`extern "C" { ... }`), `asm!`, a `use` nested more than
+  64 deep. A file that builds another into it (`include!`, `include_str!`,
+  `include_bytes!`, `#[path]`, an out-of-line `mod x;`) is refused under a `quillo.confirmed`,
+  by `quillo confirm`, `check`, `build` and the start, since the other file is outside its
+  SHA-256; without one, it is a warning. It is a reading of the text, not a proof: a crate
+  can do what it does unseen (`libc::kill` reads as the `libc` crate, which the file's
+  `crates` list confirms by name).
 
 Not held yet: [`--watch`](#options-of-quillo-run) does not read `quillo.confirmed` again
 when it changes (restart after `quillo confirm`); what a page loads and calls is only
