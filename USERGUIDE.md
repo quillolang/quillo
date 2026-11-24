@@ -10993,8 +10993,10 @@ for the site and the visitor.
   *(since 0.8.11)* So that what its SQL reaches can be read, a taken file's statement on
   PostgreSQL or MySQL/MariaDB that has the database run SQL, or name a table, from text is
   refused: `DO`, `PREPARE` and `EXECUTE` (`EXECUTE IMMEDIATE`), `CALL`, `CREATE FUNCTION`,
-  `PROCEDURE`, `TRIGGER`, `RULE` or `EVENT`, the `*_to_xml` functions, and `::regclass`,
-  `to_regclass` or a cast to `regclass`. A word inside a string, a comment or a quoted name
+  `PROCEDURE`, `TRIGGER`, `RULE` or `EVENT`, the `*_to_xml` functions, `::regclass`,
+  `to_regclass` or a cast to `regclass`, and a function that takes a table (`nextval`,
+  `setval`, `has_table_privilege`, `row_security_active`, ...) given it by anything but a
+  plain string such as `'kit_seq'`. A word inside a string, a comment or a quoted name
   is not one. The refusal says to run it from the main file's SQL, or a migration the main
   file runs; the main file's SQL, and a program without a `quillo.confirmed`, are not read
   this way. A function the program's own SQL made that runs SQL text can still be called
@@ -11002,7 +11004,8 @@ for the site and the visitor.
   adds, beyond `crosstab`, `connectby`, `ts_stat`, `ts_rewrite`, the `dblink` functions and
   the `*_to_xml` ones, which are refused by their names, and so can a trigger the program
   made that a taken file's write sets off. The reading fails closed: what it cannot read for
-  certain is refused (MySQL's `/*!` comments, a string left open, a statement inside an `IF`
+  certain is refused (MySQL's `/*!` comments, a `[` outside a string on MySQL/MariaDB, which
+  `sql_mode=MSSQL` reads as a quoted name, a string left open, a statement inside an `IF`
   or a label), `EXECUTE`, `CALL` and `PREPARE` anywhere in the statement, a `CREATE` of
   anything but a table, an index, a view or a sequence, SQL that reaches the server's files
   (`COPY`, `INTO OUTFILE`, `pg_read_file`, `LOAD`), and the catalogs that hold other tables'

@@ -1289,7 +1289,8 @@ enum Tk<'a> {
     Word(&'a [u8]),
     /// A quoted name, as the server works it out (a `U&` one by each escape it may have).
     Names(Vec<Vec<u8>>),
-    Str,
+    /// A string as written, its prefix and quotes with it.
+    Str(&'a [u8]),
     Punct(u8),
     /// `::`
     Cast,
@@ -1319,6 +1320,15 @@ fn tokens(r: Reading, t: &[u8]) -> (Vec<Tk<'_>>, Option<&'static str>) {
         if my && t[i] == b'/' && t.get(i + 1) == Some(&b'*') && (t.get(i + 2) == Some(&b'!') || (t.get(i + 2) == Some(&b'M') && t.get(i + 3) == Some(&b'!'))) {
             return (out, Some("a `/*! */` comment, whose SQL runs or not as the server's version says"));
         }
+        // MariaDB's `[...]`, a quoted name under `sql_mode=MSSQL`, which a main file may leave on a
+        // pooled connection: a `'` inside one opened a string for this reading that the server did
+        // not, and `select 1 as [a']; execute immediate ...` wrote Quillo's own table (FEEDBACK83.md,
+        // Q-1300, found by review 8 of cb0ce59; branch feedback82-85). MySQL has no other use for
+        // it outside a string. The other modes that change how a text is read are read both ways
+        // (`ANSI_QUOTES`, in ANSI, ORACLE, DB2, POSTGRESQL, MAXDB and MSSQL; `NO_BACKSLASH_ESCAPES`).
+        if my && t[i] == b'[' {
+            return (out, Some("a `[`, which MariaDB's sql_mode MSSQL takes for the start of a quoted name"));
+        }
         let mut open = false;
         if let Some(e) = space_end_shut(r, t, i, &mut runs, &mut open) {
             if open {
@@ -1340,8 +1350,9 @@ fn tokens(r: Reading, t: &[u8]) -> (Vec<Tk<'_>>, Option<&'static str>) {
         if c == b'\'' || (c == b'"' && my && !ansi) || prefixed || (unicode && t[word + 1] == b'\'') {
             let at = if c == b'\'' || c == b'"' { i } else if unicode { word + 1 } else { word };
             let backslash = (escapes || (pg && w.eq_ignore_ascii_case(b"e"))) && !unicode;
+            let from = i;
             (i, shut) = quoted_shut(t, at, t[at], backslash, &mut scratch);
-            out.push(Tk::Str);
+            out.push(Tk::Str(&t[from..i]));
         } else if unicode {
             (i, shut) = quoted_shut(t, word + 1, b'"', false, &mut scratch);
             out.push(Tk::Names(unicode_texts(&scratch)));
@@ -1355,7 +1366,7 @@ fn tokens(r: Reading, t: &[u8]) -> (Vec<Tk<'_>>, Option<&'static str>) {
             }
             k
         }).filter(|k| t.get(*k) == Some(&b'$')) {
-            let tag = &t[i..=tag_end];
+            let (tag, from) = (&t[i..=tag_end], i);
             match t[tag_end + 1..].windows(tag.len()).position(|w| w == tag) {
                 Some(e) => i = tag_end + 1 + e + tag.len(),
                 None => {
@@ -1363,7 +1374,7 @@ fn tokens(r: Reading, t: &[u8]) -> (Vec<Tk<'_>>, Option<&'static str>) {
                     shut = false;
                 }
             }
-            out.push(Tk::Str);
+            out.push(Tk::Str(&t[from..i]));
         } else if word > i {
             out.push(Tk::Word(w));
             i = word;
@@ -1407,17 +1418,38 @@ fn starts_with_any(name: &[u8], starts: &[&[u8]]) -> bool {
     starts.iter().any(|p| name.len() >= p.len() && name[..p.len()].eq_ignore_ascii_case(p))
 }
 
-/// PostgreSQL's functions that take a table by its name as a `regclass`, from text: a sequence's
-/// (`nextval`, `currval`, `setval`), the privileges' and the descriptions'. Given a name worked out
-/// as it runs (`pg_relation_size('_quil' || 'lo_mine')` was one), any table is reached: under a
-/// hold a taken file's call of one takes a string or a word as each argument, the name judged with
-/// the statement's other names (`own_table_named`), and nothing else (FEEDBACK83.md, Q-1300, found
-/// by review 7 of 64df6c0; branch feedback82-85). Those named `pg_...` are refused by their name.
+/// PostgreSQL's functions that take a table by its name as a `regclass`, from text, or by its
+/// number (oid): a sequence's (`nextval`, `currval`, `setval`), the privileges', the descriptions'
+/// and BRIN's and GIN's upkeep. Given a name worked out as it runs (`pg_relation_size('_quil' ||
+/// 'lo_mine')` was one), any table is reached: under a hold a taken file's call of one takes the
+/// literals `plain_arguments` allows, and nothing else (FEEDBACK83.md, Q-1300, found by review 7 of
+/// 64df6c0; branch feedback82-85). Those named `pg_...` are refused by their name.
+///
+/// The list is PostgreSQL 17.11's, from its `pg_proc`, those named `pg_...` left out:
+///
+/// ```sql
+/// -- a relation by its regclass:
+/// select distinct proname from pg_proc
+///  where 'regclass'::regtype = any(proargtypes::oid[]) and proname !~ '^pg_';
+/// -- a relation by its name as text, or its oid, by the C function's name:
+/// select distinct proname from pg_proc
+///  where proname !~ '^pg_' and prosrc ~ '(table|relation|column|sequence|rls|row_security|any_column|toast)'
+///    and proargtypes::oid[] && array['text'::regtype, 'oid'::regtype, 'name'::regtype, 'regclass'::regtype]::oid[];
+/// ```
+///
+/// the second's `string_to_table` and `regexp_split_to_table`, which split text, left out, and the
+/// descriptions (`obj_description`, `col_description`, `shobj_description`, SQL functions of an
+/// object's oid) added. A bare word was a column of a subquery that named Quillo's own sequence,
+/// which `setval(n, 1000000)` then moved (`(select '_quil' || 'lo_mine_id_seq' as n) t`), and
+/// `row_security_active` and `brin_summarize_new_values` were not on the list (FEEDBACK83.md,
+/// Q-1300, found by review 8 of cb0ce59; branch feedback82-85).
 fn regclass_fn(name: &[u8]) -> bool {
     const NAMES: &[&[u8]] = &[
-        b"nextval", b"currval", b"setval", b"has_table_privilege", b"has_column_privilege", b"has_sequence_privilege", b"has_any_column_privilege", b"obj_description", b"col_description", b"shobj_description",
+        b"brin_desummarize_range", b"brin_summarize_new_values", b"brin_summarize_range", b"currval", b"gin_clean_pending_list", b"nextval", b"regclassout", b"regclasssend", b"setval", b"table_to_xml",
+        b"table_to_xml_and_xmlschema", b"table_to_xmlschema", b"has_any_column_privilege", b"has_column_privilege", b"has_sequence_privilege", b"has_table_privilege", b"has_tablespace_privilege",
+        b"row_security_active", b"obj_description", b"col_description", b"shobj_description",
     ];
-    NAMES.iter().any(|w| name.eq_ignore_ascii_case(w))
+    NAMES.iter().any(|w| name.eq_ignore_ascii_case(w)) || starts_with_any(name, &[b"binary_upgrade_"])
 }
 
 /// The functions that reach the database server's own files or programs: PostgreSQL's
@@ -1450,7 +1482,7 @@ fn holds_others(name: &[u8]) -> bool {
 /// reading: read whole, a taken file's every statement on PostgreSQL cost some 5,000 instructions
 /// (measured, 20,000 `db.one`).
 fn may_run_text(sql: &[u8]) -> bool {
-    if sql.iter().any(|&c| c == b'&' || c == 0 || c == b';') || sql.windows(3).any(|w| w == b"/*!" || w == b"/*M") || after_wide(sql) {
+    if sql.iter().any(|&c| c == b'&' || c == 0 || c == b';' || c == b'[') || sql.windows(3).any(|w| w == b"/*!" || w == b"/*M") || after_wide(sql) {
         return true;
     }
     // One statement whose first word is a plain one, as written (no comment before it): one whose
@@ -1486,7 +1518,7 @@ fn after_wide(sql: &[u8]) -> bool {
 fn looked_for(w: &[u8]) -> bool {
     let mut buf = [0u8; 24];
     if w.len() > buf.len() {
-        return runs_text(w) || holds_others(w) || starts_with_any(w, &[b"pg_"]);
+        return runs_text(w) || holds_others(w) || regclass_fn(w) || starts_with_any(w, &[b"pg_"]);
     }
     for (b, c) in buf.iter_mut().zip(w) {
         *b = c.to_ascii_lowercase();
@@ -1499,8 +1531,8 @@ fn looked_for(w: &[u8]) -> bool {
         b"pg_read_file" | b"pg_read_binary_file" | b"pg_ls_dir" | b"pg_stat_file" | b"lo_import" | b"lo_export" | b"load_file" | b"pg_file_write" => true,
         b"pg_stats" | b"pg_statistic" | b"pg_stats_ext" | b"pg_stats_ext_exprs" | b"pg_statistic_ext_data" | b"pg_prepared_statements" | b"pg_stat_statements" | b"pg_stat_statements_info" | b"pg_stat_activity"
         | b"performance_schema" | b"general_log" | b"slow_log" | b"processlist" | b"innodb_trx" => true,
-        b"set_config" | b"mysql" | b"has_table_privilege" | b"has_column_privilege" | b"has_sequence_privilege" | b"has_any_column_privilege" | b"obj_description" | b"col_description" | b"shobj_description" => true,
-        _ if l.starts_with(b"pg_") || l.starts_with(b"innodb_") => true,
+        b"set_config" | b"mysql" => true,
+        _ if l.starts_with(b"pg_") || l.starts_with(b"innodb_") || regclass_fn(l) => true,
         _ => matches!(l[0], b'q' | b'c' | b't' | b's' | b'd' | b'e') && (runs_text(l) || holds_others(l)),
     }
 }
@@ -1727,7 +1759,7 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
             // word for each argument (`regclass_fn`).
             if called {
                 if let Some(n) = names.clone().find(|n| regclass_fn(n)) {
-                    if !plain_arguments(&stmt[after + 1..]) {
+                    if !plain_arguments(n, &stmt[after + 1..]) {
                         return runs(format!("the function {} given a table's name worked out as it runs", String::from_utf8_lossy(n).to_ascii_lowercase()));
                     }
                 }
@@ -1748,7 +1780,7 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
                     before = Some(&stmt[k - 3]);
                 }
                 let in_cast = casts.last() == Some(&true);
-                let typed = matches!(before, Some(Tk::Cast)) || (in_cast && matches!(before, Some(Tk::Word(x)) if x.eq_ignore_ascii_case(b"as"))) || matches!(stmt.get(k + 1), Some(Tk::Str)) || called;
+                let typed = matches!(before, Some(Tk::Cast)) || (in_cast && matches!(before, Some(Tk::Word(x)) if x.eq_ignore_ascii_case(b"as"))) || matches!(stmt.get(k + 1), Some(Tk::Str(_))) || called;
                 if typed {
                     return runs(format!("a {} worked out as it runs", if n.eq_ignore_ascii_case(b"oid") { "table's number (oid)" } else { "table's name (regclass)" }));
                 }
@@ -1761,20 +1793,42 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
     None
 }
 
-/// Whether the arguments of a call, the tokens after its `(` (`rest`), are each one string or one
-/// word, its `)` closing them: no parameter (`$1`, `?`), no operator, no call, no cast.
-fn plain_arguments(rest: &[Tk<'_>]) -> bool {
+/// Whether the arguments of a call of a `regclass_fn` named `f`, the tokens after its `(`
+/// (`rest`), are literals its `)` closes: a table (or a user, a column, a privilege) by a plain
+/// string `'...'` with a letter in it and no backslash, judged with the statement's other names
+/// (`own_table_named`), for a string of digits is a table by its number (oid) and a backslash an
+/// escape under `standard_conforming_strings` off; a number, `true` or `false` only where `f` takes
+/// a value (`setval`'s, a range's block, `col_description`'s column; `has_column_privilege`'s
+/// column number is a `smallint`, which a number is not without a cast).
+/// A word (a column, `n` of a subquery), a parameter (`$1`, `?`), an operator, a call, a cast and
+/// any other string are refused (FEEDBACK83.md, Q-1300, found by review 8 of cb0ce59; branch
+/// feedback82-85).
+fn plain_arguments(f: &[u8], rest: &[Tk<'_>]) -> bool {
+    let mut args: Vec<&Tk<'_>> = Vec::new();
     let mut one = false;
-    for t in rest {
-        match t {
-            Tk::Punct(b')') => return one,
-            Tk::Punct(b',') if one => one = false,
-            Tk::Str if !one => one = true,
-            Tk::Word(x) if !one && !x.starts_with(b"$") => one = true,
-            _ => return false,
+    let shut = 'read: {
+        for t in rest {
+            match t {
+                Tk::Punct(b')') => break 'read one,
+                Tk::Punct(b',') if one => one = false,
+                Tk::Str(_) | Tk::Word(_) if !one => {
+                    args.push(t);
+                    one = true;
+                }
+                _ => return false,
+            }
         }
-    }
-    false
+        false
+    };
+    let value_at = |k: usize| {
+        let is = |w: &[u8]| f.eq_ignore_ascii_case(w);
+        (is(b"setval") && k >= 1) || ((is(b"brin_summarize_range") || is(b"brin_desummarize_range") || is(b"col_description")) && k == 1)
+    };
+    shut && args.iter().enumerate().all(|(k, t)| match t {
+        Tk::Str(s) => s.len() >= 2 && s[0] == b'\'' && !s.contains(&b'\\') && s.iter().any(|c| c.is_ascii_alphabetic() || *c == b'_'),
+        Tk::Word(x) => value_at(k) && (x.iter().all(u8::is_ascii_digit) || x.eq_ignore_ascii_case(b"true") || x.eq_ignore_ascii_case(b"false")),
+        _ => false,
+    })
 }
 
 /// What a taken file's statement may begin with, where a quillo.confirmed holds the run, as its
@@ -1843,7 +1897,7 @@ fn table_options_refused(stmt: &[Tk<'_>]) -> Option<String> {
     for (k, t) in stmt.iter().enumerate() {
         let Tk::Word(x) = t else { continue };
         let next = stmt.get(k + 1);
-        let valued = matches!(next, Some(Tk::Punct(b'=') | Tk::Str));
+        let valued = matches!(next, Some(Tk::Punct(b'=') | Tk::Str(_)));
         if x.eq_ignore_ascii_case(b"engine") {
             let at = if matches!(next, Some(Tk::Punct(b'='))) { k + 2 } else { k + 1 };
             let name = match stmt.get(at) {

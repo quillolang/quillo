@@ -1371,3 +1371,123 @@ fn on_mysql_a_taken_files_statement_may_begin_only_with_what_it_may_do() {
     }
     assert_eq!(tables.matches("t: ").count(), 3, "{}", out);
 }
+
+// ---- review 8 of cb0ce59's fixes -----------------------------------------------------------------
+
+/// What MariaDB's `[` is refused as.
+const BRACKET: &str = "unsure:a `[`, which MariaDB's sql_mode MSSQL takes for the start of a quoted name";
+
+/// Under a quillo.confirmed on MySQL (MariaDB) a taken file's `[` outside a string, a comment or a
+/// quoted name is refused: under `sql_mode=MSSQL` (the server's here, set by a run before; a main
+/// file's `set sql_mode` stays on its connection too), `[...]` is a quoted name, and `select 1 as
+/// [a']; execute immediate concat(0x..., 0x...) -- '` wrote Quillo's own table, the `'` in it
+/// opening a string for the reading that the server did not; `select [x] from kits` is refused too. A `[` in a string (a JSON path `'$[0]'`, `'[a'']'`),
+/// in each kind of comment and in a backtick name runs, under MSSQL, and the main file's `[y]`
+/// runs; `_quillo_mine` keeps the main file's row alone (src/db.rs tokens, may_run_text;
+/// FEEDBACK83.md Q-1300, found by review 8 of cb0ce59; branch feedback82-85).
+#[test]
+fn on_mysql_a_taken_files_bracket_is_refused_as_sql_mode_mssql_reads_it() {
+    let Some(my) = support::mariadb("cov8285db5r5") else {
+        eprintln!("MariaDB is not installed: skipped");
+        return;
+    };
+    let url = my.url("brackets");
+    let d = dir("my-brackets");
+    let refused: Vec<(&str, &str, Option<&str>, &str)> = vec![
+        ("db.exec", "select 1 as [a']; execute immediate concat(0x696e7365727420696e746f205f7175696c, 0x6c6f5f6d696e652076616c75657320283229) -- '", None, BRACKET),
+        ("db.query", "select [x] from kits", None, BRACKET),
+    ];
+    let ran: Vec<(&str, &str, Option<&str>)> = vec![
+        ("db.query", "select json_extract('[1,2]', '$[0]') as v", None),
+        ("db.query", "select '[a'']' as s", None),
+        ("db.query", "select 1 as x /* [a' */", None),
+        ("db.query", "select 1 as x -- [a'", None),
+        ("db.query", "select 1 as x # [a'", None),
+        ("db.query", "select 1 as `[a'`", None),
+    ];
+    let mut calls: Vec<(&str, &str, Option<&str>)> = refused.iter().map(|(f, s, v, _)| (*f, *s, *v)).collect();
+    calls.extend(ran.iter().copied());
+    // The server's mode is set by a run of its own, so that each connection of the next is opened
+    // under it, whichever of the pool's a statement takes.
+    write(&d, "main.qwe", "db.exec(\"set global sql_mode = 'MSSQL'\")\n");
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    write(&d, "kit/k.qwe", &kit_with(&calls));
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\ndb.exec(\"create table if not exists kits (x int)\")\ndb.exec(\"create table if not exists _quillo_mine (x varchar(40))\")\ndb.exec(\"insert into _quillo_mine values ('main-secret')\")\nprint(\"mode: \" + str(db.one(\"select @@session.sql_mode as m\")))\nprint(\"main: \" + str(db.query(\"select x as [y] from kits\")))\nprint(steal())\nprint(\"rows: \" + str(db.query(\"select x from _quillo_mine order by 1\")))\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.lines().any(|l| l.starts_with("mode: ") && l.contains("MSSQL")), "{}", out);
+    assert!(out.contains("main: []\n"), "{}", out);
+    let whats: Vec<&str> = refused.iter().map(|(_, _, _, w)| *w).collect();
+    assert!(out.contains(&kit_said(&whats, ran.len(), "kit/k.qwe")), "{}", out);
+    assert!(out.contains("rows: [{ x: \"main-secret\" }]\n"), "{}", out);
+}
+
+/// The refusal of a function that takes a table, `f`, given anything but the literals it may take.
+fn given_from_text(f: &str) -> String {
+    format!("the function {} given a table's name worked out as it runs", f)
+}
+
+/// Under a quillo.confirmed on PostgreSQL a taken file's call of a function that takes a table
+/// (`regclass_fn`, PostgreSQL 17's `pg_proc` list) takes the table by a plain string with a letter
+/// in it, and a number only where the function takes a value:
+/// - A bare word is refused: `setval(n, 1000000)` and `nextval(n)` of
+///   `(select '_quil' || 'lo_mine_id_seq' as n) t` moved Quillo's own sequence;
+///   `has_table_privilege(n, ...)`, `gin_clean_pending_list(n)`, `currval(kit_seq)`, a word as
+///   `setval`'s value and as `brin_summarize_range`'s block are refused too.
+/// - `row_security_active` and `brin_summarize_new_values` of a concatenation are refused, as the
+///   others were.
+/// - A table by its number is refused: `nextval('16390')`, `col_description(16384, 1)`; and a
+///   string with a prefix or a backslash (`E'kit_seq'`).
+/// Run: `nextval('kit_seq')`, `setval('kit_seq', 5, true)`, `has_column_privilege('kits', 'x',
+/// 'select')`, `has_sequence_privilege`, `row_security_active('kits')`,
+/// `brin_summarize_new_values('kit_brin')`, `brin_summarize_range('kit_brin', 0)`, a JSON path
+/// `'$[0]'`, and the names in a string or a comment. The main file's `setval(n, 2)` of the same
+/// subquery runs, and Quillo's sequence is where the main file left it (src/db.rs regclass_fn,
+/// plain_arguments; FEEDBACK83.md Q-1300, found by review 8 of cb0ce59; branch feedback82-85).
+#[test]
+fn on_postgresql_a_function_that_takes_a_table_takes_it_by_a_literal() {
+    let Some(pg) = support::postgres("cov8285db5r5") else {
+        eprintln!("PostgreSQL is not installed: skipped");
+        return;
+    };
+    let url = pg.database("by_literal");
+    let d = dir("pg-literal");
+    let refused: Vec<(&str, &str, Option<&str>, String)> = vec![
+        ("db.query", "select setval(n, 1000000) as v from (select '_quil' || 'lo_mine_id_seq' as n) t", None, given_from_text("setval")),
+        ("db.query", "select nextval(n) as v from (select '_quil' || 'lo_mine_id_seq' as n) t", None, given_from_text("nextval")),
+        ("db.query", "select has_table_privilege(n, 'select') as v from (select '_quil' || 'lo_mine' as n) t", None, given_from_text("has_table_privilege")),
+        ("db.query", "select row_security_active('_quil' || 'lo_mine') as v", None, given_from_text("row_security_active")),
+        ("db.query", "select brin_summarize_new_values('_quil' || 'lo_mine_pkey') as v", None, given_from_text("brin_summarize_new_values")),
+        ("db.query", "select gin_clean_pending_list(n) as v from (select 'kit_brin' as n) t", None, given_from_text("gin_clean_pending_list")),
+        ("db.query", "select currval(kit_seq) as v", None, given_from_text("currval")),
+        ("db.query", "select setval('kit_seq', n) as v from (select 5 as n) t", None, given_from_text("setval")),
+        ("db.query", "select brin_summarize_range('kit_brin', n) as v from (select 0 as n) t", None, given_from_text("brin_summarize_range")),
+        ("db.query", "select nextval('16390') as v", None, given_from_text("nextval")),
+        ("db.query", "select col_description(16384, 1) as v", None, given_from_text("col_description")),
+        ("db.query", "select nextval(E'kit_seq') as v", None, given_from_text("nextval")),
+    ];
+    let ran: Vec<(&str, &str, Option<&str>)> = vec![
+        ("db.query", "select nextval('kit_seq') as n", None),
+        ("db.query", "select setval('kit_seq', 5, true) as n", None),
+        ("db.query", "select has_column_privilege('kits', 'x', 'select') as p", None),
+        ("db.query", "select has_sequence_privilege('kit_seq', 'usage') as p", None),
+        ("db.query", "select row_security_active('kits') as v", None),
+        ("db.query", "select brin_summarize_new_values('kit_brin') as v", None),
+        ("db.query", "select brin_summarize_range('kit_brin', 0) as v", None),
+        ("db.query", "select jsonb_path_query_first('[1, 2]', '$[0]') as v", None),
+        ("db.query", "select '[' || 'nextval(n)' as s, 1 as x /* setval(n, 1) [ */", None),
+    ];
+    let mut calls: Vec<(&str, &str, Option<&str>)> = refused.iter().map(|(f, s, v, _)| (*f, *s, *v)).collect();
+    calls.extend(ran.iter().copied());
+    write(&d, "kit/k.qwe", &kit_with(&calls));
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\ndb.exec(\"create table if not exists kits (x int primary key)\")\ndb.exec(\"create index if not exists kit_brin on kits using brin (x)\")\ndb.exec(\"create sequence if not exists kit_seq\")\ndb.exec(\"create table if not exists _quillo_mine (id serial primary key, x text)\")\ndb.exec(\"insert into _quillo_mine (x) values ('tok-A'), ('tok-B')\")\nprint(\"main: \" + str(db.one(\"select setval(n, 2) as v from (select '_quil' || 'lo_mine_id_seq' as n) t\")))\nprint(steal())\nprint(\"seq: \" + str(db.one(\"select last_value as v from _quillo_mine_id_seq\")))\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("main: { v: 2 }\n"), "{}", out);
+    let whats: Vec<&str> = refused.iter().map(|(_, _, _, w)| w.as_str()).collect();
+    assert!(out.contains(&said_r4(&whats, ran.len(), "kit/k.qwe")), "{}", out);
+    assert!(out.contains("seq: { v: 2 }\n"), "{}", out);
+}

@@ -92,7 +92,10 @@ and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2
   SONAME` reached them); `SET` of any kind is refused, as `SET NAMES gbk` let a character
   take the backslash after it, and so is a non-ASCII byte just before a `\` or a backtick; on
   MariaDB only InnoDB, Aria, MyISAM and MEMORY tables, without file or connection options; on
-  PostgreSQL any `pg_` name; `nextval` and the like only with a written name.
+  PostgreSQL any `pg_` name; a function that takes a table (from `pg_proc`: `nextval`,
+  `setval`, `has_table_privilege`, `row_security_active`, the `brin_*` ones and the rest) only
+  with the name written as a string, not a column, a number (an oid) or a parameter; on
+  MariaDB a `[` outside strings, which `sql_mode=MSSQL` reads as a quoted name.
 - **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
   of 2026-11-24): a name another file defines, used without taking it, is an error in
   `quillo check`, and the start refuses it with `--no-check` too, as the value under it
