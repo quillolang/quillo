@@ -826,6 +826,15 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
     // A new file is its owner's alone, and so its `-wal` and `-shm`, which SQLite makes with
     // the database's mode: sessions and password hashes were readable by every user of the
     // machine (FEEDBACK51.md, Q-675; branch feedback51-fixes). One there already keeps its own.
+    // Never made, or opened, where a write of the program's is refused (a `.quillo`, a source, a
+    // `.env`, quillo.confirmed, a journal), judged before the file is made: `db.open` of
+    // quillo.confirmed was refused as SQLite opened it, and left an empty one, which held the next
+    // start (FEEDBACK85.md, Q-1340, found by the verdict review of 8989870; branch feedback82-85).
+    if path != ":memory:" && !path.starts_with("file:") {
+        if let Some(why) = crate::builtins::own_file_apart(Path::new(path)) {
+            return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN), Some(format!("{}: {}", path, why))));
+        }
+    }
     #[cfg(unix)]
     if path != ":memory:" && !path.starts_with("file:") && !Path::new(path).exists() {
         use std::os::unix::fs::OpenOptionsExt;
@@ -3309,7 +3318,7 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         let full = if Path::new(&target).is_absolute() { Path::new(&target).to_path_buf() } else { it.base_dir.join(&target) };
         // Never a file of the program's own `.quillo`, judged before its folder is made
         // (`new_tenant`'s too).
-        if let Some(why) = crate::builtins::quillo_refused(it, &full) {
+        if let Some(why) = crate::builtins::quillo_refused(it, &full).or_else(|| made_refused(&full)) {
             return Err(format!("tenant {}: {}", name, why));
         }
         if !make && !full.exists() {
@@ -3636,6 +3645,22 @@ fn unix_connects(path: &Path, wait: std::time::Duration) -> bool {
     }
 }
 
+/// Why a tenant's database file `full` may not be made, if it may not: it, or a folder of it that
+/// is not there yet and would be made for it, is where a write of the program's is refused
+/// (`builtins::own_file_apart`: a source, a `.env`, quillo.confirmed, a `.quillo` of the
+/// process's, a journal), as `connect` judges the file (FEEDBACK85.md, Q-1340, found by the
+/// verdict review of 8989870; branch feedback82-85).
+fn made_refused(full: &Path) -> Option<String> {
+    let mut at = Some(full);
+    while let Some(p) = at {
+        if let Some(why) = crate::builtins::own_file_apart(p) {
+            return Some(format!("{}: {}", p.display(), why));
+        }
+        at = p.parent().filter(|d| !d.as_os_str().is_empty() && !d.exists());
+    }
+    None
+}
+
 /// Makes tenant `name`'s database, and says false when there is one already, in one step
 /// on each kind of database, so that of two signups for one name only one makes it
 /// (FEEDBACK20.md, Q-165; branch feedback20-fixes).
@@ -3667,7 +3692,11 @@ pub(crate) fn claim_tenant(it: &mut Interp, name: &str, line: u32) -> Result<boo
         // its file is made: `db.open(".quillo/{tenant}.lock")` then `new_tenant("plugins", ...)`
         // made an empty `.quillo/plugins.lock` before its open refused it (FEEDBACK85.md, Q-1340,
         // found by the final review of a6cee54; branch feedback82-85).
-        if let Some(why) = crate::builtins::quillo_refused(it, &full) {
+        // Nor where a write of the program's is refused, it or a folder made for it: `db.open(
+        // "{tenant}.confirmed")` then `new_tenant("quillo", ...)` made an empty quillo.confirmed
+        // and said the tenant was made (FEEDBACK85.md, Q-1340, found by the verdict review of
+        // 8989870; branch feedback82-85).
+        if let Some(why) = crate::builtins::quillo_refused(it, &full).or_else(|| made_refused(&full)) {
             return fail(line, format!("`new_tenant`: {}", why));
         }
         if let Some(dir) = full.parent() {

@@ -1626,3 +1626,67 @@ fn a_tenants_database_in_a_quillo_is_refused_before_anything_is_made() {
         assert!(left.is_empty(), "{}: {:?}", target, left);
     }
 }
+
+// Fix round 12
+
+/// `db.open` and `db.connect` of a file where a write of the program's is refused (quillo.confirmed,
+/// `.env.local`, `.ENV`, a source) are refused before any file is made: each was refused as SQLite
+/// opened it and left an empty file, and an empty quillo.confirmed held the next start. A database
+/// elsewhere (`app.env`) opens; the next start runs (src/db.rs connect; FEEDBACK85.md Q-1340, found
+/// by the verdict review of 8989870; branch feedback82-85).
+#[test]
+fn no_file_is_made_by_a_refused_db_open_or_db_connect() {
+    let d = dir("openmade");
+    let (settings, confirmed, source) = ("it is the program's settings (.env)", "it is what the program was confirmed to reach (quillo.confirmed)", "it is one of the program's own files");
+    let calls: Vec<(&str, &str, &str)> = vec![
+        ("db.open(\"quillo.confirmed\")", "quillo.confirmed", confirmed),
+        ("db.connect(\"quillo.confirmed\")", "quillo.confirmed", confirmed),
+        ("db.connect(\".env.local\")", ".env.local", settings),
+        ("db.connect(\".ENV\")", ".ENV", settings),
+        ("db.connect(\"main.qwe\")", "main.qwe", source),
+        ("db.connect(\"app.env\")", "", ""),
+    ];
+    let lines: Vec<String> = calls.iter().map(|(c, _, _)| format!("print(said({}))", c)).collect();
+    let main = format!("let said = (r) => is_err(r) ? r.error : \"ran\"\n{}\nexit(0)\n", lines.join("\n"));
+    write(&d, "main.qwe", &main);
+    let (code, out) = quillo_env(&d, &["run", "--no-check", "main.qwe"], 120, &[]);
+    assert_eq!(code, Some(0), "{}", out);
+    let printed: Vec<&str> = out.lines().filter(|l| l.starts_with("db: ") || *l == "ran").collect();
+    assert_eq!(printed.len(), calls.len(), "{}", out);
+    for ((call, file, why), line) in calls.iter().zip(&printed) {
+        if file.is_empty() {
+            assert_eq!(*line, "ran", "{}: {}", call, out);
+        } else {
+            assert!(line.ends_with(&format!("{}: {}", file, why)), "{}: {}", call, line);
+        }
+    }
+    for f in ["quillo.confirmed", ".env.local", ".ENV", ".env"] {
+        assert!(!d.join(f).exists(), "{} was made", f);
+    }
+    assert_eq!(std::fs::read_to_string(d.join("main.qwe")).unwrap(), main);
+    assert!(d.join("app.env").exists());
+    let (code, out) = quillo_env(&d, &["run", "--no-check", "main.qwe"], 120, &[]);
+    assert_eq!(code, Some(0), "the next start: {}", out);
+}
+
+/// `new_tenant` makes no tenant whose database, or a folder made for it, is where a write of the
+/// program's is refused, and says so: `db.open("{tenant}.confirmed")` then `new_tenant("quillo",
+/// ...)` made an empty quillo.confirmed and gave the tenant's function's value, as if it were made.
+/// So `.env.{tenant}` and `{tenant}.confirmed/x.db` (the folder quillo.confirmed); nothing is made
+/// (src/db.rs claim_tenant, made_refused; FEEDBACK85.md Q-1340, found by the verdict review of
+/// 8989870; branch feedback82-85).
+#[test]
+fn a_tenant_where_a_write_of_the_programs_is_refused_is_not_made() {
+    let d = dir("tenantmade");
+    let (settings, confirmed) = ("it is the program's settings (.env)", "it is what the program was confirmed to reach (quillo.confirmed)");
+    for (target, tenant, file, why) in [("{tenant}.confirmed", "quillo", "quillo.confirmed", confirmed), (".env.{tenant}", "prod", ".env.prod", settings), ("{tenant}.confirmed/x.db", "quillo", "quillo.confirmed", confirmed)] {
+        write(&d, "main.qwe", &format!("tenant_from(\"example.com\")\ndb.open({})\nprint(new_tenant({}, () => \"made\"))\nexit(0)\n", lit(target), lit(tenant)));
+        let (code, out) = quillo_env(&d, &["run", "--no-check", "main.qwe"], 120, &[]);
+        assert_ne!(code, Some(0), "{}: {}", target, out);
+        assert!(!out.lines().any(|l| l == "made"), "{}: {}", target, out);
+        assert!(out.contains(&format!("`new_tenant`: ./{}: {}", file, why)), "{}: {}", target, out);
+        let mut left: Vec<String> = std::fs::read_dir(d.join(".")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n != "main.qwe" && n != "cmd.log").collect();
+        left.sort();
+        assert!(left.is_empty(), "{}: {:?}", target, left);
+    }
+}
