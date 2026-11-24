@@ -2791,9 +2791,10 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
     }) {
         Ok(stmts) => {
             c.out.parsed = c.links.parsed.clone();
-            c.out.parsed.extend(main_parsed.take().map(|m| (crate::modules::key(Path::new(file)), m)));
+            let real = c.real_of(file);
+            c.out.parsed.extend(main_parsed.take().map(|m| (real.clone().unwrap_or_else(|| PathBuf::from(file)), m)));
             let mut seen = HashSet::new();
-            if let Ok(p) = Path::new(file).canonicalize() {
+            if let Some(p) = real {
                 seen.insert(p);
             }
             let mut order = Vec::new();
@@ -3073,6 +3074,10 @@ struct Checker {
     links: crate::modules::Links,
     /// Each file's key, as finding it means asking the file system.
     keys: HashMap<Arc<str>, PathBuf>,
+    /// The real path of each file asked (`real_of`): the main file's was asked four times a check,
+    /// each ~170k instructions, which made `quillo check` +1% over 0.8.10's (the release benchmark
+    /// of 0.8.11; FEEDBACK83.md, Q-1300; branch feedback82-85).
+    reals: HashMap<String, Option<PathBuf>>,
     /// Names every file sees: types, and services.
     everywhere: HashSet<String>,
     /// Names already reported as not taken, by the file using them.
@@ -3337,6 +3342,7 @@ impl Checker {
             js_libs: Vec::new(),
             links: Default::default(),
             keys: HashMap::new(),
+            reals: HashMap::new(),
             everywhere: HashSet::new(),
             told: HashSet::new(),
             early: Vec::new(),
@@ -3508,7 +3514,7 @@ impl Checker {
         self.value_comments.extend(comments);
         // Said at the import line, by the path the program wrote, and once: the name it could
         // not take is not said again where it is used (FEEDBACK45.md, Q-523).
-        let main_key = Path::new(file).canonicalize().ok();
+        let main_key = self.real_of(file);
         // A used file by the path the program writes, as every other message names it, not the
         // machine's (FEEDBACK55.md, Q-822; branch feedback55).
         let shown_file = |links: &crate::modules::Links, f: &Path| if f.canonicalize().ok() == main_key { file.to_string() } else { base.join(links.written(f)).display().to_string() };
@@ -3523,7 +3529,8 @@ impl Checker {
             let shown = shown_file(&self.links, &p.file);
             self.diag_at(Arc::from(shown), p.line, Severity::Warning, p.message);
         }
-        match self.renames_for(&crate::modules::key(Path::new(file)), src) {
+        let main_real = self.real_of(file).unwrap_or_else(|| PathBuf::from(file));
+        match self.renames_for(&main_real, src) {
             Some(names) => reparsed(src, &names).map(Arc::new),
             None => Ok(stmts),
         }
@@ -5351,6 +5358,16 @@ impl Checker {
             from: at,
             script: script.map(|(f, l)| (f.to_string(), l)),
         });
+    }
+
+    /// `file`'s real path, asked of the system once a check (`reals`).
+    fn real_of(&mut self, file: &str) -> Option<PathBuf> {
+        if let Some(r) = self.reals.get(file) {
+            return r.clone();
+        }
+        let r = Path::new(file).canonicalize().ok();
+        self.reals.insert(file.to_string(), r.clone());
+        r
     }
 
     fn key_of(&mut self, file: &Arc<str>) -> PathBuf {

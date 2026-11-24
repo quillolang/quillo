@@ -682,15 +682,24 @@ impl Parser {
     // ---- token helpers -------------------------------------------------
 
     fn peek(&mut self) -> PResult<Tok> {
+        Ok(self.peek_ref()?.tok.clone())
+    }
+
+    /// The next token, looked at where it is. `line`, `at` and `at_kw` took a copy of it (`peek`),
+    /// a name's or a text's allocated and freed again, at each look; with `at` no longer inlined,
+    /// 0.8.11's parse of a small program took a third more instructions than 0.8.10's (196,000 to
+    /// 262,000). Looked at in place, a check of quillolang.org's site takes 6.2% fewer than
+    /// 0.8.11's did, 6.8% fewer than 0.8.10's (the release benchmark of 0.8.11; branch
+    /// feedback82-85).
+    fn peek_ref(&mut self) -> PResult<&Token> {
         if self.peeked.is_none() {
             self.peeked = Some(self.lx.next_token()?);
         }
-        Ok(self.peeked.as_ref().unwrap().tok.clone())
+        Ok(self.peeked.as_ref().unwrap())
     }
 
     fn line(&mut self) -> PResult<u32> {
-        self.peek()?;
-        Ok(self.peeked.as_ref().unwrap().line)
+        Ok(self.peek_ref()?.line)
     }
 
     fn next(&mut self) -> PResult<Token> {
@@ -701,7 +710,7 @@ impl Parser {
     }
 
     fn at(&mut self, t: &Tok) -> PResult<bool> {
-        Ok(&self.peek()? == t)
+        Ok(self.peek_ref()?.tok == *t)
     }
 
     fn eat(&mut self, t: &Tok) -> PResult<bool> {
@@ -723,7 +732,7 @@ impl Parser {
     }
 
     fn at_kw(&mut self, kw: &str) -> PResult<bool> {
-        Ok(matches!(self.peek()?, Tok::Ident(ref k) if k == kw))
+        Ok(matches!(&self.peek_ref()?.tok, Tok::Ident(k) if k == kw))
     }
 
     fn eat_kw(&mut self, kw: &str) -> PResult<bool> {

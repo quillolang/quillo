@@ -831,7 +831,7 @@ unsafe extern "C" fn map_count(map: *mut Value, key: i64, op: u64, st: u64, sb: 
     };
     let mut digits = [0u8; 20];
     let k = crate::interp::int_text(key, &mut digits);
-    let at = m.get_index_of(k);
+    let at = map_index_of(m, k);
     let old = match at {
         Some(i) => m[i].clone(),
         None => value_of(of_tag(st), sb),
@@ -848,14 +848,28 @@ unsafe extern "C" fn map_count(map: *mut Value, key: i64, op: u64, st: u64, sb: 
             let m = value::sole(m);
             match at {
                 Some(i) => m[i] = now,
-                None => {
-                    m.insert(value::Key::new(k), now);
-                }
+                None => map_insert(m, k, now),
             }
             0
         }
         Err(e) => failed(cx, e),
     }
+}
+
+// `map_count`'s look-up and its insert, each a call of its own, as they were in 0.8.10: built
+// where LLVM put the map's `get_index_of` and `insert_full` inside `map_count`, that function
+// grew by 296 bytes and its every round by 23 instructions (bench/vs-python's `int histogram`,
+// +2.86%), though nothing in this file had changed: a shift of the code's units, as in 0.8.9.
+// Called apart, `map_count` is again the code it was (the release benchmark of 0.8.11; FEEDBACK55.md,
+// string speed; branch feedback82-85).
+#[inline(never)]
+fn map_index_of(m: &value::Map, k: &str) -> Option<usize> {
+    m.get_index_of(k)
+}
+
+#[inline(never)]
+fn map_insert(m: &mut value::Map, k: &str, now: Value) {
+    m.insert(value::Key::new(k), now);
 }
 
 const OPS: [BinOp; 10] = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div, BinOp::Mod, BinOp::Lt, BinOp::Le, BinOp::Gt, BinOp::Ge, BinOp::Eq];

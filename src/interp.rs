@@ -2285,7 +2285,7 @@ impl Drop for Loading {
 /// gone in a program of some 46 files that each handed `db` and `http` on (FEEDBACK83.md, Q-1300,
 /// found by the review of 2a1d3f7; branch feedback82-85); a member taken alone takes one
 /// (`field_of_name`). Each stand-in is a function of 24 bytes, its name in the binary's symbols
-/// and its entry in `NAMED_FNS`: some 310 KB more of the binary than 1,024 took (0.9%), and their
+/// and its entry in `named_fns`: some 310 KB more of the binary than 1,024 took (0.9%), and their
 /// builtins and files (`NAMED`) are made only for a held run.
 const NAMED_SLOTS: usize = 4096;
 
@@ -2311,28 +2311,49 @@ fn named_slot<const K: usize>(it: &mut Interp, args: Vec<Value>, line: u32) -> R
     it.call_named(K, args, line)
 }
 
+/// Row `$hi` of 32 stand-ins written into the table `$t`.
 macro_rules! named_row {
-    ($hi:expr) => {
-        named_row!(@ $hi; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
+    ($t:ident, $hi:expr) => {
+        named_row!(@ $t, $hi; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
     };
-    (@ $hi:expr; $($lo:literal)*) => {
-        [$(named_slot::<{ $hi * 32 + $lo }> as BuiltinFn),*]
+    (@ $t:ident, $hi:expr; $($lo:literal)*) => {
+        // SAFETY: each place is in the table, whose length the index is checked against as the
+        // code is compiled.
+        $(unsafe { std::ptr::write_volatile(std::ptr::addr_of_mut!($t[$hi * 32 + $lo]), named_slot::<{ $hi * 32 + $lo }> as BuiltinFn) };)*
     };
 }
 
 /// 32 rows of 32 stand-ins, the `$block`th such.
 macro_rules! named_rows {
-    ($block:literal) => {
-        named_rows!(@ $block; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
+    ($t:ident, $block:literal) => {
+        named_rows!(@ $t, $block; 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
     };
-    (@ $block:literal; $($row:literal)*) => {
-        [$(named_row!($block * 32 + $row)),*]
+    (@ $t:ident, $block:literal; $($row:literal)*) => {
+        $(named_row!($t, $block * 32 + $row);)*
     };
 }
 
-static NAMED_FNS: [[[BuiltinFn; 32]; 32]; NAMED_SLOTS / 1024] = [
-    named_rows!(0), named_rows!(1), named_rows!(2), named_rows!(3),
-];
+/// The stand-ins, by number: made the first time one is given, which is in a held run only. They
+/// were a `static` table of 4,096 function addresses, which the system's loader writes into place
+/// as every process starts, a `quillo check` and a run with no `quillo.confirmed` too: 4,096 of
+/// its 61,000 fixups and two pages written, `quillo --version` 68.01M instructions where 0.8.10's
+/// took 67.64M. Here each address is the code's own, which the loader does not touch, written one
+/// by one (volatile, so that no constant table of them is made again): 67.64M again (the release
+/// benchmark of 0.8.11; FEEDBACK83.md, Q-1300; branch feedback82-85).
+#[cold]
+#[inline(never)]
+fn named_fns() -> &'static [BuiltinFn; NAMED_SLOTS] {
+    static FNS: OnceLock<Box<[BuiltinFn; NAMED_SLOTS]>> = OnceLock::new();
+    FNS.get_or_init(|| {
+        let mut t: Box<[BuiltinFn; NAMED_SLOTS]> = vec![named_full as BuiltinFn; NAMED_SLOTS].into_boxed_slice().try_into().unwrap_or_else(|_| unreachable!());
+        let t_ref: &mut [BuiltinFn; NAMED_SLOTS] = &mut t;
+        named_rows!(t_ref, 0);
+        named_rows!(t_ref, 1);
+        named_rows!(t_ref, 2);
+        named_rows!(t_ref, 3);
+        t
+    })
+}
 
 /// The interpreter of a stand-in's call, whose `cur_file` is the file that named the builtin, and
 /// the caller's, put back when the call ends, however it ends (`call_named`).
@@ -2454,7 +2475,7 @@ fn named_fn(name: &str, f: BuiltinFn, file: &Option<Arc<str>>) -> BuiltinFn {
         return *g;
     }
     let k = given.by.len();
-    let Some(g) = NAMED_FNS.get(k / 1024).map(|block| block[k / 32 % 32][k % 32]) else { return named_full };
+    let Some(&g) = named_fns().get(k) else { return named_full };
     let _ = named()[k].set((f, file.clone(), makes_builtins(name)));
     given.fns.insert(g as usize);
     given.by.insert(key, g);
@@ -4439,6 +4460,12 @@ impl Interp {
                 // 16 bytes larger, and a 3,000-deep walk ran out of stack on Linux (CI run
                 // 43733282629, feedback52_jit).
                 match lookup(env, *n) {
+                    // What is named most, a value that is no map, function or builtin, in one look
+                    // at its kind, as in 0.8.10: asked `carries_any` and then `is_page_state`
+                    // first, each name cost 3 instructions more, 6 a round of `for x in xs { t +=
+                    // x }` (bench/vs-python's `sum by loop` +1%) (the release benchmark of 0.8.11;
+                    // FEEDBACK83.md, Q-1300; branch feedback82-85).
+                    Some(v) if matches!(v, Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) | Value::List(_)) => Ok(v),
                     // A builtin or a module named as a value where a `quillo.confirmed` holds the
                     // run: held to this file when it is called, wherever that is (`named_here`;
                     // FEEDBACK83.md, Q-1300, found by the coverage tests; branch feedback82-85). A

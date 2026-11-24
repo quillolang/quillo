@@ -714,11 +714,16 @@ fn entry_name(d: &FnDef) -> String {
 /// as each lookup asks the system where the file is (a check of quillolang.org's site has 150).
 fn scan_taken(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>>>) -> Scan {
     let dir = dir_of(main);
-    let base = crate::modules::source_dir(main);
+    // Each asked of the system only once a file takes something: a check of a program that takes
+    // nothing asked both, ~170k instructions each (the release benchmark of 0.8.11; FEEDBACK83.md,
+    // Q-1300; branch feedback82-85).
+    let base_cell = std::cell::OnceCell::new();
+    let base = || base_cell.get_or_init(|| crate::modules::source_dir(main));
     // The main file is the program's own here too: `import main.qwe use site`, which `quillo fix`
     // writes, had check say "main.qwe is taken for site, and also adds GET /" (FEEDBACK83.md,
     // Q-1301, found by the coverage tests; branch feedback82-85).
-    let main_key = crate::modules::key(main);
+    let main_cell = std::cell::OnceCell::new();
+    let main_key = || main_cell.get_or_init(|| crate::modules::key(main));
     let mut out = Scan::default();
     let mut taken: HashMap<PathBuf, Vec<String>> = HashMap::new();
     for (file, stmts) in parsed {
@@ -727,7 +732,7 @@ fn scan_taken(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>>>)
             if is_script(path) || (names.is_none() && !crate::native::is_rust(path) && !options.implied) {
                 continue;
             }
-            let full = base.join(crate::modules::resolve_use(&base, file, path, options.implied));
+            let full = base().join(crate::modules::resolve_use(base(), file, path, options.implied));
             if crate::native::is_rust(&full.to_string_lossy()) {
                 let name = rel_name(&dir, &full);
                 if !out.files.contains_key(&name) {
@@ -737,7 +742,7 @@ fn scan_taken(main: &Path, parsed: &HashMap<PathBuf, std::sync::Arc<Vec<Stmt>>>)
                 }
             } else if let Some(names) = names {
                 let key = crate::modules::key(&full);
-                if key != main_key {
+                if key != *main_key() {
                     taken.entry(key).or_default().extend(names.iter().map(|(n, _)| n.clone()));
                 }
             }
