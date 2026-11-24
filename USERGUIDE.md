@@ -10965,8 +10965,10 @@ Asking, and who answers:
   in `<(std::net::TcpStream)>::connect`, the type an `impl` is for), however `::` and `!`
   are spaced, and reads `include_str!`, `include_bytes!` and `include!` as `fs`. What it
   cannot follow it reads as every effect but `db`, and says where: a path a macro builds
-  from its argument, a foreign block (`extern "C" { ... }`), `asm!`, a `use` nested more than
-  64 deep. A file that builds another into it is refused under a `quillo.confirmed`, by
+  from its argument, a foreign block (`extern "C" { ... }`, written out or by a macro), a
+  crate that reaches the system or loads or runs code itself (`libc`, `nix`, `rustix`,
+  `libloading`, `memmap2`, `region`, `duct`, `mlua`, `pyo3`, `jni`, `core-foundation`,
+  `objc2`, any `-sys` crate and the like), `asm!`, a `use` nested more than 64 deep. A file that builds another into it is refused under a `quillo.confirmed`, by
   `quillo confirm`, `check`, `build`, the start and a reload, since the other file is outside
   its SHA-256; without one, it is a warning. That is `include!`, `include_str!` or
   `include_bytes!` however it is written or named, assembly (`asm!`, `global_asm!`,
@@ -11002,8 +11004,10 @@ Asking, and who answers:
   `/System/Library`; Linux: the C runtime's). A Linux linker without `--dependency-file`
   (binutils before 2.35) refuses the build: use lld. A pinned source's dependencies are not
   locked: each fresh build takes the newest release their version allows, and their build
-  scripts and macros run as cargo runs them. A crate that reaches the system or loads code itself (`libc`,
-  `nix`, `rustix`, `libloading`, `dlopen`, any `-sys` crate) reads as every effect but `db`.
+  scripts and macros run as cargo runs them. A crate that reaches the system or loads code
+  itself (`libc`, `nix`, `rustix`, `libloading`, `dlopen`, any `-sys` crate, and those
+  listed above) reads as every effect but `db`; the list is no proof, as a crate it does not
+  know can do what these do.
   A held or pinned plugin's library is read once, hashed, judged by what it loads (the C
   runtime's exact library names on Linux, `/usr/lib` and `/System` on macOS, no rpath, not
   named as a system library) and opened as a private copy of those bytes; no other plugin's

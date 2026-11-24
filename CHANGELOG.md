@@ -353,7 +353,10 @@ What a program may notice:
   `lib/rustlib` only (found by the review of a86f326: a framework named by a path past 1024
   bytes, lld's list written with `..` removed by text, a library loaded by its install name). A crate
   that reaches the system or loads code itself (`libc`, `nix`, `rustix`, `libloading`,
-  `dlopen`, any `-sys` crate) reads as every effect but `db` (`libc::dlopen` read as `none`);
+  `dlopen`, any `-sys` crate, and those that map, run or load code or call the system's
+  frameworks: `memmap2`, `region`, `duct`, `mlua`, `pyo3`, `jni`, `core-foundation`,
+  `objc2` and the like) reads as every effect but `db` (`libc::dlopen` read as `none`), and
+  so does a foreign block a macro writes;
   a held or pinned library is read once and loaded from a private copy of the bytes judged,
   ELF libraries are read where their loader reads them (exact C-runtime sonames, the dynamic
   table at its address), and an unpinned plugin is not judged where another is pinned (found
