@@ -107,9 +107,10 @@ fn column(db: &Path, sql: &str) -> Vec<String> {
     s.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
 }
 
-/// A Quillo string of `s`, as written in a `.qwe` file.
+/// A Quillo string of `s`, as written in a `.qwe` file: `\r` written as its escape, which a file
+/// read as source would take for a line's end.
 fn lit(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"))
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r"))
 }
 
 /// A kit taken for `Badge`, whose `steal()` makes each call of `calls` (a function, `db.query` or
@@ -550,10 +551,40 @@ fn kit_with(calls: &[(&str, &str, Option<&str>)]) -> String {
     )
 }
 
-/// The lines `steal()` gives for `refused` (each the hold's refusal of what it names) then `ran`.
+/// What the hold says when a taken file's SQL reaches the server's files or programs.
+fn reaches(what: &str, file: &str) -> String {
+    format!("db: {} reaches the database server's own files or programs, or another database, which is refused for {}'s SQL where a quillo.confirmed holds the run. Run it from the main file's SQL, or from a migration the main file runs", what, file)
+}
+
+/// What the hold says when a taken file's SQL names a catalog of other tables' data or SQL.
+fn reads(what: &str, file: &str) -> String {
+    format!("db: {} holds other tables' data or other statements' SQL, which is refused for {}'s SQL where a quillo.confirmed holds the run. Run it from the main file's SQL, or from a migration the main file runs", what, file)
+}
+
+/// What the hold says when a taken file's SQL cannot be read for certain.
+fn unsure(what: &str, file: &str) -> String {
+    format!("db: this statement has {}, which this reading cannot read for certain as the server would, and what it cannot read is refused for {}'s SQL where a quillo.confirmed holds the run. Run it from the main file's SQL, or from a migration the main file runs", what, file)
+}
+
+/// The refusal `w` says: `reaches:`, `reads:` or `unsure:` before what was found for those kinds,
+/// what was found alone for SQL run from text (`text_run`).
+fn refusal(w: &str, file: &str) -> String {
+    match (w.strip_prefix("reaches:"), w.strip_prefix("reads:"), w.strip_prefix("unsure:")) {
+        (Some(x), _, _) => reaches(x, file),
+        (_, Some(x), _) => reads(x, file),
+        (_, _, Some(x)) => unsure(x, file),
+        _ => text_run(w, file),
+    }
+}
+
+/// What MySQL's `/*! */` is refused as.
+const EXECUTABLE_COMMENT: &str = "unsure:a `/*! */` comment, whose SQL runs or not as the server's version says";
+
+/// The lines `steal()` gives for `refused` (each the hold's refusal of what it names, `refusal`)
+/// then `ran`.
 fn kit_said(refused: &[&str], ran: usize, file: &str) -> String {
     let mut want = vec!["kit:".to_string()];
-    want.extend(refused.iter().map(|w| text_run(w, file)));
+    want.extend(refused.iter().map(|w| refusal(w, file)));
     want.extend(std::iter::repeat_n("ran".to_string(), ran));
     format!("{}\n", want.join("\n"))
 }
@@ -562,14 +593,17 @@ fn kit_said(refused: &[&str], ran: usize, file: &str) -> String {
 /// from text, or name a table from text, is refused, says what it found and what to do, and
 /// nothing of it runs: `do` (in capitals, in mixed case after a comment and spaces, and as a second
 /// statement after `;`), `prepare`, `execute` (after `explain analyze` too), `call`, `create [or
-/// replace] function`/`procedure`, `create trigger` (and inside `create schema`), `create rule`,
-/// `create event trigger`, `copy ... program`, the `*_to_xml` functions (in a schema, by a quoted
+/// replace] function`/`procedure`, `create trigger`, `create schema` (with a trigger in it),
+/// `create rule`, `create event trigger`, `copy` (to a program), the `*_to_xml` functions (in a schema, by a quoted
 /// name, by a `U&` name whose escape hides a letter), `ts_stat`, `dblink`, `nextval`/`setval`/`currval`, `to_regclass`, and `regclass` and
 /// `oid` as types (`::regclass` of a text, of a value, `::pg_catalog.regclass`, `cast(... as
 /// regclass)`, `regclass '...'`, `::oid` of a number). The same words in a string, a dollar quote,
 /// a comment or a quoted name run, as do `create table`, `oid` as a column and SQL naming none of
 /// them. The main file's same statements run, and the kit's without a quillo.confirmed (src/db.rs
 /// text_run, FEEDBACK83.md Q-1300, the user's decision of 2026-11-24; branch feedback82-85).
+/// Changed by review 6 of aebe60e's fixes (fail closed): `create schema` is refused for what it
+/// makes, a schema not being on what a taken file may make, before the trigger in it; and `copy`
+/// for reaching the server's files or programs, whatever it reaches.
 #[test]
 fn on_postgresql_a_taken_files_sql_run_from_text_is_refused() {
     let Some(pg) = support::postgres("cov8285db5b") else {
@@ -589,10 +623,10 @@ fn on_postgresql_a_taken_files_sql_run_from_text_is_refused() {
         ("db.exec", "create function kit_f() returns int language sql as $$ select 1 $$", None, "`create function`"),
         ("db.exec", "CREATE OR REPLACE PROCEDURE kit_p() language sql as $$ select 1 $$", None, "`create procedure`"),
         ("db.exec", "create trigger kit_t after insert on kits for each row execute function main_f()", None, "`create trigger`"),
-        ("db.exec", "create schema kit_s create table kit_t (x int) create trigger kit_tt after insert on kit_t for each row execute function main_f()", None, "`create trigger`"),
+        ("db.exec", "create schema kit_s create table kit_t (x int) create trigger kit_tt after insert on kit_t for each row execute function main_f()", None, "`create schema`"),
         ("db.exec", "create rule kit_r as on insert to kits do instead nothing", None, "`create rule`"),
         ("db.exec", "create event trigger kit_e on ddl_command_start execute function main_f()", None, "`create event`"),
-        ("db.exec", "copy kits to program 'cat'", None, "`copy ... program`"),
+        ("db.exec", "copy kits to program 'cat'", None, "reaches:`copy`"),
         ("db.query", "select query_to_xml('select 1', true, false, '')", None, "the function query_to_xml"),
         ("db.query", "select pg_catalog.table_to_xmlschema('kits', true, false, '')", None, "the function table_to_xmlschema"),
         ("db.query", "select \"cursor_to_xml\"('c', 1, true, false, '')", None, "the function cursor_to_xml"),
@@ -644,10 +678,13 @@ fn on_postgresql_a_taken_files_sql_run_from_text_is_refused() {
 /// SQL from text is refused, says what it found and what to do, and nothing of it runs: `prepare
 /// ... from`, `execute`, `execute immediate` (in mixed case), `call`, `create procedure`/`function`
 /// (with a definer), `create trigger`, `create event`, `alter event`, `begin not atomic`, inside a
-/// `/*! */` comment (its version's digits before the word too), and as a second statement after `;`. The same words in a string, a comment
-/// (`#`, `-- `, `/* */`) or a quoted name run, as do `create table` and `do 1`. The main file's
-/// `execute immediate` runs (src/db.rs text_run, FEEDBACK83.md Q-1300, the user's decision of
-/// 2026-11-24; branch feedback82-85).
+/// `/*! */` comment (its version's digits before the word too), and as a second statement after
+/// `;`. The same words in a string, a comment (`#`, `-- `, `/* */`) or a quoted name run, as does
+/// `create table`. The main file's `execute immediate` runs (src/db.rs text_run, FEEDBACK83.md
+/// Q-1300, the user's decision of 2026-11-24; branch feedback82-85). Changed by review 6 of
+/// aebe60e's fixes (fail closed): a definer before what `create` makes is refused as itself, `begin
+/// not atomic` as a compound statement, `/*! */` as what cannot be read for certain, and `do 1`,
+/// which ran, is refused, `do` being refused where a statement begins.
 #[test]
 fn on_mysql_a_taken_files_sql_run_from_text_is_refused() {
     let Some(my) = support::mariadb("cov8285db5b") else {
@@ -662,14 +699,15 @@ fn on_mysql_a_taken_files_sql_run_from_text_is_refused() {
         ("db.exec", "ExEcUtE ImMeDiAtE 'select 1'", None, "`execute immediate`"),
         ("db.exec", "call kit_p()", None, "`call`"),
         ("db.exec", "create procedure kit_p() select 1", None, "`create procedure`"),
-        ("db.exec", "create definer = current_user function kit_f() returns int return 1", None, "`create function`"),
+        ("db.exec", "create definer = current_user function kit_f() returns int return 1", None, "`create definer`"),
         ("db.exec", "create trigger kit_t before insert on kits for each row set new.x = new.x", None, "`create trigger`"),
         ("db.exec", "create event kit_e on schedule every 1 day do select 1", None, "`create event`"),
         ("db.exec", "alter event main_e disable", None, "`alter event`"),
-        ("db.exec", "begin not atomic select 1; end", None, "`begin not atomic`"),
-        ("db.exec", "/*! call kit_p() */", None, "`call`"),
-        ("db.exec", "/*!50000call kit_p() */", None, "`call`"),
+        ("db.exec", "begin not atomic select 1; end", None, "a compound statement (`begin`)"),
+        ("db.exec", "/*! call kit_p() */", None, EXECUTABLE_COMMENT),
+        ("db.exec", "/*!50000call kit_p() */", None, EXECUTABLE_COMMENT),
         ("db.exec", "select 1; execute immediate 'select 1'", None, "`execute immediate`"),
+        ("db.exec", "do 1", None, "`do`"),
     ];
     let ran: Vec<(&str, &str, Option<&str>)> = vec![
         ("db.query", "select 'call p(); execute immediate \\'x\\'; create procedure' as s", None),
@@ -678,7 +716,6 @@ fn on_mysql_a_taken_files_sql_run_from_text_is_refused() {
         ("db.query", "select 1 /* create trigger t */ as one", None),
         ("db.query", "select 1 as `call`, 2 as `execute`", None),
         ("db.exec", "create table if not exists kits2 (x int)", None),
-        ("db.exec", "do 1", None),
     ];
     let mut calls: Vec<(&str, &str, Option<&str>)> = refused.iter().map(|(f, s, v, _)| (*f, *s, *v)).collect();
     calls.extend(ran.iter().copied());
@@ -723,11 +760,15 @@ fn on_postgresql_a_taken_files_migration_run_from_text_is_refused() {
 // ---- conn_ok: a connection judged where its statement runs -------------------------------------
 
 /// Under a quillo.confirmed a map a taken file writes that names the main file's connection by its
-/// number (`{ "$db": 0, query: db.query }`) is judged as the connection it names, for the file that
-/// runs the statement: confirmed for nothing, its `query`, `exec`, `db.transaction` and `db.atomic`
-/// on it are refused, nothing read; a number that is no connection says so; a second kit confirmed
-/// to write that database reads it through the same map, and so does the main file (src/db.rs
-/// conn_ok, FEEDBACK83.md Q-1300, found by the review of S3's fixes; branch feedback82-85).
+/// number (`{ "$db": 0, query: db.query }`) reaches no connection: its `db.query`, `db.exec` and
+/// `db.transaction` are the kit's, made for no connection, and run on the program's database, which
+/// is every file's (`SELECT` finds no `secrets` there); `db.atomic` of it is judged for the kit as
+/// the connection it names, and refused; a number that is no connection runs on the program's
+/// database too. A helper confirmed to write that database, and the main file itself, reach it by
+/// such a map no more (src/db.rs conn_of, src/interp.rs stand_in_conn, FEEDBACK83.md Q-1300, found
+/// by the review of S3's fixes; branch feedback82-85). Changed by review 6 of aebe60e's fixes: a
+/// map's `$db` is not taken for a stand-in's call, which runs on the connection it was made for
+/// (none here), where this test had each statement on connection 0 judged and refused.
 #[test]
 fn a_connection_map_a_taken_file_writes_is_judged_as_the_connection_it_names() {
     let d = dir("forged");
@@ -740,28 +781,31 @@ fn a_connection_map_a_taken_file_writes_is_judged_as_the_connection_it_names() {
     write(
         &d,
         "kit/k.qwe",
-        "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  let said = (r) => is_err(r) ? r.error : str(r)\n  let m = { \"$db\": 0, query: db.query, exec: db.exec, transaction: db.transaction }\n  let none = { \"$db\": 99, query: db.query }\n  return \"kit:\\n\" + join([said(m.query(\"select v from secrets\")), said(m.exec(\"delete from secrets\")), said(m.transaction(() => 1)), said(db.atomic([m], () => 1)), said(none.query(\"select 1\"))], \"\\n\")\n}\n",
+        "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  let said = (r) => is_err(r) ? r.error : str(r)\n  let m = { \"$db\": 0, query: db.query, exec: db.exec, transaction: db.transaction }\n  let none = { \"$db\": 99, query: db.query }\n  return \"kit:\\n\" + join([said(m.query(\"select v from secrets\")), said(m.exec(\"delete from secrets\")), said(m.transaction(() => 1)), said(db.atomic([m], () => 1)), said(none.query(\"select 1 as one\"))], \"\\n\")\n}\n",
     );
     write(&d, "lib/l.qwe", "component Card() {\n  return <i>c</i>\n}\nfn read_secret() {\n  let m = { \"$db\": 0, query: db.query }\n  return str(m.query(\"select v from secrets\"))\n}\n");
     write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"lib/l.qwe\"]\nwrites = [\"data/secret.db\"]\n");
     checked(&d);
     let (code, out) = run(&d, &[]);
     assert_eq!(code, 0, "{}", out);
-    let refused = "db: data/secret.db is not confirmed for kit/k.qwe (quillo confirm)";
-    let want = ["kit:", refused, refused, refused, refused, "db: this connection is not one of this program's"].join("\n");
+    let none = "db: no such table: secrets";
+    let want = ["kit:", none, none, "1", "db: data/secret.db is not confirmed for kit/k.qwe (quillo confirm)", "[{ one: 1 }]"].join("\n");
     assert!(out.contains(&format!("{}\n", want)), "{}", out);
-    assert!(out.contains("lib: [{ v: \"main secret\" }]\nmain: [{ v: \"main secret\" }]\n"), "{}", out);
+    assert!(out.contains("lib: err(\"db: no such table: secrets\")\nmain: err(\"db: no such table: secrets\")\n"), "{}", out);
     assert_eq!(column(&d.join("data/secret.db"), "select v from secrets"), ["main secret"]);
 }
 
 /// Under a quillo.confirmed a kit confirmed for nothing that writes a connection's map itself, by
 /// `set`, as a literal or by `merge`, with `db.one` and `db.exec` and a connection's number, gets
-/// no connection by it: the number of a helper file's connection (`libc`, which only the helper was
-/// confirmed to write), of the main file's own, and of one never made are each refused, reading and
-/// writing, and `db.connect` of a target already open (the helper's, the main file's) is refused as
-/// a new one would be; nothing is written, and the helper's and the main file's own calls of them
-/// run. `quillo check` names the kit's `db.connect` calls (src/db.rs conn_ok, FEEDBACK83.md
-/// Q-1300, found by the review of S3's fixes; branch feedback82-85).
+/// no connection by it: with the number of a helper file's connection (`libc`, which only the
+/// helper was confirmed to write), of the main file's own, or of one never made, its statements run
+/// on the program's database, every file's, and none on the connection named; `db.connect` of a
+/// target already open (the helper's, the main file's) is refused as a new one would be; nothing is
+/// written to those, and the helper's and the main file's own calls of them run. `quillo check`
+/// names the kit's `db.connect` calls (src/db.rs conn_of and conn_ok, FEEDBACK83.md Q-1300, found
+/// by the review of S3's fixes; branch feedback82-85). Changed by review 6 of aebe60e's fixes: a
+/// map's `$db` is not taken for a stand-in's call (the kit's `db.one` is made for no connection),
+/// where this test had each refused by `conn_ok` as the connection it named.
 #[test]
 fn a_connection_map_a_taken_file_writes_by_set_literal_or_merge_reaches_no_connection() {
     let d = dir("forge");
@@ -786,17 +830,19 @@ fn a_connection_map_a_taken_file_writes_by_set_literal_or_merge_reaches_no_conne
     let lib = "db: data/lib.db is not confirmed for kit/k.qwe (quillo confirm)";
     let main = "db: data/main.db is not confirmed for kit/k.qwe (quillo confirm)";
     let none = "db: this connection is not one of this program's";
+    let _ = none;
     let mut want = vec!["kit:".to_string()];
-    for (n, why) in [(0, lib), (1, main), (7, none)] {
-        want.extend(std::iter::repeat_n(format!("{}: {} | {}", n, why, why), 3));
+    for n in [0, 1, 7] {
+        want.extend(std::iter::repeat_n(format!("{}: {{ x: 1 }} | {{ changes: 0, last_id: null }}", n), 3));
     }
     want.push(format!("connect: {}", lib));
     want.push(format!("connect main's: {}", main));
     assert!(out.contains(&format!("{}\n", want.join("\n"))), "{}", out);
     assert!(out.contains("after: [{ v: \"lib secret\" }] [{ v: \"main secret\" }]\n"), "{}", out);
-    for db in ["data/lib.db", "data/main.db", "data/app.db"] {
+    for db in ["data/lib.db", "data/main.db"] {
         assert!(column(&d.join(db), "select name from sqlite_master where name = 'kit_wrote'").is_empty(), "{}", db);
     }
+    assert_eq!(column(&d.join("data/app.db"), "select name from sqlite_master where name = 'kit_wrote'"), ["kit_wrote"]);
 }
 
 /// Under a quillo.confirmed a tenant's migrations are judged as the code that set them, not as the
@@ -817,4 +863,303 @@ fn a_tenants_migrations_are_judged_as_the_code_that_set_them() {
     assert_eq!(code, 0, "{}", out);
     assert!(out.contains("quillo: applied migration 001_a.sql for tenant acme\nkit: { changes: 1, last_id: 1 }\nmain: [{ x: \"kit note\" }]\n"), "{}", out);
     assert_eq!(column(&d.join("data/t/acme.db"), "select name from sqlite_master where name = '_quillo_audit'"), ["_quillo_audit"]);
+}
+
+// ---- round 3: what the reader cannot read for certain is refused (review 6 of aebe60e) ----------
+
+/// Under a quillo.confirmed on PostgreSQL a taken file's statement is read fail closed:
+/// - `--` ends at `\r` as PostgreSQL ends it (`--\rDO ...` and `--\r\nDO ...` are a `do` block);
+///   `\f` and `\v` do not end it, as PostgreSQL's do not.
+/// - `execute`, `deallocate` anywhere (`create table ... as execute`, after `explain analyze`,
+///   after `;`).
+/// - A `create` or `alter` of what a taken file may not make: an extension, an operator (whose
+///   `function = ts_stat` names a function with no `(`), an aggregate, a cast, a language, a
+///   schema, a server, a foreign table, a policy, a type, a domain, `or replace function`; `alter
+///   function`, `alter system`, `alter role`.
+/// - tablefunc's `crosstab` and `connectby`, `ts_rewrite`.
+/// - What reaches the server's files (`pg_read_file`, `lo_import`, `copy` from a file, `load`,
+///   `import foreign schema`).
+/// - The catalogs of other tables' data and other statements' SQL (`pg_stats`,
+///   `pg_catalog.pg_statistic`, `pg_stat_activity`, `pg_prepared_statements`, a quoted
+///   `"pg_stats_ext"`).
+/// Each says what it found. What a taken file may make runs: a table (unlogged, `if not exists`,
+/// `as select`; a temp one is a session's, which Quillo refuses on a shared connection), a unique index, an index `concurrently`, `or replace view`, a
+/// materialized view, a sequence, and `alter` of each. So do `on conflict do nothing` and `do
+/// update`, `case`, a column named `"execute"`, and the words in a string, a dollar quote and a
+/// comment. The main file's `do` runs, and its `select 1 --\r; begin`, which began a transaction
+/// left open on a shared connection, is refused as one (src/db.rs text_run, space_end; src/sql.rs
+/// line_end; FEEDBACK83.md Q-1300, found by review 6 of aebe60e; branch feedback82-85).
+#[test]
+fn on_postgresql_a_taken_files_statement_is_read_fail_closed() {
+    let Some(pg) = support::postgres("cov8285db5r3") else {
+        eprintln!("PostgreSQL is not installed: skipped");
+        return;
+    };
+    let url = pg.database("fail_closed");
+    let d = dir("pg-closed");
+    let refused: Vec<(&str, &str, Option<&str>, &str)> = vec![
+        ("db.exec", "--\rDO $q$ begin perform 1; end $q$ /*\n*/", None, "`do`"),
+        ("db.exec", "-- c\r\nDO $q$ begin perform 1; end $q$", None, "`do`"),
+        ("db.exec", "create temp table kit_t as execute main_s('x')", None, "`execute`"),
+        ("db.query", "explain analyze create table kit_t2 as execute main_s('x')", None, "`execute`"),
+        ("db.exec", "select 1 as one; execute main_s('x')", None, "`execute`"),
+        ("db.exec", "deallocate all", None, "`deallocate`"),
+        ("db.exec", "create extension if not exists tablefunc", None, "`create extension`"),
+        ("db.exec", "create operator ~~~ (rightarg = text, function = ts_stat)", None, "`create operator`"),
+        ("db.exec", "create aggregate kit_a (sfunc = int4pl, stype = int)", None, "`create aggregate`"),
+        ("db.exec", "create cast (text as int) with inout", None, "`create cast`"),
+        ("db.exec", "create language plpgsql", None, "`create language`"),
+        ("db.exec", "create schema kit_s", None, "`create schema`"),
+        ("db.exec", "create server kit_srv foreign data wrapper x", None, "`create server`"),
+        ("db.exec", "create foreign table kit_f (x int) server kit_srv", None, "`create foreign`"),
+        ("db.exec", "create policy kit_p on kits using (true)", None, "`create policy`"),
+        ("db.exec", "create type kit_e as enum ('a')", None, "`create type`"),
+        ("db.exec", "create domain kit_d as int", None, "`create domain`"),
+        ("db.exec", "create or replace function kit_f() returns int language sql as $$ select 1 $$", None, "`create function`"),
+        ("db.exec", "alter function main_f() rename to kit_f", None, "`alter function`"),
+        ("db.exec", "ALTER SYSTEM set work_mem = '1MB'", None, "`alter system`"),
+        ("db.exec", "alter role quillo superuser", None, "`alter role`"),
+        ("db.query", "select * from crosstab('select 1') as t(a int)", None, "the function crosstab"),
+        ("db.query", "select * from connectby('kits', 'x', 'x', '1', 0) as t(a text, b text, c int)", None, "the function connectby"),
+        ("db.query", "select ts_rewrite('a'::tsquery, 'select 1')", None, "the function ts_rewrite"),
+        ("db.query", "select pg_read_file('/etc/hosts')", None, "reaches:the function pg_read_file"),
+        ("db.query", "select lo_import('/etc/hosts')", None, "reaches:the function lo_import"),
+        ("db.exec", "copy kits from '/etc/hosts'", None, "reaches:`copy`"),
+        ("db.exec", "load 'auto_explain'", None, "reaches:`load`"),
+        ("db.exec", "import foreign schema public from server kit_srv into public", None, "reaches:`import`"),
+        ("db.query", "select * from pg_stats", None, "reads:the catalog pg_stats"),
+        ("db.query", "select * from pg_catalog.pg_statistic", None, "reads:the catalog pg_statistic"),
+        ("db.query", "select query from pg_stat_activity", None, "reads:the catalog pg_stat_activity"),
+        ("db.query", "select statement from pg_prepared_statements", None, "reads:the catalog pg_prepared_statements"),
+        ("db.query", "select * from \"pg_stats_ext\"", None, "reads:the catalog pg_stats_ext"),
+    ];
+    let ran: Vec<(&str, &str, Option<&str>)> = vec![
+        ("db.exec", "insert into kits values (1) on conflict do nothing", None),
+        ("db.exec", "insert into kits values (1) on conflict (x) do update set x = excluded.x", None),
+        ("db.query", "select 1 as \"execute\", 2 as \"call\", 3 as \"do\"", None),
+        ("db.query", "select 'execute call do create function pg_stats crosstab(' as s", None),
+        ("db.query", "select $q$ execute deallocate do $q$ as s", None),
+        ("db.query", "select 1 /* execute call */ as one -- do pg_stats\n", None),
+        ("db.query", "select 1 as one --\x0c do $q$ $q$\n", None),
+        ("db.query", "select 1 as one --\x0b execute\n", None),
+        ("db.query", "select case when 1 = 1 then 'a' else 'b' end as c", None),
+        ("db.exec", "create table if not exists kit_t3 (x int)", None),
+        ("db.exec", "create table if not exists kit_t4 as select 1 as x", None),
+        ("db.exec", "create unlogged table if not exists kit_t5 (x int)", None),
+        ("db.exec", "create unique index if not exists kit_i on kit_t3 (x)", None),
+        ("db.exec", "create index concurrently if not exists kit_i2 on kit_t3 (x)", None),
+        ("db.exec", "create or replace view kit_v as select 1 as x", None),
+        ("db.exec", "create materialized view if not exists kit_mv as select 1 as x", None),
+        ("db.exec", "create sequence if not exists kit_seq", None),
+        ("db.exec", "alter table kit_t3 add column y int", None),
+        ("db.exec", "alter index kit_i rename to kit_i3", None),
+        ("db.exec", "alter sequence kit_seq restart", None),
+        ("db.exec", "alter view kit_v rename to kit_v2", None),
+    ];
+    let mut calls: Vec<(&str, &str, Option<&str>)> = refused.iter().map(|(f, s, v, _)| (*f, *s, *v)).collect();
+    calls.extend(ran.iter().copied());
+    write(&d, "kit/k.qwe", &kit_with(&calls));
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\ndb.exec(\"create table if not exists kits (x int primary key)\")\ndb.exec(\"create or replace function main_f() returns trigger language plpgsql as $$ begin return new; end $$\")\nprint(\"main: \" + str(db.exec(\"do $$ begin perform 1; end $$\")))\nprint(steal())\nprint(\"made: \" + str(db.query(\"select proname as n from pg_proc where proname like 'kit%' union all select nspname from pg_namespace where nspname like 'kit%' order by 1\")))\ndb.exec(\"select 1 --\\r; begin\")\nprint(\"not here\")\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_ne!(code, 0, "{}", out);
+    assert!(out.contains("main: { changes: 0, last_id: null }\n"), "{}", out);
+    let whats: Vec<&str> = refused.iter().map(|(_, _, _, w)| *w).collect();
+    assert!(out.contains(&kit_said(&whats, ran.len(), "kit/k.qwe")), "{}", out);
+    assert!(out.contains("made: []\n"), "{}", out);
+    assert!(out.contains("this SQL begins or ends a transaction") && !out.contains("not here"), "{}", out);
+}
+
+/// Under a quillo.confirmed on MySQL (MariaDB) a taken file's statement is read fail closed:
+/// - A `/*! */` or `/*M! */` comment, with a version above the server's or none, its `'` hiding
+///   what follows from a reading that takes it as SQL, is refused as what cannot be read for
+///   certain.
+/// - `execute` and `call` after `set statement ... for`, and `deallocate`.
+/// - The compound statements (`if`, `while`, `repeat`, `case`, `declare`, a label before `loop`).
+/// - A definer, or `sql security`, before what `create` makes; `or replace function`;
+///   `create database` and `create user`; `alter user` and `alter database`.
+/// - `into outfile`, `load_file`, `load data`.
+/// - performance_schema, the `sys` schema, `mysql.general_log` and the processlist.
+/// What a taken file may make runs: a table (`if not exists`, `or replace`), a unique index, a
+/// view with `algorithm = merge`, and `alter table`. So do `if()` and `case` in a select, `on
+/// duplicate key update`, a column named `` `execute` ``, and `/*!` in a string or `/* ! */`. The
+/// main file's `/*!50000 ... */` runs (src/db.rs text_run, tokens; FEEDBACK83.md Q-1300, found by
+/// review 6 of aebe60e; branch feedback82-85).
+#[test]
+fn on_mysql_a_taken_files_statement_is_read_fail_closed() {
+    let Some(my) = support::mariadb("cov8285db5r3") else {
+        eprintln!("MariaDB is not installed: skipped");
+        return;
+    };
+    let url = my.url("fail_closed");
+    let d = dir("my-closed");
+    let refused: Vec<(&str, &str, Option<&str>, &str)> = vec![
+        ("db.exec", "/*!99999 ' */ call kit_p() -- '", None, EXECUTABLE_COMMENT),
+        ("db.exec", "/*M!100000 select 1 */", None, EXECUTABLE_COMMENT),
+        ("db.query", "select 1 as one /*!*/", None, EXECUTABLE_COMMENT),
+        ("db.exec", "set statement max_statement_time=60 for execute immediate 'select 1'", None, "`execute immediate`"),
+        ("db.exec", "SET STATEMENT max_statement_time=60 FOR CALL kit_p()", None, "`call`"),
+        ("db.exec", "deallocate prepare kit_s", None, "`deallocate`"),
+        ("db.exec", "if 1 then select 1; end if", None, "a compound statement (`if`)"),
+        ("db.exec", "while 0 do select 1; end while", None, "a compound statement (`while`)"),
+        ("db.exec", "repeat select 1; until 1 end repeat", None, "a compound statement (`repeat`)"),
+        ("db.exec", "case when 1 then select 1; end case", None, "a compound statement (`case`)"),
+        ("db.exec", "declare x int", None, "a compound statement (`declare`)"),
+        ("db.exec", "kit_l: loop leave kit_l; end loop", None, "a compound statement (a label)"),
+        ("db.exec", "create definer = current_user procedure kit_p() select 1", None, "`create definer`"),
+        ("db.exec", "create sql security definer view kit_v as select 1 as x", None, "`create sql`"),
+        ("db.exec", "create or replace function kit_f() returns int return 1", None, "`create function`"),
+        ("db.exec", "create database kit_db", None, "`create database`"),
+        ("db.exec", "create user kit", None, "`create user`"),
+        ("db.exec", "alter user root identified by 'x'", None, "`alter user`"),
+        ("db.exec", "alter database fail_closed character set utf8mb4", None, "`alter database`"),
+        ("db.query", "select 1 into outfile '/tmp/kit.txt'", None, "reaches:`into outfile`"),
+        ("db.query", "select load_file('/etc/hosts') as f", None, "reaches:the function load_file"),
+        ("db.exec", "load data infile '/etc/hosts' into table kits", None, "reaches:`load`"),
+        ("db.query", "select * from performance_schema.events_statements_history", None, "reads:the catalog performance_schema"),
+        ("db.query", "select * from sys.statement_analysis", None, "reads:the `sys` schema"),
+        ("db.query", "select * from mysql.general_log", None, "reads:the catalog general_log"),
+        ("db.query", "select * from information_schema.processlist", None, "reads:the catalog processlist"),
+    ];
+    let ran: Vec<(&str, &str, Option<&str>)> = vec![
+        ("db.query", "select '/*! x */' as s", None),
+        ("db.query", "select 1 /* ! not */ as one", None),
+        ("db.query", "select 1 as `execute`, 2 as `call`", None),
+        ("db.query", "select if(1, 2, 3) as v, case when 1 then 'a' end as c", None),
+        ("db.exec", "create table if not exists kit_t (x int primary key)", None),
+        ("db.exec", "create or replace table kit_t2 (x int)", None),
+        ("db.exec", "create unique index kit_i on kit_t2 (x)", None),
+        ("db.exec", "create algorithm = merge view kit_v2 as select 1 as x", None),
+        ("db.exec", "alter table kit_t2 add column y int", None),
+        ("db.exec", "insert into kit_t (x) values (1) on duplicate key update x = 2", None),
+    ];
+    let mut calls: Vec<(&str, &str, Option<&str>)> = refused.iter().map(|(f, s, v, _)| (*f, *s, *v)).collect();
+    calls.extend(ran.iter().copied());
+    write(&d, "kit/k.qwe", &kit_with(&calls));
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\ndb.exec(\"create table if not exists kits (x int)\")\nprint(\"main: \" + str(db.query(\"select 1 /*!50000 + 1 */ as two\")))\nprint(steal())\nprint(\"routines: \" + str(db.query(\"select routine_name from information_schema.routines where routine_schema = database()\")))\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("main: [{ two: 2 }]\n"), "{}", out);
+    let whats: Vec<&str> = refused.iter().map(|(_, _, _, w)| *w).collect();
+    assert!(out.contains(&kit_said(&whats, ran.len(), "kit/k.qwe")), "{}", out);
+    assert!(out.contains("routines: []\n"), "{}", out);
+}
+
+/// Under a quillo.confirmed a taken file's migration on MySQL (MariaDB) with a compound statement
+/// (`if 1 then execute immediate ...; end if;`), which ran in a kit's own `c.migrate`, is refused
+/// by the text that runs, its name said; nothing of it is applied (src/db.rs text_run,
+/// migration_judge; FEEDBACK83.md Q-1300, found by review 6 of aebe60e; branch feedback82-85).
+#[test]
+fn on_mysql_a_taken_files_migration_with_a_compound_statement_is_refused() {
+    let Some(my) = support::mariadb("cov8285db5r3m") else {
+        eprintln!("MariaDB is not installed: skipped");
+        return;
+    };
+    let url = my.url("migrate_compound");
+    let kit_db = my.url("migrate_compound_kit");
+    let d = dir("my-migrate");
+    write(&d, "kit/m/001_a.sql", "create table if not exists kit_notes (x int);\nif 1 then execute immediate concat('insert into kit_', 'notes values (1)'); end if;\n");
+    write(&d, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  let c = db.connect(env(\"KIT_DB\"))\n  return \"kit: \" + str(c.migrate(\"kit/m\"))\n}\n");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\nprint(steal())\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n\n[\"kit/k.qwe\"]\nfiles = [\"kit/m/\"]\nhttp = [\"127.0.0.1\"]\n");
+    let (code, out) = run(&d, &[("QUILLO_DB", &url), ("KIT_DB", &kit_db)]);
+    assert_ne!(code, 0, "{}", out);
+    assert!(out.contains(&format!("db.migrate: kit/m/001_a.sql: {}", text_run("a compound statement (`if`)", "kit/k.qwe").trim_start_matches("db: "))), "{}", out);
+    assert!(!out.contains("kit: ["), "{}", out);
+}
+
+/// Under a quillo.confirmed a stand-in runs on the connection it was made for, whatever map it is
+/// put in: the main file's `db.query` handed to a kit, put with `"$db": 0` (the main file's
+/// `db.connect("data/secret.db")`), runs on the program's database, not on that connection, and so
+/// does the kit's own `db.query` there; a connection's own function put in a map with another
+/// number runs on its own connection (the kit's `data/k.db`), not the number's. The main file's
+/// connection reads as ever. Without a quillo.confirmed nothing is held, and the map's number is
+/// the connection, as before (src/db.rs conn_of, src/interp.rs stand_in_conn and held_to;
+/// FEEDBACK83.md Q-1300, found by review 6 of aebe60e; branch feedback82-85).
+#[test]
+fn a_stand_in_runs_on_the_connection_it_was_made_for() {
+    let d = dir("bound");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\nlet secret = db.connect(\"data/secret.db\")\nsecret.exec(\"create table if not exists s (x text)\")\nsecret.exec(\"delete from s\")\nsecret.exec(\"insert into s values ('top-secret')\")\ndb.exec(\"create table if not exists notes (x text)\")\nprint(steal(db.query))\nprint(\"main: \" + str(secret.query(\"select x from s\")))\n");
+    write(
+        &d,
+        "kit/k.qwe",
+        "component Badge() {\n  return <b>b</b>\n}\nfn steal(q) {\n  let said = (r) => is_err(r) ? r.error : str(r)\n  let mine = db.connect(\"data/k.db\")\n  mine.exec(\"create table if not exists k (x text)\")\n  mine.exec(\"delete from k\")\n  mine.exec(\"insert into k values ('kit row')\")\n  return \"kit:\\n\" + join([said(q(\"select count(*) as n from notes\")), said({ \"$db\": 0, query: q }.query(\"select x from s\")), said({ \"$db\": 0, query: db.query }.query(\"select x from s\")), said({ \"$db\": 0, query: mine.query }.query(\"select x from k\")), said(set({}, \"$db\", 0).x)], \"\\n\")\n}\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/k.db\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    let want = ["kit:", "[{ n: 0 }]", "db: no such table: s", "db: no such table: s", "[{ x: \"kit row\" }]"].join("\n");
+    assert!(out.contains(&format!("{}\n", want)), "{}", out);
+    assert!(out.contains("main: [{ x: \"top-secret\" }]\n"), "{}", out);
+    assert!(!out.contains("kit:\n[{ n: 0 }]\n[{ x: \"top-secret\" }]"), "{}", out);
+    // Without a quillo.confirmed: the map's number is the connection.
+    std::fs::remove_file(d.join("quillo.confirmed")).unwrap();
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("kit:\n[{ n: 0 }]\n[{ x: \"top-secret\" }]\n[{ x: \"top-secret\" }]\n"), "{}", out);
+}
+
+/// Under a quillo.confirmed a connection's number that `db.system` moves is judged again: a kit
+/// confirmed to write `data/a.db` reads it by its own `db.connect`, the main file's `db.system`
+/// again takes the system database's place away, and the kit's same map, whose number is now the
+/// main file's `data/b.db`'s, is refused there, where the verdict kept for the number let it read
+/// `b secret` (src/db.rs closed_at, CONN_GEN; FEEDBACK83.md Q-1300, found by review 6 of aebe60e;
+/// branch feedback82-85).
+#[test]
+fn a_connections_number_moved_by_db_system_is_judged_again() {
+    let d = dir("moved");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, first, again\ndb.system(\"data/sys1.db\")\nlet a = db.connect(\"data/a.db\")\nlet b = db.connect(\"data/b.db\")\na.exec(\"create table if not exists t (v text)\")\na.exec(\"delete from t\")\na.exec(\"insert into t values ('a row')\")\nb.exec(\"create table if not exists t (v text)\")\nb.exec(\"delete from t\")\nb.exec(\"insert into t values ('b secret')\")\nlet k = first()\ndb.system(\"data/sys2.db\")\nprint(again(k))\n",
+    );
+    write(
+        &d,
+        "kit/k.qwe",
+        "component Badge() {\n  return <b>b</b>\n}\nfn first() {\n  let k = db.connect(\"data/a.db\")\n  print(\"first: \" + str(k.query(\"select v from t\")))\n  return k\n}\nfn again(k) {\n  let r = k.query(\"select v from t\")\n  return \"again: \" + (is_err(r) ? r.error : str(r))\n}\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/a.db\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("first: [{ v: \"a row\" }]\n"), "{}", out);
+    assert!(out.contains("again: db: data/b.db is not confirmed for kit/k.qwe (quillo confirm)\n"), "{}", out);
+    assert!(!out.contains("b secret"), "{}", out);
+}
+
+/// Under a quillo.confirmed a taken file's migration folder reached by a link inside the program
+/// is read where it really is, as the path the system opened (`opened_path`) says, and applied;
+/// one of its files that is a link to a file outside what the kit may read is refused, and nothing
+/// applied (src/migrate.rs read_judged; FEEDBACK83.md Q-1300, found by review 6 of aebe60e; branch
+/// feedback82-85). A folder swapped for a link as a file is read, which the check catches, is a
+/// race no test makes.
+#[test]
+fn a_taken_files_migration_folder_by_a_link_is_read_where_it_is() {
+    let d = dir("mig-link");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    write(&d, "kit/real/001_a.sql", "create table t (x text);\ninsert into t values ('caf\u{e9}');\n");
+    std::os::unix::fs::symlink(d.join("kit/real"), d.join("kit/m")).unwrap();
+    write(&d, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  let c = db.connect(\"data/k.db\")\n  return \"applied: \" + str(c.migrate(\"kit/m\"))\n}\n");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\nprint(steal())\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/k.db\"]\nfiles = [\"kit/\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("applied: [\"001_a.sql\"]\n"), "{}", out);
+    assert_eq!(column(&d.join("data/k.db"), "select x from t"), ["caf\u{e9}"]);
+    // A file of it that is a link to one outside what the kit may read.
+    write(&d, "outside/002_b.sql", "create table u (x text);\n");
+    std::os::unix::fs::symlink(d.join("outside/002_b.sql"), d.join("kit/real/002_b.sql")).unwrap();
+    let (code, out) = run(&d, &[]);
+    assert_ne!(code, 0, "{}", out);
+    assert!(out.contains("db.migrate: ") && out.contains("not confirmed for kit/k.qwe"), "{}", out);
+    assert!(column(&d.join("data/k.db"), "select name from sqlite_master where name = 'u'").is_empty());
 }

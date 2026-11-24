@@ -78,7 +78,14 @@ and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2
   is read as the database reads it, so a word in a string, comment or quoted name is not
   refused. A connection is held to the file that opened it: a connection's map a taken file
   built by hand reached a helper's database. A tenant's migrations run as the code that set
-  them, and a migration file is judged as the text that runs.
+  them, and a migration file is judged as the text that runs, at the path the system says it
+  opened. The reading fails closed (found in review): what it cannot read for certain is
+  refused (`/*!`, a string left open, a compound statement), `EXECUTE`, `CALL` and `PREPARE`
+  anywhere, a `CREATE` of anything but a table, index, view or sequence, SQL reaching the
+  server's files (`COPY`, `INTO OUTFILE`, `pg_read_file`), and the catalogs holding other
+  tables' values or SQL text (`pg_stats`, `pg_prepared_statements`, `performance_schema`). A
+  `--` comment ends at `\r` too, also for the main file's transaction check (`select 1 --\r;
+  begin` left a transaction open on a shared connection).
 - **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
   of 2026-11-24): a name another file defines, used without taking it, is an error in
   `quillo check`, and the start refuses it with `--no-check` too, as the value under it

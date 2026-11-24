@@ -2298,11 +2298,38 @@ fn named() -> &'static [OnceLock<(BuiltinFn, Option<Arc<str>>, bool)>] {
     NAMED.get_or_init(|| (0..NAMED_SLOTS).map(|_| OnceLock::new()).collect())
 }
 
-/// The stand-ins given: by builtin and file, and each by its address, to know one.
+/// The stand-ins given: by builtin, file and the connection it was made for, and each by its
+/// address, to know one, with that connection (`stand_in_conn`).
 #[derive(Default)]
 struct StandIns {
-    by: std::collections::HashMap<(usize, Option<Arc<str>>), BuiltinFn>,
-    fns: HashSet<usize>,
+    by: std::collections::HashMap<(usize, Option<Arc<str>>, Option<usize>), BuiltinFn>,
+    fns: std::collections::HashMap<usize, Option<usize>>,
+}
+
+/// Whether `f` is a stand-in, and if so the connection it was made for (`held_to`: a connection's
+/// map's `exec` and the rest; None: `db.query` and the rest as a file names them): a call through
+/// it runs on that connection, whatever the map it is in says (`db::conn_of`). A map written by a
+/// kit, `{ "$db": 0, query: q }`, with `q` the main file's `db.query` handed to it, ran the main
+/// file's statement on the main file's `db.connect("data/secret.db")` (FEEDBACK83.md, Q-1300, found
+/// by review 6 of aebe60e; branch feedback82-85). None of one that is not: no stand-in is made
+/// where nothing is held, so nothing is asked there.
+/// The last answer is kept for the thread: a stand-in's connection never changes once it is given,
+/// and a builtin's address is never one's before it is given (a connection's every call under a
+/// hold looked in the table, 0.76% of a `c.one`, measured).
+pub(crate) fn stand_in_conn(f: BuiltinFn) -> Option<Option<usize>> {
+    thread_local! {
+        static LAST: std::cell::Cell<(usize, Option<Option<usize>>)> = const { std::cell::Cell::new((0, None)) };
+    }
+    let (at, bound) = LAST.get();
+    if at == f as usize {
+        return bound;
+    }
+    let bound = GIVEN.read().unwrap_or_else(std::sync::PoisonError::into_inner).fns.get(&(f as usize)).copied();
+    // Kept only once given: an address asked about before it is given is asked about again.
+    if bound.is_some() {
+        LAST.set((f as usize, bound));
+    }
+    bound
 }
 
 static GIVEN: std::sync::LazyLock<std::sync::RwLock<StandIns>> = std::sync::LazyLock::new(Default::default);
@@ -2460,10 +2487,16 @@ fn name_carries_first(n: &'static str, key: u64, seen: &std::sync::atomic::Atomi
 /// `f`'s stand-in for `file`: the one given before, or a new one; `f` itself where it is one.
 /// `name` is the builtin's, which says whether what it makes is held too (`makes_builtins`).
 fn named_fn(name: &str, f: BuiltinFn, file: &Option<Arc<str>>) -> BuiltinFn {
-    let key = (f as usize, file.clone());
+    named_fn_on(name, f, file, None)
+}
+
+/// `named_fn` of a connection's builtin, made for the connection `conn` (`held_to`), which a call
+/// through it runs on (`stand_in_conn`).
+fn named_fn_on(name: &str, f: BuiltinFn, file: &Option<Arc<str>>, conn: Option<usize>) -> BuiltinFn {
+    let key = (f as usize, file.clone(), conn);
     {
         let given = GIVEN.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if given.fns.contains(&key.0) || key.0 == named_full as BuiltinFn as usize {
+        if given.fns.contains_key(&key.0) || key.0 == named_full as BuiltinFn as usize {
             return f;
         }
         if let Some(g) = given.by.get(&key) {
@@ -2477,7 +2510,7 @@ fn named_fn(name: &str, f: BuiltinFn, file: &Option<Arc<str>>) -> BuiltinFn {
     let k = given.by.len();
     let Some(&g) = named_fns().get(k) else { return named_full };
     let _ = named()[k].set((f, file.clone(), makes_builtins(name)));
-    given.fns.insert(g as usize);
+    given.fns.insert(g as usize, conn);
     given.by.insert(key, g);
     g
 }
@@ -2503,10 +2536,15 @@ fn makes_builtins(name: &str) -> bool {
 #[inline(never)]
 fn held_to(m: Arc<Map>, file: &Option<Arc<str>>) -> Value {
     let mut held = Arc::unwrap_or_clone(m);
+    // Each made for this connection, which it runs on wherever it goes (`stand_in_conn`).
+    let conn = match held.get(crate::db::CONN_KEY) {
+        Some(Value::Int(i)) if *i >= 0 => Some(*i as usize),
+        _ => None,
+    };
     for x in held.values_mut() {
         if let Value::Builtin(n, f) = x {
             if carries_name(n) {
-                *f = named_fn(n, *f, file);
+                *f = named_fn_on(n, *f, file, conn);
             }
         }
     }

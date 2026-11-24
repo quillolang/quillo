@@ -10989,7 +10989,17 @@ for the site and the visitor.
   is not one. The refusal says to run it from the main file's SQL, or a migration the main
   file runs; the main file's SQL, and a program without a `quillo.confirmed`, are not read
   this way. A function the program's own SQL made that runs SQL text can still be called
-  from a taken file: it is the program's.
+  from a taken file: it is the program's. So can one an extension the program installed
+  adds, beyond `crosstab`, `connectby`, `ts_stat`, `ts_rewrite`, the `dblink` functions and
+  the `*_to_xml` ones, which are refused by their names, and so can a trigger the program
+  made that a taken file's write sets off. The reading fails closed: what it cannot read for
+  certain is refused (MySQL's `/*!` comments, a string left open, a statement inside an `IF`
+  or a label), `EXECUTE`, `CALL` and `PREPARE` anywhere in the statement, a `CREATE` of
+  anything but a table, an index, a view or a sequence, SQL that reaches the server's files
+  (`COPY`, `INTO OUTFILE`, `pg_read_file`, `LOAD`), and the catalogs that hold other tables'
+  values or SQL text (`pg_stats`, `pg_prepared_statements`, `performance_schema`'s
+  statements, `sys.`, the process list). Other catalogs the database user can read
+  (`mysql.user`, other databases) are not.
 - **A connection is its maker's.** A connection `db.connect` (or `db.shards`) opened is
   held to the file that opened it: a taken file that builds a connection's map by hand
   reaches nothing through it, and one that connects to the same database is held to its own

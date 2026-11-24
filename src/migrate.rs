@@ -50,7 +50,10 @@ fn files(dir: &Path, judge: Judge<'_>) -> Result<Vec<(String, String)>, String> 
 }
 
 /// The text of the migration at `path`, read where it really is, and judged there with it (`judge`):
-/// its last part is read as no link (`O_NOFOLLOW`), so the file judged is the file read.
+/// its last part is read as no link (`O_NOFOLLOW`), and the file opened is the one judged, by the
+/// path the system says it opened (`opened_path`): a folder of the path swapped for a link between
+/// the two had the file read be another than the one judged (FEEDBACK83.md, Q-1300, found by review
+/// 6 of aebe60e; branch feedback82-85).
 fn read_judged(path: &Path, judge: Judge<'_>) -> Result<String, String> {
     let cannot = |e: std::io::Error| format!("cannot read {}: {}", path.display(), e);
     let real = std::fs::canonicalize(path).map_err(cannot)?;
@@ -61,10 +64,43 @@ fn read_judged(path: &Path, judge: Judge<'_>) -> Result<String, String> {
         use std::os::unix::fs::OpenOptionsExt;
         o.custom_flags(libc::O_NOFOLLOW);
     }
+    let mut f = o.open(&real).map_err(cannot)?;
+    if let Some(opened) = opened_path(&f) {
+        if opened != real {
+            return Err(format!("cannot read {}: the file opened, {}, is not the one judged, {} (a folder of its path changed as it was read)", path.display(), opened.display(), real.display()));
+        }
+    }
     let mut text = String::new();
-    std::io::Read::read_to_string(&mut o.open(&real).map_err(cannot)?, &mut text).map_err(cannot)?;
+    std::io::Read::read_to_string(&mut f, &mut text).map_err(cannot)?;
     judge(path, &real, &text)?;
     Ok(text)
+}
+
+/// Where the system says the file `f` is, as it opened it: macOS's `F_GETPATH`, Linux's
+/// `/proc/self/fd`. None where it cannot say (another system).
+#[cfg(target_os = "macos")]
+fn opened_path(f: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::AsRawFd;
+    let mut buf = vec![0u8; libc::PATH_MAX as usize + 1];
+    // SAFETY: the buffer holds PATH_MAX bytes and its end, as F_GETPATH asks; the descriptor is
+    // the open file's.
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETPATH, buf.as_mut_ptr()) } == -1 {
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0)?;
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len])))
+}
+
+#[cfg(target_os = "linux")]
+fn opened_path(f: &std::fs::File) -> Option<std::path::PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd())).ok()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn opened_path(_: &std::fs::File) -> Option<std::path::PathBuf> {
+    None
 }
 
 fn digest(text: &str) -> String {

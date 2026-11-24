@@ -248,8 +248,12 @@ fn comment_end(b: &[u8], i: usize, nest: bool) -> (usize, usize) {
     (b.len(), depth)
 }
 
-fn line_end(b: &[u8], i: usize) -> usize {
-    b[i..].iter().position(|&c| c == b'\n').map_or(b.len(), |k| i + k)
+/// Where a `--` (or MySQL's `#`) comment at `i` ends: at `\n`, and on PostgreSQL (`pg`) at `\r` too,
+/// its lexer's `non_newline` being `[^\n\r]`: read to the `\n`, `--\rDO $q$ ... $q$` was taken for a
+/// comment that PostgreSQL ran (FEEDBACK83.md, Q-1300, found by review 6 of aebe60e; branch
+/// feedback82-85). SQLite's and MySQL's end at `\n` alone.
+fn line_end(b: &[u8], i: usize, pg: bool) -> usize {
+    b[i..].iter().position(|&c| c == b'\n' || (pg && c == b'\r')).map_or(b.len(), |k| i + k)
 }
 
 /// `$tag$ ... $tag$` (PostgreSQL) starting at `i`: where it ends, or None for no such quote.
@@ -391,11 +395,11 @@ pub(crate) fn lex(d: Dialect, s: &str) -> (Vec<Tok>, usize) {
                 continue;
             }
             b'-' if b.get(i + 1) == Some(&b'-') && (!my || b.get(i + 2).map_or(true, |c| c.is_ascii_whitespace() || c.is_ascii_control())) => {
-                i = line_end(b, i);
+                i = line_end(b, i, pg);
                 continue;
             }
             b'#' if my => {
-                i = line_end(b, i);
+                i = line_end(b, i, false);
                 continue;
             }
             b'/' if b.get(i + 1) == Some(&b'*') => {
