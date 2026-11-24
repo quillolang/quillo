@@ -1953,3 +1953,70 @@ fn a_plugin_with_a_byte_order_mark_under_a_source_pin_builds_no_dependency_from_
     assert!(out.contains("builds another file into it (the dependency `evil2` from a folder (`path`) at line 4)") && !out.contains("building ") && !out.contains("4242"), "{}", out);
     assert!(!d.0.join("MARKER").exists(), "the dependency was built: {}", out);
 }
+
+// Fix round 13 (F3)
+
+/// A pinned build whose dependency a cargo home's `[patch.crates-io]` takes from a folder (the
+/// glue's serde_json, from a crate whose build script writes `MARKER`) is refused as its
+/// dependencies are resolved, before anything is built: the build script never runs, and the start
+/// says which package and from where. Before, the lock was judged after the build, when that build
+/// script had run (src/native.rs build_private, packages_refused, FEEDBACK83.md Q-1305, found by
+/// the coverage tests; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_dependency_patched_to_a_folder_is_refused_before_anything_is_built() {
+    use sha2::Digest;
+    let d = Dir(support::temp_dir("cov8285r3-patch").canonicalize().unwrap());
+    let (app, tmp, ch, sj) = (d.0.join("app"), d.0.join("tmp"), d.0.join("cargo-home"), d.0.join("sj"));
+    for f in [&app, &tmp, &ch, &sj.join("src")] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    std::fs::write(sj.join("Cargo.toml"), "[package]\nname = \"serde_json\"\nversion = \"1.0.999\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n[lib]\npath = \"src/lib.rs\"\n").unwrap();
+    std::fs::write(sj.join("build.rs"), format!("fn main() {{ std::fs::write({:?}, \"ran\").unwrap(); }}\n", d.0.join("MARKER").display().to_string())).unwrap();
+    std::fs::write(sj.join("src/lib.rs"), "pub fn x() {}\n").unwrap();
+    std::fs::write(ch.join("config.toml"), format!("[patch.crates-io]\nserde_json = {{ path = {:?} }}\n", sj.display().to_string())).unwrap();
+    let src = "//! version: 1.0.0\n//! effects: none\npub fn hi() -> i64 { 7 }\n";
+    std::fs::write(app.join("hi.qwer"), src).unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let hash: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
+    std::fs::write(app.join("pin.toml"), format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash)).unwrap();
+    let (t, c, record) = (tmp.display().to_string(), ch.display().to_string(), d.0.join("record").display().to_string());
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--policy", "pin.toml"], &[("TMPDIR", &t), ("CARGO_HOME", &c), ("QUILLO_BUILT_RECORD_DIR", &record)], &d.0.join("run.log"), 600);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains(&format!("and its dependencies resolve to the package serde_json from a folder ({}), whose code that hash does not cover: it does not load, and nothing was built", sj.join("Cargo.toml").display())), "{}", out);
+    assert!(!d.0.join("MARKER").exists(), "the patched crate's build script ran: {}", out);
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "a private folder was left");
+}
+
+/// On macOS a pinned build is refused where the program can reach the user's own temporary folder,
+/// where xcrun keeps the cache that picks the clang and ld `cc` runs, whatever TMPDIR says, and
+/// where it can reach the developer folder (`xcode-select -p`) its linker is taken from; the start
+/// says which, and nothing is built (src/native.rs toolchain_reached, FEEDBACK82.md Q-1285, found
+/// by the coverage tests; branch feedback82-85).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_pinned_build_is_refused_where_the_program_reaches_xcruns_cache_or_the_developer_folder() {
+    use sha2::Digest;
+    let d = Dir(support::temp_dir("cov8285r3-xcrun").canonicalize().unwrap());
+    let (app, tmp) = (d.0.join("app"), d.0.join("tmp"));
+    for f in [&app, &tmp] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    let src = "//! version: 1.0.0\n//! effects: none\npub fn hi() -> i64 { 7 }\n";
+    std::fs::write(app.join("hi.qwer"), src).unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let hash: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
+    std::fs::write(app.join("pin.toml"), format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash)).unwrap();
+    let ask = |cmd: &str, args: &[&str]| PathBuf::from(String::from_utf8(Command::new(cmd).args(args).output().unwrap().stdout).unwrap().trim()).canonicalize().unwrap();
+    let (user, developer) = (ask("/usr/bin/getconf", &["DARWIN_USER_TEMP_DIR"]), ask("/usr/bin/xcode-select", &["-p"]));
+    let (t, record) = (tmp.display().to_string(), d.0.join("record").display().to_string());
+    for (allowed, said) in [
+        (user.clone(), format!("and the build would use the user's temporary folder, {}, where xcrun keeps the cache that picks the linker, which is inside {}", user.display(), user.display())),
+        (developer.clone(), format!("and the build would use the developer folder its linker is taken from (xcode-select -p), {}, which is inside {}", developer.display(), developer.display())),
+    ] {
+        let a = allowed.display().to_string();
+        let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--policy", "pin.toml", "--allow-path", &a], &[("TMPDIR", &t), ("QUILLO_BUILT_RECORD_DIR", &record)], &d.0.join("run.log"), 120);
+        assert_eq!(code, Some(1), "{}: {}", a, out);
+        assert!(out.contains(&said) && !out.contains("building "), "{}: {}", a, out);
+    }
+}

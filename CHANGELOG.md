@@ -384,7 +384,12 @@ What a program may notice:
   library's hash is never built (a repository's source was, its build script run, under a
   host's library pin); an ELF library's dynamic table is read to its end as the loader reads
   it; on macOS an install name's folders are judged and a weak load of a missing file is
-  refused (found by the final review of a6cee54).
+  refused (found by the final review of a6cee54). The dependencies are resolved and judged
+  before any build script runs, by each package's source and place (a path dependency's
+  build script rewrote the lock before it was read; a folder package named like the
+  plugin's crate passed), and the build is `--locked` to the judged lock; on macOS the
+  developer folder and xcrun's cache folder join the toolchain's reach check (found by the
+  review of 47371f6).
 - **What `quillo.confirmed` does not confirm** is an error at its line, and so is a name used
   from another file and not taken, under one (see Security).
 - **`"""` and `'''`** say that text over several lines is a backtick string (FEEDBACK85.md,

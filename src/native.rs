@@ -103,6 +103,35 @@ pub fn rust_text(src: &str) -> &str {
     src.strip_prefix('\u{FEFF}').unwrap_or(src)
 }
 
+/// Why what `cargo metadata` resolved for a pinned build (`metadata`, its JSON) may not be built held
+/// to the plugin's SHA-256, if it may not: a package with no source (a folder) but the plugin's own
+/// crate, which is the one whose manifest is `crate_dir`'s `Cargo.toml`, not one by its name; and a
+/// package from git or a registry but crates.io's (FEEDBACK83.md, Q-1305, found by the review of
+/// 47371f6; branch feedback82-85). Public so it is tested on its own.
+pub fn packages_refused(metadata: &str, crate_dir: &Path) -> Option<String> {
+    const CRATES_IO: &[&str] = &["registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/"];
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(metadata) else { return Some("what cargo resolved, which cannot be read".to_string()) };
+    let Some(packages) = v.get("packages").and_then(|p| p.as_array()).filter(|p| !p.is_empty()) else { return Some("no package".to_string()) };
+    let root = crate_dir.join("Cargo.toml");
+    let same = |a: &Path, b: &Path| a == b || a.canonicalize().ok().zip(b.canonicalize().ok()).is_some_and(|(x, y)| x == y);
+    let mut roots = 0;
+    for p in packages {
+        let name = crate::confirm::escaped(p.get("name").and_then(|n| n.as_str()).unwrap_or("a package with no name")).into_owned();
+        match p.get("source").and_then(|s| s.as_str()) {
+            None => {
+                let at = p.get("manifest_path").and_then(|m| m.as_str()).unwrap_or("");
+                if !same(Path::new(at), &root) {
+                    return Some(format!("the package {} from a folder ({})", name, crate::confirm::escaped(at)));
+                }
+                roots += 1;
+            }
+            Some(s) if CRATES_IO.contains(&s) => {}
+            Some(s) => return Some(format!("the package {} from {}", name, crate::confirm::escaped(s))),
+        }
+    }
+    (roots != 1).then(|| "no package of the plugin's own".to_string())
+}
+
 /// Why the Cargo.lock a pinned build's cargo wrote, `lock`, may not be built held to the plugin's
 /// SHA-256, if it may not: a package but the plugin's own crate (`own`) whose source is not
 /// crates.io's index (`registry+https://github.com/rust-lang/crates.io-index`, or the sparse
@@ -2195,12 +2224,31 @@ fn toolchain_reached(qwer: &Path) -> Result<(), String> {
         // Its lib/rustlib, which the build trusts (`Trusted`), not the whole sysroot: a
         // distribution's Rust has `/usr` (found by the review of a86f326).
         ("the Rust toolchain's lib/rustlib", toolchain_sysroot().map(|s| s.join("lib").join("rustlib"))),
+        // macOS's developer folder (`xcode-select -p`), whose clang, ld and SDK `cc` runs (found by
+        // the review of 47371f6).
+        ("the developer folder its linker is taken from (xcode-select -p)", developer_dir()),
     ];
     // And each folder of its PATH, whose programs it runs: rustc's linker `cc`, and what a
     // dependency's build script runs (found getting round this check; FEEDBACK82.md, Q-1285;
     // branch feedback82-85).
     used.extend(std::env::split_paths(&real("PATH").unwrap_or_default()).filter(|d| d.is_absolute()).map(|d| ("a folder of its PATH, whose programs it runs", Some(d))));
     let reach = program_reach();
+    // The user's own temporary folder on macOS, where xcrun keeps the cache (`xcrun_db`) that picks
+    // the clang and ld `/usr/bin/cc` runs, whatever TMPDIR says: under `--allow-path` of it, the
+    // program could write that cache and steer a source pin's link (FEEDBACK82.md, Q-1285, found by
+    // the review of 47371f6; branch feedback82-85). Judged one way: the cache is a file of that
+    // folder itself, which a folder inside it cannot write, and a program in a folder of its own
+    // there is no reach of it.
+    if let Some(t) = user_temp_dir() {
+        if let Some(r) = reached(&t.join("xcrun_db"), &reach) {
+            return Err(format!(
+                "{} is held to its source's SHA-256 and built here, and the build would use the user's temporary folder, {}, where xcrun keeps the cache that picks the linker, which is inside {}, which the program can reach and so could steer what is built: it does not load (have the policy pin its library by its own SHA-256 instead, as .quillo/plugins.lock has it)",
+                qwer.display(),
+                t.display(),
+                r.display()
+            ));
+        }
+    }
     for (what, p) in used {
         let Some(p) = p else { continue };
         // Each name as far as it is there, resolved, then the rest: a cargo home not made yet can
@@ -2477,18 +2525,58 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         write(&crate_dir.join("lib.rs"), glue(&src_file, &parsed.exports).as_bytes())?;
         let target = dir.join("target");
         eprintln!("quillo: building {} (held to its SHA-256: from its source, apart)", qwer.display());
-        let mut cmd = std::process::Command::new(path_cargo());
-        cmd.current_dir(cargo_dir()).env_clear();
-        for k in BUILD_ENV {
-            if let Some(v) = real(k) {
-                cmd.env(k, v);
+        // cargo, with the variables of `BUILD_ENV` alone, for the resolution and the build alike.
+        let cargo = || {
+            let mut cmd = std::process::Command::new(path_cargo());
+            cmd.current_dir(cargo_dir()).env_clear();
+            for k in BUILD_ENV {
+                if let Some(v) = real(k) {
+                    cmd.env(k, v);
+                }
             }
+            // Where cargo keeps what it builds on the way, its build dir, set here, in the private
+            // folder: cargo 1.100 keeps it apart from the target, and a crate's dep-info is no
+            // longer in `release/deps` (`read_in`). Set, not taken from whoever starts Quillo
+            // (FEEDBACK83.md, Q-1305, found by CI run 45354741594 on Rust 1.100; branch
+            // feedback82-85).
+            cmd.env("CARGO_BUILD_BUILD_DIR", target.join("build"));
+            cmd
+        };
+        // Resolved first, before anything is built, and judged by what cargo resolved: every
+        // package but the plugin's own crate, which is the one at this manifest's path, from
+        // crates.io (`packages_refused`, then `lock_refused` of the lock it wrote). The lock was
+        // judged after the build, when a path dependency's build script had run, and one rewrote
+        // its own block of the lock to read as crates.io's; and the plugin's crate was taken by its
+        // name, which a folder's package can have (FEEDBACK83.md, Q-1305, found by the review of
+        // 47371f6; branch feedback82-85). No build script runs before this; the build then takes
+        // that lock as it is (`--locked`), and is refused where it changed.
+        let manifest_file = crate_dir.join("Cargo.toml");
+        let metadata = |offline: bool| {
+            let mut c = cargo();
+            c.args(["metadata", "--format-version", "1", "--manifest-path"]).arg(&manifest_file).stdin(std::process::Stdio::null());
+            if offline {
+                c.arg("--offline");
+            }
+            c.output()
+        };
+        let mut resolved = metadata(false).map_err(|e| format!("cannot resolve the dependencies of {}: cargo did not run ({})", qwer.display(), e))?;
+        if !resolved.status.success() {
+            // Where the index cannot be reached, what it has kept.
+            resolved = metadata(true).map_err(|e| format!("cannot resolve the dependencies of {}: cargo did not run ({})", qwer.display(), e))?;
         }
-        // Where cargo keeps what it builds on the way, its build dir, set here, in the private
-        // folder: cargo 1.100 keeps it apart from the target, and a crate's dep-info is no longer
-        // in `release/deps` (`read_in`). Set, not taken from whoever starts Quillo (FEEDBACK83.md,
-        // Q-1305, found by CI run 45354741594 on Rust 1.100; branch feedback82-85).
-        cmd.env("CARGO_BUILD_BUILD_DIR", target.join("build"));
+        if !resolved.status.success() {
+            return Err(format!("cannot resolve the dependencies of {}:\n{}", qwer.display(), String::from_utf8_lossy(&resolved.stderr).trim()));
+        }
+        let lock_bytes = std::fs::read(crate_dir.join("Cargo.lock")).map_err(|e| format!("{} is held to its SHA-256, and the Cargo.lock its dependencies resolve to cannot be read ({}): it does not load", qwer.display(), e))?;
+        let resolve_refused = packages_refused(&String::from_utf8_lossy(&resolved.stdout), &crate_dir).or_else(|| lock_refused(&String::from_utf8_lossy(&lock_bytes), &crate_name));
+        if let Some(why) = resolve_refused {
+            return Err(format!(
+                "{} is held to its SHA-256, and its dependencies resolve to {}, whose code that hash does not cover: it does not load, and nothing was built (take each dependency from crates.io by its version)",
+                qwer.display(),
+                why
+            ));
+        }
+        let mut cmd = cargo();
         // The plugin's own crate is built with its LLVM IR beside it, and the linker lists each
         // file it reads (`judged_args`), so the build is judged where the assembler and the linker
         // act, as `read_in` judges it where rustc reads (FEEDBACK83.md, Q-1305, found by the
@@ -2496,7 +2584,7 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         // In the target, among what the linker may write (`link_args_refused` judges its name).
         let list = target.join("linked.list");
         let out = cmd
-            .args(["rustc", "--release", "--lib", "--message-format=short", "--manifest-path"])
+            .args(["rustc", "--release", "--lib", "--locked", "--message-format=short", "--manifest-path"])
             .arg(crate_dir.join("Cargo.toml"))
             .arg("--target-dir")
             .arg(&target)
@@ -2514,15 +2602,10 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
             let errors: Vec<&str> = log.lines().filter(|l| !l.trim_start().starts_with("Compiling") && !l.trim_start().starts_with("Updating") && !l.trim_start().starts_with("Locking")).collect();
             return Err(format!("cannot build {}:\n{}", qwer.display(), errors.join("\n")));
         }
-        // Judged where cargo acts too: every package of the Cargo.lock it wrote, but the plugin's
-        // own crate, from crates.io, whatever the header said (`lock_refused`).
-        let lock = std::fs::read_to_string(crate_dir.join("Cargo.lock")).map_err(|e| format!("{} is held to its SHA-256, and its build's Cargo.lock cannot be read ({}): it does not load", qwer.display(), e))?;
-        if let Some(why) = lock_refused(&lock, &crate_name) {
-            return Err(format!(
-                "{} is held to its SHA-256, and its build took {}, whose code that hash does not cover: it does not load, and what was built is not kept (take each dependency from crates.io by its version)",
-                qwer.display(),
-                why
-            ));
+        // The lock it built with is the one judged, byte for byte: a build script that wrote it
+        // after the judge is no change that passes.
+        if std::fs::read(crate_dir.join("Cargo.lock")).ok().as_deref() != Some(lock_bytes.as_slice()) {
+            return Err(format!("{} is held to its SHA-256, and its Cargo.lock changed while it was built: it does not load, and what was built is not kept", qwer.display()));
         }
         // Judged by what the compiler read: nothing but its source and Quillo's glue. Else its
         // library is not kept, nor recorded, and the private folder goes (`result`).

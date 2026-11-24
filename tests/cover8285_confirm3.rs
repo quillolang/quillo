@@ -1657,3 +1657,37 @@ fn a_weak_or_writable_install_name_is_refused() {
         eprintln!("skipped: {} is not a folder others may write in here", open.display());
     }
 }
+
+// Fix round 13
+
+/// What cargo resolved for a pinned build is judged package by package before anything is built:
+/// the plugin's own crate is the package whose manifest is the private crate's, not one by its
+/// name; crates.io's packages pass; a folder's package, the one named as the plugin's crate too
+/// (`package = "quillo_hi_pinned"` of another folder), one from git or another registry, two
+/// crates of the plugin's own, none, or what cannot be read are refused, named
+/// (src/native.rs packages_refused, FEEDBACK83.md Q-1305, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn what_cargo_resolved_is_judged_by_each_packages_source_and_place() {
+    let d = dir("fix13-resolve");
+    let root = d.join("crate");
+    std::fs::create_dir_all(&root).unwrap();
+    let pkg = |name: &str, source: Option<&str>, manifest: &Path| serde_json::json!({ "name": name, "version": "1.0.0", "id": format!("x#{}@1.0.0", name), "source": source, "manifest_path": manifest.display().to_string() });
+    let meta = |pkgs: Vec<serde_json::Value>| serde_json::json!({ "packages": pkgs, "version": 1 }).to_string();
+    let own = pkg("quillo_hi_pinned", None, &root.join("Cargo.toml"));
+    let io = pkg("serde_json", Some("registry+https://github.com/rust-lang/crates.io-index"), &d.join("reg/serde_json/Cargo.toml"));
+    assert_eq!(quillo::native::packages_refused(&meta(vec![own.clone(), io.clone()]), &root), None);
+    let other = d.join("evil4/Cargo.toml");
+    for (extra, said) in [
+        (pkg("quillo_hi_pinned", None, &other), format!("the package quillo_hi_pinned from a folder ({})", other.display())),
+        (pkg("evil", None, &other), format!("the package evil from a folder ({})", other.display())),
+        (pkg("evil", Some("git+https://example.com/evil#0123"), &other), "the package evil from git+https://example.com/evil#0123".to_string()),
+        (pkg("evil", Some("registry+https://other.example/index"), &other), "the package evil from registry+https://other.example/index".to_string()),
+    ] {
+        assert_eq!(quillo::native::packages_refused(&meta(vec![own.clone(), io.clone(), extra.clone()]), &root), Some(said), "{}", extra);
+    }
+    assert_eq!(quillo::native::packages_refused(&meta(vec![own.clone(), own.clone()]), &root), Some("no package of the plugin's own".to_string()));
+    assert_eq!(quillo::native::packages_refused(&meta(vec![io.clone()]), &root), Some("no package of the plugin's own".to_string()));
+    assert_eq!(quillo::native::packages_refused(&meta(vec![]), &root), Some("no package".to_string()));
+    assert_eq!(quillo::native::packages_refused("not json", &root), Some("what cargo resolved, which cannot be read".to_string()));
+}
