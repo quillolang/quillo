@@ -929,7 +929,6 @@ fn what_a_name_a_use_gives_stands_for_is_read_wherever_it_is_used() {
         ("macro", "macro_rules! m { ($x:ident) => { std::$x::read_to_string } }\npub fn r(p: String) -> String { m!(fs)(p).unwrap_or_default() }", all, "`::$x` (a path a macro builds from what it is given) (line 3)"),
         ("macrohead", "macro_rules! m { ($x:ident) => { $x::read_to_string } }\npub fn r(p: String) -> String { m!(fs)(p).unwrap_or_default() }", all, "`$x::` (a path a macro builds from what it is given) (line 3)"),
         ("foreign", "extern \"C\" { fn system(c: *const u8) -> i32; }\npub fn r() -> i64 { unsafe { system(std::ptr::null()) as i64 } }", all, "a foreign block (`extern \"C\" { ... }`), whose functions are not Rust's to read (line 3)"),
-        ("asm", "pub fn r() { unsafe { core::arch::asm!(\"nop\") } }", all, "`asm!`, code that is not Rust's to read (line 3)"),
     ];
     for (name, code, effects, call) in &cases {
         let f = format!("{}.qwer", name);
@@ -938,6 +937,13 @@ fn what_a_name_a_use_gives_stands_for_is_read_wherever_it_is_used() {
         assert_eq!(code, Some(1), "{}: {}", name, out);
         assert_eq!(out, format!("{}: effects: {}\n  but it says `effects: none`, and calls {}: a reading of its text, not a proof (a crate can do what it does unseen)\n", f, effects, call), "{}", name);
     }
+    // `asm!` reads as everything, and builds another file in too, by its `.include` and `.incbin`,
+    // said as `include!` is (FEEDBACK83.md, Q-1305, found by the coverage tests of 3117dea; branch
+    // feedback82-85).
+    write(&d, "asm.qwer", "//! version: 1.0.0\n//! effects: none\npub fn r() { unsafe { core::arch::asm!(\"nop\") } }\n");
+    let (code, out) = quillo(&d, &["confirm", "--effects", "asm.qwer"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert_eq!(out, format!("asm.qwer: effects: {}\n  but it says `effects: none`, and calls `asm!`, code that is not Rust's to read (line 3): a reading of its text, not a proof (a crate can do what it does unseen)\n  but it builds another file into it (`asm!`, assembly, whose `.include` and `.incbin` read another file in at line 3), which this reading does not see; under a quillo.confirmed it does not load\n", all));
     for (name, code) in [
         ("cratemacro", "macro_rules! m { () => { $crate::r() } }\npub fn r() -> u8 { 1 }"),
         ("turbofish", "macro_rules! m { ($f:ident) => { $f::<u8>() } }\npub fn r() -> u8 { 1 }"),

@@ -10945,17 +10945,22 @@ Asking, and who answers:
   library's file, network, process, clock and random calls, the crates that do them) and
   proposes its `//! effects:` line, saying where the file's own leaves something out. It
   follows the names the file gives them (`use std::fs as disk`, `use std::{fs::*}`, `r#fs`,
-  `extern crate reqwest as web`, a dependency's `package = "reqwest"`), however `::` and `!`
+  `extern crate reqwest as web`, a dependency's `package = "reqwest"`, a type in brackets as
+  in `<(std::net::TcpStream)>::connect`, the type an `impl` is for), however `::` and `!`
   are spaced, and reads `include_str!`, `include_bytes!` and `include!` as `fs`. What it
   cannot follow it reads as every effect but `db`, and says where: a path a macro builds
   from its argument, a foreign block (`extern "C" { ... }`), `asm!`, a `use` nested more than
   64 deep. A file that builds another into it is refused under a `quillo.confirmed`, by
   `quillo confirm`, `check`, `build`, the start and a reload, since the other file is outside
   its SHA-256; without one, it is a warning. That is `include!`, `include_str!` or
-  `include_bytes!` however it is written or named, `#[path]`, a `mod x;` that is not `mod x
+  `include_bytes!` however it is written or named, assembly (`asm!`, `global_asm!`,
+  `naked_asm!`, by any name: its `.include` and `.incbin` read a file), an attribute that
+  links a library (`#[link]`, or one a macro is given or builds) or reads a file
+  (`#[debugger_visualizer]`), `#[path]`, a `mod x;` that is not `mod x
   { ... }` (one a macro writes too), a macro named by a macro's argument (`$m!`), a
   dependency by anything but its version (`path`, `git`, `registry`), and a crate whose
-  macros build files in (`rust-embed`, `include_dir`, `askama`, `sqlx` and the like). The
+  macros build files in (`rust-embed`, `include_dir`, `askama`, `sqlx` and the like, and
+  their macro crates). The
   file is read as Rust reads it, by its tokens: comments, every kind of string and Rust's
   whitespace, from where rustc starts (after a byte order mark and a `#!` first line that is
   not `#![...]`); a dependency line's texts as TOML reads them (`'x'` as written; a `\`
@@ -10968,7 +10973,8 @@ Asking, and who answers:
   reading of the text misses, as a dependency's macro that includes a file
   (`doc_comment::doctest!`). It is still a reading, not a proof: a crate can do what it does
   unseen (`libc::kill` reads as the `libc` crate, which the file's `crates` list confirms by
-  name), and a proc macro that reads a file without telling rustc is not seen.
+  name), and a proc macro that reads a file without telling rustc, or a dependency's own
+  macro that writes assembly, is not seen.
 
 Not held yet: [`--watch`](#options-of-quillo-run) does not read `quillo.confirmed` again
 when it changes (restart after `quillo confirm`); what a page loads and calls is only

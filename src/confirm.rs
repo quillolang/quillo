@@ -1581,9 +1581,15 @@ fn rust_lifetime_or_char(src: &str, q: usize) -> (RKind, usize, bool) {
         let (end, closed) = rust_quoted(src, q + 1);
         return (RKind::Char, end, closed);
     }
-    let end = rust_name_end(src, q + 1);
+    let mut end = rust_name_end(src, q + 1);
     if src.as_bytes().get(end) == Some(&b'\'') {
         return (RKind::Char, end + 1, true);
+    }
+    // A raw lifetime, `'r#a`, one token as rustc reads it: read as `'r`, `#` and `a`, its `#` was
+    // one that starts no attribute (`attribute_built_in`; FEEDBACK83.md, Q-1305, found by the
+    // coverage tests of 3117dea; branch feedback82-85).
+    if &src[q + 1..end] == "r" && src.as_bytes().get(end) == Some(&b'#') && src[end + 1..].chars().next().is_some_and(|n| rust_name_char(n) && !n.is_ascii_digit()) {
+        end = rust_name_end(src, end + 1);
     }
     (RKind::Lifetime, end, true)
 }
@@ -1660,24 +1666,59 @@ fn rust_written(src: &str, toks: &[RTok]) -> (String, Vec<(u32, usize, String)>)
     // `::`, its two colons with nothing between: `k` its first.
     let colons = |k: usize| punct(k, ':') && punct(k + 1, ':') && !toks[k + 1].spaced;
     let pathy = |k: usize| (word(k) && toks.get(k).is_some_and(|t| rust_tok(src, t) != "as")) || punct(k, ':');
-    // A qualified path at `<`, `<P>::` or `<P as Q>::`: where its path ends, and where the `::`
-    // after its `>` starts.
-    let qualified = |k: usize| -> Option<(usize, usize)> {
+    // A qualified path at `<`, `<P>::` or `<P as Q>::`: where its path starts and ends, and where
+    // the `::` after its `>` starts. Its type in brackets or a reference to it, `<(P)>::`,
+    // `<((P))>::`, `<(P) as Q>::`, `<&'a mut (P)>::`, is `P`, and a trait's generics passed
+    // over (`<P as From<T>>::`): `<(std::net::TcpStream)>::connect(a)`, which rustc compiles, read
+    // as `effects: none` (FEEDBACK83.md, Q-1305, found by the coverage tests of 3117dea; branch
+    // feedback82-85).
+    let qualified = |k: usize| -> Option<(usize, usize, usize)> {
         let mut j = k + 1;
+        let mut parens = 0usize;
+        while punct(j, '(') || punct(j, '&') || toks.get(j).is_some_and(|t| t.kind == RKind::Lifetime) || (word(j) && rust_tok(src, &toks[j]) == "mut") {
+            parens += usize::from(punct(j, '('));
+            j += 1;
+        }
+        let path_start = j;
         while pathy(j) {
             j += 1;
         }
         let path_end = j;
-        if path_end == k + 1 {
+        if path_end == path_start {
             return None;
+        }
+        for _ in 0..parens {
+            if !punct(j, ')') {
+                return None;
+            }
+            j += 1;
         }
         if toks.get(j).is_some_and(|t| t.kind == RKind::Ident && rust_tok(src, t) == "as") {
             j += 1;
             while pathy(j) {
                 j += 1;
             }
+            // Its generics, to the `>` that closes them (not the `>` of a `->`).
+            if punct(j, '<') {
+                let mut depth = 0usize;
+                while let Some(t) = toks.get(j) {
+                    if !matches!(t.kind, RKind::Ident | RKind::RawIdent | RKind::Punct | RKind::Lifetime | RKind::Number) {
+                        return None;
+                    }
+                    if punct(j, '<') {
+                        depth += 1;
+                    } else if punct(j, '>') && !punct(j - 1, '-') {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                j += 1;
+            }
         }
-        (punct(j, '>') && punct(j + 1, ':') && punct(j + 2, ':')).then_some((path_end, j + 1))
+        (punct(j, '>') && punct(j + 1, ':') && punct(j + 2, ':')).then_some((path_start, path_end, j + 1))
     };
     let mut k = 0;
     let mut skip_to: Option<(usize, usize)> = None;
@@ -1685,6 +1726,8 @@ fn rust_written(src: &str, toks: &[RTok]) -> (String, Vec<(u32, usize, String)>)
         let t = &toks[k];
         if let Some((path_end, resume)) = skip_to {
             if k == path_end {
+                // The line breaks of what is passed over are put back with the next break.
+                owed += toks[path_end..resume].iter().map(|t| t.gap_lines).sum::<u32>();
                 k = resume;
                 skip_to = None;
                 continue;
@@ -1711,9 +1754,10 @@ fn rust_written(src: &str, toks: &[RTok]) -> (String, Vec<(u32, usize, String)>)
         // `<` where a value starts, not after a name, `>` or `)` (`Vec<u8>`, `f()<x`).
         let starts = k == 0 || !(word(k - 1) || punct(k - 1, '>') || punct(k - 1, ')') || punct(k - 1, ']'));
         if punct(k, '<') && skip_to.is_none() && starts {
-            if let Some(q) = qualified(k) {
-                skip_to = Some(q);
-                k += 1;
+            if let Some((path_start, path_end, resume)) = qualified(k) {
+                skip_to = Some((path_end, resume));
+                owed += toks[k + 1..path_start].iter().map(|t| t.gap_lines).sum::<u32>();
+                k = path_start;
                 continue;
             }
         }
@@ -1878,6 +1922,23 @@ fn rust_use_names(code: &str) -> RustUses {
             from = end;
         }
     }
+    // The type an `impl` is for, read as a path a `use` takes is, where the code calls it `Self`:
+    // `impl X for std::net::TcpStream { fn c(a: &str) -> Self { Self::connect(a).unwrap() } }`
+    // read as `effects: none` (FEEDBACK83.md, Q-1305, found getting round the fix of a
+    // parenthesized qualified path, from the coverage tests of 3117dea; branch feedback82-85).
+    // Each header read once, to its `{` or `;`: an `impl` inside one is a type, not a block.
+    let mut from = 0;
+    while let Some(at) = code[from..].find("impl").map(|a| a + from) {
+        from = at + 4;
+        if (at > 0 && (rust_name_byte(b[at - 1]) || b[at - 1] == b':')) || b.get(from).is_some_and(|c| rust_name_byte(*c)) {
+            continue;
+        }
+        let Some(end) = b[from..].iter().position(|c| matches!(c, b'{' | b';')).map(|e| e + from) else { break };
+        if let Some((ty, ty_at)) = impl_self_type(&code[from..end]) {
+            out.leaves.push((ty, from + ty_at));
+        }
+        from = end;
+    }
     out.spans.sort_unstable();
     out.names.retain(|(n, full, _)| n != "_" && *n != *full && !["crate", "self", "super"].iter().any(|s| full.split("::").next() == Some(*s)));
     // A path that starts at a name another `use` gives is the path that name stands for: `use
@@ -1896,6 +1957,62 @@ fn rust_use_names(code: &str) -> RustUses {
         leaf.0 = by.resolved(&leaf.0, &out.names, None);
     }
     out
+}
+
+/// The type the `impl` whose header is `head` (what is between `impl` and its `{`) is for, as a
+/// path, and where it starts in `head`: `<T> X<T> for std::net::TcpStream where T: Y` gives
+/// `std::net::TcpStream`, `std::fs::File` itself; a `&`, `mut`, a lifetime, `(` or `dyn` before it
+/// passed over, its generics left out. None where no path is (a tuple, a slice).
+fn impl_self_type(head: &str) -> Option<(String, usize)> {
+    let b = head.as_bytes();
+    let word_at = |i: usize, w: &str| b[i..].starts_with(w.as_bytes()) && (i == 0 || !rust_name_byte(b[i - 1])) && !b.get(i + w.len()).is_some_and(|c| rust_name_byte(*c));
+    // Its own generics first (`impl<T>`), then the type, or the trait and `for` the type, to a
+    // `where`: each at no depth of `<...>` (a `>` of `->` closes none).
+    let mut i = head.len() - head.trim_start().len();
+    let (mut depth, mut ty) = (0usize, None::<usize>);
+    let mut generics = b.get(i) == Some(&b'<');
+    while i < b.len() {
+        match b[i] {
+            b'<' => depth += 1,
+            b'>' if i == 0 || b[i - 1] != b'-' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && generics {
+                    generics = false;
+                    ty = Some(i + 1);
+                }
+            }
+            _ if depth == 0 && !generics => {
+                if ty.is_none() {
+                    ty = Some(i);
+                }
+                if word_at(i, "for") {
+                    ty = Some(i + 3);
+                } else if word_at(i, "where") {
+                    break;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut at = ty?;
+    loop {
+        let rest = &head[at..];
+        let skip = rest.len() - rest.trim_start_matches([' ', '\t', '\n', '\r', '&', '(']).len();
+        at += skip;
+        let rest = &head[at..];
+        if let Some(w) = ["mut", "dyn"].iter().find(|w| word_at(at, w)) {
+            at += w.len();
+        } else if rest.starts_with('\'') {
+            at += 1 + rest[1..].bytes().take_while(|c| rust_name_byte(*c)).count();
+        } else if skip == 0 {
+            break;
+        }
+    }
+    let at = at + head[at..].bytes().take_while(|c| *c == b':').count();
+    let path: String = head[at..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':' || !c.is_ascii()).collect();
+    let path = path.trim_end_matches(':');
+    (!path.is_empty() && !path.starts_with(|c: char| c.is_ascii_digit())).then(|| (path.to_string(), at))
 }
 
 /// The names `use`s give, by name: for each, the first two that stand for a path that does not
@@ -2148,8 +2265,10 @@ fn unfollowed(code: &str) -> Option<(u32, &'static str)> {
             break;
         }
     }
+    // A macro's `!`, not a name compared: `asm != 1` read as everything (FEEDBACK83.md, Q-1305,
+    // found by the coverage tests of 3117dea; branch feedback82-85).
     for m in ["asm!", "global_asm!", "naked_asm!"] {
-        if let Some((at, _)) = code.match_indices(m).find(|(at, _)| *at == 0 || !rust_name_byte(b[at - 1])) {
+        if let Some((at, _)) = code.match_indices(m).find(|(at, _)| (*at == 0 || !rust_name_byte(b[at - 1])) && b.get(at + m.len()) != Some(&b'=')) {
             keep(at, "`asm!`, code that is not Rust's to read");
         }
     }
@@ -2422,10 +2541,143 @@ fn compiled_in_said(b: &Block) -> Option<String> {
 /// The macros that build a file into the code they are in.
 const RUST_INCLUDES: &[&str] = &["include", "include_str", "include_bytes"];
 
+/// The macros of assembly (`core::arch::`, `std::arch::`), whose `.include` and `.incbin` the
+/// assembler reads as the plugin is built (`builds_in`).
+const RUST_ASM: &[&str] = &["asm", "global_asm", "naked_asm"];
+
+/// How `builds_in` says assembly, an attribute that links a library and a debugger's visualizer,
+/// each at the end of what it says (`built_in_instead`).
+const ASM_HOW: &str = "assembly, whose `.include` and `.incbin` read another file in";
+const LINKED: &str = "a library the linker reads in";
+const VISUALIZER: &str = "`#[debugger_visualizer(...)]`, a file rustc reads in";
+
+/// What the attribute at the `#` token `k` of `toks` (of `src`) builds in, if it can: `#[link(...)]`
+/// (in a `cfg_attr` too), a library the linker reads in; `#[debugger_visualizer(...)]`, a file
+/// rustc reads in; an attribute a macro is given (`#[$m]`, `#[$a(name = "x")]` with `m!(link)`;
+/// a `$` after its own `=`, `#[doc = $d]`, is in its value) or one paste builds
+/// (`#[[<li nk>](...)]`), each of which can be `#[link(...)]`; and a `#` that starts no
+/// attribute, handed to a macro, which can make one of it (`$h [ $a (name = "x") ]` with
+/// `m!(# link)`). The linker reads a library from its search paths, or from a path with
+/// `+verbatim`, and neither the SHA-256 confirmed nor rustc's list of what it read covers it
+/// (FEEDBACK83.md, Q-1305, found by the coverage tests of 3117dea; branch feedback82-85). A
+/// `#![feature]` is not one: a plugin is built as a module (`#[path = "x.qwer"] mod user;`),
+/// where rustc leaves it unread.
+fn attribute_built_in(src: &str, toks: &[RTok], k: usize) -> Option<String> {
+    let punct = |j: usize, c: u8| toks.get(j).is_some_and(|t| t.kind == RKind::Punct && src.as_bytes()[t.at] == c);
+    let word = |j: usize, s: &str| toks.get(j).is_some_and(|t| matches!(t.kind, RKind::Ident | RKind::RawIdent) && rust_tok(src, t) == s);
+    let open = if punct(k + 1, b'[') {
+        k + 1
+    } else if punct(k + 1, b'!') && punct(k + 2, b'[') {
+        k + 2
+    } else {
+        return Some(format!("a `#` that starts no attribute, handed to a macro, which can make one of it, `#[link(...)]`: {}", LINKED));
+    };
+    // How deep in `[` and in `(` it is, and whether its own `=` came (`#[doc = ...]`), after which
+    // all is its value.
+    let (mut depth, mut parens, mut valued) = (0usize, 0usize, false);
+    for j in open..toks.len() {
+        if punct(j, b'[') {
+            depth += 1;
+        } else if punct(j, b']') {
+            depth -= 1;
+            if depth == 0 {
+                break;
+            }
+        } else if punct(j, b'(') {
+            parens += 1;
+        } else if punct(j, b')') {
+            parens = parens.saturating_sub(1);
+        } else if punct(j, b'=') && depth == 1 && parens == 0 {
+            valued = true;
+        }
+        if j == open {
+            continue;
+        }
+        if word(j, "link") && punct(j + 1, b'(') {
+            return Some(format!("`#[link(...)]`, {}", LINKED));
+        }
+        if word(j, "debugger_visualizer") {
+            return Some(VISUALIZER.to_string());
+        }
+        if punct(j, b'$') && !valued {
+            return Some(format!("an attribute a macro is given (`#[$m]`), which can be `#[link(...)]`: {}", LINKED));
+        }
+        if punct(j, b'[') && punct(j + 1, b'<') {
+            return Some(format!("an attribute paste builds (`#[[<...>]]`), which can be `#[link(...)]`: {}", LINKED));
+        }
+    }
+    None
+}
+
+/// What a Rust file that builds another file into it (`builds_in`'s `how`) is to do instead, said
+/// where a hold refuses it: assembly and an attribute that links a library have no file to put
+/// in it (FEEDBACK83.md, Q-1305, found by the coverage tests of 3117dea; branch feedback82-85).
+fn built_in_instead(how: &str, name: &str) -> String {
+    if how.ends_with(ASM_HOW) {
+        "write that code in Rust, without assembly".to_string()
+    } else if how.ends_with(LINKED) {
+        "take that library through a crate instead, and write each attribute out".to_string()
+    } else if how == VISUALIZER {
+        "leave the visualizer out".to_string()
+    } else {
+        format!("put that code in {}", escaped(name))
+    }
+}
+
 /// Crates whose macros build files into the code they are in as it is built (templates, assets,
 /// migrations, a grammar), which the SHA-256 pinned for the plugin does not cover. No plugin of the
-/// catalog takes one.
-const RUST_FILE_CRATES: &[&str] = &["rust-embed", "rust_embed", "include_dir", "include-flate", "include_flate", "askama", "rinja", "sailfish", "sqlx", "pest_derive", "diesel_migrations", "refinery", "static-files", "static_files"];
+/// catalog takes one. And the crate of each one's macros, which a plugin can take itself:
+/// `askama_derive = "0.12"` then `#[derive(askama_derive::Template)]`, `rust-embed-impl` (or
+/// `e = { package = "rust-embed-impl" }`), `include_dir_macros`, `sqlx-macros` were each confirmed
+/// (FEEDBACK83.md, Q-1305, found by the coverage tests of 3117dea; branch feedback82-85). A name is
+/// compared as cargo finds it, a `-` and a `_` alike and in any case (`dep_built_elsewhere`).
+const RUST_FILE_CRATES: &[&str] = &[
+    "rust-embed",
+    "rust-embed-impl",
+    "include_dir",
+    "include_dir_macros",
+    "include_dir_impl",
+    "include-flate",
+    "include-flate-codegen",
+    "include-flate-codegen-exports",
+    "askama",
+    "askama_derive",
+    "askama_macros",
+    "rinja",
+    "rinja_derive",
+    "sailfish",
+    "sailfish-macros",
+    "sqlx",
+    "sqlx-macros",
+    "sqlx-macros-core",
+    "pest_derive",
+    "diesel_migrations",
+    "migrations_macros",
+    "refinery",
+    "refinery-macros",
+    "static-files",
+    // More whose macros read a file as the plugin is built: templates (yarte, ramhorns),
+    // translations (rust-i18n), a GraphQL schema and query (graphql_client), a JSON schema
+    // (typify), an OpenAPI document (progenitor), the repository's `.git` (git-version) and a
+    // `.env` (dotenv_codegen), each with its macros' crate (FEEDBACK83.md, Q-1305, found by the
+    // review of the coverage tests' fixes of 3117dea; branch feedback82-85).
+    "yarte",
+    "yarte_derive",
+    "ramhorns",
+    "ramhorns-derive",
+    "rust-i18n",
+    "rust-i18n-macro",
+    "graphql_client",
+    "graphql_query_derive",
+    "typify",
+    "typify-macro",
+    "progenitor",
+    "progenitor-macro",
+    "git-version",
+    "git-version-macro",
+    "dotenv_codegen",
+    "dotenv_codegen_implementation",
+];
 
 /// The keys a plugin's dependency may give: what crates.io's crate of that version is built with.
 /// Another (`path`, `git`, `branch`, `registry`, ...) takes the crate's code from elsewhere.
@@ -2437,9 +2689,11 @@ const RUST_DEP_KEYS: &[&str] = &["version", "features", "default-features", "def
 /// `include!`, `include_str!` and `include_bytes!`, with any delimiter and any space or comment
 /// around their `!`, by any name a `use` gives them (`use std::include_str as grab;`); a macro whose
 /// name is what a macro is given (`$m!`) or one paste builds (`[<...>]!`), which can be any of
-/// these; and a dependency whose code is not crates.io's crate of its version (`path`, `git`, or a
-/// key other than `RUST_DEP_KEYS`), or a crate whose macros build files in (`RUST_FILE_CRATES`). A
-/// plugin is built as `#[path = "x.qwer"] mod user;`, so each compiles code that neither the
+/// these; assembly, `asm!`, `global_asm!` and `naked_asm!` by any name a `use` gives them, whose
+/// `.include` and `.incbin` read a file; an attribute that has the linker read a library in
+/// (`attribute_built_in`); and a dependency whose code is not crates.io's crate of its version
+/// (`path`, `git`, or a key other than `RUST_DEP_KEYS`), or a crate whose macros build files in
+/// (`RUST_FILE_CRATES`). A plugin is built as `#[path = "x.qwer"] mod user;`, so each compiles code that neither the
 /// reading nor the SHA-256 that quillo.confirmed pins (nor the built library's key) covers. One
 /// reading for all that asks: `quillo confirm`, `quillo check`, a start, a load, a `--watch`
 /// reload and `quillo build`. Before, these were read from the text, and `mod/**/helper;`,
@@ -2456,10 +2710,11 @@ fn builds_in_toks(src: &str, toks: &[RTok]) -> Option<(u32, String)> {
     let is = |k: usize, kind: RKind, s: &str| toks.get(k).is_some_and(|t| t.kind == kind && rust_tok(src, t) == s);
     let punct = |k: usize, s: &str| toks.get(k).is_some_and(|t| t.kind == RKind::Punct && src.as_bytes()[t.at] == s.as_bytes()[0]);
     let name = |k: usize| toks.get(k).is_some_and(|t| matches!(t.kind, RKind::Ident | RKind::RawIdent));
-    // The names `use`s give the macros that include: only where the file names one, as a `use`
-    // that gives one names it.
-    let uses = if src.contains("include") { rust_use_names(&rust_joined(&rust_written(src, toks).0)).names } else { Vec::new() };
-    let includes: HashSet<&str> = RUST_INCLUDES.iter().copied().chain(uses.iter().filter(|(_, full, _)| full.rsplit("::").next().is_some_and(|l| RUST_INCLUDES.contains(&l))).map(|(n, _, _)| n.as_str())).collect();
+    // The names `use`s give the macros that include, and those of assembly: only where the file
+    // names one, as a `use` that gives one names it.
+    let uses = if src.contains("include") || src.contains("asm") { rust_use_names(&rust_joined(&rust_written(src, toks).0)).names } else { Vec::new() };
+    let given = |list: &'static [&'static str]| -> HashSet<&str> { list.iter().copied().chain(uses.iter().filter(|(_, full, _)| full.rsplit("::").next().is_some_and(|l| list.contains(&l))).map(|(n, _, _)| n.as_str())).collect() };
+    let (includes, asms) = (given(RUST_INCLUDES), given(RUST_ASM));
     let mut found: Option<(u32, String)> = None;
     // What rustc reads otherwise than this reading, which cannot then be sure of the rest: a byte
     // order mark past the first character, and a string or a character that does not end as
@@ -2483,10 +2738,22 @@ fn builds_in_toks(src: &str, toks: &[RTok]) -> Option<(u32, String)> {
                 (true, false, false) => Some(format!("`{}` handed to a macro, which can make a module in another file of it", written)),
                 (false, _, _) => Some("`mod` handed to a macro, which can make a module in another file of it".to_string()),
             }
+        } else if punct(k, "#") {
+            attribute_built_in(src, toks, k)
         } else if punct(k, "!") && !punct(k + 1, "=") && k > 0 {
             if name(k - 1) && includes.contains(text(k - 1).unwrap_or("")) {
                 let n = text(k - 1).unwrap_or("");
                 Some(if RUST_INCLUDES.contains(&n) { format!("`{}!`", n) } else { format!("`{}!`, an include macro by another name", n) })
+            } else if name(k - 1) && asms.contains(text(k - 1).unwrap_or("")) {
+                // Assembly, whose `.include "f.s"` and `.incbin "f"` the assembler reads as the
+                // plugin is built, a file neither the reading, the SHA-256 confirmed nor rustc's
+                // list of what it read (`native::read_in`) sees: `global_asm!(".include
+                // \"/abs/evil.s\"")` built another file's machine code into a plugin confirmed by
+                // its SHA-256, and a change to that file ran on the next machine. The macro itself,
+                // as `concat!` can write the directive (FEEDBACK83.md, Q-1305, found by the
+                // coverage tests of 3117dea; branch feedback82-85).
+                let n = text(k - 1).unwrap_or("");
+                Some(if RUST_ASM.contains(&n) { format!("`{}!`, {}", n, ASM_HOW) } else { format!("`{}!`, an assembly macro by another name: {}", n, ASM_HOW) })
             } else if name(k - 1) && k >= 2 && punct(k - 2, "$") {
                 Some(format!("`${}!`, a macro named by what a macro is given, which can be `include!`", text(k - 1).unwrap_or("")))
             } else if punct(k - 1, "]") && k >= 2 && punct(k - 2, ">") {
@@ -2638,7 +2905,9 @@ fn toml_text(s: &str) -> Option<(String, &str)> {
 /// or its `package`), or a line `dep_line` does not read, which is not read further.
 fn dep_built_elsewhere(line: &str) -> Option<String> {
     let Some(dep) = dep_line(line) else { return Some(format!("the dependency line `{}`, not read as a crate's name and version", line)) };
-    if let Some(c) = RUST_FILE_CRATES.iter().find(|c| dep.name == **c || dep.package.as_deref() == Some(**c)) {
+    // Cargo takes `rust_embed_impl` for `rust-embed-impl`, as crates.io keeps one of the two.
+    let same = |a: &str, c: &str| a.len() == c.len() && a.bytes().zip(c.bytes()).all(|(x, y)| x.eq_ignore_ascii_case(&y) || (matches!(x, b'-' | b'_') && matches!(y, b'-' | b'_')));
+    if let Some(c) = RUST_FILE_CRATES.iter().find(|c| same(&dep.name, c) || dep.package.as_deref().is_some_and(|p| same(p, c))) {
         return Some(format!("the dependency `{}`, {}, whose macros build files in", dep.name, c));
     }
     match dep.keys.iter().find(|k| !RUST_DEP_KEYS.contains(&k.as_str())).map(String::as_str) {
@@ -2653,7 +2922,17 @@ fn dep_built_elsewhere(line: &str) -> Option<String> {
 /// if it may not: it builds another file into it (`builds_in`).
 fn compiled_in_refused(name: &str, b: &Block) -> Option<String> {
     let (line, how) = b.compiles.as_ref()?;
-    Some(format!("{} builds another file into it ({} at line {}), which its SHA-256 in {} would not cover: a change there would build another plugin under the one confirmed, so it is not confirmed and does not load under a {} (put that code in {})", escaped(name), how, line, FILE, FILE, escaped(name)))
+    Some(format!("{} builds another file into it ({} at line {}), which its SHA-256 in {} would not cover: a change there would build another plugin under the one confirmed, so it is not confirmed and does not load under a {} ({})", escaped(name), how, line, FILE, FILE, built_in_instead(how, name)))
+}
+
+/// Why the Rust file `name`, whose text is `src`, may not be built held to its bytes, if it may
+/// not: it builds another file into it (`builds_in`). For a build that a provider's policy holds
+/// to the source's SHA-256 where no quillo.confirmed holds the run (`native::build_private`),
+/// whose judge, rustc's list of what it read, does not list what the assembler or the linker reads
+/// (FEEDBACK83.md, Q-1305, found by the coverage tests of 3117dea; branch feedback82-85).
+pub fn built_in_refused(name: &str, src: &str) -> Option<String> {
+    let (line, how) = builds_in(src)?;
+    Some(format!("{} builds another file into it ({} at line {}), which the SHA-256 its source is held to would not cover, so it does not load ({})", escaped(name), how, line, built_in_instead(&how, name)))
 }
 
 // ---- quillo.confirmed --------------------------------------------------------------------------

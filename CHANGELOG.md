@@ -281,12 +281,15 @@ What a program may notice:
 - **A file taken for some of its names that adds routes or tools, or reaches out at start**, is
   warned of (Q-1301); **a Rust file whose effects line leaves out what its code plainly calls**
   (`std::process::Command` without `run`) is warned of, a reading, not a proof, that follows
-  `use ... as` names, `use std::{fs::*}` and `r#fs`, `::` and `!` however spaced, and
+  `use ... as` names, `use std::{fs::*}` and `r#fs`, a type in brackets (`<(T)>::`) and an
+  `impl`'s type, `::` and `!` however spaced, and
   `include_str!` and the like as `fs`; what it cannot follow (a path a macro builds, a
   foreign block, `asm!`, a `use` nested past 64) reads as every effect but `db` (Q-1305).
   Under a `quillo.confirmed` a Rust file that builds another into it (`include!`,
-  `include_str!`, `include_bytes!` however written or named, `#[path]`, a `mod x;`, a `$m!`,
-  a `path`, `git` or `registry` dependency, a crate that embeds files such as `rust-embed`)
+  `include_str!`, `include_bytes!` however written or named, assembly by any name, whose
+  `.include` and `.incbin` read a file, `#[link]` and `#[debugger_visualizer]`, `#[path]`, a
+  `mod x;`, a `$m!`, a `path`, `git` or `registry` dependency, a crate that embeds files such
+  as `rust-embed` or its macro crate)
   is refused, as that file is outside its SHA-256; without one, warned of. The file is read
   by its tokens, from where rustc starts (after a BOM and a `#!` line), and its dependency
   lines as TOML reads them. Under a hold the build itself is judged by what rustc read: a
