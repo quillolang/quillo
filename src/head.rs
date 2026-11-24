@@ -11,7 +11,7 @@
 //! the same depth, the one inside more components, as the browser has it; then the later. Null says nothing, which leaves the key to an outer call or the
 //! document. The browser's side is `B.page_head` in src/client/runtime.js.
 
-use crate::interp::escape;
+use crate::interp::escape_into;
 
 /// The keys `page_head` takes, in the order their tags are written.
 pub const KEYS: [&str; 4] = ["title", "description", "image", "canonical"];
@@ -50,21 +50,36 @@ impl Head {
         self.said[i].as_ref().map(|(_, _, _, v)| v.as_str())
     }
 
-    /// The tags the winners make, each key's in one place.
+    /// The tags the winners make, each key's in one place: written into one text, its room made
+    /// once, each value escaped into it as it goes (FEEDBACK83.md Q-1300 / FEEDBACK84.md Q-1320, the
+    /// release benchmark of 0.8.11; branch feedback82-85: a `format!` for each key and an escaped
+    /// copy of each value, twice, were a dozen allocations of a page's).
     fn tags(&self) -> String {
-        let mut out = String::new();
-        let attr = |s: &str| escape(s);
-        if let Some(t) = self.get("title") {
-            out.push_str(&format!("<title>{}</title><meta property=\"og:title\" content=\"{}\">", escape(t), attr(t)));
+        let value = |k: usize| self.said[k].as_ref().map(|(_, _, _, v)| v.as_str());
+        let mut out = String::with_capacity(self.said.iter().flatten().map(|(_, _, _, v)| 96 + 2 * v.len()).sum());
+        // A value written twice, as `a`, the value, `b`, the value, `c`: escaped once, and copied.
+        let twice = |out: &mut String, a: &str, v: &str, b: &str, c: &str| {
+            out.push_str(a);
+            let from = out.len();
+            escape_into(v, out);
+            let to = out.len();
+            out.push_str(b);
+            out.extend_from_within(from..to);
+            out.push_str(c);
+        };
+        if let Some(t) = value(0) {
+            twice(&mut out, "<title>", t, "</title><meta property=\"og:title\" content=\"", "\">");
         }
-        if let Some(d) = self.get("description") {
-            out.push_str(&format!("<meta name=\"description\" content=\"{}\"><meta property=\"og:description\" content=\"{}\">", attr(d), attr(d)));
+        if let Some(d) = value(1) {
+            twice(&mut out, "<meta name=\"description\" content=\"", d, "\"><meta property=\"og:description\" content=\"", "\">");
         }
-        if let Some(i) = self.get("image") {
-            out.push_str(&format!("<meta property=\"og:image\" content=\"{}\">", attr(i)));
+        if let Some(i) = value(2) {
+            out.push_str("<meta property=\"og:image\" content=\"");
+            escape_into(i, &mut out);
+            out.push_str("\">");
         }
-        if let Some(c) = self.get("canonical") {
-            out.push_str(&format!("<link rel=\"canonical\" href=\"{}\"><meta property=\"og:url\" content=\"{}\">", attr(c), attr(c)));
+        if let Some(c) = value(3) {
+            twice(&mut out, "<link rel=\"canonical\" href=\"", c, "\"><meta property=\"og:url\" content=\"", "\">");
         }
         out
     }
@@ -72,36 +87,155 @@ impl Head {
     /// Whether `tag` (one tag's text, `<meta ...>`, its name `name` as written) is one of a key
     /// this head says.
     fn replaces(&self, name: &[u8], tag: &[u8]) -> bool {
-        let said = |k: &str| self.get(k).is_some();
+        // By `KEYS`' place, not by name (the release benchmark of 0.8.11).
+        let said = |k: usize| self.said[k].is_some();
         if name.eq_ignore_ascii_case(b"title") {
-            said("title")
+            said(0)
         } else if name.eq_ignore_ascii_case(b"meta") {
             // Compared as written, in any case, with nothing allocated (FEEDBACK84.md, Q-1320,
             // found by the review of 1a4bb9b; branch feedback82-85: each meta of a head was a
-            // String or two).
-            let Some(n) = attr_of(tag, b"name").or_else(|| attr_of(tag, b"property")) else { return false };
-            let is = |w: &[u8]| n.eq_ignore_ascii_case(w);
-            if is(b"og:title") {
-                said("title")
-            } else if is(b"description") || is(b"og:description") {
-                said("description")
-            } else if is(b"og:image") {
-                said("image")
-            } else if is(b"og:url") {
-                said("canonical")
-            } else {
-                false
-            }
+            // String or two). Its `name` and its `property` both: a meta is one of a key's where
+            // either says it, as `page_head` writes the one and the other and a crawler reads the
+            // one it looks for; `<meta name="twitter:description" property="og:description">`
+            // was read by its name alone and left, a second og:description (FEEDBACK84.md Q-1320,
+            // found by the review of 1c77039; branch feedback82-85).
+            let (n, p) = meta_names(tag);
+            n.and_then(meta_key).is_some_and(said) || p.and_then(meta_key).is_some_and(said)
         } else if name.eq_ignore_ascii_case(b"link") {
-            said("canonical") && attr_of(tag, b"rel").is_some_and(|r| r.split(|&c| is_space(c)).any(|w| w.eq_ignore_ascii_case(b"canonical")))
+            said(3) && attr_of(tag, b"rel").is_some_and(|r| has_token(r, b"canonical"))
         } else {
             false
         }
     }
 }
 
-/// The value of attribute `name` in one tag's text, its quotes taken off (entities left as they
-/// are: the names compared are plain words); of two of one name, the first, as the browser keeps.
+/// A meta's first `name` and first `property`, as `attr_of` reads each, in one read of the tag
+/// (FEEDBACK83.md Q-1300 / FEEDBACK84.md Q-1320, the release benchmark of 0.8.11; branch
+/// feedback82-85).
+fn meta_names(tag: &[u8]) -> (Option<&[u8]>, Option<&[u8]>) {
+    let (mut name, mut property) = (None, None);
+    for (key, value) in attrs(tag) {
+        if name.is_none() && key.eq_ignore_ascii_case(b"name") {
+            name = Some(value);
+        } else if property.is_none() && key.eq_ignore_ascii_case(b"property") {
+            property = Some(value);
+        }
+    }
+    (name, property)
+}
+
+/// The key (`KEYS`' place) a meta's name or property of `page_head`'s is of, read as the browser
+/// reads the value (`value_is`).
+fn meta_key(v: &[u8]) -> Option<usize> {
+    const WORDS: [(&[u8], usize); 5] = [(b"og:title", 0), (b"description", 1), (b"og:description", 1), (b"og:image", 2), (b"og:url", 3)];
+    WORDS.iter().find(|(w, _)| value_is(v, w)).map(|&(_, k)| k)
+}
+
+/// Whether the value `v` of an attribute is `word` (ASCII, in lower case) in any case, its
+/// character references read as the browser's tokenizer reads them (`decoded`): the browser reads
+/// `name="descr&#105;ption"` as a description, which was left beside `page_head`'s (FEEDBACK84.md
+/// Q-1320, found by the review of 1c77039; branch feedback82-85). A value without an `&`, nearly
+/// all, is compared as it is.
+fn value_is(v: &[u8], word: &[u8]) -> bool {
+    if !v.contains(&b'&') {
+        return v.eq_ignore_ascii_case(word);
+    }
+    let mut cs = decoded(v);
+    word.iter().all(|&w| cs.next().is_some_and(|c| c < 0x80 && (c as u8).to_ascii_lowercase() == w)) && cs.next().is_none()
+}
+
+/// Whether the value `v` of an attribute holds `word` (ASCII, in lower case) as one of its tokens,
+/// split at ASCII whitespace, in any case: a `rel`'s, read as `value_is` reads a value, so a
+/// `&#32;` splits it too (FEEDBACK84.md Q-1320, found by the review of 1c77039; branch
+/// feedback82-85).
+fn has_token(v: &[u8], word: &[u8]) -> bool {
+    if !v.contains(&b'&') {
+        return v.split(|&c| is_space(c)).any(|t| t.eq_ignore_ascii_case(word));
+    }
+    // How much of `word` the token so far is, None where it is not it.
+    let mut at = Some(0);
+    for c in decoded(v) {
+        if c < 0x80 && is_space(c as u8) {
+            if at == Some(word.len()) {
+                return true;
+            }
+            at = Some(0);
+        } else {
+            at = at.filter(|&k| k < word.len() && c < 0x80 && (c as u8).to_ascii_lowercase() == word[k]).map(|k| k + 1);
+        }
+    }
+    at == Some(word.len())
+}
+
+/// The characters of an attribute's value as the tokenizer reads them, as code points: its
+/// character references decoded (FEEDBACK84.md Q-1320, found by the review of 1c77039; branch
+/// feedback82-85). A number's (`&#105;`, `&#x69;`, `&#X69`, the `;` left out or not) is the
+/// character it names where that is ASCII, else not ASCII (given as U+FFFD: it is that for 0, a
+/// surrogate or past U+10FFFF, a character past ASCII otherwise, from 0x80 to 0x9F windows-1252's).
+/// Of the named ones, those that are ASCII (`ASCII_REFS`, the standard's whole list of them); every
+/// other is a character past ASCII, or `&fjlig;`'s "fj", which no name or token compared here has,
+/// so it is given as written, which compares the same. Every other byte as it is (one of UTF-8's
+/// past ASCII is no ASCII either).
+fn decoded(v: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        let c = *v.get(i)?;
+        if c == b'&' {
+            if let Some((ch, n)) = char_ref(&v[i..]) {
+                i += n;
+                return Some(ch);
+            }
+        }
+        i += 1;
+        Some(u32::from(c))
+    })
+}
+
+/// The ASCII character a reference at the start of `s` (an `&`) is, in an attribute's value, and
+/// its length (`decoded`).
+fn char_ref(s: &[u8]) -> Option<(u32, usize)> {
+    if s.get(1) == Some(&b'#') {
+        let hex = matches!(s.get(2), Some(b'x' | b'X'));
+        let radix = if hex { 16 } else { 10 };
+        let from = 2 + usize::from(hex);
+        let mut k = from;
+        let mut v: u32 = 0;
+        while let Some(d) = s.get(k).and_then(|&c| (c as char).to_digit(radix)) {
+            v = v.saturating_mul(radix).saturating_add(d);
+            k += 1;
+        }
+        if k == from {
+            return None;
+        }
+        k += usize::from(s.get(k) == Some(&b';'));
+        return Some((if (1..0x80).contains(&v) { v } else { 0xFFFD }, k));
+    }
+    let name = &s[1..];
+    if let Some(&(r, c)) = ASCII_REFS.iter().find(|(r, _)| name.starts_with(r)) {
+        return Some((u32::from(c), 1 + r.len()));
+    }
+    // The four the standard keeps from before, without their `;`: in a value, not where a letter,
+    // a digit or `=` follows.
+    let (r, c) = LEGACY_REFS.iter().find(|(r, _)| name.starts_with(r))?;
+    let next = name.get(r.len());
+    (!next.is_some_and(|&b| b.is_ascii_alphanumeric() || b == b'=')).then_some((u32::from(*c), 1 + r.len()))
+}
+
+/// The HTML standard's named character references that are one ASCII character, with their `;`.
+const ASCII_REFS: [(&[u8], u8); 45] = [
+    (b"Tab;", b'\t'), (b"NewLine;", b'\n'), (b"excl;", b'!'), (b"quot;", b'"'), (b"QUOT;", b'"'), (b"num;", b'#'), (b"dollar;", b'$'), (b"percnt;", b'%'),
+    (b"amp;", b'&'), (b"AMP;", b'&'), (b"apos;", b'\''), (b"lpar;", b'('), (b"rpar;", b')'), (b"ast;", b'*'), (b"midast;", b'*'), (b"plus;", b'+'),
+    (b"comma;", b','), (b"period;", b'.'), (b"sol;", b'/'), (b"colon;", b':'), (b"semi;", b';'), (b"lt;", b'<'), (b"LT;", b'<'), (b"equals;", b'='),
+    (b"gt;", b'>'), (b"GT;", b'>'), (b"quest;", b'?'), (b"commat;", b'@'), (b"lsqb;", b'['), (b"lbrack;", b'['), (b"bsol;", b'\\'), (b"rsqb;", b']'),
+    (b"rbrack;", b']'), (b"Hat;", b'^'), (b"lowbar;", b'_'), (b"UnderBar;", b'_'), (b"grave;", b'`'), (b"DiacriticalGrave;", b'`'), (b"lcub;", b'{'),
+    (b"lbrace;", b'{'), (b"verbar;", b'|'), (b"vert;", b'|'), (b"VerticalLine;", b'|'), (b"rcub;", b'}'), (b"rbrace;", b'}'),
+];
+
+/// Those of `ASCII_REFS` the standard also reads without their `;`.
+const LEGACY_REFS: [(&[u8], u8); 8] = [(b"quot", b'"'), (b"QUOT", b'"'), (b"amp", b'&'), (b"AMP", b'&'), (b"lt", b'<'), (b"LT", b'<'), (b"gt", b'>'), (b"GT", b'>')];
+
+/// The value of attribute `name` in one tag's text, its quotes taken off (its character references
+/// left as they are, for `value_is` to read); of two of one name, the first, as the browser keeps.
 /// Read by the tokenizer's attribute states, as `tag_close` ends the tag: before a name, spaces
 /// and a `/` are passed over and any other character starts it, `=` too, so `<meta ="x
 /// name="description">` is an attribute named `="x`, then the name. Read as `=` and a quoted
@@ -110,12 +244,18 @@ impl Head {
 /// 0038a97; branch feedback82-85). A name ends at a space, `/`, `>` or `=`; a value is quoted, or
 /// runs to a space or `>`.
 fn attr_of<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    attrs(tag).find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, value)| value)
+}
+
+/// Each attribute of one tag's text, its name and its value, in their order, read as `attr_of`
+/// says (`meta_names` reads two names in one pass).
+fn attrs(tag: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
     // Past the tag's name.
     let mut i = 1;
     while i < tag.len() && !is_space(tag[i]) && tag[i] != b'>' && tag[i] != b'/' {
         i += 1;
     }
-    while i < tag.len() {
+    std::iter::from_fn(move || {
         while i < tag.len() && (is_space(tag[i]) || tag[i] == b'/') {
             i += 1;
         }
@@ -153,11 +293,8 @@ fn attr_of<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
                 }
             }
         }
-        if key.eq_ignore_ascii_case(name) {
-            return Some(value);
-        }
-    }
-    None
+        Some((key, value))
+    })
 }
 
 fn is_space(b: u8) -> bool {
@@ -168,21 +305,34 @@ fn is_space(b: u8) -> bool {
 /// page that is no document (no doctype, `<html>`, `<head>`, `<body>`, `<frameset>` or `</head>`: a
 /// part of one, as an `hx-get` asks for) is left as it is.
 pub fn apply(body: &mut Vec<u8>, head: &Head) {
-    let tags = head.tags();
-    if tags.is_empty() {
+    if head.said.iter().all(Option::is_none) {
         return;
     }
     // Read once, as the browser reads it (`scan`): where the head ends, and the head's own tags of
     // the keys said, to be taken away: a `<title>` with its text and end tag, a `<meta>` or
-    // `<link>` whole.
-    let mut cuts: Vec<(usize, usize)> = Vec::new();
+    // `<link>` whole. Kept on the stack up to `FEW` of them, as a head has a few (FEEDBACK83.md
+    // Q-1300 / FEEDBACK84.md Q-1320, the release benchmark of 0.8.11; branch feedback82-85).
+    const FEW: usize = 8;
+    let mut few = [(0, 0); FEW];
+    let mut n = 0;
+    let mut more: Vec<(usize, usize)> = Vec::new();
     let Some((end, first)) = scan(body, true, |lt, name, close, end| {
         if head.replaces(name, &body[lt..close]) {
-            cuts.push((lt, if name.eq_ignore_ascii_case(b"title") { end } else { close }));
+            let cut = (lt, if name.eq_ignore_ascii_case(b"title") { end } else { close });
+            if n < FEW {
+                few[n] = cut;
+                n += 1;
+            } else {
+                if more.is_empty() {
+                    more.extend_from_slice(&few);
+                }
+                more.push(cut);
+            }
         }
     }) else {
         return;
     };
+    let cuts = if more.is_empty() { &few[..n] } else { &more[..] };
     // A head the page leaves out the browser starts at its first element: where that is cut, the
     // tags take its place, so what follows it (spaces, a comment, a doctype, which the browser
     // passes over in a head) stays in the head (FEEDBACK84.md, Q-1320, found by the review of
@@ -190,27 +340,58 @@ pub fn apply(body: &mut Vec<u8>, head: &Head) {
     let at = first.filter(|&p| cuts.first().is_some_and(|c| c.0 == p)).unwrap_or(end);
     // The page made again in one pass, what is kept copied once and the tags put in at `at`, which
     // no cut holds (FEEDBACK84.md, Q-1320, found by the review of 1a4bb9b; branch feedback82-85:
-    // each cut was a drain of the page's rest, a head of many of them quadratic).
-    let mut out = Vec::with_capacity(body.len() + tags.len());
-    let mut kept = 0;
-    let mut put = false;
-    for &(from, to) in &cuts {
-        if !put && at <= from {
-            out.extend_from_slice(&body[kept..at]);
-            out.extend_from_slice(tags.as_bytes());
-            kept = at;
-            put = true;
-        }
-        out.extend_from_slice(&body[kept..from]);
-        kept = to;
+    // each cut was a drain of the page's rest, a head of many of them quadratic); in the page's own
+    // bytes, rather than a copy of the page (`rewrite`; the release benchmark of 0.8.11).
+    rewrite(body, cuts, at, head.tags().as_bytes());
+}
+
+/// `body` without the bytes of `cuts` (in order, none holding `at`) and with `tags` at `at`, made
+/// in place: what is kept before `at` moved down over the cuts, then what is kept after it (the
+/// rest of the page) moved once to its place after the tags, then the tags written between
+/// (FEEDBACK83.md Q-1300 / FEEDBACK84.md Q-1320, the release benchmark of 0.8.11; branch
+/// feedback82-85: a copy of the whole page was made and the page's own bytes freed). The kept runs
+/// after `at` move by less and less (each cut before one takes its length off), so those that move
+/// up are the first few, moved last to first, and those that move down are moved first to last:
+/// no run is written over before it has moved.
+fn rewrite(body: &mut Vec<u8>, cuts: &[(usize, usize)], at: usize, tags: &[u8]) {
+    let len = body.len();
+    let (before, after) = cuts.split_at(cuts.partition_point(|c| c.0 < at));
+    // Before `at`: each kept run moved down over the cuts before it.
+    let mut w = before.first().map_or(at, |c| c.0);
+    for (k, &(_, to)) in before.iter().enumerate() {
+        let next = before.get(k + 1).map_or(at, |c| c.0);
+        body.copy_within(to..next, w);
+        w += next - to;
     }
-    if !put {
-        out.extend_from_slice(&body[kept..at]);
-        out.extend_from_slice(tags.as_bytes());
-        kept = at;
+    // After `at`: the kept runs, `run(k)` from `at` (or the end of the cut before it) to the next
+    // cut (or the page's end), from `w + tags.len()` on.
+    let run = |k: usize| (if k == 0 { at } else { after[k - 1].1 }, after.get(k).map_or(len, |c| c.0));
+    let from = w + tags.len();
+    let total = from + (len - at) - after.iter().map(|(f, t)| t - f).sum::<usize>();
+    if total > len {
+        body.resize(total, 0);
     }
-    out.extend_from_slice(&body[kept..]);
-    *body = out;
+    // The first run that moves down, or not at all, and where it goes.
+    let (mut down, mut to) = (0, from);
+    while down <= after.len() && to > run(down).0 {
+        let (f, t) = run(down);
+        to += t - f;
+        down += 1;
+    }
+    let mut d = to;
+    for k in down..=after.len() {
+        let (f, t) = run(k);
+        body.copy_within(f..t, d);
+        d += t - f;
+    }
+    let mut d = to;
+    for k in (0..down).rev() {
+        let (f, t) = run(k);
+        d -= t - f;
+        body.copy_within(f..t, d);
+    }
+    body[w..from].copy_from_slice(tags);
+    body.truncate(total);
 }
 
 /// Where `page_head`'s tags go in the page: where the browser's tree builder ends its head
@@ -610,7 +791,10 @@ fn foreign<'a>(name: &'a [u8], tag: &[u8], svg: bool) -> Open<'a> {
     } else if is_one(name, &[b"mi", b"mo", b"mn", b"ms", b"mtext"]) {
         Point::Text
     } else if name.eq_ignore_ascii_case(b"annotation-xml")
-        && attr_of(tag, b"encoding").is_some_and(|e| e.eq_ignore_ascii_case(b"text/html") || e.eq_ignore_ascii_case(b"application/xhtml+xml"))
+        // Its value as the browser reads it, references decoded (`encoding="text&sol;html"`), as a
+        // meta's name is (`value_is`; FEEDBACK84.md Q-1320, found by the review of 1c77039; branch
+        // feedback82-85).
+        && attr_of(tag, b"encoding").is_some_and(|e| value_is(e, b"text/html") || value_is(e, b"application/xhtml+xml"))
     {
         Point::Html
     } else {
@@ -978,49 +1162,80 @@ pub fn head_scripts(body: &[u8]) -> Vec<String> {
 /// `<a ="x>` (a name that starts with `=`) and `<a b==">` (a value that does) at their first, as
 /// the browser ends them. `<a b=c/>` does not end `/>`: its `/` is the value's.
 fn tag_close(body: &[u8], lt: usize) -> Option<(usize, bool)> {
-    #[derive(Clone, Copy)]
-    enum S {
-        /// The tag's name; an unquoted value.
-        Name,
-        Unquoted,
-        /// Before an attribute's name (after a space, a `/`, a quoted value).
-        Before,
-        /// In an attribute's name, after it.
-        Attr,
-        After,
-        /// After its `=`.
-        Value,
-    }
-    let mut s = S::Name;
-    let mut slash = false;
+    // Each of the tokenizer's states its own loop, a byte read once in the state it is in
+    // (FEEDBACK83.md Q-1300 / FEEDBACK84.md Q-1320, the release benchmark of 0.8.11; branch
+    // feedback82-85: one loop that matched the state at each byte was 1,100 of the 17,000
+    // instructions `page_head` added to a page). Only a `/` read before an attribute's name (the
+    // tag's name and an attribute's name and the spaces after it go there at a `/`) makes a `>`
+    // right after it end the tag `/>`.
     let mut k = lt + 1 + usize::from(body.get(lt + 1) == Some(&b'/'));
-    while k < body.len() {
-        let c = body[k];
-        if c == b'>' {
-            return Some((k + 1, slash));
+    // The tag's name.
+    loop {
+        match *body.get(k)? {
+            b'>' => return Some((k + 1, false)),
+            c if c == b'/' || is_space(c) => break,
+            _ => k += 1,
         }
-        let space = is_space(c);
-        slash = c == b'/' && matches!(s, S::Name | S::Before | S::Attr | S::After);
-        s = match s {
-            S::Name | S::Unquoted if space => S::Before,
-            S::Name if c == b'/' => S::Before,
-            S::Name | S::Unquoted => s,
-            S::Before if space || c == b'/' => S::Before,
-            S::Before => S::Attr,
-            S::Attr | S::After if c == b'=' => S::Value,
-            S::Attr | S::After if c == b'/' => S::Before,
-            S::Attr | S::After if space => S::After,
-            S::Attr | S::After => S::Attr,
-            S::Value if space => S::Value,
-            S::Value if c == b'"' || c == b'\'' => {
-                k += 1 + memchr::memchr(c, &body[k + 1..])?;
-                S::Before
-            }
-            S::Value => S::Unquoted,
-        };
-        k += 1;
     }
-    None
+    'before: loop {
+        // Before an attribute's name: spaces and `/`, the last of them read for `/>`.
+        let mut slash = false;
+        loop {
+            match *body.get(k)? {
+                b'>' => return Some((k + 1, slash)),
+                b'/' => slash = true,
+                c if is_space(c) => slash = false,
+                _ => break,
+            }
+            k += 1;
+        }
+        // An attribute's name, its first character whatever it is (`=` too), and the spaces after
+        // it, up to its `=`; another character after them starts another name.
+        k += 1;
+        'name: loop {
+            loop {
+                match *body.get(k)? {
+                    b'>' => return Some((k + 1, false)),
+                    b'/' => continue 'before,
+                    b'=' => break 'name,
+                    c if is_space(c) => break,
+                    _ => k += 1,
+                }
+            }
+            loop {
+                match *body.get(k)? {
+                    b'>' => return Some((k + 1, false)),
+                    b'/' => continue 'before,
+                    b'=' => break 'name,
+                    c if is_space(c) => k += 1,
+                    _ => {
+                        k += 1;
+                        continue 'name;
+                    }
+                }
+            }
+        }
+        // Its value: spaces, then a quoted one to its quote, or one to a space or `>`.
+        k += 1;
+        loop {
+            match *body.get(k)? {
+                b'>' => return Some((k + 1, false)),
+                q @ (b'"' | b'\'') => {
+                    k += 1 + memchr::memchr(q, &body[k + 1..])? + 1;
+                    continue 'before;
+                }
+                c if is_space(c) => k += 1,
+                _ => break,
+            }
+        }
+        loop {
+            match *body.get(k)? {
+                b'>' => return Some((k + 1, false)),
+                c if is_space(c) => continue 'before,
+                _ => k += 1,
+            }
+        }
+    }
 }
 
 #[cfg(test)]

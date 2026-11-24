@@ -5211,14 +5211,34 @@ const STYLE_ATTRS: &[&str] = &["style-src-attr", "style-src", "default-src"];
 pub(crate) fn policy_refuses(resp: &HttpResponse) -> Refused {
     let mut r = Refused::default();
     for (_, v) in resp.headers.iter().filter(|(k, v)| is_policy(k) && v != DROPPED) {
-        for policy in v.split(',') {
-            let ds = directives(policy);
-            let refuses = |names: &[&str]| deciding(&ds, names).is_some_and(|s| !lets_inline(s, names == SCRIPTS));
-            r.scripts |= refuses(SCRIPTS);
-            r.attr |= refuses(STYLE_ATTRS);
-        }
+        let one = held_refuses(v).unwrap_or_else(|| refuses_of(v));
+        r.scripts |= one.scripts;
+        r.attr |= one.attr;
     }
     r
+}
+
+/// What one header's policies refuse, each of them read.
+fn refuses_of(v: &str) -> Refused {
+    let mut r = Refused::default();
+    for policy in v.split(',') {
+        let ds = directives(policy);
+        let refuses = |names: &[&str]| deciding(&ds, names).is_some_and(|s| !lets_inline(s, names == SCRIPTS));
+        r.scripts |= refuses(SCRIPTS);
+        r.attr |= refuses(STYLE_ATTRS);
+    }
+    r
+}
+
+/// What the page policy of a run held to its `quillo.confirmed` refuses, where `v` is that policy:
+/// worked out once, as it is fixed for the run (`confirm::page_policy`, set once at the start).
+/// Read again on every page, it was a third of a held page's time, about 25,000 instructions on
+/// each, the Fortunes page's +50% (FEEDBACK83.md Q-1300 / FEEDBACK84.md Q-1320, the release
+/// benchmark of 0.8.11; branch feedback82-85). Another policy, a program's own, is read as before.
+fn held_refuses(v: &str) -> Option<Refused> {
+    static HELD: std::sync::OnceLock<Refused> = std::sync::OnceLock::new();
+    let held = crate::confirm::page_policy()?;
+    (v == held).then(|| *HELD.get_or_init(|| refuses_of(held)))
 }
 
 /// The text of each `<script>` element in markup Quillo wrote.

@@ -205,7 +205,9 @@ What a program may notice:
   the tags go where it puts the head, before the text or element that ends it early, and an
   `<svg>`'s, a `<template>`'s or a script's `<title>` stays. They go before the head's first
   `<noscript>`, and its title, description or canonical is cut, so a crawler without scripts
-  reads exactly one of each.
+  reads exactly one of each. A tag the page has is known by its `name` or its `property`, with
+  its character references read as the browser reads them (`name="&#100;escription"` is the
+  description; found in review).
 - **`page_url()` and `page_url(path)`**: the page's public address, with its scheme (https only
   through a trusted proxy), host and `--base` prefix (Q-1328).
 - **`moves_in_place()`**: same-site links and `navigate` move between the program's routes
