@@ -1134,7 +1134,12 @@ Asking, and who answers:
   library a process opens, which every instance and reload shares; the copy is made where
   the program cannot reach (on Linux a sealed memfd, else a private file; on macOS in the
   user's own temporary folder where `TMPDIR` is the program's), else the plugin does not
-  load. No other plugin's library is judged. It is still a reading, not a proof: a crate can do what it does
+  load. No other plugin's library is judged. A plugin's text is read from where rustc starts,
+  past a byte order mark; a pinned build is also judged by the `Cargo.lock` it wrote: every
+  dependency from crates.io, none from a folder, git or another registry. A plugin pinned by
+  its library's SHA-256 is never built: only that library loads. On macOS each install name's
+  folders must be the system's alone, and a weak load of a file that is not there is
+  refused. It is still a reading, not a proof: a crate can do what it does
   unseen (`libc::kill` reads as the `libc` crate, which the file's `crates` list confirms by
   name), and a proc macro that reads a file without telling rustc, or a dependency's own
   macro that writes assembly into a function inlined into the plugin (refused, as assembly,

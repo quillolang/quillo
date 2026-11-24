@@ -377,7 +377,14 @@ What a program may notice:
   by the review of 0a3aeb9). A held or pinned library is copied once a process, shared by instances and
   reloads (each loaded a copy of its own, its state reset), in a folder the program cannot
   reach; musl's sonames are the C runtime's; an ELF library with overlapping segments is
-  refused and its names are read through the mapping (found by the review of ce4f15d).
+  refused and its names are read through the mapping (found by the review of ce4f15d). A
+  plugin is read from where rustc starts, so a byte order mark no longer hides its
+  dependency lines (a `path` dependency built and changed under one SHA-256), and a pinned
+  build is judged by the `Cargo.lock` it wrote (crates.io only); a plugin pinned by its
+  library's hash is never built (a repository's source was, its build script run, under a
+  host's library pin); an ELF library's dynamic table is read to its end as the loader reads
+  it; on macOS an install name's folders are judged and a weak load of a missing file is
+  refused (found by the final review of a6cee54).
 - **What `quillo.confirmed` does not confirm** is an error at its line, and so is a name used
   from another file and not taken, under one (see Security).
 - **`"""` and `'''`** say that text over several lines is a backtick string (FEEDBACK85.md,

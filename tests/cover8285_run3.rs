@@ -1880,3 +1880,76 @@ fn an_elf_librarys_strings_are_read_where_its_loader_reads_them() {
     let far = elf_of(&[(0, 0, 0x1000), (0x1000, 0x10000, 0x100)], 0x200, &[(1, 0xfd00), (5, 0x300)], &[(0x300, b"\0"), (0x1000, b"libssl.so.3\0"), (0x10000, b"libc.so.6\0")], 0x10010);
     assert_eq!(quillo::native::loads_refused(&far), Some("needs libssl.so.3, which is not the C runtime's".to_string()));
 }
+
+// Fix round 12 (F3)
+
+/// A crate of the test's folder, `evil2`, whose build script writes `MARKER` beside it when cargo
+/// builds it, and its path.
+fn marker_crate(d: &Path) -> PathBuf {
+    let dep = d.join("evil2");
+    std::fs::create_dir_all(dep.join("src")).unwrap();
+    std::fs::write(dep.join("Cargo.toml"), "[package]\nname = \"evil2\"\nversion = \"0.1.0\"\nedition = \"2021\"\nbuild = \"build.rs\"\n\n[lib]\npath = \"src/lib.rs\"\n").unwrap();
+    std::fs::write(dep.join("build.rs"), format!("fn main() {{ std::fs::write({:?}, \"ran\").unwrap(); }}\n", d.join("MARKER").display().to_string())).unwrap();
+    std::fs::write(dep.join("src/lib.rs"), "pub fn x() -> i64 { 4242 }\n").unwrap();
+    dep
+}
+
+/// A plugin a host's layer pins by its library's SHA-256 is never built, building on or not: with
+/// the pinned library in `.quillo/native` (bytes that are no library) and a lock line of another
+/// hash, the start does not build the repository's plugin, so its dependency's build script never
+/// runs, and the library pinned is refused as what it is. Before, the start said it was building it
+/// again and ran cargo (src/native.rs build_with, prebuild, FEEDBACK83.md Q-1305, found by the
+/// coverage tests; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_plugin_pinned_by_its_library_is_never_built() {
+    use sha2::Digest;
+    let d = Dir(support::temp_dir("cov8285r3-never").canonicalize().unwrap());
+    let (app, tmp) = (d.0.join("app"), d.0.join("tmp"));
+    for f in [&app, &tmp] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    let dep = marker_crate(&d.0);
+    std::fs::write(app.join("qr.qwer"), format!("//! version: 1.0.0\n//! effects: none\n//! [dependencies]\n//! evil2 = {{ path = {:?} }}\npub fn hi() -> i64 {{ evil2::x() }}\n", dep.display().to_string())).unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"qr.qwer\"\nprint(hi())\n").unwrap();
+    let lib = quillo::native::library_path(&app.join("qr.qwer")).unwrap();
+    std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+    let fake = b"not the library built from qr.qwer";
+    std::fs::write(&lib, fake).unwrap();
+    std::fs::write(app.join(".quillo/plugins.lock"), format!("{} {}\n", lib.file_name().unwrap().to_string_lossy(), "0".repeat(64))).unwrap();
+    let hash: String = sha2::Sha256::digest(fake).iter().map(|b| format!("{:02x}", b)).collect();
+    let host = d.0.join("host.toml");
+    std::fs::write(&host, format!("[plugins]\nallow = [\"qr@sha256:{}\"]\n", hash)).unwrap();
+    let (h, t, cache) = (host.display().to_string(), tmp.display().to_string(), r10_cache("never"));
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check"], &[("QUILLO_POLICY_PATH", &h), ("TMPDIR", &t), ("QUILLO_NATIVE_CACHE", &cache)], &d.0.join("run.log"), 600);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("is not a library this system loads: it does not load") && !out.contains("building"), "{}", out);
+    assert!(!d.0.join("MARKER").exists(), "the repository's dependency was built: {}", out);
+}
+
+/// A plugin that starts with a byte order mark, held to its source's SHA-256, builds no dependency
+/// its header names from a folder: refused before anything is built, at the dependency's line,
+/// where the header was read on the text with the mark (no header) and the build on the text
+/// without it, which built `evil2` and ran its build script (src/native.rs rust_text, build_private;
+/// FEEDBACK83.md Q-1305, found by the coverage tests; branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_plugin_with_a_byte_order_mark_under_a_source_pin_builds_no_dependency_from_a_folder() {
+    use sha2::Digest;
+    let d = Dir(support::temp_dir("cov8285r3-bom").canonicalize().unwrap());
+    let (app, tmp) = (d.0.join("app"), d.0.join("tmp"));
+    for f in [&app, &tmp] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    let dep = marker_crate(&d.0);
+    let src = format!("\u{FEFF}//! version: 1.0.0\n//! effects: none\n//! [dependencies]\n//! evil2 = {{ path = {:?} }}\npub fn hi() -> i64 {{ evil2::x() }}\n", dep.display().to_string());
+    std::fs::write(app.join("hi.qwer"), &src).unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let hash: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
+    std::fs::write(app.join("pin.toml"), format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash)).unwrap();
+    let (t, record) = (tmp.display().to_string(), d.0.join("record").display().to_string());
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--policy", "pin.toml"], &[("TMPDIR", &t), ("QUILLO_BUILT_RECORD_DIR", &record)], &d.0.join("run.log"), 600);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("builds another file into it (the dependency `evil2` from a folder (`path`) at line 4)") && !out.contains("building ") && !out.contains("4242"), "{}", out);
+    assert!(!d.0.join("MARKER").exists(), "the dependency was built: {}", out);
+}

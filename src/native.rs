@@ -92,6 +92,58 @@ pub struct Parsed {
     pub errors: Vec<(u32, String)>,
 }
 
+/// A Rust file's text from where rustc starts reading it: past a byte order mark. Every reading
+/// of a plugin's text starts here (its header's lines, `header_lines`; its functions, `parse`; the
+/// build, which is given what `parse` read; the effects reading, `confirm::rust_code`, which skips
+/// it as rustc does): the dependency lines were read on the raw text, where a mark made the first
+/// line no comment and the header empty, while the build stripped the mark and built every
+/// dependency, a `path` one too, under a source pin or a quillo.confirmed (FEEDBACK83.md, Q-1305,
+/// found by the review of a6cee54; branch feedback82-85).
+pub fn rust_text(src: &str) -> &str {
+    src.strip_prefix('\u{FEFF}').unwrap_or(src)
+}
+
+/// Why the Cargo.lock a pinned build's cargo wrote, `lock`, may not be built held to the plugin's
+/// SHA-256, if it may not: a package but the plugin's own crate (`own`) whose source is not
+/// crates.io's index (`registry+https://github.com/rust-lang/crates.io-index`, or the sparse
+/// index's `sparse+https://index.crates.io/`): one with no source (a folder: a `path`, a `[patch]`
+/// to one), a git one, another registry. Judged where cargo acted, whatever the plugin's header
+/// said and however it was read (FEEDBACK83.md, Q-1305, found by the review of a6cee54; branch
+/// feedback82-85). Public so it is tested on its own.
+pub fn lock_refused(lock: &str, own: &str) -> Option<String> {
+    const CRATES_IO: &[&str] = &["registry+https://github.com/rust-lang/crates.io-index", "sparse+https://index.crates.io/"];
+    let unquote = |v: &str| v.trim().trim_matches('"').to_string();
+    let judge = |name: Option<String>, source: Option<String>| -> Option<String> {
+        let name = name.unwrap_or_else(|| "a package with no name".to_string());
+        match source {
+            None if name == own => None,
+            None => Some(format!("the package {} from a folder (it has no source in Cargo.lock)", crate::confirm::escaped(&name))),
+            Some(s) if CRATES_IO.contains(&s.as_str()) => None,
+            Some(s) => Some(format!("the package {} from {}", crate::confirm::escaped(&name), crate::confirm::escaped(&s))),
+        }
+    };
+    let (mut name, mut source, mut in_package, mut packages) = (None, None, false, 0usize);
+    for line in lock.lines().map(str::trim).chain(std::iter::once("[end]")) {
+        if line.starts_with('[') {
+            if in_package {
+                packages += 1;
+                if let Some(why) = judge(name.take(), source.take()) {
+                    return Some(why);
+                }
+            }
+            in_package = line == "[[package]]";
+            (name, source) = (None, None);
+        } else if in_package {
+            if let Some(v) = line.strip_prefix("name = ") {
+                name = Some(unquote(v));
+            } else if let Some(v) = line.strip_prefix("source = ") {
+                source = Some(unquote(v));
+            }
+        }
+    }
+    (packages == 0).then(|| "a Cargo.lock with no package in it".to_string())
+}
+
 /// The `//!` lines at the top of a file: each one's line (from 0) and its text after `//!` and one
 /// space. Blank lines, plain `//` comments and block comments before and between them are passed
 /// over, and in Rust (`rust`) `#![...]` and `/*! ... */` too; anything else ends them, a `///` line
@@ -102,6 +154,8 @@ pub struct Parsed {
 /// feedback56; the block comments as the lexer reads them found in review, for `.qwer` files too,
 /// where `/* a */ /* b` on one line left the second open unseen and `/*!` ended the header).
 pub fn header_lines(src: &str, rust: bool) -> Vec<(usize, &str)> {
+    // A Rust file's from where rustc starts (`rust_text`); a mark takes no line.
+    let src = if rust { rust_text(src) } else { src };
     let mut out = Vec::new();
     // How deep in block comments a line starts (Quillo's: at most 1), and in an attribute.
     let (mut depth, mut attribute) = (0usize, false);
@@ -179,6 +233,7 @@ fn comment_end<'a>(s: &'a str, depth: &mut usize, rust: bool) -> Option<&'a str>
 
 /// Reads a `.qwer` file's header and its top-level `pub fn`s.
 pub fn parse(src: &str) -> Parsed {
+    let src = rust_text(src);
     let mut out = Parsed::default();
     // The header: `//!` lines at the top, from `[dependencies]` on.
     let mut in_deps = false;
@@ -1694,7 +1749,8 @@ pub fn prebuild(files: &[PathBuf]) {
         }
         // Nor what is not confirmed, nor what is built apart from its confirmed bytes
         // (FEEDBACK83.md, Q-1300, found in review; branch feedback82-85).
-        if crate::confirm::plugin_ok(f).is_err() || crate::confirm::pinned(f) {
+        // Nor one pinned by its library's SHA-256, which is never built (`build_with`).
+        if crate::confirm::plugin_ok(f).is_err() || crate::confirm::pinned(f) || pinned_by_hash(f) {
             continue;
         }
         let Ok(src) = crate::error::read_text(f) else { continue };
@@ -1792,6 +1848,19 @@ fn build_with(qwer: &Path, here: bool) -> Result<(PathBuf, Parsed), String> {
     }
     let src = crate::error::read_source(qwer).map_err(|e| format!("cannot read {}: {}", qwer.display(), e))?;
     let parsed = parse(&src);
+    // A plugin a layer pins by its library's SHA-256 (not its source's, which `here` builds apart)
+    // is never built: only that library loads, from `.quillo/native`, its hash judged as it is
+    // opened (`load_copy`). Before, a library that did not match the lock was built again, and the
+    // repository's crate and its dependency's build script ran before the load was refused
+    // (FEEDBACK83.md, Q-1305, found by the review of a6cee54; branch feedback82-85).
+    if pinned_by_hash(qwer) {
+        let lib = lib_path(qwer, &src);
+        return if lib_there(&lib).map_err(|why| format!("will not load the library of {}: {}", qwer.display(), why))? {
+            Ok((lib, parsed))
+        } else {
+            Err(format!("{} is pinned by its library's SHA-256, so only that library loads, and it is not in .quillo/native: nothing is built for it (bring the library the policy pins)", qwer.display()))
+        };
+    }
     let abs = qwer.canonicalize().unwrap_or_else(|_| qwer.to_path_buf());
     let lib = lib_path(qwer, &src);
     // Built, and the library that was built: loaded (Q-477).
@@ -2363,7 +2432,7 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
     }
     let version = crate::install::header_version(&src);
     crate::policy::get().plugin(&stem(qwer), version.as_deref(), std::slice::from_ref(&hash))?;
-    let parsed = parse(src.strip_prefix('\u{FEFF}').unwrap_or(&src));
+    let parsed = parse(&src);
     // Loaded already (an instance, a reload): the library in memory, whose file is gone.
     let kept = BUILT_HERE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|m| m.get(&hash).cloned());
     if let Some((lib, _)) = kept {
@@ -2444,6 +2513,16 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
             }
             let errors: Vec<&str> = log.lines().filter(|l| !l.trim_start().starts_with("Compiling") && !l.trim_start().starts_with("Updating") && !l.trim_start().starts_with("Locking")).collect();
             return Err(format!("cannot build {}:\n{}", qwer.display(), errors.join("\n")));
+        }
+        // Judged where cargo acts too: every package of the Cargo.lock it wrote, but the plugin's
+        // own crate, from crates.io, whatever the header said (`lock_refused`).
+        let lock = std::fs::read_to_string(crate_dir.join("Cargo.lock")).map_err(|e| format!("{} is held to its SHA-256, and its build's Cargo.lock cannot be read ({}): it does not load", qwer.display(), e))?;
+        if let Some(why) = lock_refused(&lock, &crate_name) {
+            return Err(format!(
+                "{} is held to its SHA-256, and its build took {}, whose code that hash does not cover: it does not load, and what was built is not kept (take each dependency from crates.io by its version)",
+                qwer.display(),
+                why
+            ));
         }
         // Judged by what the compiler read: nothing but its source and Quillo's glue. Else its
         // library is not kept, nor recorded, and the private folder goes (`result`).
@@ -3067,6 +3146,59 @@ pub fn loads_refused(bytes: &[u8]) -> Option<String> {
     }
 }
 
+/// Whether the folders of the install name `n` are the system's alone, as dyld reads them: the
+/// nearest one there, resolved, and each above it, root's, that no one else may write in (a folder
+/// with the sticky bit lets no one rename what is root's in it). One not there yet is judged by
+/// its nearest folder that is, in which only root could make it.
+fn system_folders(n: &str) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mut at = Path::new(n).parent();
+        while let Some(d) = at {
+            if d.exists() {
+                break;
+            }
+            at = d.parent();
+        }
+        let Some(real) = at.and_then(|d| d.canonicalize().ok()) else { return false };
+        real.ancestors().all(|a| std::fs::symlink_metadata(a).is_ok_and(|m| m.uid() == 0 && (m.mode() & 0o022 == 0 || (m.is_dir() && m.mode() & 0o1000 != 0))))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = n;
+        true
+    }
+}
+
+/// Whether dyld's shared cache holds the library `n` (macOS 11 on keeps the system's libraries
+/// there, not as files): `_dyld_shared_cache_contains_path`, asked by its name, so a macOS without
+/// it is asked nothing (false).
+fn in_shared_cache(n: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        static ASK: OnceLock<usize> = OnceLock::new();
+        let f = *ASK.get_or_init(|| {
+            // SAFETY: dlsym with RTLD_DEFAULT and a NUL-ended name only looks the name up.
+            unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"_dyld_shared_cache_contains_path".as_ptr()) as usize }
+        });
+        let Ok(c) = std::ffi::CString::new(n) else { return false };
+        if f == 0 {
+            return false;
+        }
+        // SAFETY: the symbol is dyld's `bool _dyld_shared_cache_contains_path(const char*)`, given
+        // a NUL-ended path.
+        let ask: unsafe extern "C" fn(*const libc::c_char) -> bool = unsafe { std::mem::transmute(f) };
+        // SAFETY: that function, given a NUL-ended path it only reads.
+        unsafe { ask(c.as_ptr()) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = n;
+        false
+    }
+}
+
 /// The system's page size, which a loader maps a library's segments by.
 fn page_size() -> u64 {
     #[cfg(unix)]
@@ -3129,6 +3261,17 @@ fn macho_loads(b: &[u8]) -> Option<String> {
                 let Some(n) = name(8) else { return unreadable() };
                 if !(system(&n) && (n.starts_with("/usr/lib/") || n.starts_with("/System/Library/"))) {
                     return Some(format!("loads {} by its install name, which is not the system's (/usr/lib, /System/Library)", crate::confirm::escaped(&n)));
+                }
+                // Its folders the system's alone: `/System/Library/AssetsV2/downloadDir` is root's
+                // and anyone may write in it, and a library weak-loaded from there passed
+                // (FEEDBACK83.md, Q-1305, found by the review of a6cee54; branch feedback82-85).
+                if !system_folders(&n) {
+                    return Some(format!("loads {} by its install name, whose folder others than the system may write in", crate::confirm::escaped(&n)));
+                }
+                // A weak load of a file that is not there, nor in dyld's shared cache: a file put
+                // there later is loaded.
+                if cmd == 0x8000_0018 && !Path::new(&n).exists() && !in_shared_cache(&n) {
+                    return Some(format!("weak-loads {}, which is not there: a file put there later would be loaded", crate::confirm::escaped(&n)));
                 }
             }
             // LC_ID_DYLIB
@@ -3223,11 +3366,21 @@ fn elf_loads(b: &[u8]) -> Option<String> {
         Some(at) if at == dyn_off => {}
         _ => return Some("has a dynamic table (PT_DYNAMIC) whose place in the file is not where its loader reads it".to_string()),
     }
+    // Its entries read as the loader reads them, from its start to its DT_NULL, whatever its
+    // `p_filesz` says, inside the segment that holds it: glibc and musl read on past a table of 16
+    // bytes to a DT_RUNPATH and a DT_NEEDED after it, which this reading never saw. One with no
+    // DT_NULL in its segment is no library this reading takes (FEEDBACK83.md, Q-1305, found by the
+    // review of a6cee54; branch feedback82-85).
     let entry = 2 * word as u64;
+    let Some(seg_end) = loads.iter().find(|(l_va, _, l_sz)| dyn_va >= *l_va && dyn_va < l_va + l_sz).map(|(_, l_off, l_sz)| l_off + l_sz) else { return unreadable() };
+    let _ = dyn_size;
     let mut entries: Vec<(u64, u64)> = Vec::new();
     let mut strtab = None;
     let mut o = dyn_off;
-    while o + entry <= dyn_off + dyn_size {
+    loop {
+        if o + entry > seg_end {
+            return unreadable();
+        }
         let (Some(tag), Some(val)) = (num(o as usize, word), num(o as usize + word, word)) else { return unreadable() };
         if tag == 0 {
             break;
@@ -3420,7 +3573,7 @@ fn build_confirmed(qwer: &Path, program: &Path) -> Result<(PathBuf, Parsed), Str
         if let Some(want) = record.as_ref().and_then(|r| record_get(r, &key)) {
             let same = |h: &str| if h == want { Ok(()) } else { Err(format!("{} is not the library built here", lib.display())) };
             if let Ok(checked) = load_copy(&lib, &same) {
-                return Ok((checked, parse(src.strip_prefix('\u{FEFF}').unwrap_or(&src))));
+                return Ok((checked, parse(&src)));
             }
         }
     }
