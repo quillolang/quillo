@@ -102,6 +102,13 @@ impl Head {
 
 /// The value of attribute `name` in one tag's text, its quotes taken off (entities left as they
 /// are: the names compared are plain words); of two of one name, the first, as the browser keeps.
+/// Read by the tokenizer's attribute states, as `tag_close` ends the tag: before a name, spaces
+/// and a `/` are passed over and any other character starts it, `=` too, so `<meta ="x
+/// name="description">` is an attribute named `="x`, then the name. Read as `=` and a quoted
+/// value, the name was lost in it, and the page had its own description beside `page_head`'s,
+/// where the browser and a crawler read both (FEEDBACK84.md Q-1320, found by the coverage tests of
+/// 0038a97; branch feedback82-85). A name ends at a space, `/`, `>` or `=`; a value is quoted, or
+/// runs to a space or `>`.
 fn attr_of<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     // Past the tag's name.
     let mut i = 1;
@@ -115,7 +122,9 @@ fn attr_of<'a>(tag: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
         if i >= tag.len() || tag[i] == b'>' {
             return None;
         }
+        // Its first character is the name's, whatever it is.
         let from = i;
+        i += 1;
         while i < tag.len() && !is_space(tag[i]) && !matches!(tag[i], b'=' | b'>' | b'/') {
             i += 1;
         }

@@ -2289,11 +2289,12 @@ impl Drop for Loading {
 /// builtins and files (`NAMED`) are made only for a held run.
 const NAMED_SLOTS: usize = 4096;
 
-/// Each stand-in's builtin and the file that named it, given before the stand-in is: made the first
-/// time a stand-in is given, which is in a held run only (32 bytes each), not kept in the binary.
-static NAMED: OnceLock<Box<[OnceLock<(BuiltinFn, Option<Arc<str>>)>]>> = OnceLock::new();
+/// Each stand-in's builtin, the file that named it, and whether the builtin makes builtins
+/// (`makes_builtins`), given before the stand-in is: made the first time a stand-in is given, which
+/// is in a held run only (40 bytes each), not kept in the binary.
+static NAMED: OnceLock<Box<[OnceLock<(BuiltinFn, Option<Arc<str>>, bool)>]>> = OnceLock::new();
 
-fn named() -> &'static [OnceLock<(BuiltinFn, Option<Arc<str>>)>] {
+fn named() -> &'static [OnceLock<(BuiltinFn, Option<Arc<str>>, bool)>] {
     NAMED.get_or_init(|| (0..NAMED_SLOTS).map(|_| OnceLock::new()).collect())
 }
 
@@ -2436,7 +2437,8 @@ fn name_carries_first(n: &'static str, key: u64, seen: &std::sync::atomic::Atomi
 }
 
 /// `f`'s stand-in for `file`: the one given before, or a new one; `f` itself where it is one.
-fn named_fn(f: BuiltinFn, file: &Option<Arc<str>>) -> BuiltinFn {
+/// `name` is the builtin's, which says whether what it makes is held too (`makes_builtins`).
+fn named_fn(name: &str, f: BuiltinFn, file: &Option<Arc<str>>) -> BuiltinFn {
     let key = (f as usize, file.clone());
     {
         let given = GIVEN.read().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2453,10 +2455,41 @@ fn named_fn(f: BuiltinFn, file: &Option<Arc<str>>) -> BuiltinFn {
     }
     let k = given.by.len();
     let Some(g) = NAMED_FNS.get(k / 1024).map(|block| block[k / 32 % 32][k % 32]) else { return named_full };
-    let _ = named()[k].set((f, file.clone()));
+    let _ = named()[k].set((f, file.clone(), makes_builtins(name)));
     given.fns.insert(g as usize);
     given.by.insert(key, g);
     g
+}
+
+/// The builtins whose value holds builtins: `db.connect` and a shards' `on` make a connection,
+/// `db.shards` the shards, each a map of `db`'s functions and its number. Called by its stand-in
+/// (`held_maker` gives it one where it is called by its name), what one makes is held to the
+/// file of the code that made it (`call_maker`, `held_to`), as a builtin that code names is
+/// (FEEDBACK83.md Q-1300, found by the coverage tests of 0038a97; branch feedback82-85). A
+/// file's connections take the stand-ins of `db`'s functions for that file, the ones `db` handed
+/// on whole by it takes, and shards' `on` and `all`. A builtin that comes to make a map of builtins
+/// belongs here, and its name as a member in `eval_receiver`; no other stand-in's call looks at
+/// what it gives.
+fn makes_builtins(name: &str) -> bool {
+    matches!(name, "db.connect" | "db.shards" | "db.on")
+}
+
+/// `m`, which a stand-in's builtin made for `file`, with each builtin in it that may reach
+/// something held to `file`: a connection's `exec` and the rest, which were the builtins
+/// themselves, so that handed to another file's helper they ran as the helper's file
+/// (FEEDBACK83.md Q-1300, found by the coverage tests of 0038a97; branch feedback82-85).
+#[cold]
+#[inline(never)]
+fn held_to(m: Arc<Map>, file: &Option<Arc<str>>) -> Value {
+    let mut held = Arc::unwrap_or_clone(m);
+    for x in held.values_mut() {
+        if let Value::Builtin(n, f) = x {
+            if carries_name(n) {
+                *f = named_fn(n, *f, file);
+            }
+        }
+    }
+    Value::Map(Arc::new(held))
 }
 
 /// What a one-parameter function gives without being called, when calling it can do nothing
@@ -5940,12 +5973,35 @@ impl Interp {
     /// The caller's `cur_file` is put back on every way out, a builtin's panic included, which a
     /// `catch_unwind` above may recover from with this interpreter: its code went on held to the
     /// stand-in's file (FEEDBACK83.md, Q-1300, found by the review of 2a1d3f7; branch feedback82-85).
+    /// One of a builtin that makes builtins goes on in `call_maker`.
     #[inline(never)]
     fn call_named(&mut self, k: usize, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
-        let Some((f, file)) = NAMED.get().and_then(|n| n.get(k)).and_then(OnceLock::get) else { return named_full(self, args, line) };
+        let Some((f, file, makes)) = NAMED.get().and_then(|n| n.get(k)).and_then(OnceLock::get) else { return named_full(self, args, line) };
+        if *makes {
+            return self.call_maker(*f, file, args, line);
+        }
         let was = std::mem::replace(&mut self.cur_file, file.clone());
         let back = FileBack { it: self, was: std::mem::ManuallyDrop::new(was) };
         f(&mut *back.it, args, line)
+    }
+
+    /// `call_named` of a builtin that makes builtins (`makes_builtins`: `db.connect`, `db.shards`, a
+    /// shards' `on`): what it makes, a connection, is held to the stand-in's file too (`held_to`).
+    /// Its functions were the builtins themselves, so that `c.exec` handed to another file's helper
+    /// ran as the helper's file (FEEDBACK83.md Q-1300, found by the coverage tests of 0038a97;
+    /// branch feedback82-85).
+    #[cold]
+    #[inline(never)]
+    fn call_maker(&mut self, f: BuiltinFn, file: &Option<Arc<str>>, args: Vec<Value>, line: u32) -> Result<Value, Ctrl> {
+        let r = {
+            let was = std::mem::replace(&mut self.cur_file, file.clone());
+            let back = FileBack { it: self, was: std::mem::ManuallyDrop::new(was) };
+            f(&mut *back.it, args, line)
+        };
+        match r {
+            Ok(Value::Map(m)) => Ok(held_to(m, file)),
+            r => r,
+        }
     }
 
     /// `v`, which the code of `cur_file` names as a value while a `quillo.confirmed` holds the run:
@@ -5958,13 +6014,13 @@ impl Interp {
     #[inline(never)]
     fn named_here(&self, v: Value) -> Value {
         match v {
-            Value::Builtin(n, f) if carries_name(n) => Value::Builtin(n, named_fn(f, &self.cur_file)),
-            Value::Map(m) if is_module_map(&m) && m.values().any(|x| matches!(x, Value::Builtin(n, f) if carries_name(n) && named_fn(*f, &self.cur_file) as usize != *f as usize)) => {
+            Value::Builtin(n, f) if carries_name(n) => Value::Builtin(n, named_fn(n, f, &self.cur_file)),
+            Value::Map(m) if is_module_map(&m) && m.values().any(|x| matches!(x, Value::Builtin(n, f) if carries_name(n) && named_fn(n, *f, &self.cur_file) as usize != *f as usize)) => {
                 let mut held = (*m).clone();
                 for x in held.values_mut() {
                     if let Value::Builtin(n, f) = x {
                         if carries_name(n) {
-                            *f = named_fn(*f, &self.cur_file);
+                            *f = named_fn(n, *f, &self.cur_file);
                         }
                     }
                 }
@@ -6038,10 +6094,41 @@ impl Interp {
     #[inline(never)]
     fn eval_receiver(&mut self, obj: &Expr, name: &str, env: &Env) -> Result<Value, Ctrl> {
         let v = self.called_value(obj, env)?;
-        if matches!(v, Value::Builtin(..) | Value::Map(_)) && crate::confirm::held() && !matches!(&v, Value::Map(m) if m.contains_key(name)) {
-            return Ok(self.named_here(v));
+        if matches!(v, Value::Builtin(..) | Value::Map(_)) && crate::confirm::held() {
+            if !matches!(&v, Value::Map(m) if m.contains_key(name)) {
+                return Ok(self.named_here(v));
+            }
+            // Asked by the name called first, which a call of another name passes in a compare
+            // or two (`makes_builtins`).
+            if matches!(name, "connect" | "shards" | "on") {
+                return Ok(self.held_maker(v, name));
+            }
         }
         Ok(v)
+    }
+
+    /// The receiver `v` of a builtin that makes builtins (`makes_builtins`: `db.connect`,
+    /// `db.shards`, a shards' `on`), called by its name where a `quillo.confirmed` holds the run:
+    /// with the builtin's stand-in for this file, so that what it makes is held to this file
+    /// (`call_named`). A connection's functions were the builtins themselves, held to no file: read
+    /// as its fields and handed to another file's helper, `c.exec` ran there as the helper's
+    /// file, and a kit confirmed for nothing attached a database only the helper was confirmed to
+    /// write, and made it (FEEDBACK83.md Q-1300, found by the coverage tests of 0038a97; branch
+    /// feedback82-85). Made held, a connection is held to the file of the code that made it
+    /// wherever it goes and however its functions are read: a field of a local, `c["exec"]`,
+    /// `values(c)`, inside a list, a record, an error or a lambda's scope, handed on whole.
+    #[cold]
+    #[inline(never)]
+    fn held_maker(&self, v: Value, name: &str) -> Value {
+        let Value::Map(m) = &v else { return v };
+        let Some(&Value::Builtin(n, f)) = m.get(name).filter(|x| matches!(x, Value::Builtin(n, _) if makes_builtins(n))) else { return v };
+        let g = named_fn(n, f, &self.cur_file);
+        if g as usize == f as usize {
+            return v;
+        }
+        let mut held = (**m).clone();
+        held.insert(name.into(), Value::Builtin(n, g));
+        Value::Map(Arc::new(held))
     }
 
     /// `css(x)` by that name: css`...` as the parser writes it, the builtin's (`parser::css_tag_arg`),
