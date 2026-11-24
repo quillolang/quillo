@@ -3142,10 +3142,22 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
     }
     // One of them under another name: a second hard link writes into it (FEEDBACK55.md, Q-701;
     // branch feedback55).
+    let mut a_folder = false;
     for f in &both {
-        if let Some(why) = std::fs::metadata(f).ok().and_then(|m| own_meta(&m)) {
-            return Some(why);
+        if let Ok(m) = std::fs::metadata(f) {
+            if let Some(why) = own_meta(&m) {
+                return Some(why);
+            }
+            a_folder |= m.is_dir();
         }
+    }
+    // A folder that holds one of its files, by the folders themselves (`statics::holds_any`): by
+    // the names alone, `/System/Volumes/Data` (which only the long name names), `/.nofollow/...`
+    // or a bind mount held none, and `delete_file` removed the program with it; 0.8.10 refused the
+    // first for a program started by the long name (FEEDBACK85.md, Q-1340, found by the review of
+    // 3e793e3; branch feedback82-85). A file costs nothing more: the look above said what it is.
+    if a_folder && crate::statics::holds_any(&real, it.loaded.iter().map(|f| real_as_made(f))) {
+        return Some(OWN_SOURCE);
     }
     // What a path of the settings or the TLS key leads to now, by any name (FEEDBACK55.md, Q-701;
     // branch feedback55).
@@ -3473,12 +3485,54 @@ fn delete_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     if let Err(why) = crate::confirm::path_ok(it.cur_file.as_deref(), &it.base_dir, &p, true) {
         return Ok(Value::err(Value::str(format!("delete_file: {}", why))));
     }
+    // A folder is deleted whole: what is in it is judged first, each file by itself, as
+    // `remove_dir_all` walks it (FEEDBACK85.md, Q-1340, found by the review of 3e793e3; branch
+    // feedback82-85).
+    if std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_dir()) {
+        match own_inside(&full) {
+            Ok(None) => {}
+            Ok(Some(why)) => return Ok(Value::err(Value::str(format!("delete_file: will not delete {}: {}", p, why)))),
+            Err(e) => return Ok(Value::err(Value::str(format!("delete_file: {}: {}", p, e)))),
+        }
+    }
     let r = if full.is_dir() { std::fs::remove_dir_all(&full) } else { std::fs::remove_file(&full) };
     Ok(match r {
         Ok(()) => Value::Nil,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Nil,
         Err(e) => Value::err(Value::str(format!("delete_file: {}: {}", p, e))),
     })
+}
+
+/// Why the folder `dir`, which `delete_file` would delete whole, holds one of the program's own
+/// files, if it does: each file in it judged by itself, its device and inode (`own_meta`: its
+/// sources, settings, policy and key, and a database it has open), and a journal of a database it
+/// has open (`db::database_file`), walked as `remove_dir_all` walks it, no link followed. By the
+/// folder's name, `own_file` asks db.rs by the names it keeps a database by, which a database
+/// opened by another (`/.nofollow/...`, a bind mount) is not: its folder went with it
+/// (FEEDBACK85.md, Q-1340, found by the review of 3e793e3; branch feedback82-85). A folder in it
+/// that cannot be read is an error, and nothing is deleted: `remove_dir_all` deleted what it
+/// could and stopped there. A look at each file, as the deletion would make.
+fn own_inside(dir: &Path) -> std::io::Result<Option<&'static str>> {
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for e in std::fs::read_dir(&d)? {
+            let path = e?.path();
+            let m = std::fs::symlink_metadata(&path)?;
+            // A link goes, not what it leads to.
+            if m.file_type().is_symlink() {
+                continue;
+            }
+            if let Some(why) = own_meta(&m) {
+                return Ok(Some(if why == crate::db::OPEN { "it holds the database the program has open" } else { why }));
+            }
+            if m.is_dir() {
+                todo.push(path);
+            } else if crate::db::database_file(&path) == Some(crate::db::OPEN) {
+                return Ok(Some("it holds the database the program has open"));
+            }
+        }
+    }
+    Ok(None)
 }
 
 // ---- randomness --------------------------------------------------------

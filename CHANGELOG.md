@@ -273,7 +273,11 @@ What a program may notice:
   refused the paths it allows; `delete_file` by the other name deleted the program's folder or
   its database's; `db.migrate()` of a program started by the long name failed (0.8.10 applied
   it). A pinned source that builds another file in (`global_asm!`'s `.include`, `include!`)
-  is refused without a `quillo.confirmed` too.
+  is refused without a `quillo.confirmed` too. `delete_file` of a folder judges what is in it
+  by the files themselves: a folder holding the program's files or a database it has open is
+  refused whatever name it is given (`/System/Volumes/Data`, `/.nofollow/...`, a bind
+  mount), and a folder in it that cannot be read stops it before anything is deleted (it
+  deleted what it could). `/.nofollow/x` names `/x`.
 - **`read_file`, `write_file` and `delete_file`'s refusal of a path outside the folder** ends
   with the way out: ``; `--allow-path ..` (on `quillo run` or `quillo mcp`) lets the program
   read it`` (Q-1341). Refused for a link, it names the link and where it leads, with the

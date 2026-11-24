@@ -342,15 +342,30 @@ pub fn real_dir(dir: &Path) -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 const DATA: &str = "/System/Volumes/Data";
 
+/// The firmlinks of macOS 15 and 26, as /usr/share/firmlinks lists them: for a process that may
+/// not read that file (a sandbox), each still taken only where a look finds it one folder.
+#[cfg(target_os = "macos")]
+const KNOWN_FIRMLINKS: &str = "/AppleInternal\tAppleInternal\n/Applications\tApplications\n/Library\tLibrary\n/System/Library/Caches\tSystem/Library/Caches\n\
+/System/Library/Assets\tSystem/Library/Assets\n/System/Library/PreinstalledAssets\tSystem/Library/PreinstalledAssets\n/System/Library/AssetsV2\tSystem/Library/AssetsV2\n\
+/System/Library/PreinstalledAssetsV2\tSystem/Library/PreinstalledAssetsV2\n/System/Library/CoreServices/CoreTypes.bundle/Contents/Library\tSystem/Library/CoreServices/CoreTypes.bundle/Contents/Library\n\
+/System/Library/Speech\tSystem/Library/Speech\n/Users\tUsers\n/Volumes\tVolumes\n/cores\tcores\n/opt\topt\n/pkg\tpkg\n/private\tprivate\n/usr/local\tusr/local\n\
+/usr/libexec/cups\tusr/libexec/cups\n/usr/share/snmp\tusr/share/snmp\n";
+
 /// The data volume's folders that have a second name on macOS, as (long, short):
 /// `/System/Volumes/Data/private` is `/private`, `/System/Volumes/Data/Users` is `/Users` (the
 /// system's list, /usr/share/firmlinks), each taken only once a look finds the two one folder (its
-/// device and inode, no link on either side). Longest first. Read once.
+/// device and inode, no link on either side). Longest first. Read once. Where the list cannot be
+/// read (a sandbox), the known one is looked at in its place: with none, a folder's two names
+/// were two folders, which refused a path an `--allow-path` by the other name allows (closed),
+/// but let a pinned build into a temporary folder under `--allow-path /System/Volumes/Data`, a
+/// root only the long name names (open) (FEEDBACK82.md, Q-1285, found by the review of 3e793e3;
+/// branch feedback82-85). Where no look finds them one folder either, the names are not the
+/// system's, and stay as they are.
 #[cfg(target_os = "macos")]
 fn firmlinks() -> &'static [(PathBuf, PathBuf)] {
     static LINKS: std::sync::OnceLock<Vec<(PathBuf, PathBuf)>> = std::sync::OnceLock::new();
     LINKS.get_or_init(|| {
-        let Ok(text) = std::fs::read_to_string("/usr/share/firmlinks") else { return Vec::new() };
+        let text = std::fs::read_to_string("/usr/share/firmlinks").unwrap_or_else(|_| KNOWN_FIRMLINKS.to_string());
         let dir = |p: &Path| std::fs::symlink_metadata(p).ok().filter(|m| m.file_type().is_dir()).and_then(|m| id_of(&m));
         let mut out: Vec<(PathBuf, PathBuf)> = text
             .lines()
@@ -377,12 +392,23 @@ pub fn sys_form(p: PathBuf) -> PathBuf {
     }
 }
 
-/// `sys_form`, borrowed where it is already in that form.
+/// `sys_form`, borrowed where it is already in that form. On macOS `/.nofollow/x` is `/x` too: the
+/// system resolves a path under it from `/` with no link followed, and realpath keeps the prefix,
+/// so for a path it resolved (no link left in it) it names the same file, which `path_of` names
+/// without it; a program started as `/.nofollow/.../main.qwe`, or given `--allow-path
+/// /.nofollow/...`, was refused every path, and its migrations as "not the one judged"
+/// (FEEDBACK85.md Q-1340 and FEEDBACK83.md Q-1300, found by the review of 3e793e3; branch
+/// feedback82-85). `/.nofollow` itself is a folder of its own, and stays.
 pub fn sys_form_of(p: &Path) -> std::borrow::Cow<'_, Path> {
     #[cfg(target_os = "macos")]
     {
         use std::os::unix::ffi::OsStrExt;
-        if p.as_os_str().as_bytes().starts_with(b"/System/Volumes/Data/") {
+        let b = p.as_os_str().as_bytes();
+        if b.starts_with(b"/.nofollow/") {
+            let plain = Path::new(std::ffi::OsStr::from_bytes(&b["/.nofollow".len()..]));
+            return std::borrow::Cow::Owned(sys_form_of(plain).into_owned());
+        }
+        if b.starts_with(b"/System/Volumes/Data/") {
             if let Some((long, short)) = firmlinks().iter().find(|(long, _)| p.starts_with(long)) {
                 let rest = p.strip_prefix(long).unwrap_or(Path::new(""));
                 return std::borrow::Cow::Owned(if rest.as_os_str().is_empty() { short.clone() } else { short.join(rest) });
@@ -454,12 +480,40 @@ pub fn long_form(p: &Path) -> PathBuf {
 /// `dir`: for what must stay out of the program's reach, once, never on a path a request takes
 /// (FEEDBACK82.md, Q-1285, found by the coverage tests; branch feedback82-85).
 pub fn holds(root: &Path, dir: &Path) -> bool {
-    if within(dir, root) {
-        return true;
+    holds_any(root, [dir.to_path_buf()])
+}
+
+/// Whether the folder `root` holds any of `paths` (each resolved), as `holds` judges one: `root`
+/// looked at once, and each folder above them once, however many share it. For a folder the
+/// program would delete whole, whatever name it is given: `delete_file("/System/Volumes/Data")`
+/// or `"/.nofollow/..."`, which no name of the program's files began with (FEEDBACK85.md, Q-1340,
+/// found by the review of 3e793e3; branch feedback82-85).
+pub fn holds_any(root: &Path, paths: impl IntoIterator<Item = PathBuf>) -> bool {
+    let mut want = None;
+    let mut seen = std::collections::HashSet::new();
+    for p in paths {
+        if within(&p, root) {
+            return true;
+        }
+        if want.is_none() {
+            want = std::fs::metadata(root).ok().and_then(|m| id_of(&m));
+            if want.is_none() {
+                return false;
+            }
+        }
+        for chain in [long_form(&p), p] {
+            for a in chain.ancestors() {
+                // Looked at already, and so every folder above it.
+                if !seen.insert(a.to_path_buf()) {
+                    break;
+                }
+                if std::fs::metadata(a).ok().and_then(|m| id_of(&m)) == want {
+                    return true;
+                }
+            }
+        }
     }
-    let Some(want) = std::fs::metadata(root).ok().and_then(|m| id_of(&m)) else { return false };
-    let long = long_form(dir);
-    long.ancestors().chain(dir.ancestors()).any(|a| std::fs::metadata(a).ok().and_then(|m| id_of(&m)) == Some(want))
+    false
 }
 
 /// Up to `len` bytes of the file from `start`, read where they are: never more, whatever the file

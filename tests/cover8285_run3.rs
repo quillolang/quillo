@@ -359,9 +359,17 @@ fn a_pinned_build_is_refused_a_temporary_folder_the_program_reaches_by_its_other
     refused(&app, pinned(&["--allow-path", &o_s]), &lg(&o.join("tmp")), &lg(&o.join("tmp")), &o);
     refused(&app, pinned(&["--allow-path", &lo]), &o, &o, &lg(&o));
     refused(&app, pinned(&["--allow-path", &o_s]), &root.join("via"), &lg(&o.join("tmp")), &o);
-    // The data volume's root, which holds `/private` by its long name only; and `/`.
-    refused(&app, pinned(&["--allow-path", "/System/Volumes/Data"]), &o.join("tmp"), &o.join("tmp"), Path::new("/System/Volumes/Data"));
-    refused(&app, pinned(&["--allow-path", "/"]), &o.join("tmp"), &o.join("tmp"), Path::new("/"));
+    // The data volume's root, which holds `/private` by its long name only; and `/`. Each holds the
+    // cargo home too, which is judged first (native.rs toolchain_reached, fix round 7): refused
+    // naming the root either way.
+    for root_named in ["/System/Volumes/Data", "/"] {
+        let args = pinned(&["--allow-path", root_named]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, out) = run(&app, &args, &o.join("tmp"), 120);
+        assert_eq!(code, Some(1), "{}: {}", root_named, out);
+        assert!(out.contains(&format!(" is inside {}, which the program can reach", root_named)), "{}: {}", root_named, out);
+        assert!(!out.contains("building ") && none_left(&o.join("tmp")), "{}", out);
+    }
     // A unicode name, given decomposed in the long form: the folder as the system keeps it.
     let decomposed = long.join("o\u{308}rt").display().to_string();
     refused(&app, pinned(&["--allow-path", &decomposed]), &u.join("tmp"), &u.join("tmp"), &lg(&u));
@@ -609,7 +617,10 @@ fn the_whole_disk_named_and_the_programs_folder_by_another_path_are_judged_by_th
     let t = tmp.display().to_string();
     let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--policy", "pin.toml", "--allow-path", "/"], &[("TMPDIR", &t)], &d.0.join("a.log"), 120);
     assert_eq!(code, Some(1), "{}", out);
-    assert!(out.contains(&format!("the temporary folder {} is inside /, which the program can reach", t)) && !out.contains("building "), "{}", out);
+    // The temporary folder's, or (where `/` holds the cargo home too, judged first: native.rs
+    // toolchain_reached, fix round 7) the cargo home's.
+    assert!(out.contains(" is inside /, which the program can reach") && !out.contains("building "), "{}", out);
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "a private folder was made");
     std::fs::write(app.join("del.qwe"), "print(delete_file(\"../app\"))\nprint(delete_file(\".\"))\nprint(delete_file(\"../app/del.qwe\"))\n").unwrap();
     let (code, out) = quillo_at(&app, &["run", "del.qwe", "--allow-path", ".."], &[], &d.0.join("b.log"), 60);
     assert_eq!(code, Some(0), "{}", out);
@@ -655,4 +666,203 @@ fn a_pinned_plugin_that_builds_another_file_in_is_refused_without_a_quillo_confi
         assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "{}: a private folder was made", how);
         assert!(!app.join(".quillo/native").exists(), "{}", how);
     }
+}
+
+// Fix round 7
+
+/// A sandbox profile (written in `dir`) under which nothing can be deleted but a SQLite database's
+/// journal, and nothing written in the home folders: a `delete_file` that is not refused fails
+/// there, and deletes nothing. None, said, where `sandbox-exec` is not there or does not hold.
+#[cfg(target_os = "macos")]
+fn no_unlink(dir: &Path) -> Option<PathBuf> {
+    let profile = dir.join("nounlink.sb");
+    std::fs::write(
+        &profile,
+        "(version 1)\n(allow default)\n(deny file-write-unlink)\n(allow file-write-unlink (regex #\"\\.db-(journal|wal|shm)$\"))\n\
+         (deny file-write* (subpath \"/Users\") (subpath \"/System/Volumes/Data/Users\") (subpath \"/Applications\") (subpath \"/System/Volumes/Data/Applications\") (subpath \"/Library\") (subpath \"/System/Volumes/Data/Library\"))\n",
+    )
+    .unwrap();
+    let probe = dir.join("sandbox-probe");
+    std::fs::create_dir_all(&probe).unwrap();
+    let held = Command::new("/usr/bin/sandbox-exec").arg("-f").arg(&profile).arg("/bin/rmdir").arg(&probe).stderr(Stdio::null()).status().is_ok_and(|s| !s.success()) && probe.exists();
+    if !held {
+        eprintln!("skipped: sandbox-exec is not there or lets a folder be deleted");
+        return None;
+    }
+    Some(profile)
+}
+
+/// `quillo args` under the sandbox `profile`, as `quillo_at` runs it.
+#[cfg(target_os = "macos")]
+fn sandboxed_at(cwd: &Path, profile: &Path, args: &[&str], vars: &[(&str, &str)], log: &Path, secs: u64) -> (Option<i32>, String) {
+    let file = std::fs::File::create(log).unwrap();
+    let mut child = Command::new("/usr/bin/sandbox-exec")
+        .arg("-f")
+        .arg(profile)
+        .arg(env!("CARGO_BIN_EXE_quillo"))
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("QUILLO_POLICY_PATH")
+        .env_remove("QUILLO_DB")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTFLAGS")
+        .envs(vars.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(file.try_clone().unwrap())
+        .stderr(file)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let code = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s.code();
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (code, std::fs::read_to_string(log).unwrap_or_default())
+}
+
+/// A folder that holds the program's files or a database it has open is its own by the folder
+/// itself, whatever name it is given. Started by the long name under `--allow-path
+/// /System/Volumes/Data`, `delete_file("/System/Volumes/Data")` went on to `remove_dir_all` (0.8.10
+/// refused it); under `--allow-path /`, the folder above the program's and its database's folder
+/// named `/.nofollow/...`, and a folder holding a database opened by `/.nofollow/...` named
+/// plainly (a unicode name) or long. A folder holding none of them is let through, to the
+/// deletion, which the sandbox refuses: run under it, nothing is deleted whatever the binary does
+/// (src/builtins.rs own_file and own_inside, src/statics.rs holds_any and sys_form, FEEDBACK85.md
+/// Q-1340, found by the review of 3e793e3; branch feedback82-85)
+#[cfg(target_os = "macos")]
+#[test]
+fn a_folder_that_holds_the_programs_files_or_database_is_its_own_by_the_folder_itself() {
+    let Some((d, long)) = named_twice("cov8285r3-hold-names") else { return };
+    let Some(profile) = no_unlink(&d.0) else { return };
+    let root = d.0.clone();
+    let lg = |p: &Path| long.join(p.strip_prefix(&root).unwrap());
+    let (app, other, ord) = (root.join("app"), root.join("other"), root.join("\u{f6}rdner"));
+    for f in [app.join("data"), other.clone(), ord.clone(), root.join("cwd")] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    std::fs::write(other.join("x.txt"), "x").unwrap();
+    std::fs::write(app.join("a.qwe"), "print(delete_file(\"/System/Volumes/Data\"))\n").unwrap();
+    let la = lg(&app.join("a.qwe")).display().to_string();
+    let (code, out) = sandboxed_at(&root.join("cwd"), &profile, &["run", &la, "--allow-path", "/System/Volumes/Data"], &[], &root.join("a.log"), 60);
+    assert_eq!((code, out.as_str()), (Some(0), "err(\"delete_file: will not delete /System/Volumes/Data: it is one of the program's own files\")\n"));
+    let nf = |p: &Path| format!("/.nofollow{}", p.display());
+    let deletes = [nf(&root), nf(&app.join("data")), ord.display().to_string(), lg(&ord).display().to_string(), other.display().to_string()];
+    let mut main = format!(
+        "db.open(\"data/app.db\")\ndb.exec(\"create table if not exists t (x int)\")\nlet c = db.connect(\"{}\")\nc.exec(\"create table if not exists t (x int)\")\n",
+        nf(&ord.join("x.db"))
+    );
+    for p in &deletes {
+        main.push_str(&format!("print(delete_file(\"{}\"))\n", p));
+    }
+    std::fs::write(app.join("b.qwe"), main).unwrap();
+    let want = format!(
+        "err(\"delete_file: will not delete {}: it is one of the program's own files\")\n\
+         err(\"delete_file: will not delete {}: it holds the database the program has open\")\n\
+         err(\"delete_file: will not delete {}: it holds the database the program has open\")\n\
+         err(\"delete_file: will not delete {}: it holds the database the program has open\")\n\
+         err(\"delete_file: {}: Operation not permitted (os error 1)\")\n",
+        deletes[0], deletes[1], deletes[2], deletes[3], deletes[4]
+    );
+    let (code, out) = sandboxed_at(&app, &profile, &["run", "b.qwe", "--allow-path", "/"], &[], &root.join("b.log"), 60);
+    assert_eq!((code, out.as_str()), (Some(0), want.as_str()));
+    assert!(app.join("data/app.db").exists() && ord.join("x.db").exists() && other.join("x.txt").exists());
+}
+
+/// A program started as `/.nofollow/.../main.qwe`, or given `--allow-path /.nofollow/...`, reaches
+/// what the plain name reaches: realpath keeps the prefix, which the system drops, and every path
+/// out of the folder was refused, a link into the folder allowed was a 404, and its migrations
+/// were "not the one judged". A folder not named stays out, and under `/.nofollow` a link is not
+/// followed, by the system's own rule (src/statics.rs sys_form_of,
+/// src/migrate.rs read_judged, FEEDBACK85.md Q-1340 and FEEDBACK83.md Q-1300, found by the review
+/// of 3e793e3; branch feedback82-85)
+#[cfg(target_os = "macos")]
+#[test]
+fn a_program_or_allow_path_named_under_nofollow_reaches_what_its_plain_name_reaches() {
+    let d = Dir(support::temp_dir("cov8285r3-nofollow").canonicalize().unwrap());
+    let root = d.0.clone();
+    if !Path::new("/.nofollow").join(root.strip_prefix("/").unwrap()).is_dir() {
+        eprintln!("skipped: no /.nofollow here");
+        return;
+    }
+    let nf = |p: &Path| format!("/.nofollow{}", p.display());
+    let (app, shared) = (root.join("app"), root.join("shared"));
+    for f in [app.join("migrations"), app.join("data"), app.join("public"), shared.clone(), root.join("secret"), root.join("cwd")] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    std::fs::write(app.join("a.txt"), "mine").unwrap();
+    std::fs::write(shared.join("a.txt"), "from shared").unwrap();
+    std::fs::write(root.join("secret/b.txt"), "secret").unwrap();
+    std::fs::write(app.join("migrations/001_t.sql"), "create table t (x int);\n").unwrap();
+    std::os::unix::fs::symlink("../../shared", app.join("public/s")).unwrap();
+    std::fs::write(
+        app.join("main.qwe"),
+        "print(read_file(\"a.txt\"))\nprint(read_file(\"../shared/a.txt\"))\nprint(files(\"public/s\", \"a.txt\"))\nprint(is_err(read_file(\"../secret/b.txt\")))\ndb.open(\"data/app.db\")\nprint(db.migrate())\n",
+    )
+    .unwrap();
+    let want = "mine\nfrom shared\n<response 200>\ntrue\nquillo: applied migration 001_t.sql\n[\"001_t.sql\"]\n";
+    let fresh = || {
+        for f in ["data/app.db", "data/app.db-wal", "data/app.db-shm", "data/app.db-journal"] {
+            let _ = std::fs::remove_file(app.join(f));
+        }
+    };
+    let (ns, ss) = (nf(&shared), shared.display().to_string());
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--allow-path", &ns], &[], &root.join("a.log"), 60);
+    assert_eq!((code, out.as_str()), (Some(0), want), "--allow-path under /.nofollow");
+    fresh();
+    let nmain = nf(&app.join("main.qwe"));
+    // Under `/.nofollow` the system follows no link: `public/s` is not followed, by the system
+    // itself (ELOOP), a 404, as `cat` of it fails.
+    let (code, out) = quillo_at(&root.join("cwd"), &["run", &nmain, "--allow-path", &ss], &[], &root.join("b.log"), 60);
+    assert_eq!((code, out.as_str()), (Some(0), want.replace("<response 200>", "<response 404>").as_str()), "the program under /.nofollow");
+}
+
+/// Where /usr/share/firmlinks cannot be read (a sandbox), the firmlinks are still known: each of
+/// the known list is taken where a look finds its two names one folder. Without them, a pinned
+/// build ran in a temporary folder under `--allow-path /System/Volumes/Data` (which holds it only by
+/// the long name), and `--allow-path` by the long name refused `../shared/a.txt` (src/statics.rs
+/// firmlinks, FEEDBACK82.md Q-1285 and FEEDBACK85.md Q-1340, found by the review of 3e793e3; branch
+/// feedback82-85)
+#[cfg(target_os = "macos")]
+#[test]
+fn the_firmlinks_are_known_where_the_systems_list_cannot_be_read() {
+    use sha2::Digest;
+    let Some((d, long)) = named_twice("cov8285r3-firm-unread") else { return };
+    let root = d.0.clone();
+    let profile = root.join("nofirm.sb");
+    std::fs::write(&profile, "(version 1)\n(allow default)\n(deny file-read* (literal \"/usr/share/firmlinks\"))\n").unwrap();
+    let denied = Command::new("/usr/bin/sandbox-exec").arg("-f").arg(&profile).args(["/bin/cat", "/usr/share/firmlinks"]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| !s.success());
+    if !denied {
+        eprintln!("skipped: sandbox-exec is not there or lets /usr/share/firmlinks be read");
+        return;
+    }
+    let (app, tmp, shared) = (root.join("app"), root.join("tmp"), root.join("shared"));
+    for f in [&app, &tmp, &shared] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    std::fs::write(shared.join("a.txt"), "from shared").unwrap();
+    let src = "//! version: 1.0.0\n//! effects: none\npub fn hi() -> String { \"hi\".into() }\n";
+    std::fs::write(app.join("hi.qwer"), src).unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    std::fs::write(app.join("r.qwe"), "print(read_file(\"../shared/a.txt\"))\n").unwrap();
+    let hash: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
+    std::fs::write(app.join("pin.toml"), format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash)).unwrap();
+    let (t, record) = (tmp.display().to_string(), root.join("record").display().to_string());
+    let (code, out) = sandboxed_at(&app, &profile, &["run", "main.qwe", "--no-check", "--policy", "pin.toml", "--allow-path", "/System/Volumes/Data"], &[("TMPDIR", &t), ("QUILLO_BUILT_RECORD_DIR", &record)], &root.join("a.log"), 120);
+    // The temporary folder's, or the cargo home's (judged first: native.rs toolchain_reached, fix
+    // round 7); each by the same firmlinks.
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains(" is inside /System/Volumes/Data, which the program can reach") && !out.contains("building "), "{}", out);
+    assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "a private folder was made");
+    let ls = long.join("shared").display().to_string();
+    let (code, out) = sandboxed_at(&app, &profile, &["run", "r.qwe", "--allow-path", &ls], &[], &root.join("b.log"), 60);
+    assert_eq!((code, out.as_str()), (Some(0), "from shared\n"));
 }
