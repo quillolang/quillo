@@ -1295,7 +1295,8 @@ fn a_pinned_build_is_judged_by_what_the_compiler_read() {
     write(&d, "main.qwe", "import hi.qwer use hi\nroute GET / = hi()\n");
     let (code, out) = quillo(&d, &["confirm", "--yes"]);
     assert_eq!(code, Some(0), "the tokens build nothing in: {}", out);
-    let real = secret.canonicalize().unwrap();
+    // Named as rustc read it, as the plugin wrote it (no link resolved).
+    let real = secret.clone();
     let why = format!("hi.qwer is held to its SHA-256, and building it read {}, which that hash does not cover: it does not load, and what was built is not kept", real.display());
     let (code, out) = quillo(&d, &["run", "main.qwe", "--port", "0", "--no-check"]);
     assert_eq!(code, Some(1), "{}", out);

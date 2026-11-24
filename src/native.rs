@@ -2174,17 +2174,17 @@ fn read_in(target: &Path, crate_name: &str, crate_dir: &Path, own: &[PathBuf]) -
         return Err(format!("the compiler's list of what it read to build {} is not in {}, or is not one: it does not load", crate_name, deps.display()));
     };
     let text = std::fs::read_to_string(&list).map_err(|e| format!("cannot read {}: {}", list.display(), e))?;
-    let real = |p: &Path| {
-        let p = crate_dir.join(p);
-        p.canonicalize().unwrap_or(p)
-    };
-    let own: Vec<PathBuf> = own.iter().map(|p| real(p)).collect();
+    // Each name as rustc wrote it, a relative one from the crate's folder as rustc reads it, and
+    // never resolved through the links there are now: compared so, a link swapped back after
+    // the build read as the source (FEEDBACK83.md, Q-1305, found by the review of 0009010; branch
+    // feedback82-85). The private folder is made at its real path (`private_dir`), and `own` are
+    // the paths Quillo wrote into it, so the source and the glue are named as they are.
     for line in text.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
         let names = make_names(line);
         // `out: a b c` lists what `out` was made of; `a:` names `a` alone.
         let read: &[String] = if names.len() > 1 { &names[1..] } else { &names[..] };
         for r in read {
-            let p = real(Path::new(r));
+            let p = crate_dir.join(r);
             if !own.contains(&p) {
                 return Ok(Some(p));
             }
@@ -2730,6 +2730,39 @@ pub fn walk_program(main: &Path, visit: &mut dyn FnMut(&Path, &[crate::ast::Stmt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A build's dep-info is read by its names as rustc wrote them: the source and the glue as
+    /// Quillo wrote them pass, a link to the source, or the source named through a link to its
+    /// folder, does not, though it leads to it (FEEDBACK83.md, Q-1305, found by the review of
+    /// 0009010; branch feedback82-85).
+    #[cfg(unix)]
+    #[test]
+    fn dep_info_names_are_read_as_rustc_wrote_them() {
+        let dir = std::env::temp_dir().canonicalize().unwrap().join(format!("quillo-depinfo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (crate_dir, deps) = (dir.join("crate"), dir.join("target/release/deps"));
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        std::fs::create_dir_all(&deps).unwrap();
+        let src = dir.join("hi.qwer");
+        std::fs::write(&src, "pub fn hi() {}\n").unwrap();
+        std::fs::write(crate_dir.join("lib.rs"), "").unwrap();
+        std::os::unix::fs::symlink(&src, dir.join("link.qwer")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("again")).unwrap();
+        let own = [crate_dir.join("lib.rs"), src.clone()];
+        let judged = |named: &str| {
+            std::fs::write(deps.join("quillo_hi_pinned.d"), format!("{out}: lib.rs {named}\n\nlib.rs:\n{named}:\n", out = deps.join("libquillo_hi_pinned.dylib").display(), named = named)).unwrap();
+            read_in(&dir.join("target"), "quillo_hi_pinned", &crate_dir, &own).unwrap()
+        };
+        assert_eq!(judged(&src.display().to_string()), None);
+        assert_eq!(judged(&dir.join("link.qwer").display().to_string()), Some(dir.join("link.qwer")));
+        assert_eq!(judged(&dir.join("again/hi.qwer").display().to_string()), Some(dir.join("again/hi.qwer")));
+        // A name with a space in it, as rustc escapes it.
+        assert_eq!(judged(&format!("{}/other\\ file.rs", dir.display())), Some(dir.join("other file.rs")));
+        // No list, or two: refused.
+        std::fs::write(deps.join("quillo_hi_pinned-abc.d"), "").unwrap();
+        assert!(read_in(&dir.join("target"), "quillo_hi_pinned", &crate_dir, &own).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// FEEDBACK71.md, Q-983 (branch security): a link on the way to the cache is taken only when
     /// root or the user owns it, whatever it leads to; one another user owns is refused, naming
