@@ -261,6 +261,28 @@ thread_local! {
     /// branch feedback82-85).
     static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static UNTAKEN: std::cell::RefCell<Vec<Diagnostic>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// What the outermost check on this thread did not read of the program that a start reads,
+    /// each with what to do (`Analysis::unread`).
+    static UNREAD: std::cell::RefCell<Vec<(Diagnostic, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// That the check did not read `d`'s part of the program, which a start reads, and what to do
+/// about it (`UNREAD`).
+fn unread(d: &Diagnostic, what_to_do: String) {
+    UNREAD.with(|u| u.borrow_mut().push((d.clone(), what_to_do)));
+}
+
+/// What to do about a program whose files come to more than a check reads together.
+fn larger_files() -> String {
+    format!("a check reads {} MiB of a program's files together: make them smaller, or take fewer", crate::error::MOST_PROGRAM >> 20)
+}
+
+/// Whether `e` is the refusal of a source past what a check reads of a program's files together
+/// (`error::with_source_budget`), which a start, reading them without that budget, does not give.
+/// Its words are `error::source_text`'s: tests/cover8285_confirm2.rs's
+/// a_held_start_whose_files_pass_what_a_check_reads_does_not_start fails where they change.
+fn past_program_budget(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::InvalidData && e.to_string() == format!("the program's files come to more than {} MiB together", crate::error::MOST_PROGRAM >> 20)
 }
 
 /// The program whose names a check read under a `quillo.confirmed` and found each file to take
@@ -289,8 +311,13 @@ fn stamps<'a>(files: impl Iterator<Item = &'a str>) -> Stamps {
 /// as the program loads even with `--no-check`; branch feedback82-85). The checker is what knows a
 /// name from a local, so this is its reading, done as the program starts when no check of these
 /// files came first (a start that checked them stopped on the error already): the start's cost,
-/// and only under a hold. A program too complex to read through is refused too, as nothing then
-/// says which names its files take.
+/// and only under a hold. A program the check does not read through is refused too, as nothing
+/// then says which names its files take: too complex, and, as a start reads on where a check
+/// stops, mounted or called more than `MAX_PROGRAMS` deep, a chain of `use` more than `MAX_USES`
+/// long, or files past `MOST_PROGRAM` together. Before, only the first was: past 16 programs
+/// mounted one in another, a held `--no-check` start ran the 17th's kit, confirmed for nothing,
+/// that read its main file's `.env` through the main file's `reader`, which it did not take
+/// (FEEDBACK83.md, Q-1300, found by the coverage tests of 0038a97; branch feedback82-85).
 pub fn untaken_at_load(main: &Path) -> Result<(), String> {
     let key = crate::modules::key(main);
     {
@@ -302,8 +329,8 @@ pub fn untaken_at_load(main: &Path) -> Result<(), String> {
         }
     }
     let a = check_file_opts(main, HashMap::new(), Options::plain());
-    if let Some(d) = a.diagnostics.iter().find(|d| d.message == TOO_COMPLEX) {
-        return Err(format!("a quillo.confirmed holds the program, and which names each of its files takes cannot be read: {}", d));
+    if let Some((d, what_to_do)) = a.unread.first() {
+        return Err(format!("a quillo.confirmed holds the program, and its check cannot read all of it, so which names each of its files takes is not known, and one could reach what another file was confirmed for: the program is not started\n  {}\n  {} (`quillo check` says the same)", d, what_to_do));
     }
     if a.untaken.is_empty() {
         return Ok(());
@@ -2315,6 +2342,10 @@ pub struct Analysis {
     /// it mounts or calls as services: what a start refuses, checked or not (`untaken_at_load`;
     /// FEEDBACK83.md, Q-1300, decided by the user 2026-11-24; branch feedback82-85).
     pub untaken: Vec<Diagnostic>,
+    /// What the check did not read of the program, which a start reads: where it stopped (among
+    /// `diagnostics` too) and what to do, which a held start refuses (`untaken_at_load`;
+    /// FEEDBACK83.md, Q-1300, found by the coverage tests of 0038a97; branch feedback82-85).
+    pub unread: Vec<(Diagnostic, String)>,
 }
 
 /// A service's tools, offered by the program checked (`Analysis::service_tools`).
@@ -2609,6 +2640,12 @@ fn check_file_budgeted(path: &Path, overrides: HashMap<PathBuf, String>, opts: O
                 severity: Severity::Error,
                 message: format!("cannot read file: {}", e),
             });
+            // A mounted program or a service past what a check reads, which its start reads
+            // (`untaken_at_load`; FEEDBACK83.md, Q-1300, found by the coverage tests of 0038a97;
+            // branch feedback82-85).
+            if past_program_budget(&e) {
+                unread(&a.diagnostics[0], larger_files());
+            }
             a
         }
     }
@@ -2634,6 +2671,9 @@ fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: Hash
         let mut a = Analysis::default();
         let message = format!("programs mount or call each other more than {} deep", MAX_PROGRAMS);
         a.diagnostics.push(Diagnostic { file: file.to_string(), line: 0, severity: Severity::Error, message });
+        // Not read, and a start runs it: a held one is refused (`untaken_at_load`; FEEDBACK83.md,
+        // Q-1300, found by the coverage tests of 0038a97; branch feedback82-85).
+        unread(&a.diagnostics[0], format!("a check reads programs {} deep, the main one among them: mount or call the deepest from a program nearer the main file", MAX_PROGRAMS));
         return a;
     }
     let outermost = DEPTH.with(|d| {
@@ -2654,6 +2694,7 @@ fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: Hash
         let held = !opts.confined && (crate::confirm::held() || std::fs::symlink_metadata(base_dir.join(crate::confirm::FILE)).is_ok());
         HELD.with(|h| h.set(held));
         UNTAKEN.with(|u| u.borrow_mut().clear());
+        UNREAD.with(|u| u.borrow_mut().clear());
     }
     // A mounted program's types are its own.
     let outer_records = RECORDS.with(|r| std::mem::take(&mut *r.borrow_mut()));
@@ -2672,7 +2713,14 @@ fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: Hash
         // What a start refuses under a hold, and, where it found nothing, that these files were
         // read: their start does not read them again (`untaken_at_load`).
         a.untaken = UNTAKEN.with(|u| std::mem::take(&mut *u.borrow_mut()));
-        if HELD.with(|h| h.replace(false)) && a.untaken.is_empty() && !over {
+        // And what it did not read, which a start does (`untaken_at_load`): a check that did not
+        // read all of it read nothing of what its files take (FEEDBACK83.md, Q-1300, found by the
+        // coverage tests of 0038a97; branch feedback82-85).
+        a.unread = UNREAD.with(|u| std::mem::take(&mut *u.borrow_mut()));
+        if over {
+            a.unread.insert(0, (a.diagnostics[0].clone(), "make the code the check could not read through simpler, or split it".to_string()));
+        }
+        if HELD.with(|h| h.replace(false)) && a.untaken.is_empty() && a.unread.is_empty() {
             let files = a.files.iter().map(String::as_str).chain([file]);
             *NAMES_READ.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((crate::modules::key(Path::new(file)), stamps(files)));
         }
@@ -3762,7 +3810,12 @@ impl Checker {
                 // Only a chain gets here: a file used again is not read again, so no cycle does
                 // (FEEDBACK55.md, Q-822; branch feedback55).
                 if self.uses >= MAX_USES {
-                    self.diag_at(file.clone(), *line, Severity::Error, format!("this `use` is the end of a chain of files more than {} deep, each used by the one before, which is as far as files are followed: take some of them from one file", MAX_USES));
+                    let message = format!("this `use` is the end of a chain of files more than {} deep, each used by the one before, which is as far as files are followed: take some of them from one file", MAX_USES);
+                    // Not read, and a start reads it: a held one is refused (`untaken_at_load`;
+                    // FEEDBACK83.md, Q-1300, found by the coverage tests of 0038a97; branch
+                    // feedback82-85).
+                    unread(&Diagnostic { file: file.to_string(), line: *line, severity: Severity::Error, message: message.clone() }, format!("a check follows a chain of `use` {} files long: take some of its files from one file", MAX_USES));
+                    self.diag_at(file.clone(), *line, Severity::Error, message);
                     continue;
                 }
                 match text {
@@ -3820,8 +3873,16 @@ impl Checker {
             names.iter().find(|n| stem(n) == stem(&want) && **n != want).cloned().or_else(|| closest(&want, names.iter().map(|n| n.as_str())))
         });
         let shown = path.trim_start_matches("./");
-        let hint = near.map_or(String::new(), |n| format!(" (did you mean {}?)", Path::new(shown).with_file_name(n).display()));
-        self.diag_at(file.clone(), line, Severity::Error, format!("cannot read {}: {}{}", shown, e, hint));
+        // A file past what a check reads of a program's files together, which a start reads
+        // (`untaken_at_load`), is there: no other is meant (FEEDBACK83.md, Q-1300, found by the
+        // coverage tests of 0038a97; branch feedback82-85).
+        let past = past_program_budget(&e);
+        let hint = near.filter(|_| !past).map_or(String::new(), |n| format!(" (did you mean {}?)", Path::new(shown).with_file_name(n).display()));
+        let message = format!("cannot read {}: {}{}", shown, e, hint);
+        if past {
+            unread(&Diagnostic { file: file.to_string(), line, severity: Severity::Error, message: message.clone() }, larger_files());
+        }
+        self.diag_at(file.clone(), line, Severity::Error, message);
     }
 
     /// `lib/a.qwe:1`: a place in the program, from the main file's folder.

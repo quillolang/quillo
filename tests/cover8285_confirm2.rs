@@ -282,7 +282,6 @@ fn a_site_wide_call_of_a_file_taken_under_watch_is_not_applied_until_a_restart()
 /// `held_taken` take it for the program's own. What it should do: refuse them as for a file with no
 /// block, until a restart reads it (coverage of feedback82-85; branch feedback82-85).
 #[test]
-#[ignore = "BUG: a file with a block that the start did not read is unheld once --watch takes it"]
 fn a_file_with_a_block_taken_under_watch_is_held_as_one_no_start_read() {
     let d = dir("watch-block");
     write(&d, "main.qwe", "route GET / = \"one\"\nroute POST /transfer = \"transferred\"\n");
@@ -542,7 +541,6 @@ fn a_name_not_taken_stops_a_held_start_unchecked() {
 /// should do: refuse a held start whose check could not read every program (coverage of
 /// feedback82-85; branch feedback82-85).
 #[test]
-#[ignore = "BUG: past 16 mounted programs a held start does not read untaken names"]
 fn a_name_not_taken_stops_a_held_start_however_deep_its_program_is() {
     let d = dir("untaken-deep");
     let at = mounted_down(&d, 17);
@@ -629,7 +627,6 @@ fn the_rust_reading_passes_words_and_reads_a_glob() {
 /// std::fs::*;` and `use std::fs::{*};` read as fs. What it should do: read each as fs (coverage of
 /// feedback82-85; branch feedback82-85).
 #[test]
-#[ignore = "BUG: a glob inside a use group hides std::fs from the Rust reading"]
 fn a_glob_in_a_group_is_read_as_what_it_takes() {
     let d = dir("rust-glob-group");
     for (i, u) in ["use std::{fs::*};", "use std::{fs::*, io};", "use std::{fs::{*}};", "use std :: { fs :: * } ;"].iter().enumerate() {
@@ -639,4 +636,218 @@ fn a_glob_in_a_group_is_read_as_what_it_takes() {
         assert_eq!(code, Some(1), "{}: {}", u, out);
         assert!(out.starts_with(&format!("{}: effects: fs\n", f)), "{}: {}", u, out);
     }
+}
+
+// ---- edge tests of the fixes of Q-1301, Q-1305 and Q-1300 ------------------------------------
+
+/// Under `--watch`, files no start read that have blocks in quillo.confirmed confirming what they
+/// do are held as files with none, however the main file takes them since: a kit taken whole has
+/// its route not served, its `site_headers` not applied and the path its block confirms refused; a
+/// program mounted since is not served; a service called since has its `server fn` not offered;
+/// each said with "its file was not read as the program started". After a restart, each is held
+/// to its block (src/confirm.rs, FEEDBACK83.md Q-1301, found by the coverage tests; branch feedback82-85).
+#[test]
+fn files_no_start_read_are_held_as_ones_with_no_block_however_they_are_taken() {
+    let d = dir("watch-block-ways");
+    write(&d, "main.qwe", "route GET / = \"one\"\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n\n[\"kit/k.qwe\"]\nfiles = [\"kit/\"]\nroutes = [\"GET /k\"]\nsite = [\"site_headers /\"]\n\n[\"sub/main.qwe\"]\nfiles = [\"sub/\"]\n\n[\"svc/billing.qwe\"]\nfiles = [\"svc/\"]\n");
+    write(&d, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nfn rd() {\n  return str(read_file(\"kit/data.txt\"))\n}\nsite_headers(\"/\", { \"x-left\": \"1\" })\nroute GET /k = \"k\"\n");
+    write(&d, "kit/data.txt", "kit-data");
+    write(&d, "sub/main.qwe", "site_headers(\"/\", { \"x-sub\": \"1\" })\nroute GET / = \"sub\"\n");
+    write(&d, "svc/billing.qwe", "server fn data() {\n  return \"svc-data\"\n}\n");
+    let program = "use kit/k.qwe\nmount /s = \"sub/main.qwe\"\nservice billing = \"svc/billing.qwe\"\nroute GET / = <html><body><Badge/></body></html>\nroute GET /r = rd()\nroute GET /d = billing.data()\n";
+    assert_eq!(quillo(&d, &["check", "main.qwe"]).0, Some(0));
+    let (g, port, log) = serve(&d, &["--watch"]);
+    assert_eq!(send(port, "GET", "/", &[], "").body, "one");
+    write(&d, "main.qwe", program);
+    let until = Instant::now() + Duration::from_secs(30);
+    while !send(port, "GET", "/", &[], "").body.contains("<b>b</b>") && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let page = send(port, "GET", "/", &[], "");
+    assert!(page.body.contains("<b>b</b>"), "{}", read(&log));
+    assert_eq!((page.header("x-left"), page.header("x-sub")), (None, None), "{:?}", page.headers);
+    assert_eq!(send(port, "GET", "/k", &[], "").status, 404);
+    assert_eq!(send(port, "GET", "/s/", &[], "").status, 404);
+    assert_ne!(send(port, "GET", "/r", &[], "").body, "kit-data");
+    let data = send(port, "GET", "/d", &[], "");
+    assert!(data.status == 500 && !data.body.contains("svc-data"), "{} {}", data.status, data.body);
+    for (file, what) in [("kit/k.qwe", "site_headers / is not applied"), ("kit/k.qwe", "GET /k is not served"), ("sub/main.qwe", "GET / is not served"), ("svc/billing.qwe", "server fn data is not served")] {
+        assert!(log_has(&log, &format!("quillo: {}: {}: its file was not read as the program started (restart it once it is confirmed)\n", file, what), 30), "{}: {}", what, read(&log));
+    }
+    assert!(log_has(&log, "quillo: kit/k.qwe: the path kit/data.txt was refused: it is not confirmed for this file", 30), "{}", read(&log));
+    drop(g);
+    // Restarted: each file read, each held to its block (the kit, taken whole, is the program's).
+    let (g, port, log) = serve(&d, &["--no-check"]);
+    assert_eq!(send(port, "GET", "/", &[], "").header("x-left"), Some("1"), "{}", read(&log));
+    assert_eq!(send(port, "GET", "/k", &[], "").body, "k");
+    assert_eq!(send(port, "GET", "/s/", &[], "").body, "sub");
+    assert_eq!(send(port, "GET", "/r", &[], "").body, "kit-data");
+    assert_eq!(send(port, "GET", "/d", &[], "").body, "svc-data", "{}", read(&log));
+    drop(g);
+}
+
+/// A file the start read is held to its block as the start read it: under `--watch`, a kit taken
+/// for `Badge` whose block is given `routes = ["GET /k"]` has its route still not served after
+/// the kit and the file are written again, said as not confirmed; a restart reads the block and
+/// serves it (src/confirm.rs, FEEDBACK83.md Q-1301, found by the coverage tests; branch feedback82-85).
+#[test]
+fn a_block_edited_under_watch_holds_from_the_next_start() {
+    let d = dir("watch-block-edit");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nroute GET / = <html><body><Badge/></body></html>\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n\n[\"kit/k.qwe\"]\n");
+    write(&d, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nroute GET /k = \"k\"\n");
+    let (g, port, log) = serve(&d, &["--watch"]);
+    assert_eq!(send(port, "GET", "/k", &[], "").status, 404, "{}", read(&log));
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n\n[\"kit/k.qwe\"]\nroutes = [\"GET /k\"]\n");
+    write(&d, "kit/k.qwe", "component Badge() {\n  return <b>bb</b>\n}\nroute GET /k = \"k\"\n");
+    let until = Instant::now() + Duration::from_secs(30);
+    while !send(port, "GET", "/", &[], "").body.contains("<b>bb</b>") && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(send(port, "GET", "/", &[], "").body.contains("<b>bb</b>"), "{}", read(&log));
+    assert_eq!(send(port, "GET", "/k", &[], "").status, 404);
+    assert!(log_has(&log, "quillo: kit/k.qwe: the route GET /k is not served: it is not confirmed for this file (`quillo confirm` lists it)\n", 30), "{}", read(&log));
+    drop(g);
+    let (g, port, log) = serve(&d, &[]);
+    assert_eq!(send(port, "GET", "/k", &[], "").body, "k", "{}", read(&log));
+    drop(g);
+}
+
+/// What `use` declarations take, each path read as it would be written alone, however the tree
+/// is written: a glob or a name in nested groups, `self` and `as` inside a group, a glob of
+/// std::env (its `var` called bare), of a module named `process` (std's, tokio's), through a name
+/// another `use` gives (Unicode too), `use std::fs;` then a function the reading did not list,
+/// `use std::*;` then a module it gives; `env!` and `UnixListener`. What takes nothing reads as
+/// nothing: `use std::*;` alone, a glob of std::io, an empty group, `use ::*;`, `env!=` compared;
+/// and `quillo check` says the line too (src/confirm.rs, FEEDBACK83.md Q-1305, found by the coverage tests; branch feedback82-85).
+#[test]
+fn what_a_use_tree_takes_is_read_however_it_is_written() {
+    let d = dir("rust-use-trees");
+    let read = "pub fn r() -> String { read_to_string(\"/etc/hosts\").unwrap_or_default() }";
+    let cases: Vec<(&str, String, &str, &str)> = vec![
+        ("nested", format!("use std::{{io, fs::{{self, *}}}};\n{}", read), "fs", "std::fs::* (line 3)"),
+        ("selfas", "use std::{fs::{self as f}};\npub fn r() { f::hard_link(\"/a\", \"/b\").ok(); }".into(), "fs", "std::fs::hard_link (line 4)"),
+        ("renamed", "use std::{env::{var as v}};\npub fn r() -> String { v(\"K\").unwrap_or_default() }".into(), "env", "std::env::var (line 4)"),
+        ("envglob", "use std::{env::{*}};\npub fn r() -> String { var(\"K\").unwrap_or_default() }".into(), "env", "std::env::* (line 3)"),
+        ("envalone", "use std::env::*;\npub fn r() -> String { var(\"K\").unwrap_or_default() }".into(), "env", "std::env::* (line 3)"),
+        ("process", "use std::{process::*};\npub fn r() { Command::new(\"ls\"); }".into(), "run", "Command::new (line 4)"),
+        ("tokio", "use tokio::process::*;\npub fn r() { Command::new(\"ls\"); }".into(), "run", "Command::new (line 4)"),
+        ("alias", format!("use std::fs as ü;\nuse ü::*;\n{}", read), "fs", "std::fs::* (line 4)"),
+        ("named", format!("extern crate std as s;\nuse s::fs::read_to_string;\n{}", read), "fs", "s::fs::read_to_string (line 4), std::fs::read_to_string (line 5)"),
+        ("unlisted", "use std::fs;\npub fn r() { fs::hard_link(\"/a\", \"/b\").ok(); }".into(), "fs", "fs::hard_link (line 4)"),
+        ("file", "use std::{fs::File};\npub fn r() { File::options().write(true).open(\"/x\").ok(); }".into(), "fs", "fs::File (line 3)"),
+        ("root", "use std::*;\npub fn r() { fs::hard_link(\"/a\", \"/b\").ok(); }".into(), "fs", "fs::hard_link (line 4)"),
+        ("rootglob", "use std::*;\nuse env::*;\npub fn r() -> String { var(\"K\").unwrap_or_default() }".into(), "env", "env::* (line 4)"),
+        ("built", "pub fn r() -> String { env!(\"AWS_SECRET_ACCESS_KEY\").to_string() }".into(), "env", "env! (line 3)"),
+        ("socket", "use std::os::unix::net::UnixListener;\npub fn r() { UnixListener::bind(\"/tmp/s\").ok(); }".into(), "net", "UnixListener::bind (line 4)"),
+    ];
+    for (name, code, effect, call) in &cases {
+        let f = format!("{}.qwer", name);
+        write(&d, &f, &format!("//! version: 1.0.0\n//! effects: none\n{}\n", code));
+        let (code, out) = quillo(&d, &["confirm", "--effects", &f]);
+        assert_eq!(code, Some(1), "{}: {}", name, out);
+        assert!(out.starts_with(&format!("{}: effects: {}\n  but it says `effects: none`, and calls {}: a reading", f, effect, call)), "{}: {}", name, out);
+    }
+    for (name, code) in [("rootonly", "use std::*;\npub fn r() -> u8 { 1 }"), ("io", "use std::{io::*};\npub fn r() -> u8 { 1 }"), ("empty", "use std::{};\npub fn r() -> u8 { 1 }"), ("bare", "use ::*;\npub fn r() -> u8 { 1 }"), ("compared", "pub fn r() -> bool { let env = 1; env!=2 }")] {
+        let f = format!("{}.qwer", name);
+        write(&d, &f, &format!("//! version: 1.0.0\n//! effects: none\n{}\n", code));
+        assert_eq!(quillo(&d, &["confirm", "--effects", &f]), (Some(0), format!("{}: effects: none\n", f)), "{}", name);
+    }
+    // `quillo check` of a program that takes one says it at the file's line.
+    write(&d, "main.qwe", "import nested.qwer use r\nroute GET / = r()\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("nested.qwer:3: warning: nested.qwer says `effects: none`, and calls std::fs::* (line 3)"), "{}", out);
+}
+
+/// `depth` programs mounted one in another, the last answering "deepest", nothing taken wrong,
+/// under a quillo.confirmed: the path of the last program's folder from `d`.
+fn mounted_clean(d: &Path, depth: usize) -> String {
+    let mut at = String::new();
+    for i in 0..depth {
+        write(d, &format!("{}main.qwe", at), &format!("mount /m = \"m/main.qwe\"\nroute GET / = \"level {}\"\n", i));
+        at.push_str("m/");
+    }
+    write(d, &format!("{}main.qwe", at), "route GET / = \"deepest\"\n");
+    write(d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    at
+}
+
+/// A held `--no-check` start reads as deep as a check does: 16 programs (15 mounted one in
+/// another), the kit of the 16th using its main file's `reader` untaken is refused by that name;
+/// 16 programs with nothing wrong start, the deepest served; 17 do not start, said with what the
+/// check could not read and what to do, which `quillo check` says too; a chain of 64 `use`d files
+/// is read through (its last file's route served), 65 is refused the same way
+/// (src/check.rs, FEEDBACK83.md Q-1300, found by the coverage tests; branch feedback82-85).
+#[test]
+fn a_held_start_reads_as_deep_as_a_check_and_no_deeper() {
+    let d = dir("untaken-16");
+    let at = mounted_down(&d, 15);
+    let (code, out) = quillo(&d, &["run", "main.qwe", "--port", "0", "--no-check"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains(&format!("the program is not started\n  ./{}kit.qwe:5: error: `reader` comes from main.qwe, which this file does not take", at)), "{}", out);
+    // Nothing wrong: 16 start, 17 do not.
+    let d = dir("clean-16");
+    let at = mounted_clean(&d, 15);
+    let (g, port, log) = serve(&d, &["--no-check"]);
+    assert_eq!(send(port, "GET", &format!("/{}", at), &[], "").body, "deepest", "{}", read(&log));
+    drop(g);
+    let d = dir("clean-17");
+    let at = mounted_clean(&d, 16);
+    let (code, out) = quillo(&d, &["run", "main.qwe", "--port", "0", "--no-check"]);
+    assert_eq!(code, Some(1), "{}", out);
+    let deep = format!("./{}main.qwe: error: programs mount or call each other more than 16 deep", at);
+    assert!(out.contains(&format!("quillo: a quillo.confirmed holds the program, and its check cannot read all of it, so which names each of its files takes is not known, and one could reach what another file was confirmed for: the program is not started\n  {}\n  a check reads programs 16 deep, the main one among them: mount or call the deepest from a program nearer the main file (`quillo check` says the same)\n", deep)), "{}", out);
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains(&format!("{}\n", deep)), "{}", out);
+    // A chain of `use`, the last file's route the program's own.
+    let chain = |name: &str, n: usize| {
+        let d = dir(name);
+        write(&d, "main.qwe", "use u1.qwe\nroute GET / = \"main\"\n");
+        for i in 1..n {
+            write(&d, &format!("u{}.qwe", i), &format!("use u{}.qwe\n", i + 1));
+        }
+        write(&d, &format!("u{}.qwe", n), "route GET /leaf = \"leaf\"\n");
+        write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+        d
+    };
+    let d = chain("chain-64", 64);
+    let (g, port, log) = serve(&d, &["--no-check"]);
+    assert_eq!(send(port, "GET", "/leaf", &[], "").body, "leaf", "{}", read(&log));
+    drop(g);
+    let d = chain("chain-65", 65);
+    let (code, out) = quillo(&d, &["run", "main.qwe", "--port", "0", "--no-check"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("the program is not started\n  ./u64.qwe:1: error: this `use` is the end of a chain of files more than 64 deep") && out.contains("\n  a check follows a chain of `use` 64 files long: take some of its files from one file (`quillo check` says the same)\n"), "{}", out);
+}
+
+/// A held `--no-check` start whose files come to more than a check reads together (32 MiB): the
+/// kit read last, which uses the main file's `reader` untaken to read `.env`, is not read by the
+/// check, and the start is refused, said with what to do; the page never shows the `.env`
+/// (src/check.rs, FEEDBACK83.md Q-1300, found by the coverage tests; branch feedback82-85).
+#[test]
+fn a_held_start_whose_files_pass_what_a_check_reads_does_not_start() {
+    let d = dir("untaken-budget");
+    let mib = 1usize << 20;
+    write(&d, "main.qwe", "let reader = read_file\nuse a.qwe\nuse b.qwe\nuse kit.qwe\nroute GET / = \"main\"\n");
+    write(&d, "a.qwe", &format!("fn fa() {{\n  return 1\n}}\n{}", "\n".repeat(16 * mib - 64)));
+    write(&d, "b.qwe", &format!("fn fb() {{\n  return 2\n}}\n{}", "\n".repeat(16 * mib - 600)));
+    write(&d, "kit.qwe", &format!("route GET /leak = str(reader(\".env\"))\n{}", "\n".repeat(600)));
+    write(&d, ".env", "SECRET=hunter2\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nfiles = [\".env\"]\n");
+    let log = d.join("run.log");
+    let child = quillo_cmd(&d, Path::new(env!("CARGO_BIN_EXE_quillo")), &["run", "main.qwe", "--port", "0", "--no-check"]).stdout(Stdio::null()).stderr(std::fs::File::create(&log).unwrap()).spawn().unwrap();
+    let mut g = Guard::new(child);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !read(&log).contains("listening on") && g.0.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Some(port) = support::port_said_in(&log) {
+        assert!(!send(port, "GET", "/leak", &[], "").body.contains("hunter2"), "the kit read the .env");
+    }
+    drop(g);
+    let said = read(&log);
+    assert!(said.contains("the program is not started\n  main.qwe:4: error: cannot read kit.qwe: the program's files come to more than 32 MiB together\n  a check reads 32 MiB of a program's files together: make them smaller, or take fewer (`quillo check` says the same)\n"), "{}", said);
 }

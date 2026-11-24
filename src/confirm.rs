@@ -1134,6 +1134,14 @@ pub fn normal(p: &str) -> String {
 /// (FEEDBACK83.md, Q-1305 and Q-1308; branch feedback82-85).
 const RUST_CALLS: &[(&str, &str)] = &[
     ("std::fs::", "fs"),
+    // Any path through a module named `fs`, std's, tokio's or async-std's, however the `use` that
+    // gives it is written: `use std::{fs::*};` or `use std::{fs::File};` then a bare
+    // `read_to_string(p)` or `File::options()...open(p)`, and `use std::fs;` then
+    // `fs::hard_link(a, b)`, each read as `effects: none` where `std::fs::` was looked for and
+    // a few of its functions. A module of a crate's own by that name is read as fs too (wide, as
+    // RUST_CRATES is) (FEEDBACK83.md, Q-1305, found by the coverage tests of 0038a97; branch
+    // feedback82-85).
+    ("fs::", "fs"),
     ("fs::read", "fs"),
     ("fs::write", "fs"),
     ("fs::remove", "fs"),
@@ -1177,6 +1185,10 @@ const RUST_CALLS: &[(&str, &str)] = &[
     ("TcpListener::", "net"),
     ("UdpSocket::", "net"),
     ("UnixStream::", "net"),
+    // A Unix socket listened on or sent from: `UnixListener::bind(p)` read as `effects: none`
+    // (FEEDBACK83.md, Q-1305, found by the coverage tests of 0038a97; branch feedback82-85).
+    ("UnixListener::", "net"),
+    ("UnixDatagram::", "net"),
     // A name looked up: DNS (FEEDBACK83.md, Q-1305; branch feedback82-85: ssrf_guard.qwer).
     ("to_socket_addrs", "net"),
     ("ToSocketAddrs", "net"),
@@ -1187,6 +1199,11 @@ const RUST_CALLS: &[(&str, &str)] = &[
     ("attohttpc::", "http"),
     ("isahc::", "http"),
     ("env::var", "env"),
+    // A variable of the environment the plugin is built in, read into it, as `include_str!`
+    // reads a file: `env!("AWS_SECRET_ACCESS_KEY")` read as `effects: none` (FEEDBACK83.md,
+    // Q-1305, found by the coverage tests of 0038a97; branch feedback82-85).
+    ("env!", "env"),
+    ("option_env!", "env"),
     ("SystemTime::now", "time"),
     ("Instant::now", "time"),
     ("Utc::now", "time"),
@@ -1301,6 +1318,13 @@ const RUST_CRATE_USES: &[(&str, &[&str], &str)] = &[
 /// `SnippetGenerator::create(..)`, `mime_guess::from_path(name)` (a name's extension) (FEEDBACK83.md,
 /// Q-1305; branch feedback82-85).
 const RUST_NOT_FILES: &[&str] = &["Client::open", "Stemmer::create", "SnippetGenerator::create", "mime_guess::from_path"];
+
+/// Modules whose functions a glob of them (`use std::env::*;`, `use std::{env::{*}};`, `use
+/// tokio::fs::*;`) brings in to be called bare, `var("KEY")`, where the reading knows them only by
+/// the module's name (`env::var`, `fs::`): by the last part of the module's path, its effect. A
+/// glob of a module named `process` lets `Command::new` start a program (`rust_read`)
+/// (FEEDBACK83.md, Q-1305, found by the coverage tests of 0038a97; branch feedback82-85).
+const RUST_GLOBS: &[(&str, &str)] = &[("env", "env"), ("fs", "fs")];
 
 /// A Rust file's code with its comments taken out and each string's text out of it (`""` in its
 /// place), lines kept; and the strings, each with its line and where it stood in the code.
@@ -1472,12 +1496,15 @@ fn rust_joined(code: &str) -> String {
 }
 
 /// The names `use` declarations (and `extern crate x as y`) in `code` give: each name, the path
-/// it stands for, and whether it is another name for it (`as`); and where each declaration is.
-/// A name of the file's own (`crate::`, `self::`, `super::`) is read where it is written.
-fn rust_use_names(code: &str) -> (Vec<(String, String, bool)>, Vec<(usize, usize)>) {
+/// it stands for, and whether it is another name for it (`as`); where each declaration is; and the
+/// path each name and glob of them takes, as it would be written alone (`use std::{fs::*,
+/// net::TcpStream};`: `std::fs::*` and `std::net::TcpStream`), each with where it is. A name of
+/// the file's own (`crate::`, `self::`, `super::`) is read where it is written.
+fn rust_use_names(code: &str) -> RustUses {
     let b = code.as_bytes();
     let mut names = Vec::new();
     let mut spans = Vec::new();
+    let mut leaves = Vec::new();
     for kw in ["use", "extern crate"] {
         let mut from = 0;
         while let Some(at) = code[from..].find(kw).map(|a| a + from) {
@@ -1491,7 +1518,7 @@ fn rust_use_names(code: &str) -> (Vec<(String, String, bool)>, Vec<(usize, usize
             let toks = rust_use_tokens(&code[from..end]);
             let mut i = 0;
             if kw == "use" {
-                rust_use_tree(&toks, &mut i, &[], &mut names);
+                rust_use_tree(&toks, &mut i, &[], &mut names, &mut leaves, code.as_ptr() as usize);
             } else if let [name, rest @ ..] = toks.as_slice() {
                 if let ["as", alias] = rest {
                     names.push((alias.to_string(), name.to_string(), true));
@@ -1500,7 +1527,35 @@ fn rust_use_names(code: &str) -> (Vec<(String, String, bool)>, Vec<(usize, usize
         }
     }
     names.retain(|(n, full, _)| n != "_" && *n != *full && !["crate", "self", "super"].iter().any(|s| full.split("::").next() == Some(*s)));
-    (names, spans)
+    // A path that starts at a name another `use` gives is the path that name stands for: `use
+    // std::fs as f; use f::read_to_string;` and `use std::fs as f; use f::*;`, then a bare
+    // `read_to_string(p)`, read as `effects: none` (FEEDBACK83.md, Q-1305, found by the coverage
+    // tests of 0038a97; branch feedback82-85).
+    for k in 0..names.len() {
+        let full = rust_resolved(&names[k].1, &names, Some(k));
+        names[k].1 = full;
+    }
+    for leaf in leaves.iter_mut() {
+        leaf.0 = rust_resolved(&leaf.0, &names, None);
+    }
+    (names, spans, leaves)
+}
+
+/// What `rust_use_names` reads of a file's `use` declarations.
+type RustUses = (Vec<(String, String, bool)>, Vec<(usize, usize)>, Vec<(String, usize)>);
+
+/// `path` (`f::read_to_string`), its first part another name of `names` gives (but the one at
+/// `own`), written as the path that name stands for (`std::fs::read_to_string`), as far as eight
+/// such names lead.
+fn rust_resolved(path: &str, names: &[(String, String, bool)], own: Option<usize>) -> String {
+    let mut p = path.to_string();
+    for _ in 0..8 {
+        let first = p.split("::").next().unwrap_or("").to_string();
+        let by = names.iter().enumerate().find(|(k, (n, full, _))| Some(*k) != own && *n == first && full.split("::").next() != Some(first.as_str()));
+        let Some((_, (_, full, _))) = by else { break };
+        p = format!("{}{}", full, &p[first.len()..]);
+    }
+    p
 }
 
 fn rust_use_tokens(s: &str) -> Vec<&str> {
@@ -1526,21 +1581,30 @@ fn rust_use_tokens(s: &str) -> Vec<&str> {
     out
 }
 
-/// One tree of a `use` (`std::{fs as f, net::TcpStream}`) under `prefix`, its names into `out`.
-fn rust_use_tree(toks: &[&str], i: &mut usize, prefix: &[String], out: &mut Vec<(String, String, bool)>) {
+/// One tree of a `use` (`std::{fs as f, net::TcpStream}`) under `prefix`, its names into `out`
+/// and the path each name and glob takes into `leaves` (`std::fs`, `std::net::TcpStream`,
+/// `std::io::*`), each with where it is in the code that starts at `origin`. Before, a glob in a
+/// group (`use std::{fs::*};`, `use std::{fs::{*}};`) was passed over, and nothing read what it, or
+/// a name in a group (`use std::{fs::File};`), took (FEEDBACK83.md, Q-1305, found by the coverage
+/// tests of 0038a97; branch feedback82-85).
+fn rust_use_tree(toks: &[&str], i: &mut usize, prefix: &[String], out: &mut Vec<(String, String, bool)>, leaves: &mut Vec<(String, usize)>, origin: usize) {
     let mut path = prefix.to_vec();
+    let offset = |t: &str| (t.as_ptr() as usize).saturating_sub(origin);
     while let Some(t) = toks.get(*i).copied() {
         match t {
             "::" => *i += 1,
             "*" | "}" | "," => {
-                *i += usize::from(t == "*");
+                if t == "*" {
+                    leaves.push((path.iter().map(String::as_str).chain(["*"]).collect::<Vec<_>>().join("::"), offset(t)));
+                    *i += 1;
+                }
                 return;
             }
             "{" => {
                 *i += 1;
                 while toks.get(*i).is_some_and(|t| *t != "}") {
                     let at = *i;
-                    rust_use_tree(toks, i, &path, out);
+                    rust_use_tree(toks, i, &path, out, leaves, origin);
                     if toks.get(*i) == Some(&",") {
                         *i += 1;
                     } else if *i == at {
@@ -1567,6 +1631,7 @@ fn rust_use_tree(toks: &[&str], i: &mut usize, prefix: &[String], out: &mut Vec<
                     }
                     _ => (last, false),
                 };
+                leaves.push((path.join("::"), offset(name)));
                 out.push((given, path.join("::"), other));
                 return;
             }
@@ -1580,13 +1645,15 @@ fn rust_use_tree(toks: &[&str], i: &mut usize, prefix: &[String], out: &mut Vec<
 /// taken as it is (`use std::fs::write;`) where it is called, `write(p)`. `deps`: the names a
 /// dependency line gives a crate (`h = { package = "reqwest" }`). Before, each of these spellings
 /// read as `effects: none` (FEEDBACK83.md, Q-1305, found by the coverage tests; branch
-/// feedback82-85).
-fn rust_spelled(code: &str, deps: &[(String, String)]) -> String {
+/// feedback82-85). And the path each name and glob of the file's `use`s takes, each with its line
+/// (`rust_use_names`).
+fn rust_spelled(code: &str, deps: &[(String, String)]) -> (String, Vec<(String, u32)>) {
     let joined = rust_joined(code);
-    let (mut names, spans) = rust_use_names(&joined);
+    let (mut names, spans, leaves) = rust_use_names(&joined);
+    let leaves: Vec<(String, u32)> = leaves.into_iter().map(|(p, at)| (p, joined.get(..at).map_or(0, |b| b.matches('\n').count()) as u32 + 1)).collect();
     names.extend(deps.iter().map(|(n, p)| (n.clone(), p.clone(), true)));
     if names.is_empty() {
-        return joined;
+        return (joined, leaves);
     }
     let b = joined.as_bytes();
     let mut out = String::with_capacity(joined.len() + 64);
@@ -1610,16 +1677,48 @@ fn rust_spelled(code: &str, deps: &[(String, String)]) -> String {
         i = end;
     }
     out.push_str(&joined[last..]);
-    out
+    (out, leaves)
+}
+
+/// What the reading of `code` (`rust_code`'s, a file's code) finds it does: the code as
+/// `rust_spelled` writes it, the effects, and the calls that mean each with its line. And what its
+/// `use`s take, each path as it would be written alone (`use std::{fs::*};` as `std::fs::*`,
+/// `use std::{fs::File};` as `std::fs::File`), with a glob of a module `RUST_GLOBS` names read
+/// as it has it: a call of that path, where the code read finds that effect nowhere else. A glob
+/// of a module named `process` lets `Command::new` start a program, as `use
+/// std::process::Command;` does (FEEDBACK83.md, Q-1305, found by the coverage tests of 0038a97;
+/// branch feedback82-85). A glob of a crate itself (`use std::*;`) gives modules, not functions,
+/// so what it takes is read where they are named (`fs::hard_link(a, b)`, `env::var(k)`, `use
+/// fs::*;`), and nothing at it.
+fn rust_read(code: &str, deps: &[(String, String)]) -> (String, Effects, Vec<(&'static str, String, u32)>) {
+    let (spelled, leaves) = rust_spelled(code, deps);
+    let starts_programs = spelled.contains("std::process") || spelled.contains("process::Command") || leaves.iter().any(|(p, _)| p.ends_with("::*") && p.split("::").any(|s| s == "process"));
+    let (mut mask, mut calls) = effects_in(&spelled, starts_programs);
+    let elsewhere = mask;
+    for (path, line) in &leaves {
+        let mut taken = effects_in(path, starts_programs).0;
+        if let Some(module) = path.strip_suffix("::*") {
+            for (_, effect) in RUST_GLOBS.iter().filter(|(m, _)| module.rsplit("::").next() == Some(*m)) {
+                taken |= effect_bit(effect);
+            }
+        }
+        for effect in effect_names(taken & !elsewhere) {
+            if !calls.iter().any(|(e, c, _)| *e == effect && c == path) {
+                mask |= effect_bit(effect);
+                calls.push((effect, path.clone(), *line));
+            }
+        }
+    }
+    calls.sort_by_key(|c| c.2);
+    (spelled, mask, calls)
 }
 
 /// What a reading of a Rust file finds it does: the effects, each with the calls that mean it and
 /// their lines. A reading, not a proof: a crate can do what it does unseen.
 pub fn rust_effects(src: &str) -> (Effects, Vec<(&'static str, String, u32)>) {
     let (code, _) = rust_code(src);
-    let code = rust_spelled(&code, &[]);
-    let starts_programs = code.contains("std::process") || code.contains("process::Command");
-    effects_in(&code, starts_programs)
+    let (_, mask, calls) = rust_read(&code, &[]);
+    (mask, calls)
 }
 
 fn effects_in(code: &str, starts_programs: bool) -> (Effects, Vec<(&'static str, String, u32)>) {
@@ -1641,6 +1740,15 @@ fn effects_in(code: &str, starts_programs: bool) -> (Effects, Vec<(&'static str,
                 continue;
             }
             if *pat == "Command::new" && !starts_programs {
+                continue;
+            }
+            // A macro's `!`, not a name compared (`env!=x`).
+            if pat.ends_with('!') && tb.get(from) == Some(&b'=') {
+                continue;
+            }
+            // A `use` tree's `fs::*` or `fs::{...}`: read by its paths, each named as written
+            // alone (`rust_read`), not as `fs`.
+            if *pat == "fs::" && matches!(tb.get(from), Some(b'*' | b'{')) {
                 continue;
             }
             // A function of the file's own by that name (`fn sleep(`) is not the call; `.open(x)`
@@ -1715,8 +1823,7 @@ fn scan_rust(bytes: &[u8]) -> Block {
         .map(|(n, spec)| (n.trim().replace('-', "_"), crate_of(n.trim(), spec).replace('-', "_")))
         .filter(|(n, c)| n != c && !n.is_empty())
         .collect();
-    let spelled = rust_spelled(&code, &renamed);
-    let starts_programs = spelled.contains("std::process") || spelled.contains("process::Command");
+    let (spelled, mut mask, mut calls) = rust_read(&code, &renamed);
     for (line, at, text) in &strings {
         let address = ["https://", "http://", "wss://", "ws://"].iter().find_map(|s| text.find(s).map(|i| format!("https://{}", &text[i + s.len()..])));
         if let Some(h) = address.and_then(|a| host_of(&a, true)) {
@@ -1730,7 +1837,6 @@ fn scan_rust(bytes: &[u8]) -> Block {
             add(&mut b.env, text.clone(), *line);
         }
     }
-    let (mut mask, mut calls) = effects_in(&spelled, starts_programs);
     let code = spelled;
     for c in b.crates.keys() {
         let name = c.split(' ').next().unwrap_or("");
@@ -2242,6 +2348,8 @@ struct Hold {
     /// Block 0 is an empty one: a file with no block is confirmed for nothing.
     blocks: Vec<Block>,
     by_name: HashMap<String, u32>,
+    /// The blocks of files the start did not read (`Hold::id` gives their code block 0).
+    unread: HashSet<u32>,
     seen: RwLock<HashMap<String, u32>>,
     said: Mutex<HashSet<String>>,
     /// A confirmed script's integrity hash, by the block that confirmed it and its address: two
@@ -2277,6 +2385,15 @@ fn hold(dir: &Path, main: &Path, conf: &Confirmed, found: &Scan) {
             blocks.push(Block::default());
         }
     }
+    // A block of a file the start did not read (left from before, or written for a file not used
+    // yet): whether the file is taken for some of its names or is the program's own is what the
+    // start reads, so code of it that `--watch` takes since is held as a file no start read,
+    // whatever its block says, until a restart reads it. Given its block, it was the program's own:
+    // its routes served, its `site_headers` and `allow_cross_site("/")` applied, where a file with
+    // no block was refused them (FEEDBACK83.md, Q-1301, found by the coverage tests of 0038a97;
+    // branch feedback82-85). A Rust file's SHA-256 is still read from its block (`pinned`,
+    // `plugin_ok`): it loads only as the file confirmed, which no list is needed to hold.
+    let unread: HashSet<u32> = conf.keys().filter(|f| !found.files.contains_key(*f)).filter_map(|f| by_name.get(f).copied()).collect();
     let routes_held: HashSet<u32> = found.files.iter().filter(|(_, b)| b.taken).filter_map(|(f, _)| by_name.get(f).copied()).collect();
     let named: HashSet<(u32, String)> = found.files.iter().filter(|(_, b)| b.taken).filter_map(|(f, b)| by_name.get(f).map(|i| (*i, b))).flat_map(|(i, b)| b.named.iter().map(move |n| (i, n.clone()))).collect();
     let mut refused_tools = HashSet::new();
@@ -2306,7 +2423,7 @@ fn hold(dir: &Path, main: &Path, conf: &Confirmed, found: &Scan) {
     let current: Confirmed = conf.iter().filter(|(f, _)| found.files.contains_key(*f)).map(|(f, b)| (f.clone(), b.clone())).collect();
     let page_policy = Some(page_policy_of(&current));
     let main = rel_name(&dir, main);
-    let _ = HOLD.set(Hold { dir: dir.canonicalize().unwrap_or(dir), main, routes_held, named, blocks, by_name, seen: RwLock::new(HashMap::new()), said: Mutex::new(HashSet::new()), integrity, refused_tools, known_tools, reals: RwLock::new(HashMap::new()), page_policy });
+    let _ = HOLD.set(Hold { dir: dir.canonicalize().unwrap_or(dir), main, routes_held, named, blocks, by_name, unread, seen: RwLock::new(HashMap::new()), said: Mutex::new(HashSet::new()), integrity, refused_tools, known_tools, reals: RwLock::new(HashMap::new()), page_policy });
 }
 
 /// The `content-security-policy-report-only` of a held program's pages: what its files' scripts,
@@ -2381,7 +2498,10 @@ impl Hold {
         let path = Path::new(name);
         let full = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir().map(|d| d.join(path)).unwrap_or_else(|_| path.to_path_buf()) };
         let rel = rel_name(&self.dir, &full);
-        let i = self.by_name.get(&rel).copied().unwrap_or(0);
+        // A file the start did not read is one, whatever its block says (`unread`; FEEDBACK83.md,
+        // Q-1301, found by the coverage tests of 0038a97; branch feedback82-85). Asked once a
+        // name, as the rest of this is.
+        let i = self.by_name.get(&rel).copied().filter(|i| !self.unread.contains(i)).unwrap_or(0);
         self.seen.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.to_string(), i);
         i
     }
