@@ -257,6 +257,14 @@ What a program may notice:
 
 ### Fixed
 
+- **A folder is one folder whatever name it is given** (Q-1285, Q-1340, Q-1300): on macOS
+  `/System/Volumes/Data/private/x` is `/private/x`. A pinned plugin was built in a temporary
+  folder the program could write when `--allow-path`, `[fs] paths` or the program's folder
+  named it by the other name, and under `--allow-path /`. `--allow-path` by the long name
+  refused the paths it allows; `delete_file` by the other name deleted the program's folder or
+  its database's; `db.migrate()` of a program started by the long name failed (0.8.10 applied
+  it). A pinned source that builds another file in (`global_asm!`'s `.include`, `include!`)
+  is refused without a `quillo.confirmed` too.
 - **`read_file`, `write_file` and `delete_file`'s refusal of a path outside the folder** ends
   with the way out: ``; `--allow-path ..` (on `quillo run` or `quillo mcp`) lets the program
   read it`` (Q-1341). Refused for a link, it names the link and where it leads, with the

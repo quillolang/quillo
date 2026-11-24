@@ -1208,7 +1208,10 @@ fn safe_above(root: &Path) -> Result<(), String> {
             continue;
         }
         let real = d.canonicalize().unwrap_or_else(|_| d.clone());
-        let inside_home = home.as_ref().is_some_and(|h| real != *h && real.starts_with(h));
+        // By whichever name each is given: HOME named `/System/Volumes/Data/Users/x` was not
+        // HOME to `/Users/x` (FEEDBACK82.md, Q-1285, found by the coverage tests; branch
+        // feedback82-85).
+        let inside_home = home.as_ref().is_some_and(|h| crate::statics::rel_in(&real, h).is_some_and(|rest| !rest.as_os_str().is_empty()));
         if !(inside_home && meta.uid() == me) {
             return Err(format!("{}, above the plugin cache, can be written by other users (mode {:o}), who could put a folder of theirs in the cache's place: nothing is built there; `chmod go-w {}` makes it safe", d.display(), mode & 0o777, d.display()));
         }
@@ -1965,14 +1968,15 @@ fn private_dir() -> Result<PathBuf, String> {
     #[cfg(not(unix))]
     let base = if from_file { return Err("a pinned plugin is built in the temporary folder of whoever starts Quillo, and .env set TMP or TEMP".into()) } else { std::env::temp_dir() };
     let base = base.canonicalize().map_err(|e| format!("cannot use the temporary folder {}: {}", base.display(), e))?;
-    let mut reach: Vec<PathBuf> = crate::builtins::allowed_paths();
-    reach.extend(crate::privacy::root());
-    reach.extend(std::env::current_dir().ok().and_then(|d| d.canonicalize().ok()));
+    // Each with whether it counts as the disk's root (`reached`): the folders the program's file
+    // builtins reach do, the one it runs in and a policy's ceilings do not.
+    let mut reach: Vec<(PathBuf, bool)> = crate::builtins::allowed_paths().into_iter().map(|p| (p, true)).collect();
+    reach.extend(crate::privacy::root().map(|p| (p, true)));
+    reach.extend(std::env::current_dir().ok().and_then(|d| d.canonicalize().ok()).map(|p| (p, false)));
     for (_, paths) in &crate::policy::get().fs_paths {
-        reach.extend(paths.iter().cloned());
+        reach.extend(paths.iter().map(|p| (p.clone(), false)));
     }
-    // A folder that is the whole disk's root (a unit's working folder) holds every place.
-    if let Some(r) = reach.iter().filter(|r| r.parent().is_some()).find(|r| base.starts_with(r)) {
+    if let Some(r) = reached(&base, &reach) {
         return Err(format!("a pinned plugin is built apart, and the temporary folder {} is inside {}, which the program can reach", base.display(), r.display()));
     }
     let dir = base.join(format!("quillo-pinned-{}", crate::service::new_id(16)));
@@ -1992,6 +1996,18 @@ fn private_dir() -> Result<PathBuf, String> {
         }
     }
     Ok(dir)
+}
+
+/// The folder of `reach` that holds `dir` (each resolved), judged by the folders themselves
+/// whatever name each is given (`statics::holds`): with `--allow-path /System/Volumes/Data/x` and
+/// `TMPDIR=/private/x/tmp`, one folder by its two names on macOS, the text said no, and the pinned
+/// build ran in a folder the program could write (FEEDBACK82.md, Q-1285, found by the coverage
+/// tests; branch feedback82-85). A folder that is the whole disk's root holds every place: as the
+/// folder Quillo runs in (a unit's working folder) or a policy's ceiling (`[fs] paths = ["/"]`) it
+/// is let pass, as before; as one the program's file builtins reach (`--allow-path /`, the second
+/// way round, found fixing it) it is not, the second element of each pair `true`.
+fn reached<'a>(dir: &Path, reach: &'a [(PathBuf, bool)]) -> Option<&'a PathBuf> {
+    reach.iter().filter(|(r, at_root)| *at_root || r.parent().is_some()).map(|(r, _)| r).find(|r| crate::statics::holds(r, dir))
 }
 
 /// The library to open, as checked: on Linux, by a descriptor opened on the file whose bytes were
@@ -2053,6 +2069,14 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         }
     }
     let src = String::from_utf8(bytes.clone()).map_err(|_| format!("{} is not UTF-8 text", qwer.display()))?;
+    // Nothing that builds another file in, which the hash does not cover and rustc's list of what
+    // it read (`read_in`) does not show: `global_asm!(".include \"/x/evil.s\"")`, under a provider's
+    // source pin with no quillo.confirmed, built the other file's code in and loaded it, as
+    // `include!`, `#[link]` and the like would (FEEDBACK82.md Q-1285, FEEDBACK83.md Q-1305, found
+    // by the coverage tests of 3117dea; branch feedback82-85). Judged before anything is built.
+    if let Some(why) = crate::confirm::built_in_refused(&qwer.display().to_string(), &src) {
+        return Err(why);
+    }
     let version = crate::install::header_version(&src);
     crate::policy::get().plugin(&stem(qwer), version.as_deref(), std::slice::from_ref(&hash))?;
     let parsed = parse(src.strip_prefix('\u{FEFF}').unwrap_or(&src));
@@ -2334,9 +2358,11 @@ fn built_record(program: &Path) -> Option<PathBuf> {
     let dir = dir.canonicalize().ok()?;
     // In the program's folder, or one it may reach, it is the program's to write: not where it is
     // started from, which may be the home the cache is in (found in review 2).
-    let mut reach: Vec<PathBuf> = crate::builtins::allowed_paths();
-    reach.extend(program.canonicalize().ok());
-    if reach.iter().filter(|r| r.parent().is_some()).any(|r| dir.starts_with(r)) {
+    // Judged by the folders themselves, as the private folder is (`reached`; FEEDBACK82.md, Q-1285,
+    // found by the coverage tests; branch feedback82-85).
+    let mut reach: Vec<(PathBuf, bool)> = crate::builtins::allowed_paths().into_iter().map(|p| (p, true)).collect();
+    reach.extend(program.canonicalize().ok().map(|p| (p, true)));
+    if reached(&dir, &reach).is_some() {
         return None;
     }
     let file = dir.join("built.txt");

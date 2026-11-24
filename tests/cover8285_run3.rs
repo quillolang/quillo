@@ -223,3 +223,436 @@ print({ "$db": b["$db"], one: upper }.one("select x from t"))
          its own: select x from t\nSELECT X FROM T\n"
     );
 }
+
+// Fix round 6
+
+// ---- one folder, however it is named ------------------------------------------------------------
+
+use support::{port_in_log, send, Guard};
+
+/// `d`, a folder as the system names it, by its other name through the data volume's firmlink on
+/// macOS (`/System/Volumes/Data/private/var/...` for `/private/var/...`), looked at to be the same
+/// folder; None where it has none (Linux, as on CI).
+#[cfg(unix)]
+fn other_name(d: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let long = Path::new("/System/Volumes/Data").join(d.strip_prefix("/").ok()?);
+    let (a, b) = (std::fs::metadata(d).ok()?, std::fs::metadata(&long).ok()?);
+    (a.dev() == b.dev() && a.ino() == b.ino()).then_some(long)
+}
+
+/// A test's folder (removed at its end) as the system names it, and the same folder by its other
+/// name; None, said, where it has none, and the test has nothing to look at.
+#[cfg(unix)]
+fn named_twice(name: &str) -> Option<(Dir, PathBuf)> {
+    let d = Dir(support::temp_dir(name).canonicalize().unwrap());
+    let Some(long) = other_name(&d.0) else {
+        eprintln!("skipped: {} has no other name here (no /System/Volumes/Data firmlink, as on Linux)", d.0.display());
+        return None;
+    };
+    Some((d, long))
+}
+
+/// `quillo args` in `cwd`, with `vars`, its output in `log`, ended after `secs`: its exit code and
+/// what it wrote. No policy, database or cargo of the test's own reaches it.
+fn quillo_at(cwd: &Path, args: &[&str], vars: &[(&str, &str)], log: &Path, secs: u64) -> (Option<i32>, String) {
+    let file = std::fs::File::create(log).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .args(args)
+        .current_dir(cwd)
+        .env_remove("QUILLO_POLICY_PATH")
+        .env_remove("QUILLO_DB")
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO")
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTFLAGS")
+        .envs(vars.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(file.try_clone().unwrap())
+        .stderr(file)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let code = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s.code();
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    (code, std::fs::read_to_string(log).unwrap_or_default())
+}
+
+/// `quillo run args --port 0` in `cwd`, its log in `log`, stopped when the guard is dropped, and
+/// its port.
+fn serve_at(cwd: &Path, args: &[&str], log: &Path) -> (Guard, u16) {
+    let file = std::fs::File::create(log).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_quillo"))
+        .arg("run")
+        .args(args)
+        .args(["--port", "0"])
+        .current_dir(cwd)
+        .env_remove("QUILLO_POLICY_PATH")
+        .env_remove("QUILLO_DB")
+        .env("QUILLO_SECRET", "test secret for the tests, 32 bytes or more")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(file)
+        .spawn()
+        .unwrap();
+    let mut g = Guard::new(child);
+    let port = port_in_log(&mut g.0, log, Duration::from_secs(60));
+    (g, port)
+}
+
+/// A pinned build is refused a temporary folder the program can reach, whatever name either is
+/// given by. On macOS `/System/Volumes/Data/private/...` is the folder `/private/...`, and an
+/// `--allow-path` or `[fs] paths` in the one form with `TMPDIR` in the other (given so, or through a
+/// link) built in a folder the program could write: refused now, as the same form is, and so the
+/// folder itself (the limit), the data volume's own root (which only the long name names), the
+/// program's folder named long, a folder of a unicode name given decomposed, and `--allow-path /`.
+/// A temporary folder beside the one named, whose name starts with its name, is not in it: there,
+/// started from `/` (a unit's working folder, which holds every place and is let pass), the
+/// plugin builds (src/native.rs private_dir, FEEDBACK82.md Q-1285, found by the coverage tests;
+/// branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn a_pinned_build_is_refused_a_temporary_folder_the_program_reaches_by_its_other_name() {
+    use sha2::Digest;
+    let Some((d, long)) = named_twice("cov8285r3-pin-names") else { return };
+    let root = d.0.clone();
+    let lg = |p: &Path| long.join(p.strip_prefix(&root).unwrap());
+    let (app, o, s, u, beside) = (root.join("app"), root.join("other"), root.join("shared"), root.join("\u{f6}rt"), root.join("other-2"));
+    for f in [&app, &o, &s, &u, &beside, &root.join("cwd")] {
+        std::fs::create_dir_all(f.join("tmp")).unwrap();
+    }
+    std::os::unix::fs::symlink(lg(&o.join("tmp")), root.join("via")).unwrap();
+    let src = "//! version: 1.0.0\n//! effects: none\npub fn hi() -> String { \"hi from the pinned source\".into() }\n";
+    std::fs::write(app.join("hi.qwer"), src).unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let hash: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
+    let pin = format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash);
+    std::fs::write(app.join("pin.toml"), &pin).unwrap();
+    std::fs::write(app.join("pin-fs.toml"), format!("{}[fs]\npaths = [\"{}\"]\n", pin, lg(&s).display())).unwrap();
+    let record = root.join("record").display().to_string();
+    let log = root.join("run.log");
+    let run = |cwd: &Path, args: &[&str], tmp: &Path, secs: u64| quillo_at(cwd, args, &[("TMPDIR", &tmp.display().to_string()), ("QUILLO_BUILT_RECORD_DIR", &record)], &log, secs);
+    let none_left = |tmp: &Path| std::fs::read_dir(tmp).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with("quillo-pinned-"));
+    let (main, policy) = (app.join("main.qwe").display().to_string(), app.join("pin.toml").display().to_string());
+    let pinned = |extra: &[&str]| -> Vec<String> { ["run", &main, "--no-check", "--policy", &policy].iter().chain(extra).map(|a| a.to_string()).collect() };
+    let refused = |cwd: &Path, args: Vec<String>, tmp: &Path, shown: &Path, inside: &Path| {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, out) = run(cwd, &args, tmp, 120);
+        assert_eq!(code, Some(1), "{}: {}", tmp.display(), out);
+        let said = format!("a pinned plugin is built apart, and the temporary folder {} is inside {}, which the program can reach", shown.display(), inside.display());
+        assert!(out.contains(&said), "{} {:?}: {}", tmp.display(), args, out);
+        assert!(!out.contains("building ") && none_left(tmp), "{}", out);
+    };
+    let (lo, o_s) = (lg(&o).display().to_string(), o.display().to_string());
+    // `--allow-path` long, TMPDIR short; the other way round; the folder itself; through a link
+    // that leads to the long name.
+    refused(&app, pinned(&["--allow-path", &lo]), &o.join("tmp"), &o.join("tmp"), &lg(&o));
+    refused(&app, pinned(&["--allow-path", &o_s]), &lg(&o.join("tmp")), &lg(&o.join("tmp")), &o);
+    refused(&app, pinned(&["--allow-path", &lo]), &o, &o, &lg(&o));
+    refused(&app, pinned(&["--allow-path", &o_s]), &root.join("via"), &lg(&o.join("tmp")), &o);
+    // The data volume's root, which holds `/private` by its long name only; and `/`.
+    refused(&app, pinned(&["--allow-path", "/System/Volumes/Data"]), &o.join("tmp"), &o.join("tmp"), Path::new("/System/Volumes/Data"));
+    refused(&app, pinned(&["--allow-path", "/"]), &o.join("tmp"), &o.join("tmp"), Path::new("/"));
+    // A unicode name, given decomposed in the long form: the folder as the system keeps it.
+    let decomposed = long.join("o\u{308}rt").display().to_string();
+    refused(&app, pinned(&["--allow-path", &decomposed]), &u.join("tmp"), &u.join("tmp"), &lg(&u));
+    // `[fs] paths` in the long form.
+    let fs_pin = app.join("pin-fs.toml").display().to_string();
+    refused(&app, ["run", &main, "--no-check", "--policy", &fs_pin].map(String::from).to_vec(), &s.join("tmp"), &s.join("tmp"), &lg(&s));
+    // The program's folder named long, started from elsewhere.
+    let (lmain, lpin) = (lg(&app.join("main.qwe")).display().to_string(), lg(&app.join("pin.toml")).display().to_string());
+    refused(&root.join("cwd"), ["run", &lmain, "--no-check", "--policy", &lpin].map(String::from).to_vec(), &app.join("tmp"), &app.join("tmp"), &lg(&app));
+    // Beside it: built, and its private folder gone once loaded.
+    let (code, out) = run(Path::new("/"), &["run", &main, "--no-check", "--policy", &policy, "--allow-path", &lo], &beside.join("tmp"), 600);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains("hi from the pinned source") && none_left(&beside.join("tmp")), "{}", out);
+}
+
+/// A folder `--allow-path` names is reached by either of its names: named long
+/// (`/System/Volumes/Data/...`) for a program named short, `read_file("../shared/a.txt")` was
+/// refused with "`--allow-path ../shared` lets the program read it"; named short for a program
+/// named long, the same. Read and written by `..` and by each absolute name, in a folder of a
+/// unicode name given decomposed; a folder beside it whose name starts with its name, and one not
+/// named, stay out, with the way out said (src/builtins.rs allowed_path, FEEDBACK85.md Q-1340, found
+/// by the coverage tests; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn a_folder_allow_path_names_is_reached_by_either_of_its_names() {
+    let Some((d, long)) = named_twice("cov8285r3-allow-names") else { return };
+    let root = d.0.clone();
+    let lg = |p: &Path| long.join(p.strip_prefix(&root).unwrap());
+    let (app, shared, u) = (root.join("app"), root.join("shared"), root.join("\u{f6}rt"));
+    for f in [&app, &shared, &u, &root.join("shared-2"), &root.join("secret"), &root.join("cwd")] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    std::fs::write(shared.join("a.txt"), "from shared").unwrap();
+    std::fs::write(u.join("\u{fc}.txt"), "unicode").unwrap();
+    std::fs::write(root.join("shared-2/c.txt"), "beside").unwrap();
+    std::fs::write(root.join("secret/b.txt"), "secret").unwrap();
+    let main = format!(
+        "print(read_file(\"../shared/a.txt\"))\nprint(read_file(\"{s}/a.txt\"))\nprint(read_file(\"{ls}/a.txt\"))\nprint(read_file(\"../\u{f6}rt/\u{fc}.txt\"))\n\
+         print(write_file(\"../shared/made.txt\", \"made\") | is_err)\nprint(read_file(\"{ls}/made.txt\"))\nprint(read_file(\"../shared-2/c.txt\"))\nprint(read_file(\"../secret/b.txt\"))\n",
+        s = shared.display(),
+        ls = lg(&shared).display()
+    );
+    std::fs::write(app.join("main.qwe"), main).unwrap();
+    let want = "from shared\nfrom shared\nfrom shared\nunicode\nfalse\nmade\n\
+                err(\"read_file: path must stay inside the program's folder: ../shared-2/c.txt; `--allow-path ../shared-2` (on `quillo run` or `quillo mcp`) lets the program read it\")\n\
+                err(\"read_file: path must stay inside the program's folder: ../secret/b.txt; `--allow-path ../secret` (on `quillo run` or `quillo mcp`) lets the program read it\")\n";
+    let log = root.join("run.log");
+    let (ls, us) = (lg(&shared).display().to_string(), long.join("o\u{308}rt").display().to_string());
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--allow-path", &ls, "--allow-path", &us], &[], &log, 60);
+    assert_eq!((code, out.as_str()), (Some(0), want), "allowed by the long name");
+    std::fs::remove_file(shared.join("made.txt")).unwrap();
+    let lmain = lg(&app.join("main.qwe")).display().to_string();
+    let (ss, su) = (shared.display().to_string(), u.display().to_string());
+    let (code, out) = quillo_at(&root.join("cwd"), &["run", &lmain, "--allow-path", &ss, "--allow-path", &su], &[], &log, 60);
+    assert_eq!((code, out.as_str()), (Some(0), want), "the program named long");
+    std::fs::remove_file(shared.join("made.txt")).unwrap();
+    // Under a policy whose `[fs] paths` names the folder above by the one name, `--allow-path` by
+    // the other is inside it (src/policy.rs allows_path); a folder outside it is still refused.
+    for (ceiling, given) in [(lg(&root), ss.as_str()), (root.clone(), ls.as_str())] {
+        std::fs::write(app.join("p.toml"), format!("[fs]\npaths = [\"{}\"]\n", ceiling.display())).unwrap();
+        let (code, out) = quillo_at(&app, &["run", "main.qwe", "--policy", "p.toml", "--allow-path", given, "--allow-path", &su], &[], &log, 60);
+        assert_eq!(code, Some(0), "{}", out);
+        assert!(out.ends_with(want), "[fs] paths {}: {}", ceiling.display(), out);
+        std::fs::remove_file(shared.join("made.txt")).unwrap();
+    }
+    std::fs::write(app.join("p.toml"), format!("[fs]\npaths = [\"{}\"]\n", lg(&shared).display())).unwrap();
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--policy", "p.toml", "--allow-path", &su], &[], &log, 60);
+    assert_eq!(code, Some(2), "{}", out);
+    assert!(out.contains(&format!("--allow-path {} is not inside the folders", u.display())), "{}", out);
+}
+
+/// The program's own files are its own by either name: with `--allow-path` naming the folder above
+/// the program's by the one name, and the program's folder named by the other, writing its main
+/// file, its `.env` or the database it has open by either name is refused, and so is deleting the
+/// folder that holds the database (which was deleted by the name the database was not opened by),
+/// or the program's folder itself, refused as by the name it was started by (it was deleted by
+/// the other: its loaded files and its database were named by the one). A file of its own folder
+/// that is none of these is written (src/builtins.rs own_file and full_is_base, FEEDBACK85.md
+/// Q-1340, found by the coverage tests; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn the_programs_own_files_are_its_own_by_either_name() {
+    let Some((d, long)) = named_twice("cov8285r3-own-names") else { return };
+    let root = d.0.clone();
+    let lg = |p: &Path| long.join(p.strip_prefix(&root).unwrap());
+    let app = root.join("app");
+    std::fs::create_dir_all(app.join("data")).unwrap();
+    std::fs::create_dir_all(root.join("cwd")).unwrap();
+    std::fs::write(app.join(".env"), "X=1\n").unwrap();
+    let (a, la) = (app.display().to_string(), lg(&app).display().to_string());
+    let mut main = String::from("db.open(\"data/app.db\")\ndb.exec(\"create table if not exists t (x int)\")\n");
+    let writes = [format!("{a}/main.qwe"), format!("{la}/main.qwe"), format!("{a}/.env"), format!("{la}/.env"), format!("{a}/data/app.db"), format!("{la}/data/app.db"), format!("{la}/data/app.db-journal")];
+    let deletes = [format!("{a}/data"), format!("{la}/data"), a.clone(), la.clone()];
+    for p in &writes {
+        main.push_str(&format!("print(write_file(\"{}\", \"x\"))\n", p));
+    }
+    for p in &deletes {
+        main.push_str(&format!("print(delete_file(\"{}\"))\n", p));
+    }
+    main.push_str(&format!("print(write_file(\"{la}/notes.txt\", \"kept\") | is_err)\nprint(read_file(\"notes.txt\"))\n"));
+    std::fs::write(app.join("main.qwe"), &main).unwrap();
+    let whys = ["it is one of the program's own files", "it is one of the program's own files", "it is the program's settings (.env)", "it is the program's settings (.env)", "it is the database the program has open", "it is the database the program has open", "it is the database the program has open"];
+    let mut want = String::new();
+    for (p, why) in writes.iter().zip(whys) {
+        want.push_str(&format!("err(\"write_file: will not write {}: {}\")\n", p, why));
+    }
+    for p in &deletes[..2] {
+        want.push_str(&format!("err(\"delete_file: will not delete {}: it holds the database the program has open\")\n", p));
+    }
+    // The program's folder itself, by either name, as by the name it was started by.
+    for p in &deletes[2..] {
+        want.push_str(&format!("err(\"delete_file: path must be inside the program's folder: {}\")\n", p));
+    }
+    want.push_str("false\nkept\n");
+    let log = root.join("run.log");
+    let (lr, r) = (long.display().to_string(), root.display().to_string());
+    // The program named short, the folder above it long; then the program long, the folder short.
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--allow-path", &lr], &[], &log, 60);
+    assert_eq!((code, out.as_str()), (Some(0), want.as_str()), "the program named short");
+    assert_eq!(std::fs::read_to_string(app.join(".env")).unwrap(), "X=1\n");
+    std::fs::remove_file(app.join("notes.txt")).unwrap();
+    let lmain = lg(&app.join("main.qwe")).display().to_string();
+    let (code, out) = quillo_at(&root.join("cwd"), &["run", &lmain, "--allow-path", &r], &[], &log, 60);
+    assert_eq!((code, out.as_str()), (Some(0), want.as_str()), "the program named long");
+    assert!(app.join("main.qwe").exists() && app.join("data/app.db").exists());
+}
+
+/// `db.migrate()` applies the program's migrations whichever name its folder is given by: `quillo
+/// run /System/Volumes/Data/.../main.qwe` refused each file as "not the one judged", the system
+/// naming the file it opened `/private/...` (a regression from 0.8.10, held or not); and so from the
+/// folder entered by its long name, and through a `migrations` link to the long name of a folder
+/// named short. Each applied once (src/migrate.rs read_judged, FEEDBACK83.md Q-1300, found by the
+/// coverage tests; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn db_migrate_applies_a_program_named_by_either_name() {
+    let Some((d, long)) = named_twice("cov8285r3-migrate-names") else { return };
+    let root = d.0.clone();
+    let lg = |p: &Path| long.join(p.strip_prefix(&root).unwrap());
+    let app = root.join("app");
+    for f in [app.join("migrations"), app.join("data"), root.join("real-migrations"), root.join("cwd")] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    std::fs::write(app.join("migrations/001_t.sql"), "create table t (x int);\n").unwrap();
+    std::fs::write(app.join("main.qwe"), "db.open(\"data/app.db\")\nprint(db.migrate())\nprint(db.migrate())\n").unwrap();
+    let want = "quillo: applied migration 001_t.sql\n[\"001_t.sql\"]\n[]\n";
+    let log = root.join("run.log");
+    let fresh = || {
+        for f in ["data/app.db", "data/app.db-wal", "data/app.db-shm", "data/app.db-journal"] {
+            let _ = std::fs::remove_file(app.join(f));
+        }
+    };
+    let lmain = lg(&app.join("main.qwe")).display().to_string();
+    let (code, out) = quillo_at(&root.join("cwd"), &["run", &lmain], &[], &log, 60);
+    assert_eq!((code, out.as_str()), (Some(0), want), "the program named long");
+    fresh();
+    let (code, out) = quillo_at(&lg(&app), &["run", "main.qwe"], &[], &log, 60);
+    assert_eq!((code, out.as_str()), (Some(0), want), "its folder entered by its long name");
+    fresh();
+    // Its migrations through a link to their folder's long name.
+    std::fs::rename(app.join("migrations/001_t.sql"), root.join("real-migrations/001_t.sql")).unwrap();
+    std::fs::remove_dir(app.join("migrations")).unwrap();
+    std::os::unix::fs::symlink(lg(&root.join("real-migrations")), app.join("migrations")).unwrap();
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--allow-path", &lg(&root.join("real-migrations")).display().to_string()], &[], &log, 60);
+    assert_eq!((code, out.as_str()), (Some(0), want), "through a link to the long name");
+}
+
+/// `file()` and `files()` serve through a link into a folder `--allow-path` names by its other
+/// name: `public/s -> ../../shared/web` with `--allow-path /System/Volumes/Data/.../shared` was a
+/// 404, the log saying the link led "outside"; and a link written to the long name, a program
+/// named long, a file of a unicode name, a large file (judged as it is sent). What `files()` keeps
+/// to itself (dot files, `.qwe`) stays a 404 there, and a folder beside it is not let out
+/// (src/builtins.rs led_out, allowed_dir, hidden_target and open_hosted, FEEDBACK85.md Q-1340,
+/// found by the coverage tests; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn files_through_a_link_reach_a_folder_allow_path_names_by_either_name() {
+    let Some((d, long)) = named_twice("cov8285r3-files-names") else { return };
+    let root = d.0.clone();
+    let lg = |p: &Path| long.join(p.strip_prefix(&root).unwrap());
+    let (app, web) = (root.join("app"), root.join("shared/web"));
+    for f in [app.join("public"), web.clone(), root.join("shared-2"), root.join("cwd")] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    std::fs::write(web.join("x.js"), "x").unwrap();
+    std::fs::write(web.join("\u{f1}.js"), "unicode").unwrap();
+    std::fs::write(web.join(".env"), "SECRET=1").unwrap();
+    std::fs::write(web.join("lib.qwe"), "let a = 1").unwrap();
+    std::fs::write(web.join("big.bin"), vec![b'b'; 1_500_000]).unwrap();
+    std::fs::write(root.join("shared-2/y.js"), "y").unwrap();
+    std::os::unix::fs::symlink("../../shared/web", app.join("public/s")).unwrap();
+    std::os::unix::fs::symlink(lg(&web), app.join("public/l")).unwrap();
+    std::os::unix::fs::symlink("../../shared-2", app.join("public/b")).unwrap();
+    std::fs::write(
+        app.join("main.qwe"),
+        "route GET /s/*path = files(\"public/s\", path)\nroute GET /l/*path = files(\"public/l\", path)\nroute GET /b/*path = files(\"public/b\", path)\nroute GET /one = file(\"public/s/x.js\")\nroute GET /lone = file(\"public/l/x.js\")\n",
+    )
+    .unwrap();
+    let look = |port: u16, how: &str| {
+        for (path, body) in [("/s/x.js", "x"), ("/l/x.js", "x"), ("/one", "x"), ("/lone", "x"), ("/s/%C3%B1.js", "unicode"), ("/l/%C3%B1.js", "unicode")] {
+            let a = send(port, "GET", path, &[], "");
+            assert_eq!((a.status, a.body.as_str()), (200, body), "{} {}", how, path);
+        }
+        let big = send(port, "GET", "/s/big.bin", &[], "");
+        assert_eq!((big.status, big.body.len()), (200, 1_500_000), "{} big", how);
+        for kept in ["/s/.env", "/l/.env", "/s/lib.qwe", "/l/lib.qwe", "/b/y.js"] {
+            assert_eq!(send(port, "GET", kept, &[], "").status, 404, "{} {}", how, kept);
+        }
+    };
+    let (ls, ss) = (lg(&root.join("shared")).display().to_string(), root.join("shared").display().to_string());
+    let (g, port) = serve_at(&app, &["main.qwe", "--allow-path", &ls], &root.join("a.log"));
+    look(port, "allowed by the long name");
+    drop(g);
+    let lmain = lg(&app.join("main.qwe")).display().to_string();
+    let (g, port) = serve_at(&root.join("cwd"), &[&lmain, "--allow-path", &ss], &root.join("b.log"));
+    look(port, "the program named long");
+    drop(g);
+    // Only the folder beside it was said to lead out.
+    for log in ["a.log", "b.log"] {
+        let said = std::fs::read_to_string(root.join(log)).unwrap();
+        assert!(said.contains("leads out of the program's folder through a link") && said.contains("shared-2"), "{}: {}", log, said);
+        assert!(!said.contains("shared/web"), "{}: {}", log, said);
+    }
+}
+
+/// What a firmlink tests above, where there is none (Linux too): `--allow-path /` lets the program
+/// reach every folder, the temporary one too, so a pinned build is refused, naming `/` (it was let
+/// pass, as the folder Quillo runs in is); and the program's folder is its folder by any path, so
+/// `delete_file("../app")` under `--allow-path ..` is refused as `delete_file(".")` is (src/native.rs
+/// private_dir, FEEDBACK82.md Q-1285; src/builtins.rs full_is_base, FEEDBACK85.md Q-1340; found by
+/// the coverage tests; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn the_whole_disk_named_and_the_programs_folder_by_another_path_are_judged_by_the_folder() {
+    use sha2::Digest;
+    let d = Dir(support::temp_dir("cov8285r3-root-reach").canonicalize().unwrap());
+    let (app, tmp) = (d.0.join("app"), d.0.join("tmp"));
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(&tmp).unwrap();
+    let src = "//! version: 1.0.0\n//! effects: none\npub fn hi() -> String { \"hi\".into() }\n";
+    std::fs::write(app.join("hi.qwer"), src).unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let hash: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
+    std::fs::write(app.join("pin.toml"), format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash)).unwrap();
+    let t = tmp.display().to_string();
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--policy", "pin.toml", "--allow-path", "/"], &[("TMPDIR", &t)], &d.0.join("a.log"), 120);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains(&format!("the temporary folder {} is inside /, which the program can reach", t)) && !out.contains("building "), "{}", out);
+    std::fs::write(app.join("del.qwe"), "print(delete_file(\"../app\"))\nprint(delete_file(\".\"))\nprint(delete_file(\"../app/del.qwe\"))\n").unwrap();
+    let (code, out) = quillo_at(&app, &["run", "del.qwe", "--allow-path", ".."], &[], &d.0.join("b.log"), 60);
+    assert_eq!(code, Some(0), "{}", out);
+    assert_eq!(
+        out,
+        "err(\"delete_file: path must be inside the program's folder: ../app\")\nerr(\"delete_file: path must be inside the program's folder: .\")\nerr(\"delete_file: will not delete ../app/del.qwe: it is one of the program's own files\")\n"
+    );
+    assert!(app.join("main.qwe").exists());
+}
+
+/// A plugin a provider's policy pins by its source's SHA-256, with no quillo.confirmed, that builds
+/// another file in is refused before anything is built: `global_asm!(".include \"/x/evil.s\"")`
+/// was built, the assembler reading evil.s, which neither the hash nor rustc's list of what it read
+/// covers, and its code ran (42); so `include!` by its other spelling, `std::include!`. The private
+/// folder is never made (src/native.rs build_private, FEEDBACK82.md Q-1285 and FEEDBACK83.md Q-1305,
+/// found by the coverage tests of 3117dea; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn a_pinned_plugin_that_builds_another_file_in_is_refused_without_a_quillo_confirmed() {
+    use sha2::Digest;
+    let d = Dir(support::temp_dir("cov8285r3-pin-asm").canonicalize().unwrap());
+    let (app, tmp) = (d.0.join("app"), d.0.join("tmp"));
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(d.0.join("evil.s"), ".globl _quillo_evil\n.globl quillo_evil\n.p2align 2\n_quillo_evil:\nquillo_evil:\n    mov x0, #42\n    ret\n").unwrap();
+    std::fs::write(d.0.join("other.rs"), "pub fn other() -> i64 { 42 }\n").unwrap();
+    let evil = d.0.join("evil.s").display().to_string();
+    let other = d.0.join("other.rs").display().to_string();
+    for (src, how) in [
+        (format!("//! version: 1.0.0\n//! effects: none\nstd::arch::global_asm!(\".include \\\"{}\\\"\");\nextern \"C\" {{ fn quillo_evil() -> i64; }}\npub fn hi() -> i64 {{ unsafe {{ quillo_evil() }} }}\n", evil), "global_asm"),
+        (format!("//! version: 1.0.0\n//! effects: none\nstd::include!(\"{}\");\npub fn hi() -> i64 {{ other() }}\n", other), "include"),
+    ] {
+        std::fs::write(app.join("hi.qwer"), &src).unwrap();
+        std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+        let hash: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
+        std::fs::write(app.join("pin.toml"), format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash)).unwrap();
+        let (t, record) = (tmp.display().to_string(), d.0.join("record").display().to_string());
+        let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--policy", "pin.toml"], &[("TMPDIR", &t), ("QUILLO_BUILT_RECORD_DIR", &record)], &d.0.join("run.log"), 120);
+        assert_eq!(code, Some(1), "{}: {}", how, out);
+        assert!(out.contains("builds another file into it") && out.contains("which the SHA-256 its source is held to would not cover, so it does not load"), "{}: {}", how, out);
+        assert!(out.contains(how), "{}: {}", how, out);
+        assert!(!out.contains("building ") && !out.lines().any(|l| l.trim() == "42"), "{}: {}", how, out);
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "{}: a private folder was made", how);
+        assert!(!app.join(".quillo/native").exists(), "{}", how);
+    }
+}

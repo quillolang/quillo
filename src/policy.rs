@@ -1057,7 +1057,10 @@ impl Policy {
             if paths.is_empty() {
                 return Err(format!("--allow-path {}: {} allows no folder outside the program's ([fs] paths = [])", real.display(), file.display()));
             }
-            if !paths.iter().any(|p| real.starts_with(p)) {
+            // By whichever name each was given: `[fs] paths = ["/System/Volumes/Data/Users/x"]`
+            // held no `--allow-path /Users/x/shared` on macOS, the same folder by its other name
+            // (FEEDBACK82.md, Q-1285, found by the coverage tests; branch feedback82-85).
+            if !paths.iter().any(|p| crate::statics::within(real, p)) {
                 let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
                 return Err(format!("--allow-path {} is not inside the folders {} allows: {}", real.display(), file.display(), list.join(", ")));
             }

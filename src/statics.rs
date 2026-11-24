@@ -322,7 +322,9 @@ pub fn real_dir(dir: &Path) -> Option<PathBuf> {
             }
         }
     }
-    let form = std::fs::File::open(dir).ok().and_then(|f| path_of(&f)).or_else(|| dir.canonicalize().ok())?;
+    // A folder that cannot be opened (no read permission) is resolved, in the same form
+    // (FEEDBACK85.md, Q-1340, found by the coverage tests; branch feedback82-85).
+    let form = std::fs::File::open(dir).ok().and_then(|f| path_of(&f)).or_else(|| dir.canonicalize().ok().map(sys_form))?;
     if let Some(id) = id {
         let mut dirs = lock(&DIRS);
         let m = dirs.get_or_insert_with(HashMap::new);
@@ -332,6 +334,132 @@ pub fn real_dir(dir: &Path) -> Option<PathBuf> {
         m.insert(dir.to_path_buf(), (id, form.clone()));
     }
     Some(form)
+}
+
+// ---- one folder, however it is named ------------------------------------------------------------
+
+/// Where macOS mounts the data volume, whose folders the system volume shows through firmlinks.
+#[cfg(target_os = "macos")]
+const DATA: &str = "/System/Volumes/Data";
+
+/// The data volume's folders that have a second name on macOS, as (long, short):
+/// `/System/Volumes/Data/private` is `/private`, `/System/Volumes/Data/Users` is `/Users` (the
+/// system's list, /usr/share/firmlinks), each taken only once a look finds the two one folder (its
+/// device and inode, no link on either side). Longest first. Read once.
+#[cfg(target_os = "macos")]
+fn firmlinks() -> &'static [(PathBuf, PathBuf)] {
+    static LINKS: std::sync::OnceLock<Vec<(PathBuf, PathBuf)>> = std::sync::OnceLock::new();
+    LINKS.get_or_init(|| {
+        let Ok(text) = std::fs::read_to_string("/usr/share/firmlinks") else { return Vec::new() };
+        let dir = |p: &Path| std::fs::symlink_metadata(p).ok().filter(|m| m.file_type().is_dir()).and_then(|m| id_of(&m));
+        let mut out: Vec<(PathBuf, PathBuf)> = text
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .filter(|(short, rel)| short.starts_with('/') && !rel.is_empty() && !rel.starts_with('/'))
+            .map(|(short, rel)| (Path::new(DATA).join(rel.trim_end()), PathBuf::from(short)))
+            .filter(|(long, short)| dir(long).is_some() && dir(long) == dir(short))
+            .collect();
+        out.sort_by_key(|(long, _)| std::cmp::Reverse(long.as_os_str().len()));
+        out
+    })
+}
+
+/// `p`, a path resolved (`canonicalize`), in the form the system names files in, which `path_of`
+/// and the temporary folder give: on macOS a folder of the data volume has two names,
+/// `/System/Volumes/Data/private/tmp/x` and `/private/tmp/x`, and realpath keeps the one it was
+/// given, so one folder compared by its two names was two (FEEDBACK82.md Q-1285, FEEDBACK85.md
+/// Q-1340, FEEDBACK83.md Q-1300, found by the coverage tests; branch feedback82-85). Anything else
+/// is as it is: a path that is not in the long form costs a look at its first bytes.
+pub fn sys_form(p: PathBuf) -> PathBuf {
+    match sys_form_of(&p) {
+        std::borrow::Cow::Owned(o) => o,
+        std::borrow::Cow::Borrowed(_) => p,
+    }
+}
+
+/// `sys_form`, borrowed where it is already in that form.
+pub fn sys_form_of(p: &Path) -> std::borrow::Cow<'_, Path> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if p.as_os_str().as_bytes().starts_with(b"/System/Volumes/Data/") {
+            if let Some((long, short)) = firmlinks().iter().find(|(long, _)| p.starts_with(long)) {
+                let rest = p.strip_prefix(long).unwrap_or(Path::new(""));
+                return std::borrow::Cow::Owned(if rest.as_os_str().is_empty() { short.clone() } else { short.join(rest) });
+            }
+        }
+    }
+    std::borrow::Cow::Borrowed(p)
+}
+
+/// Whether `p` is the folder `root` or in it, both paths resolved, by whichever name each was given
+/// (`sys_form`): `/System/Volumes/Data/private/x` is in `/private`, and so is `/private/x/a`
+/// in `/System/Volumes/Data/private/x`. A root only the long form names (the data volume's own
+/// root `/System/Volumes/Data`, or `/System/Volumes/Data/usr`, which holds `/usr/local`) holds
+/// what its firmlinks show (FEEDBACK85.md, Q-1340, found by the coverage tests; branch
+/// feedback82-85). Where both are named alike, what `starts_with` said.
+pub fn within(p: &Path, root: &Path) -> bool {
+    rel_in(p, root).is_some()
+}
+
+/// What follows the folder `root` in `p`, both resolved, as `within` reads them: None where `p` is
+/// not in it. `strip_prefix`, by whichever name each was given (FEEDBACK85.md, Q-1340, found by the
+/// coverage tests; branch feedback82-85).
+pub fn rel_in<'a>(p: &'a Path, root: &Path) -> Option<std::borrow::Cow<'a, Path>> {
+    if let Ok(rest) = p.strip_prefix(root) {
+        return Some(std::borrow::Cow::Borrowed(rest));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let (sp, sr) = (sys_form_of(p), sys_form_of(root));
+        if !matches!((&sp, &sr), (std::borrow::Cow::Borrowed(_), std::borrow::Cow::Borrowed(_))) {
+            if let Ok(rest) = sp.strip_prefix(&*sr) {
+                return Some(std::borrow::Cow::Owned(rest.to_path_buf()));
+            }
+        }
+        // A root of the data volume that no short name shows: what a firmlink in it shows is in it.
+        if sr.as_os_str().as_bytes().starts_with(b"/System") {
+            for (long, short) in firmlinks() {
+                if let (Ok(above), Ok(rest)) = (long.strip_prefix(&*sr), sp.strip_prefix(short)) {
+                    return Some(std::borrow::Cow::Owned(if rest.as_os_str().is_empty() { above.to_path_buf() } else { above.join(rest) }));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `p`, resolved, by its long name on macOS where it has one (`/System/Volumes/Data/private/x`
+/// for `/private/x`): the name under which the most folders hold it, the data volume's root among
+/// them. As it is elsewhere.
+pub fn long_form(p: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let p = sys_form_of(p);
+        if let Some((long, short)) = firmlinks().iter().find(|(_, short)| p.starts_with(short)) {
+            let rest = p.strip_prefix(short).unwrap_or(Path::new(""));
+            return if rest.as_os_str().is_empty() { long.clone() } else { long.join(rest) };
+        }
+        p.into_owned()
+    }
+    #[cfg(not(target_os = "macos"))]
+    p.to_path_buf()
+}
+
+/// Whether the folder `dir`, resolved, is `root` or inside it, by the folders themselves: by their
+/// names in one form (`within`), and by identity, each folder above `dir` (by its long name, which
+/// has the most above it) looked at and compared with `root` by its device and inode, so a folder
+/// with yet another name (a bind mount on Linux) is the one it is. A look at each folder above
+/// `dir`: for what must stay out of the program's reach, once, never on a path a request takes
+/// (FEEDBACK82.md, Q-1285, found by the coverage tests; branch feedback82-85).
+pub fn holds(root: &Path, dir: &Path) -> bool {
+    if within(dir, root) {
+        return true;
+    }
+    let Some(want) = std::fs::metadata(root).ok().and_then(|m| id_of(&m)) else { return false };
+    let long = long_form(dir);
+    long.ancestors().chain(dir.ancestors()).any(|a| std::fs::metadata(a).ok().and_then(|m| id_of(&m)) == Some(want))
 }
 
 /// Up to `len` bytes of the file from `start`, read where they are: never more, whatever the file

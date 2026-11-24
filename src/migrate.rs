@@ -65,8 +65,13 @@ fn read_judged(path: &Path, judge: Judge<'_>) -> Result<String, String> {
         o.custom_flags(libc::O_NOFOLLOW);
     }
     let mut f = o.open(&real).map_err(cannot)?;
+    // The two in one form (`statics::sys_form`): realpath keeps the name it was given, where the
+    // system names the file it opened by its own, and on macOS `/System/Volumes/Data/private/x` is
+    // `/private/x`, so every migration of a program started by the long name was refused, held or
+    // not, where 0.8.10 applied it (FEEDBACK83.md, Q-1300, found by the coverage tests; branch
+    // feedback82-85). A folder swapped for a link still names another place, and is refused.
     if let Some(opened) = opened_path(&f) {
-        if opened != real {
+        if crate::statics::sys_form_of(&opened) != crate::statics::sys_form_of(&real) {
             return Err(format!("cannot read {}: the file opened, {}, is not the one judged, {} (a folder of its path changed as it was read)", path.display(), opened.display(), real.display()));
         }
     }

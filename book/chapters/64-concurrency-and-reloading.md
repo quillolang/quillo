@@ -831,7 +831,9 @@ set = { APP_ENV = "production" }  # what env("APP_ENV") gives, whatever .env say
 A plugin pinned by its hash *(since 0.8.11)*: `allow = ["qr@sha256:9f86d0..."]` lets `qr` load
 only as that file. The hash may be the source's, the `.qwer` file's SHA-256 (what the catalog's
 index gives): the plugin is then built on this machine from the very bytes hashed, in a new
-folder of its own (0700) outside the program's reach, with a cleared environment and the
+folder of its own (0700) outside the program's reach (judged by the folders themselves,
+whatever name `TMPDIR`, `--allow-path` or `[fs] paths` gives them; under `--allow-path /` no
+folder is, and the build is refused), with a cleared environment and the
 `cargo` on `PATH`, and loaded from a private copy whose hash is checked. Or it may be the built
 library's own SHA-256 (as `.quillo/plugins.lock` lists it), and then only that prebuilt
 library loads. Only the host's layers may pin a library: a pin in `quillo.policy` or a

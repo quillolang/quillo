@@ -465,6 +465,9 @@ path is judged where it really leads, with its links followed:
 - `--allow-path DIR` opens a folder outside on purpose (a path from the folder `quillo`
   runs in, taken as it really is): a deploy's `uploads -> /srv/shared/uploads` needs
   `--allow-path /srv/shared/uploads`.
+- A folder is judged as itself, whatever its name *(since 0.8.11)*: on macOS
+  `/System/Volumes/Data/Users/x` is `/Users/x`, and either name works in `--allow-path`, a
+  policy's `[fs] paths`, a link, and the path the program is started by.
 
 What is refused is what any refused path is: an error value from `read_file`,
 `write_file` and `delete_file`, which ends with the way out *(since 0.8.11)*

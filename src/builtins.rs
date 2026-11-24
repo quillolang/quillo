@@ -1874,8 +1874,10 @@ pub(crate) fn open_hosted(served: &Path, program: &Path, full: &Path) -> Result<
     }
     let (program, served) = (crate::statics::real_dir(program).ok_or(Refused)?, crate::statics::real_dir(served).ok_or(Refused)?);
     // Or in a folder `--allow-path` named, which `files` serves as `file` does (FEEDBACK85.md,
-    // Q-1340; branch feedback82-85).
-    if !(real.starts_with(&program) || allowed_dir(&real).is_some()) || hidden_target(&program, &served, &real) {
+    // Q-1340; branch feedback82-85), by whichever name it was given (`statics::within`): one named
+    // `/System/Volumes/Data/...` held no file the system names `/private/...` (FEEDBACK85.md,
+    // Q-1340, found by the coverage tests; branch feedback82-85).
+    if !(crate::statics::within(&real, &program) || allowed_dir(&real).is_some()) || hidden_target(&program, &served, &real) {
         return Err(Refused);
     }
     if crate::db::journal_of(&real).is_some_and(|db| crate::db::sqlite_file(&db)) {
@@ -2298,7 +2300,9 @@ fn hidden_target(program: &Path, served: &Path, real: &Path) -> bool {
     }
     const STORES: [&str; 4] = [".pnpm", ".deno", ".bun", ".store"];
     const TOOLS: [&str; 6] = [".vitepress/dist", ".output/public", ".next/static", ".svelte-kit/output/client", ".nuxt/dist/client", ".vercel/output/static"];
-    if let Ok(rel) = real.strip_prefix(served) {
+    // Each folder by whichever name it was given, the place a link led to by another
+    // (`statics::rel_in`; FEEDBACK85.md, Q-1340, found by the coverage tests; branch feedback82-85).
+    if let Some(rel) = crate::statics::rel_in(real, served) {
         let parts: Vec<String> = rel.components().map(|c| fold_name(name_as_taken(&c.as_os_str().to_string_lossy()))).collect();
         let Some((name, folders)) = parts.split_last() else { return false };
         let above = served.file_name().map(|n| fold_name(&n.to_string_lossy()));
@@ -2309,10 +2313,10 @@ fn hidden_target(program: &Path, served: &Path, real: &Path) -> bool {
     }
     // Out of the program's folder, into one `--allow-path` named: judged by its name there, as
     // in the program's own (FEEDBACK85.md, Q-1340; branch feedback82-85).
-    let rel = match real.strip_prefix(program) {
-        Ok(rel) => rel,
-        Err(_) => match allowed_dir(real) {
-            Some(d) => return real.strip_prefix(&d).map_or(true, |rel| hidden_path(&rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"))),
+    let rel = match crate::statics::rel_in(real, program) {
+        Some(rel) => rel,
+        None => match allowed_dir(real) {
+            Some(d) => return crate::statics::rel_in(real, &d).map_or(true, |rel| hidden_path(&rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"))),
             None => return true,
         },
     };
@@ -2321,10 +2325,10 @@ fn hidden_target(program: &Path, served: &Path, real: &Path) -> bool {
 }
 
 /// The folder `--allow-path` named that `real`, a path as it really is, is in (FEEDBACK85.md,
-/// Q-1340; branch feedback82-85).
+/// Q-1340; branch feedback82-85), by whichever name each was given (`statics::within`).
 fn allowed_dir(real: &Path) -> Option<std::path::PathBuf> {
     let dirs = ALLOWED_PATHS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-    dirs.iter().find(|d| real.starts_with(d)).cloned()
+    dirs.iter().find(|d| crate::statics::within(real, d)).cloned()
 }
 
 /// Seconds from `3600` or `"1h"` (s, m, h, d, w, y).
@@ -3007,7 +3011,10 @@ pub(crate) fn inside(it: &Interp, full: std::path::PathBuf) -> Option<std::path:
 pub(crate) fn led_out(it: &Interp, full: &Path) -> Option<std::path::PathBuf> {
     let dirs = ALLOWED_PATHS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
     let real = real_path(full);
-    if let Some(r) = real.as_ref().filter(|r| dirs.iter().any(|d| r.starts_with(d))) {
+    // By whichever name each was given: `public/s -> ../../shared` was refused for a folder named
+    // `/System/Volumes/Data/.../shared`, the log saying it led outside (FEEDBACK85.md, Q-1340, found
+    // by the coverage tests; branch feedback82-85).
+    if let Some(r) = real.as_ref().filter(|r| dirs.iter().any(|d| crate::statics::within(r, d))) {
         return Some(r.clone());
     }
     // Said once, as a deploy's `uploads -> ../shared/uploads` is then a 404 with no other word.
@@ -3036,8 +3043,11 @@ pub(crate) fn stays_in(root: &Path, full: &Path) -> bool {
 /// when it leads out of `root` or nowhere. What a link leads to is then judged as its name is
 /// (FEEDBACK55.md, Q-701; branch feedback55).
 pub(crate) fn leads_to(root: &Path, full: &Path) -> Option<Option<std::path::PathBuf>> {
+    // The folder and where the link leads by whichever name each has: a link written to the
+    // other name of a place in the folder is in it (FEEDBACK85.md, Q-1340, found by the coverage
+    // tests; branch feedback82-85).
     let resolved = || match (real_path(full), root.canonicalize()) {
-        (Some(real), Ok(base)) if real.starts_with(&base) => Some(Some(real)),
+        (Some(real), Ok(base)) if crate::statics::within(&real, &base) => Some(Some(real)),
         _ => None,
     };
     let Ok(rel) = full.strip_prefix(root) else { return resolved() };
@@ -3086,7 +3096,11 @@ fn allowed_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {
     }
     let full = if Path::new(p).is_absolute() { std::path::PathBuf::from(p) } else { it.base_dir.join(p) };
     let real = real_path(&full)?;
-    dirs.iter().any(|d| real.starts_with(d)).then_some(real)
+    // By whichever name each was given: `--allow-path /System/Volumes/Data/.../shared` refused
+    // `../shared/a.txt`, which realpath names `/private/...` from a program there, telling the
+    // program to give `--allow-path ../shared` (FEEDBACK85.md, Q-1340, found by the coverage tests;
+    // branch feedback82-85). What may be written there is `own_file`'s, by either name too.
+    dirs.iter().any(|d| crate::statics::within(&real, d)).then_some(real)
 }
 
 /// Why `full` must not be written by the program, if it is one of its own files: a `.qwe` or
@@ -3106,9 +3120,15 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
     // next start, and so `.ENV.LOCAL`, `data/APP.DB-JOURNAL` and an upload to `MIGRATIONS/`; the
     // same names are refused where case counts (FEEDBACK55.md, Q-704; branch feedback55).
     let folded_path = |p: &Path| std::path::PathBuf::from(fold_name(&p.to_string_lossy()));
+    // Each in the one form the system names files in: a program started as
+    // `/System/Volumes/Data/.../main.qwe` had its files by that name, and the same files named
+    // `/private/...` (or the other way round) were none of its own, so `delete_file` of its folder
+    // by the other name removed it, program and database (FEEDBACK85.md, Q-1340, found by the
+    // coverage tests; branch feedback82-85).
+    let sys = |p: &Path| folded_path(&crate::statics::sys_form_of(p));
     // The file, or a folder that holds one (`delete_file("lib")`).
-    let folded_target = folded_path(&target);
-    if it.loaded.iter().any(|f| folded_path(&real_as_made(f)).starts_with(&folded_target)) {
+    let folded_target = sys(&target);
+    if it.loaded.iter().any(|f| sys(&real_as_made(f)).starts_with(&folded_target)) {
         return Some(OWN_SOURCE);
     }
     let folded = fold_name(taken);
@@ -3135,7 +3155,7 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
     // And the paths themselves, while nothing is there: `--env-file`'s and `--tls-key`'s, as
     // given or as they lead (FEEDBACK55.md, Q-701; branch feedback55).
     let named: Vec<(std::path::PathBuf, &'static str)> = own().named.clone();
-    if let Some((_, why)) = named.iter().find(|(n, _)| [n.clone(), real_as_made(n)].iter().any(|n| both.iter().any(|f| fold_name(&n.to_string_lossy()) == fold_name(&f.to_string_lossy())))) {
+    if let Some((_, why)) = named.iter().find(|(n, _)| [n.clone(), real_as_made(n)].iter().any(|n| both.iter().any(|f| sys(n) == sys(f)))) {
         return Some(why);
     }
     // On Windows, a short name may be any file's (FEEDBACK55.md, Q-701; branch feedback55).
@@ -3144,20 +3164,27 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
         return Some("a short name Windows gives a file may be one of the program's own files");
     }
     // A database it has open, by any name, and the folder holding one (FEEDBACK55.md, Q-702 and
-    // Q-705; branch feedback55).
-    if let Some(why) = both.iter().find_map(|f| crate::db::database_file(f)) {
+    // Q-705; branch feedback55). db.rs keeps them by the name realpath gave as they were opened,
+    // which may be either of a folder's two (`/private/...`, `/System/Volumes/Data/private/...`):
+    // asked by both (FEEDBACK85.md, Q-1340, found by the coverage tests; branch feedback82-85).
+    let names = |p: &Path| {
+        let (short, long) = (crate::statics::sys_form_of(p).into_owned(), crate::statics::long_form(p));
+        if short == long { vec![short] } else { vec![short, long] }
+    };
+    if let Some(why) = both.iter().flat_map(|f| names(f)).find_map(|f| crate::db::database_file(&f)) {
         return Some(why);
     }
-    if crate::db::opened_under(&folded_target) {
+    let targets: Vec<std::path::PathBuf> = names(&target).iter().map(|t| folded_path(t)).collect();
+    if targets.iter().any(|t| crate::db::opened_under(t)) {
         return Some("it holds the database the program has open");
     }
     // A program may write its own migrations, and its tenants' databases; a visitor's upload may
     // not, though the tenant's has not been opened since the start (FEEDBACK55.md, Q-702; branch
     // feedback55).
-    if upload && folded_target.starts_with(folded_path(&real_as_made(&it.base_dir).join("migrations"))) {
+    if upload && folded_target.starts_with(sys(&real_as_made(&it.base_dir).join("migrations"))) {
         return Some("it is in the program's migrations");
     }
-    if upload && crate::db::tenant_file(&folded_target) {
+    if upload && targets.iter().any(|t| crate::db::tenant_file(t)) {
         return Some("it is where a tenant's database is");
     }
     None
@@ -3274,7 +3301,9 @@ pub(crate) fn why_out(it: &Interp, p: &str, verb: &str) -> String {
         if !m.file_type().is_symlink() {
             continue;
         }
-        if !at.parent().and_then(|d| d.canonicalize().ok()).is_some_and(|d| roots.iter().any(|r| d.starts_with(r))) {
+        // By whichever name each was given (FEEDBACK85.md, Q-1340, found by the coverage tests;
+        // branch feedback82-85).
+        if !at.parent().and_then(|d| d.canonicalize().ok()).is_some_and(|d| roots.iter().any(|r| crate::statics::within(&d, r))) {
             break;
         }
         let shown = at.strip_prefix(&*it.base_dir).map_or_else(|_| at.display().to_string(), |r| r.display().to_string());
@@ -3291,9 +3320,17 @@ pub(crate) fn why_out(it: &Interp, p: &str, verb: &str) -> String {
     way_out(p, verb)
 }
 
-/// Whether `p` names the program's folder itself, which no `--allow-path` lets a program delete.
+/// Whether `p` names the program's folder itself, which no `--allow-path` lets a program delete:
+/// by the folder, whatever name it is given (`/System/Volumes/Data/...` or `/private/...` on
+/// macOS, `../app` from it), not by the text of the name it was started by (FEEDBACK85.md, Q-1340,
+/// found by the coverage tests; branch feedback82-85).
 fn full_is_base(it: &Interp, p: &str) -> bool {
-    p.is_empty() || local_path(it, p).is_some_and(|f| f.as_path() == &*it.base_dir)
+    p.is_empty() || local_path(it, p).is_some_and(|f| is_base(it, &f))
+}
+
+/// Whether `full` is the program's folder, by the folder itself (`full_is_base`).
+fn is_base(it: &Interp, full: &Path) -> bool {
+    full == &*it.base_dir || same_file(full, &it.base_dir)
 }
 
 /// `read_file(path)`: the file's text, or an error value.
@@ -3427,7 +3464,7 @@ fn check_program(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// no error.
 fn delete_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let p = s_arg(&args, 0, "delete_file", line)?;
-    let Some(full) = local_path(it, &p).filter(|f| f.as_path() != &*it.base_dir) else {
+    let Some(full) = local_path(it, &p).filter(|f| !is_base(it, f)) else {
         return Ok(Value::err(Value::str(format!("delete_file: path must be inside the program's folder: {}{}", p, if full_is_base(it, &p) { String::new() } else { why_out(it, &p, "delete") }))));
     };
     if let Some(why) = own_file(it, &full, false) {
