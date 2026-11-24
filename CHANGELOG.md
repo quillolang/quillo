@@ -104,7 +104,11 @@ and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2
   taken file runs no `ANALYZE`, makes no trigger and reads no statistics (`sqlite_stat4`
   held Quillo's own rows' values). A column named `engine` is no table option, MySQL's
   `explain (select ...)` runs, and the refusals say what they refuse (found by the coverage
-  tests of 3117dea).
+  tests of 3117dea). A MySQL table's engine is judged where the server takes a table's
+  options, not by the word before it (`alter table after engine = csv` changed a table to
+  CSV), and on SQLite a taken file makes no virtual table over `dbstat` (found by the review
+  of a65644e); the SQL a kit ordinarily writes runs under a hold on SQLite, PostgreSQL and
+  MariaDB, as a test of 151 statements shows.
 - **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
   of 2026-11-24): a name another file defines, used without taking it, is an error in
   `quillo check`, and the start refuses it with `--no-check` too, as the value under it

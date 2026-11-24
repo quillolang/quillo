@@ -597,3 +597,336 @@ fn on_mysql_a_column_named_engine_is_no_table_option_and_explain_takes_a_query_i
     );
     assert!(out.contains("cols: [{ c: \"engine\", t: \"bigint\" }, { c: \"z\", t: \"int\" }, { c: \"y\", t: \"varchar\" }]\n"), "{}", out);
 }
+
+// Fix round 7
+
+/// A kit taken for `Badge`, whose `steal()` makes each call of `calls` (a function, its SQL and the
+/// values given after it, as written in Quillo, or none) and says what each gave, a line each:
+/// the error, or `ran`.
+fn kit_ran(calls: &[(&str, &str, &str)]) -> String {
+    let lines: Vec<String> = calls
+        .iter()
+        .map(|(f, sql, values)| if values.is_empty() { format!("    said({}({}))", f, lit(sql)) } else { format!("    said({}({}, {}))", f, lit(sql), values) })
+        .collect();
+    format!(
+        "component Badge() {{\n  return <b>b</b>\n}}\nfn steal() {{\n  let said = (r) => is_err(r) ? r.error : \"ran\"\n  return \"kit:\\n\" + join([\n{}\n  ], \"\\n\")\n}}\n",
+        lines.join(",\n")
+    )
+}
+
+/// Under a quillo.confirmed on MySQL (MariaDB) a taken file's `engine` is judged by where the
+/// server takes a table's options, not by the word before it: for tables named `after`, `modify`
+/// and `engine`, `alter table after engine = CSV` (quoted, schema-qualified, after another option,
+/// after a `,`, an `alter`'s clause before it), `create table ... engine = csv select` and a
+/// partition's `engine`, added or by `partition by`, are refused; a column named `engine` added,
+/// changed, renamed and dropped, an index named `engine` on the table `engine`, `alter table
+/// engine engine = InnoDB` and `order by` run. Every table is InnoDB after (src/db.rs
+/// table_options_refused; FEEDBACK83.md Q-1300, found by the review of a65644e; branch
+/// feedback82-85).
+#[test]
+fn on_mysql_a_tables_engine_is_judged_where_the_server_takes_it_whatever_the_tables_name() {
+    let Some(my) = support::mariadb("cov8285db7g") else {
+        eprintln!("MariaDB is not installed: skipped");
+        return;
+    };
+    let url = my.url("engine_place");
+    let d = dir("myplace");
+    let csv = reaches("`engine = csv`");
+    let calls: Vec<(&str, &str, String)> = vec![
+        ("db.exec", "create table if not exists `after` (x int not null)", "ran".into()),
+        ("db.exec", "create table if not exists `modify` (x int not null)", "ran".into()),
+        ("db.exec", "create table if not exists engine (x int not null)", "ran".into()),
+        ("db.exec", "alter table after engine = CSV", csv.clone()),
+        ("db.exec", "alter table `after` engine = CSV", csv.clone()),
+        ("db.exec", "alter table modify engine = CSV", csv.clone()),
+        ("db.exec", "alter table engine engine = CSV", csv.clone()),
+        ("db.exec", "alter table engine_place.after engine CSV", csv.clone()),
+        ("db.exec", "alter table after row_format = dynamic engine csv", csv.clone()),
+        ("db.exec", "alter table after add column y int not null, engine csv", csv.clone()),
+        ("db.exec", "alter table after add column y2 int not null after x, engine = connect", reaches("`engine = connect`")),
+        ("db.exec", "create table if not exists modify2 engine = csv select 1 as x", csv.clone()),
+        ("db.exec", "alter table after add partition (partition p3 values less than (30) engine = csv)", csv.clone()),
+        ("db.exec", "alter table after partition by range (x) (partition p0 values less than (10) engine = csv)", csv.clone()),
+        ("db.exec", "alter table engine engine = InnoDB", "ran".into()),
+        ("db.exec", "alter table after add column engine int", "ran".into()),
+        ("db.exec", "alter table after modify column engine bigint", "ran".into()),
+        ("db.exec", "alter table after change engine engine2 int", "ran".into()),
+        ("db.exec", "alter table after drop column engine2", "ran".into()),
+        ("db.exec", "create index engine on engine (x)", "ran".into()),
+        ("db.exec", "alter table after order by x", "ran".into()),
+    ];
+    let made: Vec<(&str, &str, &str)> = calls.iter().map(|(f, s, _)| (*f, *s, "")).collect();
+    write(&d, "kit/k.qwe", &kit_ran(&made));
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\nprint(steal())\nprint(\"engines: \" + str(db.query(\"select table_name as t, engine as e from information_schema.tables where table_schema = database() order by 1\")))\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    let mut want = vec!["kit:".to_string()];
+    want.extend(calls.iter().map(|(_, _, w)| w.clone()));
+    assert!(out.contains(&format!("{}\n", want.join("\n"))), "{}", out);
+    assert!(out.contains("engines: [{ t: \"after\", e: \"InnoDB\" }, { t: \"engine\", e: \"InnoDB\" }, { t: \"modify\", e: \"InnoDB\" }]\n"), "{}", out);
+}
+
+/// Under a quillo.confirmed on SQLite a taken file makes no virtual table over `dbstat` (temporary
+/// or not, the module in capitals or quoted) or `sqlite_dbpage`, judged by the module's name
+/// SQLite gives as it compiles the statement; an FTS5 table of its own is made and dropped. A
+/// limit, said: the main file's own virtual table over `dbstat` is read by the kit by its name,
+/// as SQLite names no module as a table is read (src/db.rs authorize, SQLITE_CREATE_VTABLE;
+/// FEEDBACK83.md Q-1300, found by the review of a65644e; branch feedback82-85).
+#[test]
+fn on_sqlite_a_taken_file_makes_no_virtual_table_over_dbstat() {
+    let d = dir("vdbstat");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    let over = |m: &str| format!("db: a virtual table over {} is not made by a taken file's SQL where a quillo.confirmed holds the run: it holds other tables' values, Quillo's own too", m);
+    let calls: Vec<(&str, &str, String)> = vec![
+        ("db.exec", "create virtual table temp.k using dbstat(main)", over("dbstat")),
+        ("db.exec", "create virtual table k2 using DBSTAT", over("dbstat")),
+        ("db.exec", "create virtual table if not exists temp.\"k3\" using \"dbstat\"(main)", over("dbstat")),
+        ("db.query", "select name from k", "db: no such table: k".into()),
+        ("db.exec", "create virtual table k4 using sqlite_dbpage", over("sqlite_dbpage")),
+        ("db.exec", "create virtual table k5 using fts5(caf\u{e9})", "ran".into()),
+        ("db.exec", "drop table k5", "ran".into()),
+        ("db.query", "select count(*) > 0 as n from pages where name = 'kits'", "ran".into()),
+    ];
+    let made: Vec<(&str, &str, &str)> = calls.iter().map(|(f, s, _)| (*f, *s, "")).collect();
+    write(&d, "kit/k.qwe", &kit_ran(&made));
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\ndb.open(\"data/app.db\")\ndb.exec(\"create table if not exists kits (x text)\")\ndb.exec(\"create virtual table if not exists pages using dbstat(main)\")\nprint(steal())\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/app.db\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    let mut want = vec!["kit:".to_string()];
+    want.extend(calls.iter().map(|(_, _, w)| w.clone()));
+    assert!(out.contains(&format!("{}\n", want.join("\n"))), "{}", out);
+    assert_eq!(column(&d.join("data/app.db"), "select name from sqlite_master where name like 'k%' order by 1"), ["kits"]);
+}
+
+/// The SQL a kit ordinarily writes, each statement run from a taken file under a quillo.confirmed
+/// and none refused: tables with defaults, checks, foreign keys and generated columns, indexes
+/// (unique, on an expression, GIN), inserts of several rows, upserts, `returning`, updates and
+/// deletes with a join or a subquery, joins with `group by` and `having`, CTEs (recursive too),
+/// window functions, JSON, dates, `like`/`ilike` with values, `alter table` (columns, a
+/// constraint, a rename), views, `explain`, sequences, a full-text table, `truncate`, unicode
+/// values; on SQLite, PostgreSQL and MySQL (MariaDB), each its own line. And SQLite's pragmas a
+/// kit may use: its reads (`table_info`, `foreign_keys`, `journal_mode`, `foreign_key_list`,
+/// `index_list`, `user_version`, `integrity_check`, `compile_options`, `database_list`) and its
+/// settings (`user_version = 3`, `synchronous`, `busy_timeout`, `foreign_keys = off`,
+/// `journal_mode = delete`) run; `pragma optimize`, which runs `analyze` here, is refused as
+/// `analyze` is (src/db.rs text_run, head_refused, creates_ok, table_options_refused, authorize;
+/// FEEDBACK83.md Q-1300, the review of a65644e; branch feedback82-85).
+#[test]
+fn the_sql_a_kit_ordinarily_writes_runs_under_a_hold_on_each_database() {
+    let sqlite: Vec<(&str, &str, &str)> = vec![
+        ("db.exec", "create table if not exists k_users (id integer primary key, name text not null, email text unique, created text default (datetime('now')), age int check (age >= 0))", ""),
+        ("db.exec", "create table if not exists k_posts (id integer primary key autoincrement, user_id int references k_users(id) on delete cascade, title text, body text, size real generated always as (length(title) * 1.0) virtual)", ""),
+        ("db.exec", "create index if not exists k_posts_user on k_posts (user_id)", ""),
+        ("db.exec", "create unique index if not exists k_users_lname on k_users (lower(name))", ""),
+        ("db.exec", "insert into k_users (name, email, age) values ('ann', 'ann@x', 30), ('bob', 'bob@x', 40)", ""),
+        ("db.exec", "insert into k_users (name, email, age) values ('ann2', 'ann@x', 31) on conflict (email) do update set name = excluded.name", ""),
+        ("db.exec", "insert or ignore into k_users (name, email) values ('ann2', 'ann@x')", ""),
+        ("db.exec", "insert into k_posts (user_id, title, body) select id, 'hello ' || name, 'caf\u{e9}' from k_users", ""),
+        ("db.query", "insert into k_users (name, email, age) values (?, ?, ?) returning id", "\"cy\", \"cy@x\", 5"),
+        ("db.exec", "update k_users set age = age + 1 where name = :n", "{n: \"bob\"}"),
+        ("db.query", "select u.name, count(p.id) as n from k_users u left join k_posts p on p.user_id = u.id group by u.name having count(p.id) >= 0 order by u.name", ""),
+        ("db.query", "with recent as (select * from k_posts order by id desc limit 5) select count(*) as n from recent", ""),
+        ("db.query", "with recursive c(x) as (select 1 union all select x + 1 from c where x < 5) select sum(x) as s from c", ""),
+        ("db.query", "select name, row_number() over (order by age desc) as r, avg(age) over () as a, lag(name) over (order by id) as prev from k_users order by r", ""),
+        ("db.query", "select json_object('name', name, 'age', age) as j from k_users order by id limit 1", ""),
+        ("db.query", r#"select json_extract('{"a":[1,2,3]}', '$.a[1]') as v, '{"a":1}' ->> '$.a' as w"#, ""),
+        ("db.query", "select value from json_each('[1,2,3]') order by value", ""),
+        ("db.query", "select * from k_users where name like ? order by id limit ? offset ?", "\"a%\", 10, 0"),
+        ("db.query", "select coalesce(null, 'x') as c, ifnull(null, 1) as i, cast('12' as integer) as n, strftime('%Y', '2026-01-02') as y, upper('\u{e9}') as e", ""),
+        ("db.query", "select name from k_users where id in (select user_id from k_posts) and exists (select 1 from k_posts where k_posts.user_id = k_users.id)", ""),
+        ("db.query", "select case when age > 30 then 'old' else 'young' end as c, count(*) filter (where age > 0) as n from k_users group by 1", ""),
+        ("db.exec", "alter table k_users add column bio text default ''", ""),
+        ("db.exec", "alter table k_users rename column bio to about", ""),
+        ("db.exec", "alter table k_posts rename to k_posts2", ""),
+        ("db.exec", "alter table k_posts2 rename to k_posts", ""),
+        ("db.query", "explain query plan select * from k_posts where user_id = 1", ""),
+        ("db.query", "explain select 1", ""),
+        ("db.exec", "delete from k_posts where id in (select id from k_posts where title like 'hello b%')", ""),
+        ("db.exec", "create view if not exists k_named as select name from k_users", ""),
+        ("db.query", "select * from k_named", ""),
+        ("db.exec", "drop view if exists k_named", ""),
+        ("db.exec", "create temp table if not exists k_tmp (x int)", ""),
+        ("db.exec", "insert into k_tmp values (1)", ""),
+        ("db.exec", "replace into k_users (id, name, email, age) values (1, 'ann', 'ann@x', 30)", ""),
+        ("db.exec", "create virtual table if not exists k_fts using fts5(body)", ""),
+        ("db.exec", "insert into k_fts (body) values ('quillo holds the run')", ""),
+        ("db.query", "select body from k_fts where k_fts match 'holds'", ""),
+        ("db.exec", "drop table if exists k_fts", ""),
+        ("db.exec", "create table if not exists k_kv (k text primary key, v text) without rowid", ""),
+        ("db.exec", "create table if not exists k_strict (id integer primary key, n int) strict", ""),
+        ("db.query", "select group_concat(name, ',') as names from (select name from k_users order by name)", ""),
+        ("db.query", "select printf('%05d', 42) as p, substr('quillo', 1, 3) as s, instr('quillo', 'll') as i, replace('a-b', '-', '+') as r", ""),
+        ("db.exec", "drop index if exists k_posts_user", ""),
+        ("db.exec", "vacuum", ""),
+        ("db.query", "pragma table_info(k_users)", ""),
+        ("db.query", "select name from pragma_table_info('k_users') order by cid", ""),
+        ("db.query", "pragma foreign_keys", ""),
+        ("db.query", "pragma journal_mode", ""),
+        ("db.query", "pragma foreign_key_list(k_posts)", ""),
+        ("db.query", "pragma index_list(k_users)", ""),
+        ("db.query", "pragma user_version", ""),
+        ("db.query", "pragma integrity_check", ""),
+        ("db.query", "pragma compile_options", ""),
+        ("db.query", "pragma database_list", ""),
+        ("db.exec", "pragma user_version = 3", ""),
+        ("db.exec", "pragma synchronous = normal", ""),
+        ("db.exec", "pragma busy_timeout = 1000", ""),
+        ("db.exec", "pragma foreign_keys = off", ""),
+        ("db.exec", "pragma journal_mode = delete", ""),
+    ];
+    let pg: Vec<(&str, &str, &str)> = vec![
+        ("db.exec", "create table if not exists k_users (id serial primary key, name text not null, email text unique, created timestamptz default now(), age int check (age >= 0), meta jsonb default '{}')", ""),
+        ("db.exec", "create table if not exists k_posts (id bigint generated always as identity primary key, user_id int references k_users(id) on delete cascade, title text, words int generated always as (length(title)) stored)", ""),
+        ("db.exec", "create index if not exists k_posts_user on k_posts (user_id)", ""),
+        ("db.exec", "create unique index if not exists k_users_lower on k_users (lower(name))", ""),
+        ("db.exec", "create index if not exists k_users_meta on k_users using gin (meta)", ""),
+        ("db.exec", r#"insert into k_users (name, email, age, meta) values ('ann', 'ann@x', 30, '{"a": 1}'), ('bob', 'bob@x', 40, '{"b": 2}')"#, ""),
+        ("db.exec", "insert into k_users (name, email, age) values ('ann2', 'ann@x', 31) on conflict (email) do update set name = excluded.name", ""),
+        ("db.exec", "insert into k_users (name, email) values ('ann', 'ann@x') on conflict do nothing", ""),
+        ("db.query", "insert into k_posts (user_id, title) select id, 'hello ' || name from k_users returning id", ""),
+        ("db.query", "update k_users set age = age + 1 where name = :n returning age", "{n: \"bob\"}"),
+        ("db.query", "select u.name, count(p.id) as n from k_users u left join k_posts p on p.user_id = u.id group by u.name having count(p.id) >= 0 order by u.name", ""),
+        ("db.query", "with recent as (select * from k_posts order by id desc limit 5) select count(*) as n from recent", ""),
+        ("db.query", "with recursive c(x) as (select 1 union all select x + 1 from c where x < 5) select sum(x) as s from c", ""),
+        ("db.query", "select name, rank() over (partition by age > 30 order by id) as r, lag(name) over (order by id) as prev from k_users order by id", ""),
+        ("db.query", r#"select meta->>'a' as a, meta ? 'a' as has, meta @> '{"a": 1}' as c, jsonb_build_object('n', name) as j from k_users order by id"#, ""),
+        ("db.query", "select jsonb_agg(name order by name) as names, json_build_array(1, 2) as a, to_jsonb(array[1,2]) as b from k_users", ""),
+        ("db.query", "select now()::date = current_date as today, extract(year from now()) > 2000 as y, date_trunc('day', now()) <= now() as d", ""),
+        ("db.query", "select * from generate_series(1, 3) g", ""),
+        ("db.query", "select string_agg(name, ',' order by name) as s, array_agg(id) as ids from k_users", ""),
+        ("db.query", "select coalesce(null, 1) as c, greatest(1, 2) as g, nullif(1, 1) as n, md5('x') as m, to_char(42, '000') as t", ""),
+        ("db.query", "select count(*) filter (where age > 30) as old from k_users", ""),
+        ("db.query", "select name from k_users where name = any(?)", "[\"ann\", \"bob\"]"),
+        ("db.query", "select name from k_users where name ilike ? order by id limit ? offset ?", "\"a%\", 5, 0"),
+        ("db.query", "select exists(select 1 from k_users) as e, gen_random_uuid() is not null as u", ""),
+        ("db.exec", "alter table k_users add column bio text default ''", ""),
+        ("db.exec", "alter table k_users alter column bio set default 'x'", ""),
+        ("db.exec", "alter table k_users add constraint k_age check (age < 200)", ""),
+        ("db.exec", "alter table k_users rename column bio to about", ""),
+        ("db.query", "explain select * from k_posts where user_id = 1", ""),
+        ("db.query", "explain (costs off) select 1", ""),
+        ("db.query", "explain analyze select 1", ""),
+        ("db.exec", "delete from k_posts where user_id in (select id from k_users where name = 'nobody')", ""),
+        ("db.exec", "create or replace view k_v as select name from k_users", ""),
+        ("db.query", "select * from k_v", ""),
+        ("db.exec", "drop view if exists k_v", ""),
+        ("db.exec", "create materialized view if not exists k_mv as select count(*) as n from k_users", ""),
+        ("db.exec", "create sequence if not exists k_seq", ""),
+        ("db.query", "select nextval('k_seq') as n", ""),
+        ("db.exec", "create table if not exists k_like (like k_users including all)", ""),
+        ("db.exec", "create table if not exists k_parted (id int, at date) partition by range (at)", ""),
+        ("db.exec", "truncate table k_posts restart identity cascade", ""),
+        ("db.query", "select x::numeric(10, 2) as n, '2026-01-02'::date + interval '1 day' as d from (values (1.234)) v(x)", ""),
+        ("db.query", "select name from k_users order by id for update skip locked", ""),
+        ("db.query", "select distinct on (age) age, name from k_users order by age, name", ""),
+        ("db.query", "select age, sum(age) over w as s from k_users window w as (order by id)", ""),
+        ("db.exec", "insert into k_users (name, email, age) values (?, ?, ?)", "\"d\u{e9}e\", \"d@x\", 7"),
+        ("db.query", "select 'a''b' as q, $$dollar$$ as d, E'tab\\there' as e", ""),
+        ("db.exec", "drop table if exists k_like", ""),
+    ];
+    let mysql: Vec<(&str, &str, &str)> = vec![
+        ("db.exec", "create table if not exists k_users (id int auto_increment primary key, name varchar(50) not null, email varchar(80) unique, created timestamp default current_timestamp, age int check (age >= 0), meta json) engine=InnoDB default charset=utf8mb4", ""),
+        ("db.exec", "create table if not exists k_posts (id int auto_increment primary key, user_id int, title varchar(100), words int as (char_length(title)) stored, foreign key (user_id) references k_users(id) on delete cascade, index (user_id)) engine = InnoDB", ""),
+        ("db.exec", "create index k_posts_title on k_posts (title(10))", ""),
+        ("db.exec", r#"insert into k_users (name, email, age, meta) values ('ann', 'ann@x', 30, '{"a": 1}'), ('bob', 'bob@x', 40, '{"b": 2}')"#, ""),
+        ("db.exec", "insert into k_users (name, email, age) values ('ann2', 'ann@x', 31) on duplicate key update name = values(name)", ""),
+        ("db.exec", "insert ignore into k_users (name, email) values ('ann', 'ann@x')", ""),
+        ("db.exec", "insert into k_users set name = 'zed', email = 'z@x', age = 9", ""),
+        ("db.exec", "replace into k_users (id, name, email, age) values (1, 'ann', 'ann@x', 30)", ""),
+        ("db.exec", "insert into k_posts (user_id, title) select id, concat('hello ', name) from k_users", ""),
+        ("db.exec", "update k_users u join k_posts p on p.user_id = u.id set u.age = u.age + 1 where u.name = ?", "\"bob\""),
+        ("db.exec", "delete p from k_posts p join k_users u on u.id = p.user_id where u.name = 'nobody'", ""),
+        ("db.query", "select u.name, count(p.id) as n from k_users u left join k_posts p on p.user_id = u.id group by u.name having count(p.id) >= 0 order by u.name", ""),
+        ("db.query", "with recent as (select * from k_posts order by id desc limit 5) select count(*) as n from recent", ""),
+        ("db.query", "with recursive c(x) as (select 1 union all select x + 1 from c where x < 5) select sum(x) as s from c", ""),
+        ("db.query", "select name, row_number() over (order by age desc) as r, lag(name) over (order by id) as prev from k_users order by id", ""),
+        ("db.query", r#"select json_object('n', name) as j, json_extract(meta, '$.a') as a, json_unquote(json_extract('{"x":"y"}', '$.x')) as x from k_users order by id"#, ""),
+        ("db.query", "select json_arrayagg(name) as names from k_users", ""),
+        ("db.query", "select now() > '2000-01-01' as n, date_format('2026-01-02', '%Y') as y, datediff('2026-01-02', '2026-01-01') as d", ""),
+        ("db.query", "select group_concat(name order by name separator ',') as s from k_users", ""),
+        ("db.query", "select * from k_users where name like concat(?, '%') order by id limit ? offset ?", "\"a\", 5, 0"),
+        ("db.query", "select if(age > 30, 'old', 'young') as c, ifnull(null, 1) as i, coalesce(null, 2) as k, md5('x') as m from k_users order by id", ""),
+        ("db.query", "select last_insert_id() >= 0 as l, concat(:a, '-', :a) as s", "{a: \"v\"}"),
+        ("db.exec", "alter table k_users add column bio text", ""),
+        ("db.exec", "alter table k_users add index k_users_age (age)", ""),
+        ("db.exec", "alter table k_users modify column bio varchar(200)", ""),
+        ("db.exec", "alter table k_users change column bio about varchar(200)", ""),
+        ("db.exec", "alter table k_users drop column about", ""),
+        ("db.exec", "alter table k_users add column z int, algorithm = inplace, lock = none", ""),
+        ("db.exec", "alter table k_users engine = InnoDB", ""),
+        ("db.exec", "alter table k_users row_format = dynamic", ""),
+        ("db.query", "explain select * from k_posts where user_id = 1", ""),
+        ("db.query", "explain format = json select 1", ""),
+        ("db.exec", "create or replace view k_v as select name from k_users", ""),
+        ("db.query", "select * from k_v", ""),
+        ("db.exec", "drop view if exists k_v", ""),
+        ("db.exec", "create temporary table if not exists k_t (x int)", ""),
+        ("db.exec", "drop temporary table if exists k_t", ""),
+        ("db.exec", "create table if not exists k_e (engine varchar(10), kind int) engine = InnoDB", ""),
+        ("db.exec", "create table if not exists k_like like k_users", ""),
+        ("db.exec", "create table if not exists k_sel as select id, name from k_users", ""),
+        ("db.exec", "truncate table k_posts", ""),
+        ("db.query", "select cast('12' as signed) as n, convert('\u{e9}' using utf8mb4) as e, char_length('\u{e9}') as c", ""),
+        ("db.query", "select name from k_users order by id limit 1 for update", ""),
+        ("db.exec", "drop table if exists k_like, k_sel", ""),
+    ];
+    let ran = |calls: &[(&str, &str, &str)], last: &[&str]| {
+        let mut want: Vec<&str> = vec!["kit:"];
+        want.extend(std::iter::repeat_n("ran", calls.len() - last.len()));
+        want.extend(last);
+        format!("{}\n", want.join("\n"))
+    };
+    // SQLite: the kit's tables in the main file's database, which it is confirmed to write.
+    let d = dir("ordinary");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    let mut lite = sqlite.clone();
+    lite.push(("db.exec", "pragma optimize", ""));
+    write(&d, "kit/k.qwe", &kit_ran(&lite));
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\ndb.open(\"data/app.db\")\nprint(steal())\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/app.db\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains(&ran(&lite, &[ANALYZE])), "{}", out);
+    // PostgreSQL and MySQL: the program's database.
+    for (name, calls) in [("pg", &pg), ("my", &mysql)] {
+        let (_pg, _my);
+        let url = if name == "pg" {
+            let Some(pg) = support::postgres("cov8285db7o") else {
+                eprintln!("PostgreSQL is not installed: skipped");
+                continue;
+            };
+            let url = pg.database("ordinary");
+            _pg = pg;
+            url
+        } else {
+            let Some(my) = support::mariadb("cov8285db7o") else {
+                eprintln!("MariaDB is not installed: skipped");
+                continue;
+            };
+            let url = my.url("ordinary");
+            _my = my;
+            url
+        };
+        let d = dir(&format!("ordinary-{}", name));
+        write(&d, "kit/k.qwe", &kit_ran(calls));
+        write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\nprint(steal())\n");
+        write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+        checked(&d);
+        let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+        assert_eq!(code, 0, "{}", out);
+        assert!(out.contains(&ran(calls, &[])), "{}: {}", name, out);
+    }
+}

@@ -1164,11 +1164,15 @@ for the site and the visitor.
   values or SQL text (`pg_stats`, `pg_prepared_statements`, `performance_schema`'s
   statements, the `sys` and `mysql` schemas by any spelling (quoted, and the letters outside
   ASCII MariaDB takes for ASCII ones), the process list, `optimizer_trace`, and on PostgreSQL
-  every `pg_...` name). On SQLite a taken file runs no `ANALYZE`, makes no trigger, and reads
-  neither the statistics (`sqlite_stat1` to `sqlite_stat4`) nor `dbstat`. A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
+  every `pg_...` name). On SQLite a taken file runs no `ANALYZE`, makes no trigger and no
+  virtual table over `dbstat`, and reads neither the statistics (`sqlite_stat1` to
+  `sqlite_stat4`) nor `dbstat` (a virtual table the main file made over `dbstat` is read by
+  its own name: page sizes, not values). A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
   `DELETE`, `WITH`, `VALUES`, `TABLE`, `REPLACE`, `EXPLAIN` of one of these (MySQL's in
   brackets too), `CREATE` or `ALTER` as above (a MySQL table's engine InnoDB, Aria, MyISAM
-  or MEMORY, by name or string), `DROP` of a table,
+  or MEMORY, by name or string, wherever the server takes a table's options: after its name,
+  after another option, at the start of an `alter` clause, in a partition's definition),
+  `DROP` of a table,
   an index, a view or a sequence, or `TRUNCATE`; any other first word (`SET`, `GRANT`,
   `SHOW`, `INSTALL` and the rest) is refused, as is a character outside ASCII just before a
   `\` or a backtick. Tables of other databases the database user can read are not held.

@@ -1988,21 +1988,49 @@ fn head_refused(my: bool, stmt: &[Tk<'_>], h: usize) -> Option<TextRun> {
 /// `connection`, `file_name`, `table_type`, a MERGE table's `union`, `data directory` and `index
 /// directory` (FEEDBACK83.md, Q-1300; branch feedback82-85).
 ///
-/// `engine` is a column's name, not the option, at the start of a column's definition (after the
-/// `(` or a `,` of a list, no `=` or string after it), in a list (before a `)` or a `,`), after `add`,
-/// `column`, `modify`, `change`, `drop`, `alter`, `after`, `select`, `distinct`, `by` or a `.`;
-/// and a statement's query (from its `select`) has no table options: `create table t (engine int)`
-/// was refused as "`engine = int`" (FEEDBACK83.md, Q-1300, found by the coverage tests of 3117dea;
-/// branch feedback82-85). A partition's `engine = ...`, inside the brackets of its list, is the
-/// option still, and changes the table's (MariaDB). The engine is a name or a string (`engine =
-/// 'memory'`, as MariaDB takes it), said in the refusal.
+/// `engine` is the option where the server takes a table's options, read by the statement's shape,
+/// not by the word before it: after the name of what is made or altered, after another option, at
+/// the start of an `alter`'s clause (after a `,` outside brackets), and in a partition's
+/// definition, inside the brackets of its list (MariaDB takes a partition's engine for the
+/// table's). It is a column's name, or a table's, elsewhere: the name of what is made or altered
+/// itself (`alter table after engine = csv`), inside any other brackets (a column list, a key's
+/// columns, `add (...)`) where no `=` or string follows it, in an `alter`'s clause that `add`,
+/// `modify`, `change`, `alter`, `drop`, `rename` or `order` opens (a table option after such a
+/// clause takes a `,` first, MariaDB 12.3), after `like`, `on`, `to` or a `.`, and before a `)` or
+/// a `,` (an option has a value); and a statement's query (from its `select`) has no table
+/// options. `create table t (engine int)` was refused as "`engine = int`", and the word before it
+/// was judged instead: `alter table after engine = csv` changed a table's engine to CSV
+/// (FEEDBACK83.md, Q-1300, found by the coverage tests of 3117dea and the review of a65644e; branch
+/// feedback82-85). The engine is a name or a string (`engine = 'memory'`, as MariaDB takes it),
+/// said in the refusal.
 fn table_options_refused(stmt: &[Tk<'_>]) -> Option<String> {
     let is = |t: Option<&Tk<'_>>, w: &str| matches!(t, Some(Tk::Word(x)) if x.eq_ignore_ascii_case(w.as_bytes()));
-    let mut depth = 0usize;
+    let alter = is(stmt.first(), "alter");
+    // The name of what is made or altered: after its kind (`table`, `index`, `view`, `sequence`)
+    // and `if [not] exists`, before any bracket, with its schema (`db.t`).
+    let named = stmt.iter().take_while(|t| !matches!(t, Tk::Punct(b'('))).position(|t| ["table", "index", "view", "sequence"].iter().any(|w| is(Some(t), w)));
+    let name = named.map(|at| {
+        let mut k = at + 1;
+        while ["if", "not", "exists"].iter().any(|w| is(stmt.get(k), w)) {
+            k += 1;
+        }
+        let end = if matches!(stmt.get(k + 1), Some(Tk::Punct(b'.'))) { k + 3 } else { k + 1 };
+        k..end
+    });
+    // For each bracket open, whether it holds partitions' definitions (its first word, or its
+    // outer one's); and the first word of the `alter` clause this is in.
+    let mut groups: Vec<bool> = Vec::new();
+    let mut clause: Option<usize> = name.as_ref().map(|n| n.end);
     for (k, t) in stmt.iter().enumerate() {
         match t {
-            Tk::Punct(b'(') => depth += 1,
-            Tk::Punct(b')') => depth = depth.saturating_sub(1),
+            Tk::Punct(b'(') => {
+                let parts = is(stmt.get(k + 1), "partition") || is(stmt.get(k + 1), "subpartition") || groups.last() == Some(&true);
+                groups.push(parts);
+            }
+            Tk::Punct(b')') => {
+                groups.pop();
+            }
+            Tk::Punct(b',') if groups.is_empty() => clause = Some(k + 1),
             _ => {}
         }
         let Tk::Word(x) = t else { continue };
@@ -2012,10 +2040,15 @@ fn table_options_refused(stmt: &[Tk<'_>]) -> Option<String> {
         let next = stmt.get(k + 1);
         let before = k.checked_sub(1).and_then(|b| stmt.get(b));
         let valued = matches!(next, Some(Tk::Punct(b'=') | Tk::Str(_)));
-        let column = (depth > 0 && matches!(before, Some(Tk::Punct(b'(' | b','))) && !valued)
+        let in_clause = |w: &str| alter && clause.is_some_and(|c| c < k && is(stmt.get(c), w));
+        let column = name.as_ref().is_some_and(|n| n.contains(&k))
+            || match groups.last() {
+                Some(&parts) => !parts && !valued,
+                None => ["add", "modify", "change", "alter", "drop", "rename", "order"].iter().any(|w| in_clause(w)),
+            }
             || matches!(next, Some(Tk::Punct(b')' | b',')))
             || matches!(before, Some(Tk::Punct(b'.')))
-            || ["add", "column", "modify", "change", "drop", "alter", "after", "distinct", "by"].iter().any(|w| is(before, w));
+            || ["like", "on", "to"].iter().any(|w| is(before, w));
         if x.eq_ignore_ascii_case(b"engine") && !column {
             let at = if matches!(next, Some(Tk::Punct(b'='))) { k + 2 } else { k + 1 };
             let name = match stmt.get(at) {
@@ -2088,15 +2121,30 @@ fn own_tables_held(it: &Interp, on: Option<usize>, b: &Backend, sql: &str) -> Op
 }
 
 /// `taken_sql_refused` of a taken file's statement, its text as written judged already
-/// (`own_tables_held`): the text its server is sent, where Quillo writes its values' places another way (`sql::Scan::native`: PostgreSQL's
-/// `$1` for `?`, `?1` and `:name`, MySQL's `?` for `?1` and `:name`), which is the one a statement
-/// with values runs as. Judged as written alone, `$:a` was `$` and a value to this reading and
+/// (`own_tables_held`): the text its server is sent, where Quillo writes its values' places
+/// another way (`sql::Scan::native`: PostgreSQL's `$1` for `?`, `?1` and `:name`, MySQL's `?` for
+/// `?1` and `:name`), which is the one a statement with values is prepared as. Judged as written
+/// alone, `$:a` was `$` and a value to this reading and
 /// `$$1`, a dollar quote, to PostgreSQL: a kit confirmed for nothing read `_quillo_mine` with
 /// `select $:a as a, $$ || query_to_xml('select x from _quil' || 'lo_mine', ...)::text || $$ as b
 /// -- $$ ...`, whose `query_to_xml` this reading took for a string's text (FEEDBACK83.md, Q-1300,
 /// found by the coverage tests of 3117dea; branch feedback82-85). A script without values is sent
-/// as written (`simple_query`, `query_drop`); SQLite takes its values' places as written. Out of
-/// line, as `taken_sql_refused` is.
+/// as written (`simple_query`, `query_drop`); SQLite takes its values' places as written.
+///
+/// What is judged is the text up to pg.rs's one rewrite after this: once PostgreSQL has prepared
+/// this text, a value whose type it inferred as one sent as text is prepared again with its place
+/// `$n` written `($n::text)::type` (`casts_for`, and `typed`'s probe of the same text). That adds
+/// nothing a taken file controls: the places are the ones PostgreSQL's own preparing of this text
+/// numbered, and found again in it by sql.rs's reading, which this one is held to; the type is the
+/// server's inference, its name a `pg_catalog` name or one `quote_ident` quotes; and brackets,
+/// `::` and a name open no string, comment or dollar quote, nor close one at a place outside them.
+/// A `$n` right after a letter is part of a name to both readings (no place), and one right after
+/// a `$` or a digit, where a cast's `(` would change the reading, is PostgreSQL's syntax error at
+/// the first preparing, before any rewrite. What this leaves: a type of the program's own whose
+/// name needs quoting puts a `"` there, which could end a quoted name only at a place sql.rs read
+/// that PostgreSQL did not, with a session's `standard_conforming_strings` the main file turned off
+/// (FEEDBACK83.md, Q-1300, the review of a65644e; branch feedback82-85). Out of line, as
+/// `taken_sql_refused` is.
 #[inline(never)]
 fn taken_sent_refused(d: crate::sql::Dialect, sql: &str, file: impl Fn() -> String) -> Option<String> {
     let scan = crate::sql::scan(d, sql);
@@ -2322,61 +2370,74 @@ unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int
     // a view's or a trigger's too (`own_table_named`, which reads the text); Quillo's own
     // statements (`OWN_SQL`) write them.
     let own_name = |p: *const std::ffi::c_char| text(p).is_some_and(|t| t.to_bytes().len() >= 8 && t.to_bytes()[..8].eq_ignore_ascii_case(b"_quillo_"));
-    let writes = match action {
-        ffi::SQLITE_INSERT | ffi::SQLITE_UPDATE | ffi::SQLITE_DELETE | ffi::SQLITE_CREATE_TABLE | ffi::SQLITE_CREATE_TEMP_TABLE | ffi::SQLITE_DROP_TABLE | ffi::SQLITE_DROP_TEMP_TABLE | ffi::SQLITE_CREATE_VIEW | ffi::SQLITE_CREATE_TEMP_VIEW => own_name(a1),
-        ffi::SQLITE_CREATE_INDEX | ffi::SQLITE_CREATE_TEMP_INDEX | ffi::SQLITE_DROP_INDEX | ffi::SQLITE_DROP_TEMP_INDEX | ffi::SQLITE_CREATE_TRIGGER | ffi::SQLITE_CREATE_TEMP_TRIGGER | ffi::SQLITE_DROP_TRIGGER | ffi::SQLITE_DROP_TEMP_TRIGGER => own_name(a1) || own_name(a2),
-        ffi::SQLITE_ALTER_TABLE => own_name(a2),
-        // A virtual table by one of their names, which Quillo would then write into (FEEDBACK83.md,
-        // Q-1300, found by the coverage tests of 0038a97; branch feedback82-85).
-        ffi::SQLITE_CREATE_VTABLE | ffi::SQLITE_DROP_VTABLE => own_name(a1),
-        _ => false,
-    };
-    // And a read of one, by a view or a trigger of the main file's a taken file's statement goes
-    // through, as SQLite names each column it reads: the text check sees a name the statement
-    // writes, not those its view reads (FEEDBACK83.md, Q-1300, found by the coverage tests of
-    // 0038a97; branch feedback82-85).
-    let reads = action == ffi::SQLITE_READ && own_name(a1);
-    // And what holds other tables' values: SQLite's statistics, which `analyze` writes (each
-    // index's sampled values in `sqlite_stat4`, `sqlite_stat3`'s before it, and the counts of
-    // `sqlite_stat1` and `sqlite_stat2`), and the pages of `dbstat` and `sqlite_dbpage`. A kit
-    // confirmed for nothing ran `analyze` and read Quillo's own tables' values (migration names,
-    // push endpoints, MCP token hashes) from `sqlite_stat4`. Its `analyze` is refused whole: the
-    // statistics it loads back as it ends are read through this, and `analyze` of one of
-    // Quillo's tables writes them (FEEDBACK83.md, Q-1300, found by the coverage tests of 3117dea;
-    // branch feedback82-85).
-    // By its first letter before its name is read: a column read of another table costs no more
-    // (measured, 100,000 `db.exec` of a taken file).
-    let mirrors = action == ffi::SQLITE_READ
-        && !a1.is_null()
-        && matches!(unsafe { *a1 } as u8 | 0x20, b's' | b'd')
-        && text(a1).is_some_and(|t| {
-            let t = t.to_bytes();
-            (t.len() == 12 && t[..11].eq_ignore_ascii_case(b"sqlite_stat") && matches!(t[11], b'1'..=b'4')) || t.eq_ignore_ascii_case(b"dbstat") || t.eq_ignore_ascii_case(b"sqlite_dbpage")
-        });
-    let analyze = action == ffi::SQLITE_ANALYZE;
-    // And a trigger of a taken file's, on any table: its statements run inside the statement that
-    // fires it, judged as that statement's code, the main file's too. A kit's temporary trigger on
-    // the main file's table copied `sqlite_stat4` into the kit's table as the main file's insert
-    // ran; a taken file's `create trigger` is refused on PostgreSQL and MySQL too (`creates_ok`)
-    // (FEEDBACK83.md, Q-1300, found trying to get round the fix of the coverage tests of 3117dea;
-    // branch feedback82-85).
-    let trigger = matches!(action, ffi::SQLITE_CREATE_TRIGGER | ffi::SQLITE_CREATE_TEMP_TRIGGER);
-    if (writes || reads || mirrors || analyze || trigger) && OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_TAKEN.get() {
-        STATEMENTS_OF.with(|s| {
-            if let Ok(mut s) = s.try_borrow_mut() {
-                s.refused = Some(if trigger && !writes {
-                    "a taken file's SQL makes no trigger where a quillo.confirmed holds the run: its statements would run inside other statements, the main file's too, as theirs".to_string()
-                } else if analyze {
-                    "`analyze` is not run by a taken file's SQL where a quillo.confirmed holds the run: the statistics it writes and reads back (sqlite_stat1, sqlite_stat4) hold every table's values, Quillo's own too".to_string()
-                } else if mirrors {
-                    format!("{} is not read by a taken file's SQL where a quillo.confirmed holds the run: it holds other tables' values, Quillo's own too", text(a1).map_or(String::new(), |t| t.to_string_lossy().to_ascii_lowercase()))
-                } else {
-                    let how = if writes { "written" } else { "read" };
-                    format!("Quillo's own tables (_quillo_...) are not {} by a taken file's SQL where a quillo.confirmed holds the run", how)
-                });
-            }
-        });
-        return ffi::SQLITE_DENY;
+    // Only a taken file's statement is judged so: the main file's and Quillo's own go on with two
+    // looks at the thread, no name read, where each action read its names first (measured,
+    // 100,000 `db.exec` of the main file under a hold, for the fixes of the review of a65644e).
+    if OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_TAKEN.get() {
+        let writes = match action {
+            ffi::SQLITE_INSERT | ffi::SQLITE_UPDATE | ffi::SQLITE_DELETE | ffi::SQLITE_CREATE_TABLE | ffi::SQLITE_CREATE_TEMP_TABLE | ffi::SQLITE_DROP_TABLE | ffi::SQLITE_DROP_TEMP_TABLE | ffi::SQLITE_CREATE_VIEW | ffi::SQLITE_CREATE_TEMP_VIEW => own_name(a1),
+            ffi::SQLITE_CREATE_INDEX | ffi::SQLITE_CREATE_TEMP_INDEX | ffi::SQLITE_DROP_INDEX | ffi::SQLITE_DROP_TEMP_INDEX | ffi::SQLITE_CREATE_TRIGGER | ffi::SQLITE_CREATE_TEMP_TRIGGER | ffi::SQLITE_DROP_TRIGGER | ffi::SQLITE_DROP_TEMP_TRIGGER => own_name(a1) || own_name(a2),
+            ffi::SQLITE_ALTER_TABLE => own_name(a2),
+            // A virtual table by one of their names, which Quillo would then write into (FEEDBACK83.md,
+            // Q-1300, found by the coverage tests of 0038a97; branch feedback82-85).
+            ffi::SQLITE_CREATE_VTABLE | ffi::SQLITE_DROP_VTABLE => own_name(a1),
+            _ => false,
+        };
+        // And a read of one, by a view or a trigger of the main file's a taken file's statement goes
+        // through, as SQLite names each column it reads: the text check sees a name the statement
+        // writes, not those its view reads (FEEDBACK83.md, Q-1300, found by the coverage tests of
+        // 0038a97; branch feedback82-85).
+        let reads = action == ffi::SQLITE_READ && own_name(a1);
+        // And what holds other tables' values: SQLite's statistics, which `analyze` writes (each
+        // index's sampled values in `sqlite_stat4`, `sqlite_stat3`'s before it, and the counts of
+        // `sqlite_stat1` and `sqlite_stat2`), and the pages of `dbstat` and `sqlite_dbpage`. A kit
+        // confirmed for nothing ran `analyze` and read Quillo's own tables' values (migration names,
+        // push endpoints, MCP token hashes) from `sqlite_stat4`. Its `analyze` is refused whole: the
+        // statistics it loads back as it ends are read through this, and `analyze` of one of
+        // Quillo's tables writes them (FEEDBACK83.md, Q-1300, found by the coverage tests of 3117dea;
+        // branch feedback82-85).
+        // `sqlite_stmt` (other statements' SQL) too, where a build of SQLite has it. By its first letter
+        // before its name is read: a column read of another table costs no more (measured, 100,000
+        // `db.exec` of a taken file).
+        let mirror = |p: *const std::ffi::c_char| {
+            text(p).is_some_and(|t| {
+                let t = t.to_bytes();
+                (t.len() == 12 && t[..11].eq_ignore_ascii_case(b"sqlite_stat") && matches!(t[11], b'1'..=b'4')) || [&b"dbstat"[..], b"sqlite_dbpage", b"sqlite_stmt"].iter().any(|m| t.eq_ignore_ascii_case(m))
+            })
+        };
+        let mirrors = action == ffi::SQLITE_READ && !a1.is_null() && matches!(unsafe { *a1 } as u8 | 0x20, b's' | b'd') && mirror(a1);
+        // And a virtual table of a taken file's over one of those modules, by the module's name SQLite
+        // gives (`create virtual table temp.k using dbstat(main)` read dbstat as `k`). One the main file
+        // made over them is read by its own name: SQLite names no module as it reads one
+        // (FEEDBACK83.md, Q-1300, found by the review of a65644e; branch feedback82-85).
+        let over = action == ffi::SQLITE_CREATE_VTABLE && mirror(a2);
+        let analyze = action == ffi::SQLITE_ANALYZE;
+        // And a trigger of a taken file's, on any table: its statements run inside the statement that
+        // fires it, judged as that statement's code, the main file's too. A kit's temporary trigger on
+        // the main file's table copied `sqlite_stat4` into the kit's table as the main file's insert
+        // ran; a taken file's `create trigger` is refused on PostgreSQL and MySQL too (`creates_ok`)
+        // (FEEDBACK83.md, Q-1300, found trying to get round the fix of the coverage tests of 3117dea;
+        // branch feedback82-85).
+        let trigger = matches!(action, ffi::SQLITE_CREATE_TRIGGER | ffi::SQLITE_CREATE_TEMP_TRIGGER);
+        if writes || reads || mirrors || analyze || trigger || over {
+            STATEMENTS_OF.with(|s| {
+                if let Ok(mut s) = s.try_borrow_mut() {
+                    s.refused = Some(if over && !writes {
+                        format!("a virtual table over {} is not made by a taken file's SQL where a quillo.confirmed holds the run: it holds other tables' values, Quillo's own too", text(a2).map_or(String::new(), |t| t.to_string_lossy().to_ascii_lowercase()))
+                    } else if trigger && !writes {
+                        "a taken file's SQL makes no trigger where a quillo.confirmed holds the run: its statements would run inside other statements, the main file's too, as theirs".to_string()
+                    } else if analyze {
+                        "`analyze` is not run by a taken file's SQL where a quillo.confirmed holds the run: the statistics it writes and reads back (sqlite_stat1, sqlite_stat4) hold every table's values, Quillo's own too".to_string()
+                    } else if mirrors {
+                        format!("{} is not read by a taken file's SQL where a quillo.confirmed holds the run: it holds other tables' values, Quillo's own too", text(a1).map_or(String::new(), |t| t.to_string_lossy().to_ascii_lowercase()))
+                    } else {
+                        let how = if writes { "written" } else { "read" };
+                        format!("Quillo's own tables (_quillo_...) are not {} by a taken file's SQL where a quillo.confirmed holds the run", how)
+                    });
+                }
+            });
+            return ffi::SQLITE_DENY;
+        }
     }
     match action {
         ffi::SQLITE_ATTACH => {}
