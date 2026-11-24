@@ -70,6 +70,15 @@ and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2
   `notification.send` asks the hold for each push service's host, for the file that sends
   (`quillo confirm` lists the browsers' push hosts for it), and under a hold a taken file's
   SQL never touches Quillo's own `_quillo_*` tables, however it names them.
+- **A taken file's SQL that runs SQL from text is refused** on PostgreSQL and MySQL/MariaDB,
+  under a `quillo.confirmed` (the user's decision of 2026-11-24; Q-1300, found by the
+  coverage tests): `DO`, `PREPARE`/`EXECUTE`, `EXECUTE IMMEDIATE`, `CALL`, `CREATE
+  FUNCTION`/`PROCEDURE`/`TRIGGER`/`RULE`/`EVENT`, the `*_to_xml` functions and `regclass`
+  from text reached `_quillo_*` by names built at run time (`U&"_quillo..."`). The statement
+  is read as the database reads it, so a word in a string, comment or quoted name is not
+  refused. A connection is held to the file that opened it: a connection's map a taken file
+  built by hand reached a helper's database. A tenant's migrations run as the code that set
+  them, and a migration file is judged as the text that runs.
 - **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
   of 2026-11-24): a name another file defines, used without taking it, is an error in
   `quillo check`, and the start refuses it with `--no-check` too, as the value under it
@@ -242,8 +251,12 @@ What a program may notice:
 - **A file taken for some of its names that adds routes or tools, or reaches out at start**, is
   warned of (Q-1301); **a Rust file whose effects line leaves out what its code plainly calls**
   (`std::process::Command` without `run`) is warned of, a reading, not a proof, that follows
-  `use ... as` names, `::` and `!` however spaced, and `include_str!` and the like as `fs`
-  (Q-1305).
+  `use ... as` names, `use std::{fs::*}` and `r#fs`, `::` and `!` however spaced, and
+  `include_str!` and the like as `fs`; what it cannot follow (a path a macro builds, a
+  foreign block, `asm!`, a `use` nested past 64) reads as every effect but `db` (Q-1305).
+  Under a `quillo.confirmed` a Rust file that builds another into it (`include!`,
+  `include_str!`, `include_bytes!`, `#[path]`, an out-of-line `mod x;`) is refused, as that
+  file is outside its SHA-256; without one, warned of (found in review).
 - **What `quillo.confirmed` does not confirm** is an error at its line, and so is a name used
   from another file and not taken, under one (see Security).
 - **`"""` and `'''`** say that text over several lines is a backtick string (FEEDBACK85.md,

@@ -10976,6 +10976,20 @@ for the site and the visitor.
   can read and write the program's tables through `db`. What is held is opening one
   (`db.open`, `db.system`, a tenant's file), its migrations (`db.migrate()`), the files SQL
   attaches, and Quillo's own `_quillo_*` tables, which a taken file's SQL never touches.
+  *(since 0.8.11)* So that what its SQL reaches can be read, a taken file's statement on
+  PostgreSQL or MySQL/MariaDB that has the database run SQL, or name a table, from text is
+  refused: `DO`, `PREPARE` and `EXECUTE` (`EXECUTE IMMEDIATE`), `CALL`, `CREATE FUNCTION`,
+  `PROCEDURE`, `TRIGGER`, `RULE` or `EVENT`, the `*_to_xml` functions, and `::regclass`,
+  `to_regclass` or a cast to `regclass`. A word inside a string, a comment or a quoted name
+  is not one. The refusal says to run it from the main file's SQL, or a migration the main
+  file runs; the main file's SQL, and a program without a `quillo.confirmed`, are not read
+  this way. A function the program's own SQL made that runs SQL text can still be called
+  from a taken file: it is the program's.
+- **A connection is its maker's.** A connection `db.connect` (or `db.shards`) opened is
+  held to the file that opened it: a taken file that builds a connection's map by hand
+  reaches nothing through it, and one that connects to the same database is held to its own
+  list, as for any database it opens. One the main file hands a taken
+  file, or a `c.query` read from it, runs as the main file's, as its functions do.
 - **A function is its own file's.** A `fn` another file declares, taken by name (`import
   main.qwe use secret`), runs with that file's reach, a site-wide call inside it included:
   a kit confirmed for nothing that takes main's `secret()`, which reads `.env`, reads it.

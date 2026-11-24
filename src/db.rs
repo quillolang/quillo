@@ -311,7 +311,10 @@ pub struct TenantDbs {
     target: Target,
     open: Mutex<indexmap::IndexMap<String, Arc<Backend>>>,
     /// The migrations each is brought up to date with when opened.
-    migrations: Mutex<Option<std::path::PathBuf>>,
+    /// And the file whose code set them (None: the main file's), as whose code they are judged
+    /// (`migration_judge`): first used by a taken file, a tenant's database ran the main file's
+    /// migrations as the taken file's code (FEEDBACK83.md, Q-1300; branch feedback82-85).
+    migrations: Mutex<Option<(std::path::PathBuf, Option<Arc<str>>)>>,
     /// `?open_tenants=N` in a server's URL: how many are kept open, in place of
     /// `OPEN_PG_TENANTS`, as a SaaS passes 16 customers early and each past it connects
     /// again. Connections are not shared between tenants: they keep statements prepared
@@ -607,11 +610,24 @@ fn db_err(e: impl std::fmt::Display) -> Value {
     // A file attached that the hold refused: why, not SQLite's words alone (`authorize`), as a
     // statement is compiled, or as `VACUUM INTO` runs.
     let e = e.to_string();
-    let e = match e.ends_with("not authorized") || e.ends_with("authorization denied") {
+    let e = match sqlite_refused_at(&e).is_some() {
         true => STATEMENTS_OF.try_with(|s| s.try_borrow_mut().ok().and_then(|mut s| s.refused.take())).ok().flatten().unwrap_or(e),
         false => e,
     };
     Value::err(Value::str(format!("db: {}", e)))
+}
+
+/// Where SQLite's words for a statement its authorizer refused start in `e`, if they are there:
+/// `not authorized` (or `authorization denied`, as a statement runs), and `access to t.c is
+/// prohibited` for a column it refused to be read (FEEDBACK83.md, Q-1300, found by the coverage
+/// tests of 0038a97; branch feedback82-85).
+fn sqlite_refused_at(e: &str) -> Option<usize> {
+    for words in ["not authorized", "authorization denied"] {
+        if let Some(at) = e.strip_suffix(words).map(str::len) {
+            return Some(at);
+        }
+    }
+    e.strip_suffix(" is prohibited").and_then(|head| head.rfind("access to "))
 }
 
 /// `db.error_kind(e)`: what kind of failure a database's error value is,
@@ -742,13 +758,15 @@ struct Statements {
     file: Option<Arc<str>>,
     base: Option<Arc<Path>>,
     refused: Option<String>,
-    /// The code is a file taken for some of its names (`confirm::held_taken`): its statements may
-    /// not touch Quillo's own tables (`own_table_named`, `authorize`).
-    taken: bool,
 }
 
 thread_local! {
-    static STATEMENTS_OF: std::cell::RefCell<Statements> = const { std::cell::RefCell::new(Statements { file: None, base: None, refused: None, taken: false }) };
+    static STATEMENTS_OF: std::cell::RefCell<Statements> = const { std::cell::RefCell::new(Statements { file: None, base: None, refused: None }) };
+    /// The code `STATEMENTS_OF` holds is a file taken for some of its names (`confirm::held_taken`):
+    /// its statements may not touch Quillo's own tables (`own_table_named`, `authorize`). A cell of
+    /// its own, looked at in each of its statements without a borrow (measured for the fix of
+    /// Q-1300's statement cache).
+    static STATEMENTS_TAKEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Where the file and folder `STATEMENTS_OF` holds are, which it keeps alive: a call of the
     /// same code as the last is told by these alone, with nothing to drop (a refusal is taken by
     /// the error it gives, `db_err`).
@@ -785,47 +803,895 @@ impl Drop for OwnSql {
 /// to it (FEEDBACK83.md, Q-1300, found by the review of bc460fd; branch feedback82-85). Read as
 /// text, a rename into one (`alter table x rename to _quillo_push`) and a trigger writing one are
 /// refused too, which SQLite's authorizer does not show (`authorize` holds the names it sees).
-fn own_table_named(sql: &str) -> bool {
-    sql.as_bytes().windows(8).any(|w| w.eq_ignore_ascii_case(b"_quillo_"))
+///
+/// And read as the database `d` reads it (None: as each would, for a migration's file, whose
+/// database is not known yet): on PostgreSQL, where nothing is behind this reading, a kit confirmed
+/// for nothing read and wrote `U&"\005Fquillo_mine"`, which has no `_quillo_` in its bytes. A
+/// name or a string is taken as the database works it out (`read_own`): PostgreSQL's `U&` ones by
+/// any escape character (`UESCAPE`), its `E'...'` strings, and plain ones as escapes too where a
+/// session turns `standard_conforming_strings` off; MySQL's backslashes (or none, with
+/// `NO_BACKSLASH_ESCAPES`), `"..."` as a string or a name (`ANSI_QUOTES`), its hex and bit strings
+/// and the SQL of its `/*! */` comments; strings written next to each other put together; and each
+/// string's text read again as SQL, as a `do` block's body or an `execute`'s text is (FEEDBACK83.md,
+/// Q-1300, found by the coverage tests of 0038a97; branch feedback82-85). SQLite takes every name
+/// as its bytes, with no escape in a name or a string.
+fn own_table_named(d: Option<crate::sql::Dialect>, sql: &str) -> bool {
+    use crate::sql::Dialect;
+    if names_own(sql.as_bytes()) {
+        return true;
+    }
+    if d == Some(Dialect::Sqlite) {
+        return false;
+    }
+    // Only a quoted name, a string, a `U&` one, a dollar quote or MySQL's hex and bit numbers
+    // (`0x5f...`) are worked out: a statement with none is its bytes (a taken file's every
+    // statement on PostgreSQL was read, measured at some 2,000 instructions).
+    let b = sql.as_bytes();
+    if !b.iter().any(|c| matches!(c, b'\'' | b'"' | b'`' | b'$' | b'&')) && !b.windows(2).any(|w| w[0] == b'0' && (w[1] == b'x' || w[1] == b'b')) {
+        return false;
+    }
+    // The readings a backslash changes are read only where there is one: without it, each
+    // reading of a database's is the same.
+    let slash = sql.as_bytes().contains(&b'\\');
+    let pg = |escapes| read_own(Reading::Pg { escapes }, sql.as_bytes(), 0);
+    let my = |escapes, ansi| read_own(Reading::My { escapes, ansi }, sql.as_bytes(), 0);
+    match d {
+        Some(Dialect::Sqlite) => false,
+        Some(Dialect::Postgres) => pg(false) || (slash && pg(true)),
+        Some(Dialect::Mysql) => my(true, false) || (slash && (my(false, false) || my(true, true) || my(false, true))),
+        None => pg(false) || pg(true) || my(true, false) || my(false, false) || my(true, true) || my(false, true),
+    }
 }
 
-/// Why the SQL `sql` that the code of `it` runs may not run, if it may not: a taken file's naming
-/// Quillo's own tables, where a quillo.confirmed holds the run (`own_table_named`). After
-/// `backend_on`, which notes the code (`statements_of`); one look at the hold where none is.
-fn own_tables_refused(it: &Interp, sql: &str) -> Option<String> {
-    if !crate::confirm::held() || !STATEMENTS_OF.with(|s| s.borrow().taken) || !own_table_named(sql) {
+/// Whether a name or a string, as a database takes it, holds `_quillo_` in any letters: ASCII ones
+/// in either case, and the four outside ASCII whose case a database makes one of them (U+0130 İ and
+/// U+0131 ı as i, U+017F ſ as s, U+212A, the Kelvin sign, as k): MySQL keeps table names in lower
+/// case (`lower_case_table_names` 1 and 2, macOS's and Windows's) by a table in which İ is i, and
+/// MariaDB on macOS read `_QUİLLO_MINE` as `_quillo_mine` (FEEDBACK83.md, Q-1300, found by the
+/// coverage tests of 0038a97; branch feedback82-85). Bytes that are not UTF-8 are no letter.
+fn names_own(t: &[u8]) -> bool {
+    const OWN: &[u8; 8] = b"_quillo_";
+    if t.is_ascii() {
+        // Each `_` that starts eight bytes: a statement has few (measured, 100,000 `db.one` of a
+        // taken file, where every place was looked at).
+        let mut from = 0;
+        while let Some(k) = t[from..].iter().position(|&c| c == b'_') {
+            let at = from + k;
+            if t.len() - at < 8 {
+                return false;
+            }
+            if t[at..at + 8].eq_ignore_ascii_case(OWN) {
+                return true;
+            }
+            from = at + 1;
+        }
+        return false;
+    }
+    let mut seen = [0u8; 8];
+    for c in String::from_utf8_lossy(t).chars() {
+        let c = match c {
+            '\u{130}' | '\u{131}' => b'i',
+            '\u{17f}' => b's',
+            '\u{212a}' => b'k',
+            c if c.is_ascii() => (c as u8).to_ascii_lowercase(),
+            _ => 0,
+        };
+        seen.rotate_left(1);
+        seen[7] = c;
+        if &seen == OWN {
+            return true;
+        }
+    }
+    false
+}
+
+/// How a server may read a text's strings (`own_table_named`), as its session says: PostgreSQL's
+/// plain strings with backslash escapes or not (`standard_conforming_strings`), MySQL's strings
+/// with backslash escapes or not (`NO_BACKSLASH_ESCAPES`) and `"..."` a string or a name
+/// (`ANSI_QUOTES`). A text is judged as each would read it.
+#[derive(Clone, Copy)]
+enum Reading {
+    Pg { escapes: bool },
+    My { escapes: bool, ansi: bool },
+}
+
+/// How many strings deep a text is read again as SQL (`read_own`): past it, it is taken as naming
+/// one of Quillo's tables. A statement written by hand is two or three deep at most (an `execute`
+/// in a `do` block), each deeper one writing every quote twice again.
+const OWN_DEPTH: u32 = 8;
+
+/// Whether the SQL `t`, read as `r` reads it, has a quoted name or a string that names one of
+/// Quillo's own tables as the server works it out (`names_own`), or a string whose text, read again
+/// as SQL, has one (`depth` strings deep). The bytes as written are judged by `own_table_named`
+/// already (FEEDBACK83.md, Q-1300, found by the coverage tests of 0038a97; branch feedback82-85).
+fn read_own(r: Reading, t: &[u8], depth: u32) -> bool {
+    if depth > OWN_DEPTH {
+        return true;
+    }
+    let (pg, my) = match r {
+        Reading::Pg { .. } => (true, false),
+        Reading::My { .. } => (false, true),
+    };
+    let escapes = match r {
+        Reading::Pg { escapes } | Reading::My { escapes, .. } => escapes,
+    };
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let n = t.len();
+    // The strings next to each other, put together: PostgreSQL's after a line break, MySQL's after
+    // any space or comment (and taken so here for both). PostgreSQL reads them all by the first's
+    // kind, a `U&` one's escapes worked out once they are together.
+    let mut run: Vec<u8> = Vec::new();
+    let mut run_kind: Option<Str> = None;
+    let flush = |run: &mut Vec<u8>, kind: &mut Option<Str>| -> bool {
+        let Some(k) = kind.take() else { return false };
+        let found = match k {
+            Str::Unicode => unicode_texts(run).iter().any(|s| names_own(s) || read_own(r, s, depth + 1)),
+            Str::Escaped => {
+                let s = unescaped(run, pg);
+                names_own(&s) || read_own(r, &s, depth + 1)
+            }
+            Str::Plain => names_own(run) || read_own(r, run, depth + 1),
+        };
+        run.clear();
+        found
+    };
+    // MySQL: inside a `/*! ... */` comment, whose text it runs.
+    let mut runs = false;
+    let mut i = 0;
+    while i < n {
+        let c = t[i];
+        let next = t.get(i + 1).copied();
+        // Spaces and comments, which a run of strings goes on past.
+        if let Some(e) = space_end(r, t, i, &mut runs) {
+            i = e;
+            continue;
+        }
+        // A string, and its kind: its prefix (`E`, `U&`, `N`, MySQL's `_utf8mb4`) read with it.
+        let word = if ident(c) && !c.is_ascii_digit() { t[i..].iter().position(|&c| !ident(c)).map_or(n, |k| i + k) } else { i };
+        let w = &t[i..word];
+        let quote = t.get(word).copied();
+        let unicode = pg && w.eq_ignore_ascii_case(b"u") && quote == Some(b'&') && matches!(t.get(word + 1), Some(b'\'' | b'"'));
+        let opens = match (c, quote) {
+            (b'\'', _) => Some((i, if escapes { Str::Escaped } else { Str::Plain })),
+            (b'"', _) if my && !matches!(r, Reading::My { ansi: true, .. }) => Some((i, if escapes { Str::Escaped } else { Str::Plain })),
+            _ if unicode && t[word + 1] == b'\'' => Some((word + 1, Str::Unicode)),
+            _ if quote == Some(b'\'') && pg && w.eq_ignore_ascii_case(b"e") => Some((word, Str::Escaped)),
+            _ if quote == Some(b'\'') && (w.eq_ignore_ascii_case(b"n") || (my && w.first() == Some(&b'_') && w.len() > 1)) => Some((word, if escapes { Str::Escaped } else { Str::Plain })),
+            (_, Some(b'\'' | b'"')) if my && w.first() == Some(&b'_') && w.len() > 1 && !matches!(r, Reading::My { ansi: true, .. }) => Some((word, if escapes { Str::Escaped } else { Str::Plain })),
+            _ => None,
+        };
+        if let Some((at, kind)) = opens {
+            // A string of another kind after a run is the database's error; it is put with it all
+            // the same.
+            let q = t[at];
+            let backslash = matches!(kind, Str::Escaped);
+            i = quoted(t, at, q, backslash, &mut run);
+            run_kind.get_or_insert(kind);
+            continue;
+        }
+        if flush(&mut run, &mut run_kind) {
+            return true;
+        }
+        // A quoted name, as the database works it out.
+        let mut name = Vec::new();
+        if unicode {
+            i = quoted(t, word + 1, b'"', false, &mut name);
+            if unicode_texts(&name).iter().any(|s| names_own(s)) {
+                return true;
+            }
+            continue;
+        }
+        if (c == b'"' && (pg || matches!(r, Reading::My { ansi: true, .. }))) || (c == b'`' && my) {
+            i = quoted(t, i, c, false, &mut name);
+            if names_own(&name) {
+                return true;
+            }
+            continue;
+        }
+        // PostgreSQL's `$tag$ ... $tag$`, its text read again as SQL (a function's body).
+        if pg && c == b'$' && !next.is_some_and(|c| c.is_ascii_digit()) {
+            let mut k = i + 1;
+            while k < n && ident(t[k]) && t[k] != b'$' {
+                k += 1;
+            }
+            if t.get(k) == Some(&b'$') {
+                let tag = &t[i..=k];
+                let body = &t[k + 1..];
+                let end = body.windows(tag.len()).position(|w| w == tag);
+                let text = &body[..end.unwrap_or(body.len())];
+                if names_own(text) || read_own(r, text, depth + 1) {
+                    return true;
+                }
+                i = end.map_or(n, |e| k + 1 + e + tag.len());
+                continue;
+            }
+        }
+        // MySQL's hex and bit strings, `X'5f...'`, `0x5f...`, `B'01...'`, `0b01...`: their bytes,
+        // as UTF-8 or as UTF-16 or UTF-32 (an `_ucs2` or `_utf16` before them).
+        if my && quote == Some(b'\'') && (w.eq_ignore_ascii_case(b"x") || w.eq_ignore_ascii_case(b"b")) {
+            let mut digits = Vec::new();
+            i = quoted(t, word, b'\'', false, &mut digits);
+            if bytes_name_own(&digits, w.eq_ignore_ascii_case(b"x"), r, depth) {
+                return true;
+            }
+            continue;
+        }
+        if my && c == b'0' && matches!(next, Some(b'x' | b'b')) {
+            let end = t[i..].iter().position(|&c| !ident(c)).map_or(n, |k| i + k);
+            if bytes_name_own(&t[i + 2..end], next == Some(b'x'), r, depth) {
+                return true;
+            }
+            i = end;
+            continue;
+        }
+        // A word, a number, a placeholder, an operator.
+        i = if word > i {
+            word
+        } else if c.is_ascii_digit() || (my && ident(c)) {
+            t[i..].iter().position(|&c| !(ident(c) || c == b'.')).map_or(n, |k| i + k)
+        } else {
+            i + 1
+        };
+    }
+    flush(&mut run, &mut run_kind)
+}
+
+/// Where the space or comment at `i` ends, if one is there, as the server `r` reads it: `--` to
+/// the end of the line (MySQL's with a space after it), MySQL's `#`, `/* */` (PostgreSQL's nest),
+/// and MySQL's `/*! ... */` and `/*M! ... */`, whose text it runs: their start and end are spaces,
+/// their text read as SQL (`runs` says one is open) (FEEDBACK83.md, Q-1300; branch feedback82-85).
+fn space_end(r: Reading, t: &[u8], i: usize, runs: &mut bool) -> Option<usize> {
+    let (pg, my) = (matches!(r, Reading::Pg { .. }), matches!(r, Reading::My { .. }));
+    let n = t.len();
+    let next = t.get(i + 1).copied();
+    match t[i] {
+        b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c => Some(i + 1),
+        b'-' if next == Some(b'-') && (!my || t.get(i + 2).map_or(true, |c| c.is_ascii_whitespace() || c.is_ascii_control())) => Some(t[i..].iter().position(|&c| c == b'\n').map_or(n, |k| i + k)),
+        b'#' if my => Some(t[i..].iter().position(|&c| c == b'\n').map_or(n, |k| i + k)),
+        b'/' if next == Some(b'*') => {
+            let skip = match (t.get(i + 2), t.get(i + 3)) {
+                (Some(b'!'), _) => Some(3),
+                (Some(b'M'), Some(b'!')) => Some(4),
+                _ => None,
+            };
+            if let (true, Some(skip)) = (my, skip) {
+                let mut j = i + skip;
+                while j < n && t[j].is_ascii_digit() {
+                    j += 1;
+                }
+                *runs = true;
+                return Some(j);
+            }
+            let (mut level, mut j) = (0usize, i);
+            while j < n {
+                if t[j] == b'/' && t.get(j + 1) == Some(&b'*') && (level == 0 || pg) {
+                    level += 1;
+                    j += 2;
+                } else if t[j] == b'*' && t.get(j + 1) == Some(&b'/') {
+                    level -= 1;
+                    j += 2;
+                    if level == 0 {
+                        break;
+                    }
+                } else {
+                    j += 1;
+                }
+            }
+            Some(j)
+        }
+        b'*' if *runs && next == Some(b'/') => {
+            *runs = false;
+            Some(i + 2)
+        }
+        _ => None,
+    }
+}
+
+/// A string's kind, as `read_own` works its text out.
+#[derive(Clone, Copy)]
+enum Str {
+    Plain,
+    /// With backslash escapes: PostgreSQL's `E'...'`, MySQL's (by default).
+    Escaped,
+    /// PostgreSQL's `U&'...'`.
+    Unicode,
+}
+
+/// The quoted text at `at` (its quote `q`): appended to `out` as written, the quote written twice
+/// taken once, a backslash and what follows it kept for `unescaped` (`backslash`). Where it ends.
+fn quoted(t: &[u8], at: usize, q: u8, backslash: bool, out: &mut Vec<u8>) -> usize {
+    let mut j = at + 1;
+    while j < t.len() {
+        let c = t[j];
+        if backslash && c == b'\\' && j + 1 < t.len() {
+            out.extend_from_slice(&t[j..j + 2]);
+            j += 2;
+            continue;
+        }
+        if c == q {
+            if t.get(j + 1) == Some(&q) {
+                out.push(q);
+                j += 2;
+                continue;
+            }
+            return j + 1;
+        }
+        out.push(c);
+        j += 1;
+    }
+    t.len()
+}
+
+/// A string's backslash escapes worked out, as PostgreSQL's `E'...'` (`pg`: `\b \f \n \r \t`, octal
+/// `\ooo`, hex `\xhh`, `\uXXXX`, `\UXXXXXXXX`) or MySQL's (`\0 \b \n \r \t \Z`, `\%` and `\_` kept
+/// whole) take them; any other character after a backslash is itself.
+fn unescaped(s: &[u8], pg: bool) -> Vec<u8> {
+    let hex = |b: &[u8]| std::str::from_utf8(b).ok().and_then(|h| u32::from_str_radix(h, 16).ok());
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] != b'\\' || i + 1 == s.len() {
+            out.push(s[i]);
+            i += 1;
+            continue;
+        }
+        let c = s[i + 1];
+        i += 2;
+        match c {
+            b'b' => out.push(8),
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'f' if pg => out.push(12),
+            b'0'..=b'7' if pg => {
+                let mut v = (c - b'0') as u32;
+                for _ in 0..2 {
+                    match s.get(i) {
+                        Some(d @ b'0'..=b'7') => {
+                            v = v * 8 + (d - b'0') as u32;
+                            i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                out.push(v as u8);
+            }
+            b'x' if pg && s.get(i).is_some_and(u8::is_ascii_hexdigit) => {
+                let len = if s.get(i + 1).is_some_and(u8::is_ascii_hexdigit) { 2 } else { 1 };
+                out.push(hex(&s[i..i + len]).unwrap_or(0) as u8);
+                i += len;
+            }
+            b'u' | b'U' if pg => {
+                let len = if c == b'u' { 4 } else { 8 };
+                match s.get(i..i + len).and_then(hex).and_then(char::from_u32) {
+                    Some(ch) => {
+                        out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                        i += len;
+                    }
+                    None => out.push(c),
+                }
+            }
+            b'0' => out.push(0),
+            b'Z' if !pg => out.push(0x1a),
+            b'%' | b'_' if !pg => out.extend_from_slice(&[b'\\', c]),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A `U&` name's or string's text, with its escapes worked out by each character it may have been
+/// given as its escape (`UESCAPE '!'`, the backslash by default): one that comes before four hex
+/// digits, or `+` and six. The database takes one of them, whichever the statement says.
+fn unicode_texts(s: &[u8]) -> Vec<Vec<u8>> {
+    let hex = |b: &[u8]| b.iter().all(u8::is_ascii_hexdigit);
+    let mut escapes = vec![b'\\'];
+    for (i, &c) in s.iter().enumerate() {
+        let four = s.get(i + 1..i + 5).is_some_and(hex);
+        let six = s.get(i + 1) == Some(&b'+') && s.get(i + 2..i + 8).is_some_and(hex);
+        if (four || six) && !escapes.contains(&c) {
+            escapes.push(c);
+        }
+    }
+    escapes
+        .into_iter()
+        .map(|e| {
+            let mut out = Vec::with_capacity(s.len());
+            let mut i = 0;
+            while i < s.len() {
+                if s[i] != e {
+                    out.push(s[i]);
+                    i += 1;
+                    continue;
+                }
+                if s.get(i + 1) == Some(&e) {
+                    out.push(e);
+                    i += 2;
+                    continue;
+                }
+                let (from, len) = if s.get(i + 1) == Some(&b'+') { (i + 2, 6) } else { (i + 1, 4) };
+                match s.get(from..from + len).and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u32::from_str_radix(h, 16).ok()).and_then(char::from_u32) {
+                    Some(ch) => {
+                        out.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+                        i = from + len;
+                    }
+                    None => {
+                        out.push(s[i]);
+                        i += 1;
+                    }
+                }
+            }
+            out
+        })
+        .collect()
+}
+
+/// Whether MySQL's hex (`hex`) or bit string of these digits names one of Quillo's own tables, as
+/// UTF-8 (and as SQL again), UTF-16 either way or UTF-32 (`names_own`).
+fn bytes_name_own(digits: &[u8], hex: bool, r: Reading, depth: u32) -> bool {
+    let bytes: Vec<u8> = if hex {
+        let d: Vec<u8> = digits.iter().filter(|c| c.is_ascii_hexdigit()).copied().collect();
+        // An odd count has a 0 before it (MySQL's `0x5f7` is `0x05f7`).
+        let pad = if d.len() % 2 == 1 { Some(b'0') } else { None };
+        let all: Vec<u8> = pad.into_iter().chain(d).collect();
+        all.chunks(2).map(|p| std::str::from_utf8(p).ok().and_then(|h| u8::from_str_radix(h, 16).ok()).unwrap_or(0)).collect()
+    } else {
+        let d: Vec<u8> = digits.iter().filter(|c| matches!(c, b'0' | b'1')).copied().collect();
+        let pad = (8 - d.len() % 8) % 8;
+        let all: Vec<u8> = std::iter::repeat_n(b'0', pad).chain(d).collect();
+        all.chunks(8).map(|p| p.iter().fold(0u8, |v, b| (v << 1) | (b - b'0'))).collect()
+    };
+    let wide = |size: usize, big: bool| -> Vec<u8> {
+        let units = bytes.chunks_exact(size).map(|u| {
+            let v = u.iter().fold(0u32, |v, b| (v << 8) | *b as u32);
+            if big { v } else { u32::from_le_bytes([u[0], *u.get(1).unwrap_or(&0), *u.get(2).unwrap_or(&0), *u.get(3).unwrap_or(&0)]) }
+        });
+        units.map(|v| char::from_u32(v).unwrap_or('\u{fffd}')).collect::<String>().into_bytes()
+    };
+    names_own(&bytes) || read_own(r, &bytes, depth + 1) || names_own(&wide(2, true)) || names_own(&wide(2, false)) || names_own(&wide(4, true))
+}
+
+/// A token of a statement as a server reads it (`tokens`): its spaces, comments and the text of
+/// its strings are no keyword (FEEDBACK83.md, Q-1300, the user's decision of 2026-11-24 on SQL run
+/// from text; branch feedback82-85).
+enum Tk<'a> {
+    /// A word as written: a keyword or a name not quoted.
+    Word(&'a [u8]),
+    /// A quoted name, as the server works it out (a `U&` one by each escape it may have).
+    Names(Vec<Vec<u8>>),
+    Str,
+    Punct(u8),
+    /// `::`
+    Cast,
+    Semi,
+}
+
+/// The tokens of `t` read as the server `r` reads it: comments and spaces left out (MySQL's
+/// `/*! */` read as SQL), strings of every kind (PostgreSQL's `E`, `U&`, dollar-quoted, bit; MySQL's
+/// with or without backslash escapes, hex, a character set before them), quoted names (`"x"`,
+/// `U&"x"`, MySQL's `` `x` `` and, under `ANSI_QUOTES`, `"x"`).
+fn tokens(r: Reading, t: &[u8]) -> Vec<Tk<'_>> {
+    let (pg, my) = (matches!(r, Reading::Pg { .. }), matches!(r, Reading::My { .. }));
+    let escapes = match r {
+        Reading::Pg { escapes } | Reading::My { escapes, .. } => escapes,
+    };
+    let ansi = matches!(r, Reading::My { ansi: true, .. });
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let (n, mut i, mut runs) = (t.len(), 0, false);
+    let mut out = Vec::new();
+    let mut scratch = Vec::new();
+    while i < n {
+        if let Some(e) = space_end(r, t, i, &mut runs) {
+            i = e;
+            continue;
+        }
+        let c = t[i];
+        let next = t.get(i + 1).copied();
+        let word = if ident(c) && !c.is_ascii_digit() && !(pg && c == b'$') { t[i..].iter().position(|&c| !ident(c)).map_or(n, |k| i + k) } else { i };
+        let w = &t[i..word];
+        let quote = t.get(word).copied();
+        scratch.clear();
+        // A string, its prefix (`E`, `N`, `B`, `X`, `U&`, `_utf8mb4`) with it.
+        let prefixed = quote == Some(b'\'') && (w.len() == 1 && matches!(w[0] | 0x20, b'e' | b'n' | b'b' | b'x') || (my && w.len() > 1 && w[0] == b'_'));
+        let unicode = pg && w.eq_ignore_ascii_case(b"u") && quote == Some(b'&') && matches!(t.get(word + 1), Some(b'\'' | b'"'));
+        if c == b'\'' || (c == b'"' && my && !ansi) || prefixed || (unicode && t[word + 1] == b'\'') {
+            let at = if c == b'\'' || c == b'"' { i } else if unicode { word + 1 } else { word };
+            let backslash = (escapes || (pg && w.eq_ignore_ascii_case(b"e"))) && !unicode;
+            i = quoted(t, at, t[at], backslash, &mut scratch);
+            out.push(Tk::Str);
+            continue;
+        }
+        if unicode {
+            i = quoted(t, word + 1, b'"', false, &mut scratch);
+            out.push(Tk::Names(unicode_texts(&scratch)));
+            continue;
+        }
+        if (c == b'"' && (pg || ansi)) || (c == b'`' && my) {
+            i = quoted(t, i, c, false, &mut scratch);
+            out.push(Tk::Names(vec![std::mem::take(&mut scratch)]));
+            continue;
+        }
+        if pg && c == b'$' && !next.is_some_and(|c| c.is_ascii_digit()) {
+            let mut k = i + 1;
+            while k < n && ident(t[k]) && t[k] != b'$' {
+                k += 1;
+            }
+            if t.get(k) == Some(&b'$') {
+                let tag = &t[i..=k];
+                let body = &t[k + 1..];
+                i = body.windows(tag.len()).position(|w| w == tag).map_or(n, |e| k + 1 + e + tag.len());
+                out.push(Tk::Str);
+                continue;
+            }
+        }
+        if word > i {
+            out.push(Tk::Word(w));
+            i = word;
+            continue;
+        }
+        if c.is_ascii_digit() || (my && ident(c)) || c == b'$' {
+            let start = i;
+            i = t[i + 1..].iter().position(|&c| !(ident(c) || c == b'.')).map_or(n, |k| i + 1 + k);
+            out.push(Tk::Word(&t[start..i]));
+            continue;
+        }
+        out.push(match c {
+            b';' => Tk::Semi,
+            b':' if next == Some(b':') => {
+                i += 1;
+                Tk::Cast
+            }
+            c => Tk::Punct(c),
+        });
+        i += 1;
+    }
+    out
+}
+
+/// The functions of PostgreSQL's that run SQL given as text, read a table it names by text or by a
+/// number, or reach another database: the `*_to_xml` family, `ts_stat`, `ts_rewrite`, `dblink*`,
+/// `to_regclass`, and a sequence's by its name (`nextval`, `setval`, `currval`).
+fn runs_text(name: &[u8]) -> bool {
+    const NAMES: &[&[u8]] = &[b"ts_stat", b"ts_rewrite", b"to_regclass", b"nextval", b"setval", b"currval"];
+    const STARTS: &[&[u8]] = &[b"query_to_xml", b"cursor_to_xml", b"table_to_xml", b"schema_to_xml", b"database_to_xml", b"dblink"];
+    NAMES.iter().any(|w| name.eq_ignore_ascii_case(w)) || STARTS.iter().any(|p| name.len() >= p.len() && name[..p.len()].eq_ignore_ascii_case(p))
+}
+
+/// Whether `sql` may have what `text_run` looks for: a word of it (letters, digits, `_` and `$`,
+/// read in strings and comments too) that it names, or a `&` (a `U&` name, whose escapes hide its
+/// letters). A statement with none is let through with no reading: read whole, a taken file's every
+/// statement on PostgreSQL cost some 5,000 instructions (measured, 20,000 `db.one`).
+fn may_run_text(sql: &[u8]) -> bool {
+    const WORDS: &[&[u8]] = &[b"do", b"prepare", b"execute", b"call", b"create", b"copy", b"alter", b"begin", b"regclass", b"oid"];
+    if sql.contains(&b'&') {
+        return true;
+    }
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    // Digits before a word are no part of it where they are MySQL's `/*!50000call ...`'s version.
+    sql.split(|&c| !ident(c)).any(|w| {
+        let w = &w[w.iter().position(|c| !c.is_ascii_digit()).unwrap_or(w.len())..];
+        !w.is_empty() && (runs_text(w) || WORDS.iter().any(|x| w.eq_ignore_ascii_case(x)))
+    })
+}
+
+/// What in `sql`, read as the server `d` reads it, has the database run SQL from text or name a
+/// table from text, if anything does: under a quillo.confirmed a taken file's statement may not, as
+/// what that SQL does is worked out as it runs, where no reading of the statement sees it (the
+/// user's decision of 2026-11-24: "Refuse text-run SQL"; FEEDBACK83.md, Q-1300; branch
+/// feedback82-85). A kit confirmed for nothing wrote Quillo's own tables from a `do` block whose
+/// `execute` put their name together. On PostgreSQL: `do`, `prepare`, `execute`, `call`,
+/// `create [or replace] function`/`procedure`/`trigger`/`rule`/`event trigger`, `copy ... program`,
+/// the functions of `runs_text`, and `regclass` and `oid` as a type (`::regclass`, `cast(x as oid)`,
+/// `regclass 'x'`, `regclass(x)`), by which a text, a value or a number names a table. On MySQL and
+/// MariaDB: `prepare`, `execute` (`execute immediate` too), `call`, `create` a procedure, function,
+/// trigger, event or package, `alter event`, and MariaDB's `begin not atomic`. Each statement is
+/// read on its own, after a `;`; a word in a string, a comment or a quoted name is none of them.
+/// Read as each session would read it, as `own_table_named` does. Not held: a function the
+/// program's own SQL made that runs SQL from text, which a taken file may still call by its name.
+fn text_run(d: crate::sql::Dialect, sql: &str) -> Option<String> {
+    use crate::sql::Dialect;
+    let b = sql.as_bytes();
+    if d == Dialect::Sqlite || !may_run_text(b) {
         return None;
     }
-    let file = crate::confirm::held_name(it.cur_file.as_deref());
-    Some(format!("Quillo's own tables (_quillo_...) are refused for {}'s SQL where a quillo.confirmed holds the run: they hold what Quillo does (push subscriptions, jobs, tokens), and this statement names one", file))
+    let slash = b.contains(&b'\\');
+    let readings: &[Reading] = match (d, slash) {
+        (Dialect::Postgres, false) => &[Reading::Pg { escapes: false }],
+        (Dialect::Postgres, true) => &[Reading::Pg { escapes: false }, Reading::Pg { escapes: true }],
+        (Dialect::Mysql, false) => &[Reading::My { escapes: true, ansi: false }, Reading::My { escapes: true, ansi: true }],
+        (Dialect::Mysql, true) => &[Reading::My { escapes: true, ansi: false }, Reading::My { escapes: false, ansi: false }, Reading::My { escapes: true, ansi: true }, Reading::My { escapes: false, ansi: true }],
+        (Dialect::Sqlite, _) => &[],
+    };
+    readings.iter().find_map(|r| text_run_in(*r, &tokens(*r, b)))
+}
+
+/// `text_run` of a statement's tokens, read as `r`.
+fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<String> {
+    let pg = matches!(r, Reading::Pg { .. });
+    let is = |t: Option<&Tk<'_>>, w: &str| matches!(t, Some(Tk::Word(x)) if x.eq_ignore_ascii_case(w.as_bytes()));
+    let said = |what: &str| Some(format!("`{}`", what));
+    for stmt in toks.split(|t| matches!(t, Tk::Semi)) {
+        // Its first word, past PostgreSQL's `explain (...) analyze verbose`.
+        let mut h = 0;
+        if pg && is(stmt.first(), "explain") {
+            h = 1;
+            if matches!(stmt.get(h), Some(Tk::Punct(b'('))) {
+                h += stmt[h..].iter().position(|t| matches!(t, Tk::Punct(b')'))).map_or(stmt.len() - h, |k| k + 1);
+            }
+            while ["analyze", "analyse", "verbose"].iter().any(|w| is(stmt.get(h), w)) {
+                h += 1;
+            }
+        }
+        let head = stmt.get(h);
+        for w in ["prepare", "execute", "call"] {
+            if is(head, w) {
+                return said(if !pg && is(stmt.get(h + 1), "immediate") { "execute immediate" } else { w });
+            }
+        }
+        if pg && is(head, "do") {
+            return said("do");
+        }
+        if !pg && is(head, "begin") && is(stmt.get(h + 1), "not") && is(stmt.get(h + 2), "atomic") {
+            return said("begin not atomic");
+        }
+        if is(head, "alter") && is(stmt.get(h + 1), "event") {
+            return said("alter event");
+        }
+        if pg && is(head, "copy") && stmt.iter().any(|t| matches!(t, Tk::Word(x) if x.eq_ignore_ascii_case(b"program"))) {
+            return said("copy ... program");
+        }
+        // Each `create` (PostgreSQL's `create schema s create trigger ...` has more than one): the
+        // kind of what it makes, the first word that names one, past `or replace`, `temp`,
+        // `constraint`, a definer, `aggregate`.
+        const RUNS: &[&str] = &["function", "procedure", "trigger", "rule", "event", "package"];
+        const KINDS: &[&str] = &[
+            "table", "view", "index", "sequence", "schema", "database", "type", "domain", "extension", "role", "user", "policy", "server", "publication", "subscription", "collation", "cast", "operator", "statistics", "tablespace", "conversion", "language", "transform", "access", "materialized", "foreign", "text", "group", "spatial", "fulltext", "logfile", "resource", "on",
+        ];
+        for (k, t) in stmt.iter().enumerate() {
+            if !matches!(t, Tk::Word(x) if x.eq_ignore_ascii_case(b"create")) {
+                continue;
+            }
+            for t in &stmt[k + 1..] {
+                match t {
+                    Tk::Word(x) if RUNS.iter().any(|w| x.eq_ignore_ascii_case(w.as_bytes())) => {
+                        return Some(format!("`create {}`", String::from_utf8_lossy(x).to_ascii_lowercase()));
+                    }
+                    Tk::Word(x) if KINDS.iter().any(|w| x.eq_ignore_ascii_case(w.as_bytes())) => break,
+                    Tk::Punct(b'(') => break,
+                    _ => {}
+                }
+            }
+        }
+        if !pg {
+            continue;
+        }
+        // For each `(` open, whether it is a `cast(...)`'s, in which `as` names a type.
+        let mut casts: Vec<bool> = Vec::new();
+        for (k, t) in stmt.iter().enumerate() {
+            match t {
+                Tk::Punct(b'(') => casts.push(k > 0 && is(stmt.get(k - 1), "cast")),
+                Tk::Punct(b')') => {
+                    casts.pop();
+                }
+                _ => {}
+            }
+            // A function by its name, quoted or not, before `(` (a `U&` name's `uescape 'c'`
+            // between). A name as it is read, each way for a `U&` one.
+            let (one, all): (&[u8], &[Vec<u8>]) = match t {
+                Tk::Word(x) => (x, &[]),
+                Tk::Names(all) => (&[], all),
+                _ => continue,
+            };
+            let names = std::iter::once(one).filter(|n| !n.is_empty()).chain(all.iter().map(Vec::as_slice));
+            let after = if is(stmt.get(k + 1), "uescape") { k + 3 } else { k + 1 };
+            let called = matches!(stmt.get(after), Some(Tk::Punct(b'(')));
+            if let Some(n) = names.clone().find(|n| called && runs_text(n)) {
+                return Some(format!("the function {}", String::from_utf8_lossy(n).to_ascii_lowercase()));
+            }
+            // `regclass` or `oid` as a type: after `::` (`::pg_catalog.regclass` too) or a
+            // `cast(... as`, not an alias's `as`, before a string (`regclass 'x'`) or `(`.
+            if let Some(n) = names.clone().find(|n| n.eq_ignore_ascii_case(b"regclass") || n.eq_ignore_ascii_case(b"oid")) {
+                let mut before = k.checked_sub(1).map(|b| &stmt[b]);
+                if matches!(before, Some(Tk::Punct(b'.'))) && k >= 3 {
+                    before = Some(&stmt[k - 3]);
+                }
+                let in_cast = casts.last() == Some(&true);
+                let typed = matches!(before, Some(Tk::Cast)) || (in_cast && matches!(before, Some(Tk::Word(x)) if x.eq_ignore_ascii_case(b"as"))) || matches!(stmt.get(k + 1), Some(Tk::Str)) || called;
+                if typed {
+                    return Some(format!("a {} worked out as it runs", if n.eq_ignore_ascii_case(b"oid") { "table's number (oid)" } else { "table's name (regclass)" }));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Why the SQL `sql` that the code of `it` runs on the database `d` may not run, if it may not: a
+/// taken file's naming Quillo's own tables, where a quillo.confirmed holds the run
+/// (`own_table_named`). After `backend_on`, which notes the code (`statements_of`); one look at the
+/// hold where none is, the rest out of the way of a call where none is (`own_tables_held`): a call
+/// of its own there cost `db.one` and `db.exec` 0.35% (measured, 100,000 of each).
+#[inline(always)]
+fn own_tables_refused(it: &Interp, on: Option<usize>, b: &Backend, sql: &str) -> Option<String> {
+    if !crate::confirm::held() {
+        return None;
+    }
+    own_tables_held(it, on, b, sql)
+}
+
+/// `own_tables_refused` where a run is held: the connection `on` judged for the code too
+/// (`conn_ok`), whatever file's.
+#[inline(never)]
+fn own_tables_held(it: &Interp, on: Option<usize>, b: &Backend, sql: &str) -> Option<String> {
+    if let Err(e) = conn_ok(it, on) {
+        return Some(e);
+    }
+    if !STATEMENTS_TAKEN.get() {
+        return None;
+    }
+    taken_sql_refused(b.dialect(), sql, || crate::confirm::held_name(it.cur_file.as_deref()))
+}
+
+/// `conn_ok` for a call on the connection `on` that runs no statement of its own first
+/// (`db.transaction`, `db.atomic`, `c.migrate()`, `c.tenants()`): its code noted, then judged.
+fn program_conn(it: &Interp, on: Option<usize>) -> Result<(), String> {
+    if on.is_none() || !crate::confirm::held() {
+        return Ok(());
+    }
+    statements_of(it);
+    conn_ok(it, on)
+}
+
+/// Why a taken file's SQL `sql` may not run on the database `d`, where a quillo.confirmed holds the
+/// run (`file` names the file): it names one of Quillo's own tables (`own_table_named`), or it has
+/// the database run SQL from text (`text_run`): a statement's, a migration's. Out of line, so that
+/// `own_tables_held`, which the main file's every statement calls, stays small.
+#[inline(never)]
+fn taken_sql_refused(d: crate::sql::Dialect, sql: &str, file: impl Fn() -> String) -> Option<String> {
+    if own_table_named(Some(d), sql) {
+        return Some(format!("Quillo's own tables (_quillo_...) are refused for {}'s SQL where a quillo.confirmed holds the run: they hold what Quillo does (push subscriptions, jobs, tokens), and this statement names one", file()));
+    }
+    // SQLite runs no SQL from text, and its authorizer holds what a statement does.
+    if d == crate::sql::Dialect::Sqlite {
+        return None;
+    }
+    let what = text_run(d, sql)?;
+    Some(format!(
+        "{} has the database run SQL from text, or name a table from text, which is refused for {}'s SQL where a quillo.confirmed holds the run: what it does is worked out as it runs, where no reading of the statement sees it, Quillo's own tables too. Run it from the main file's SQL, or from a migration the main file runs",
+        what,
+        file()
+    ))
+}
+
+thread_local! {
+    /// The number the code whose statements this thread runs keeps its compiled ones under
+    /// (`compiled_as`), where a run is held: 0 for the main file's, as written.
+    static STATEMENTS_KEY: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Each code whose statements are kept compiled apart, where a run is held (`compiled_as`): by the
+/// block of quillo.confirmed it is held to (`confirm::held_id`) and its folder, which are all
+/// `authorize` judges a statement by. Its place is its number, from 1; the first of the main file's
+/// block keeps its statements as written.
+static CODES: Mutex<Vec<(u32, Arc<Path>)>> = Mutex::new(Vec::new());
+
+/// The number the code of block `id` in the folder `base` keeps its statements compiled under.
+fn code_key(id: u32, base: &Arc<Path>) -> u32 {
+    let mut codes = CODES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let at = match codes.iter().position(|(i, b)| *i == id && **b == **base) {
+        Some(at) => at,
+        None => {
+            codes.push((id, base.clone()));
+            codes.len() - 1
+        }
+    };
+    let main = crate::confirm::held_id(None);
+    if codes.iter().position(|(i, _)| *i == main) == Some(at) {
+        0
+    } else {
+        at as u32 + 1
+    }
+}
+
+/// The text a statement is kept compiled by (`prepare_cached`) for the code that runs it: SQLite
+/// judges a statement as it compiles it (`authorize`), and a statement with values was kept by its
+/// text alone, so a kit confirmed for nothing that ran the text the main file had run got the main
+/// file's statement, judged for the main file: its insert fired the main file's trigger and wrote
+/// `_quillo_mine`, which the same insert written anew was refused (FEEDBACK83.md, Q-1300, found by
+/// the coverage tests of 0038a97; branch feedback82-85). Where a run is held, another code's text
+/// has a comment with its number before it (`code_key`), handed to `then`, and is compiled, and
+/// judged, for it. The main file's (number 0) is kept as written (`prepared`).
+#[inline]
+fn compiled_as<T>(sql: &str, then: impl FnOnce(&str) -> T) -> T {
+    thread_local! {
+        /// The number its comment is of, and the text a statement is kept under: the comment, then
+        /// the statement's text, which alone is written again for the code's next statement. A
+        /// text made for each by `format!` cost a taken file's `db.one` 1% more, a text of its own
+        /// made at its size 0.5% more (measured, 100,000 `db.one`).
+        static KEY: std::cell::RefCell<(u32, usize, String)> = const { std::cell::RefCell::new((0, 0, String::new())) };
+    }
+    let k = STATEMENTS_KEY.get();
+    KEY.with(|key| {
+        let mut key = key.borrow_mut();
+        let (of, head, text) = &mut *key;
+        if *of != k {
+            text.clear();
+            text.push_str("/*");
+            text.push_str(&k.to_string());
+            text.push_str("*/");
+            (*of, *head) = (k, text.len());
+        }
+        text.truncate(*head);
+        text.push_str(sql);
+        then(text)
+    })
+}
+
+/// `prepare_cached` of `sql` by the text the code that runs it keeps it under (`compiled_as`): an
+/// error says the program's SQL, not the comment before it. Where nothing is held, `prepare_cached`
+/// of the text as written, as it was, the hold looked at once: a call of its own there cost a query
+/// 0.7% (measured, 100,000 `db.one`).
+#[inline(always)]
+fn prepared<'c>(c: &'c Connection, sql: &str) -> Result<rusqlite::CachedStatement<'c>, String> {
+    if !crate::confirm::held() {
+        return c.prepare_cached(sql).map_err(prepare_error);
+    }
+    prepared_apart(c, sql)
+}
+
+#[inline(never)]
+fn prepared_apart<'c>(c: &'c Connection, sql: &str) -> Result<rusqlite::CachedStatement<'c>, String> {
+    if STATEMENTS_KEY.get() == 0 {
+        return c.prepare_cached(sql).map_err(prepare_error);
+    }
+    compiled_as(sql, |key| {
+        let before = (key.len() - sql.len()) as i32;
+        c.prepare_cached(key).map_err(|e| match e {
+            rusqlite::Error::SqlInputError { error, msg, offset, .. } => rusqlite::Error::SqlInputError { error, msg, sql: sql.to_string(), offset: (offset - before).max(0) }.to_string(),
+            e => prepare_error(e),
+        })
+    })
 }
 
 /// Notes `it`'s code as the code whose statements run now (`STATEMENTS_OF`), where a run is held:
-/// the same file's calls in a row change nothing. One look at the hold where none is.
+/// the same file's calls in a row change nothing. One look at the hold where none is; another code's
+/// is noted out of the way (`statements_switch`), which kept this inlined in every database call
+/// (measured, 100,000 `db.one` and `db.exec`, for the fix of Q-1300's statement cache).
 #[inline]
 fn statements_of(it: &Interp) {
     if crate::confirm::held() {
         let at = (it.cur_file.as_ref().map_or(0, |f| Arc::as_ptr(f) as *const u8 as usize), Arc::as_ptr(&it.base_dir) as *const u8 as usize);
-        if STATEMENTS_AT.get() == at {
-            return;
+        if STATEMENTS_AT.get() != at {
+            statements_switch(it, at);
         }
-        STATEMENTS_AT.set(at);
-        STATEMENTS_OF.with(|s| {
-            let mut s = s.borrow_mut();
-            let same = match (&s.file, &it.cur_file) {
-                (None, None) => true,
-                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-                _ => false,
-            };
-            if !same {
-                s.file = it.cur_file.clone();
-            }
-            if !s.base.as_ref().is_some_and(|b| Arc::ptr_eq(b, &it.base_dir)) {
-                s.base = Some(it.base_dir.clone());
-            }
-            s.refused = None;
-            s.taken = crate::confirm::held_taken(it.cur_file.as_deref());
-        });
+    }
+}
+
+/// `statements_of` for a code not the last one's.
+#[cold]
+#[inline(never)]
+fn statements_switch(it: &Interp, at: (usize, usize)) {
+    STATEMENTS_AT.set(at);
+    let found = STATEMENTS_OF.with(|s| {
+        let mut s = s.borrow_mut();
+        s.refused = None;
+        // The same file and folder by another handle: what was found for it stands, the handle kept
+        // alive in its place, with no look in the hold.
+        let same_base = s.base.as_ref().is_some_and(|b| Arc::ptr_eq(b, &it.base_dir));
+        if same_base && s.file.as_deref() == it.cur_file.as_deref() {
+            s.file.clone_from(&it.cur_file);
+            return true;
+        }
+        s.file.clone_from(&it.cur_file);
+        if !same_base {
+            s.base = Some(it.base_dir.clone());
+        }
+        STATEMENTS_TAKEN.set(crate::confirm::held_taken(it.cur_file.as_deref()));
+        false
+    });
+    // Its statements kept compiled for it alone (`compiled_as`).
+    if !found {
+        STATEMENTS_KEY.set(code_key(crate::confirm::held_id(it.cur_file.as_deref()), &it.base_dir));
     }
 }
 
@@ -839,7 +1705,7 @@ fn statements_of(it: &Interp) {
 /// coverage fixes; branch feedback82-85). `load_extension()` stays refused, as SQLite ships it,
 /// and the folder of SQLite's temporary files is not moved.
 /// Every other action is let through at once: a statement kept compiled (`prepare_cached`) is
-/// not asked again.
+/// not asked again, and is kept for the code it was judged for alone (`compiled_as`).
 unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int, a1: *const std::ffi::c_char, a2: *const std::ffi::c_char, _: *const std::ffi::c_char, _: *const std::ffi::c_char) -> std::ffi::c_int {
     use rusqlite::ffi;
     let text = |p: *const std::ffi::c_char| (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) });
@@ -851,12 +1717,21 @@ unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int
         ffi::SQLITE_INSERT | ffi::SQLITE_UPDATE | ffi::SQLITE_DELETE | ffi::SQLITE_CREATE_TABLE | ffi::SQLITE_CREATE_TEMP_TABLE | ffi::SQLITE_DROP_TABLE | ffi::SQLITE_DROP_TEMP_TABLE | ffi::SQLITE_CREATE_VIEW | ffi::SQLITE_CREATE_TEMP_VIEW => own_name(a1),
         ffi::SQLITE_CREATE_INDEX | ffi::SQLITE_CREATE_TEMP_INDEX | ffi::SQLITE_DROP_INDEX | ffi::SQLITE_DROP_TEMP_INDEX | ffi::SQLITE_CREATE_TRIGGER | ffi::SQLITE_CREATE_TEMP_TRIGGER | ffi::SQLITE_DROP_TRIGGER | ffi::SQLITE_DROP_TEMP_TRIGGER => own_name(a1) || own_name(a2),
         ffi::SQLITE_ALTER_TABLE => own_name(a2),
+        // A virtual table by one of their names, which Quillo would then write into (FEEDBACK83.md,
+        // Q-1300, found by the coverage tests of 0038a97; branch feedback82-85).
+        ffi::SQLITE_CREATE_VTABLE | ffi::SQLITE_DROP_VTABLE => own_name(a1),
         _ => false,
     };
-    if writes && OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_OF.with(|s| s.try_borrow().map_or(true, |s| s.taken)) {
+    // And a read of one, by a view or a trigger of the main file's a taken file's statement goes
+    // through, as SQLite names each column it reads: the text check sees a name the statement
+    // writes, not those its view reads (FEEDBACK83.md, Q-1300, found by the coverage tests of
+    // 0038a97; branch feedback82-85).
+    let reads = action == ffi::SQLITE_READ && own_name(a1);
+    if (writes || reads) && OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_TAKEN.get() {
         STATEMENTS_OF.with(|s| {
             if let Ok(mut s) = s.try_borrow_mut() {
-                s.refused = Some("Quillo's own tables (_quillo_...) are not written by a taken file's SQL where a quillo.confirmed holds the run".into());
+                let how = if writes { "written" } else { "read" };
+                s.refused = Some(format!("Quillo's own tables (_quillo_...) are not {} by a taken file's SQL where a quillo.confirmed holds the run", how));
             }
         });
         return ffi::SQLITE_DENY;
@@ -879,7 +1754,7 @@ unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int
                 Some(_) if named(b"lock_proxy_file") => "SQLite's lock_proxy_file names a file to make and lock, which is not done where a quillo.confirmed holds the run",
                 // The schema written as text, under which any table can be renamed into one of
                 // Quillo's own with a name worked out in the SQL (found by the review of bc460fd).
-                Some(_) if named(b"writable_schema") && OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_OF.with(|s| s.try_borrow().map_or(true, |s| s.taken)) => "SQLite's writable_schema is not turned on by a taken file's SQL where a quillo.confirmed holds the run",
+                Some(_) if named(b"writable_schema") && OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_TAKEN.get() => "SQLite's writable_schema is not turned on by a taken file's SQL where a quillo.confirmed holds the run",
                 _ => return ffi::SQLITE_OK,
             };
             STATEMENTS_OF.with(|s| {
@@ -1375,12 +2250,14 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         b => b.map_err(|e| format!("tenant {}: {}", name, e))?,
     };
     let is_default = matches!(&*it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner), Some(DbSlot::PerTenant(t)) if Arc::ptr_eq(t, dbs));
-    let dir = dbs.migrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().or_else(|| if is_default { it.site.migrations.clone() } else { None });
-    if let Some(dir) = dir {
+    let dir = dbs.migrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().or_else(|| if is_default { it.site.migrations.clone().map(|d| (d, None)) } else { None });
+    if let Some((dir, by)) = dir {
         let mb = b.clone();
-        // Its statements judged as the code that opened the tenant's (`migrate_as`).
-        let code = (it.cur_file.clone(), it.base_dir.clone());
-        let applied = it.unlocked(move || migrate_as(code, || crate::migrate::run(&mb, &dir))).map_err(|e| format!("tenant {}: {}", name, e))?;
+        // Its statements judged as the code that set the migrations (`migrate_as`), the site's (a
+        // call confirmed for the whole site) as the main file's.
+        let code = (by, it.base_dir.clone());
+        let judge = migration_judge(code.clone(), b.dialect(), String::new());
+        let applied = it.unlocked(move || migrate_as(code, || crate::migrate::run(&mb, &dir, &judge))).map_err(|e| format!("tenant {}: {}", name, e))?;
         for m in applied {
             eprintln!("quillo: applied migration {} for tenant {}", m, name);
         }
@@ -2084,8 +2961,8 @@ fn cell_room(v: &ValueRef) -> Result<(), String> {
 pub(crate) fn rows(conn: &Connection, sql: &str, params: &[Value], limit: Option<usize>) -> Result<Vec<Value>, String> {
     // Compiled once and kept, as a statement made again and again is (a row read by its key per
     // request, an insert in a loop): faster than Python's sqlite3 there too (branch
-    // feedback40-43).
-    let mut stmt = conn.prepare_cached(sql).map_err(prepare_error)?;
+    // feedback40-43). Kept for the code that runs it (`compiled_as`).
+    let mut stmt = prepared(conn, sql)?;
     bind(&mut stmt, params)?;
     let mut rows = stmt.raw_query();
     let mut out = Vec::new();
@@ -2208,6 +3085,10 @@ fn sql_arg(args: &[Value], name: &str, line: u32) -> Result<String, Ctrl> {
 /// postgres:// URL.
 /// The program's database per tenant, or an error naming `f`.
 fn per_tenant(it: &Interp, on: Option<usize>, f: &str, line: u32) -> Result<Arc<TenantDbs>, Ctrl> {
+    // Its tenants are the connection's, judged for the code as a statement on it is (`conn_ok`).
+    if let Err(e) = program_conn(it, on) {
+        return fail(line, format!("`{}`: {}", f, e));
+    }
     match slot_on(it, on) {
         Some(DbSlot::PerTenant(t)) => Ok(t),
         _ => fail(line, format!("`{}` needs a database per tenant: db.open(\"data/{{tenant}}.db\")", f)),
@@ -2478,7 +3359,13 @@ fn db_connect(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         _ => format!("fn{}", it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()),
     };
     if matches!(args.first(), Some(Value::Str(_) | Value::Css(_))) {
-        if let Some(i) = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().position(|(l, _)| *l == label) {
+        let found = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().position(|(l, _)| *l == label);
+        if let Some(i) = found {
+            // Judged for this file, as each statement on it is (`conn_ok`).
+            statements_of(it);
+            if let Err(e) = conn_ok(it, Some(i)) {
+                return Ok(db_err(e));
+            }
             return Ok(connection(i));
         }
     }
@@ -2486,9 +3373,121 @@ fn db_connect(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(s) => s,
         Err(e) => return Ok(db_err(e)),
     };
-    let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    conns.push((label, slot));
-    Ok(connection(conns.len() - 1))
+    let at = {
+        let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        conns.push((label, slot));
+        conns.len() - 1
+    };
+    let target = match args.first() {
+        Some(Value::Str(t) | Value::Css(t)) => Some(t.to_string()),
+        _ => None,
+    };
+    opened_as(it, at, target.as_deref(), None);
+    Ok(connection(at))
+}
+
+/// The connections of a program (`Interp::db_conns`), held weakly: the list's place is never another
+/// program's while one of these is kept.
+type ConnList = std::sync::Weak<Mutex<Vec<(String, DbSlot)>>>;
+
+/// A connection the program's code opened, where a run is held (`conn_ok`): which program's list it
+/// is in and its place there, what it was opened to (None: a function's per tenant, or shards), the
+/// folder it was judged from, the block of quillo.confirmed of the file that opened it (`u32::MAX`:
+/// none did, the system database's), and the blocks since judged to have it.
+struct ConnOf {
+    conns: ConnList,
+    at: usize,
+    target: Option<String>,
+    base: Arc<Path>,
+    by: u32,
+    ok: Vec<u32>,
+}
+
+/// Every connection opened where a run is held (`opened_as`).
+static CONNS_OF: Mutex<Vec<ConnOf>> = Mutex::new(Vec::new());
+
+/// Notes the connection at `at` of `it`'s program, opened to `target` by `it`'s code (`by` None) or
+/// by none (`Some(u32::MAX)`, the system database), where a run is held.
+fn opened_as(it: &Interp, at: usize, target: Option<&str>, by: Option<u32>) {
+    if !crate::confirm::held() {
+        return;
+    }
+    let by = by.unwrap_or_else(|| crate::confirm::held_id(it.cur_file.as_deref()));
+    let c = ConnOf { conns: Arc::downgrade(&it.db_conns), at, target: target.map(str::to_string), base: it.base_dir.clone(), by, ok: Vec::new() };
+    CONNS_OF.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(c);
+}
+
+/// The connection at `at` of `it`'s program is gone from its list (`db.system` again): the ones
+/// after it are a place nearer.
+fn closed_at(it: &Interp, at: usize) {
+    if !crate::confirm::held() {
+        return;
+    }
+    let mine = Arc::downgrade(&it.db_conns);
+    let mut all = CONNS_OF.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    all.retain(|c| !(c.conns.ptr_eq(&mine) && c.at == at));
+    for c in all.iter_mut().filter(|c| c.conns.ptr_eq(&mine) && c.at > at) {
+        c.at -= 1;
+    }
+}
+
+thread_local! {
+    /// The last connection this thread's code was judged to have (`conn_ok`): its program's list,
+    /// its place, and the code's number (`STATEMENTS_KEY`, one for each block and folder).
+    static CONN_OK: std::cell::Cell<(usize, usize, u32)> = const { std::cell::Cell::new((0, usize::MAX, 0)) };
+}
+
+/// Why the code of `it` may not run a statement on its program's connection `on`, if it may not:
+/// a connection is judged for the file whose code runs the statement, as one it opened would be
+/// (`confirm::db_ok`), whoever opened it and however the code came to name it. The same target was
+/// the same connection, given to any file: a kit confirmed for nothing had the main file's
+/// `db.connect("data/secret.db")` by naming it, and read its tables, where a connection of its own
+/// to it was refused; and a map it wrote, `{ "$db": 0, query: db.query }`, was a connection to it
+/// (FEEDBACK83.md, Q-1300, found by the coverage tests of 0038a97 and by the review of S3's fixes;
+/// branch feedback82-85). One opened to a database a function works out for each tenant is the file
+/// that opened it's alone. The program's database (`on` None) is every file's, by design. After
+/// `backend_on`, which notes the code (`statements_of`); one look at the hold where none is.
+#[inline]
+fn conn_ok(it: &Interp, on: Option<usize>) -> Result<(), String> {
+    match on {
+        Some(at) if crate::confirm::held() => {
+            // The same connection for the same code as the last statement's: judged already.
+            if CONN_OK.get() == (Arc::as_ptr(&it.db_conns) as usize, at, STATEMENTS_KEY.get()) {
+                return Ok(());
+            }
+            conn_judged(it, at)
+        }
+        _ => Ok(()),
+    }
+}
+
+#[inline(never)]
+fn conn_judged(it: &Interp, at: usize) -> Result<(), String> {
+    let list = Arc::as_ptr(&it.db_conns) as usize;
+    let code = STATEMENTS_KEY.get();
+    let held = crate::confirm::held_id(it.cur_file.as_deref());
+    let mine = Arc::downgrade(&it.db_conns);
+    let (target, base) = {
+        let all = CONNS_OF.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(c) = all.iter().find(|c| c.at == at && c.conns.ptr_eq(&mine)) else {
+            return Err("this connection is not one of this program's".into());
+        };
+        if c.by == held || c.ok.contains(&held) {
+            CONN_OK.set((list, at, code));
+            return Ok(());
+        }
+        (c.target.clone(), c.base.clone())
+    };
+    let Some(target) = target else {
+        return Err(format!("this connection's databases are worked out by a function of the file that opened it, and it is not {}'s (quillo confirm)", crate::confirm::held_name(it.cur_file.as_deref())));
+    };
+    crate::confirm::db_ok(held, &base, &target)?;
+    let mut all = CONNS_OF.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(c) = all.iter_mut().find(|c| c.at == at && c.conns.ptr_eq(&mine)) {
+        c.ok.push(held);
+    }
+    CONN_OK.set((list, at, code));
+    Ok(())
 }
 
 /// What names a database, whatever the spelling of its target: a SQLite file by its real path
@@ -2566,6 +3565,10 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
         return Ok(Value::list(out));
     }
+    // A connection's migrations, judged for the code as a statement on it is (`conn_ok`).
+    if let Err(e) = program_conn(it, on) {
+        return fail(line, format!("db.migrate: {}", e));
+    }
     // The folder, and each file in it, judged as `read_file` judges a path: inside the program's
     // folder or one `--allow-path` names, links followed, and where a quillo.confirmed holds the
     // run, among what the calling file was confirmed to read. A kit confirmed for nothing ran
@@ -2594,7 +3597,7 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             }
             // A taken file's migration names none of Quillo's own tables, as its `db.exec` may not
             // (`own_table_named`; found by the review of bc460fd).
-            if crate::confirm::held() && crate::confirm::held_taken(it.cur_file.as_deref()) && std::fs::read_to_string(e.path()).is_ok_and(|t| own_table_named(&t)) {
+            if crate::confirm::held() && crate::confirm::held_taken(it.cur_file.as_deref()) && std::fs::read_to_string(e.path()).is_ok_and(|t| own_table_named(None, &t)) {
                 return fail(line, format!("db.migrate: {}: Quillo's own tables (_quillo_...) are refused for {}'s SQL where a quillo.confirmed holds the run", p, crate::confirm::held_name(it.cur_file.as_deref())));
             }
         }
@@ -2610,7 +3613,7 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     // One database per tenant: each is migrated when first opened.
     if let Some(DbSlot::PerTenant(t)) = slot_on(it, on) {
-        *t.migrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(full.clone());
+        *t.migrations.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((full.clone(), it.cur_file.clone()));
         if it.tenant().is_none() {
             return Ok(Value::list(Vec::new()));
         }
@@ -2621,7 +3624,8 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     };
     let to = full.clone();
     let code = (it.cur_file.clone(), it.base_dir.clone());
-    match it.unlocked(move || migrate_as(code, || crate::migrate::run(&b, &to))) {
+    let judge = migration_judge(code.clone(), b.dialect(), folder.clone());
+    match it.unlocked(move || migrate_as(code, || crate::migrate::run(&b, &to, &judge))) {
         Ok(applied) => {
             for name in &applied {
                 eprintln!("quillo: applied migration {}", name);
@@ -2629,6 +3633,29 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             Ok(Value::list(applied.into_iter().map(Value::str).collect()))
         }
         Err(e) => fail(line, format!("db.migrate: {}", e)),
+    }
+}
+
+/// What judges each file of a migration the code of `code` runs on a database of `d`'s, as
+/// migrate.rs reads it (`migrate::Judge`), where a quillo.confirmed holds the run: where it really
+/// is, as `read_file` judges a path for that file, and a taken file's text as its statements are
+/// (`taken_sql_refused`: Quillo's own tables, SQL run from text), said after its name in `folder`.
+/// The text judged is the text that runs: judged by a first reading of its own, the file could be
+/// another by then (FEEDBACK83.md, Q-1300, found by the coverage tests of 0038a97; branch
+/// feedback82-85).
+fn migration_judge(code: (Option<Arc<str>>, Arc<Path>), d: crate::sql::Dialect, folder: String) -> impl Fn(&Path, &Path, &str) -> Result<(), String> + Sync + Send {
+    move |listed: &Path, real: &Path, text: &str| {
+        if !crate::confirm::held() {
+            return Ok(());
+        }
+        let shown = format!("{}{}", folder, listed.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned()));
+        crate::confirm::path_ok(code.0.as_deref(), &code.1, &real.to_string_lossy(), false)?;
+        if crate::confirm::held_taken(code.0.as_deref()) {
+            if let Some(why) = taken_sql_refused(d, text, || crate::confirm::held_name(code.0.as_deref())) {
+                return Err(format!("{}: {}", shown, why));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -2644,8 +3671,9 @@ fn migrate_as<T>(code: (Option<Arc<str>>, Arc<Path>), run: impl FnOnce() -> Resu
     }
     let was = STATEMENTS_OF.with(|s| {
         let mut s = s.borrow_mut();
-        let was = (s.file.take(), s.base.take());
-        s.taken = crate::confirm::held_taken(code.0.as_deref());
+        // What `statements_switch` found for the code before is put back with it.
+        let was = (s.file.take(), s.base.take(), STATEMENTS_TAKEN.get());
+        STATEMENTS_TAKEN.set(crate::confirm::held_taken(code.0.as_deref()));
         (s.file, s.base, s.refused) = (code.0, Some(code.1), None);
         was
     });
@@ -2653,12 +3681,13 @@ fn migrate_as<T>(code: (Option<Arc<str>>, Arc<Path>), run: impl FnOnce() -> Resu
     let r = run();
     let refused = STATEMENTS_OF.with(|s| {
         let mut s = s.borrow_mut();
-        (s.file, s.base) = was;
+        (s.file, s.base) = (was.0, was.1);
+        STATEMENTS_TAKEN.set(was.2);
         s.refused.take()
     });
     STATEMENTS_AT.set((0, 0));
     r.map_err(|e| match refused {
-        Some(why) if e.ends_with("not authorized") || e.ends_with("authorization denied") => format!("{}: {}", e.trim_end_matches("not authorized").trim_end_matches("authorization denied").trim_end_matches([':', ' ']), why),
+        Some(why) if sqlite_refused_at(&e).is_some() => format!("{}: {}", e[..sqlite_refused_at(&e).unwrap_or(0)].trim_end_matches([':', ' ']), why),
         _ => e,
     })
 }
@@ -2735,6 +3764,12 @@ fn sqlite_exec(c: &Connection, scan: &crate::sql::Scan, sql: &str, params: &[Val
         while let Some(mut stmt) = rusqlite::fallible_iterator::FallibleIterator::next(&mut batch).map_err(|e| e.to_string())? {
             run(&mut stmt)?;
         }
+    } else if crate::confirm::held() {
+        // Kept for the code that runs it (`prepared_apart`); apart, as one statement made either
+        // way cost `db.exec` 0.14% where nothing is held (measured, 100,000 `db.exec`).
+        let mut stmt = prepared_apart(c, sql)?;
+        bind(&mut stmt, params)?;
+        run(&mut stmt)?;
     } else {
         let mut stmt = c.prepare_cached(sql).map_err(prepare_error)?;
         bind(&mut stmt, params)?;
@@ -2760,8 +3795,10 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
     };
     // Quillo's own statement writes its own tables; a taken file's names none (`own_table_named`).
     let _own = own.then(OwnSql::enter);
-    if let Some(e) = (!own).then(|| own_tables_refused(it, &sql)).flatten() {
-        return Ok(db_err(e));
+    if !own {
+        if let Some(e) = own_tables_refused(it, on, &b, &sql) {
+            return Ok(db_err(e));
+        }
     }
     // Read as this database reads it, once for each text (FEEDBACK55.md, Q-746; branch
     // feedback55).
@@ -2907,9 +3944,13 @@ pub(crate) fn system_on_for(it: &mut Interp, make: bool, always: bool) -> Option
         return None;
     }
     let b = open_backend(it, &target).map_err(|e| eprintln!("quillo: the system database {}: {}", target, e)).ok()?;
-    let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    conns.push((SYSTEM.to_string(), DbSlot::One(b)));
-    Some(Some(conns.len() - 1))
+    let at = {
+        let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        conns.push((SYSTEM.to_string(), DbSlot::One(b)));
+        conns.len() - 1
+    };
+    opened_as(it, at, Some(&target), Some(u32::MAX));
+    Some(Some(at))
 }
 
 /// Where Quillo's own tables are, as `system_store` tells it.
@@ -2953,9 +3994,13 @@ pub(crate) fn system_store(it: &mut Interp, make: bool) -> Result<OwnStore, Stri
         return Ok(OwnStore::NotYet);
     }
     let b = open_backend(it, &target).map_err(|e| format!("the system database {} cannot be opened: {}", target, e))?;
-    let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    conns.push((SYSTEM.to_string(), DbSlot::One(b)));
-    Ok(OwnStore::On(Some(conns.len() - 1)))
+    let at = {
+        let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        conns.push((SYSTEM.to_string(), DbSlot::One(b)));
+        conns.len() - 1
+    };
+    opened_as(it, at, Some(&target), Some(u32::MAX));
+    Ok(OwnStore::On(Some(at)))
 }
 
 /// Whether a program uses `db.atomic` (then transactions it left prepared
@@ -2999,9 +4044,17 @@ fn system(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
-    let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    conns.retain(|(l, _)| l != SYSTEM);
-    conns.push((SYSTEM.to_string(), DbSlot::One(b)));
+    let (was, at) = {
+        let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was = conns.iter().position(|(l, _)| l == SYSTEM);
+        conns.retain(|(l, _)| l != SYSTEM);
+        conns.push((SYSTEM.to_string(), DbSlot::One(b)));
+        (was, conns.len() - 1)
+    };
+    if let Some(was) = was {
+        closed_at(it, was);
+    }
+    opened_as(it, at, Some(t), Some(u32::MAX));
     Ok(Value::Nil)
 }
 
@@ -3041,7 +4094,7 @@ fn exec_many(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
     };
-    if let Some(e) = own_tables_refused(it, &sql) {
+    if let Some(e) = own_tables_refused(it, on, &b, &sql) {
         return Ok(db_err(e));
     }
     let server = !matches!(&*b, Backend::Sqlite(_));
@@ -3074,7 +4127,13 @@ fn exec_many(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             for r in chunk {
                 a.extend(r.iter().cloned());
             }
-            match exec_on(it, on, a)? {
+            // The program's statement, as `db.exec`'s is: SQLite's authorizer judges what it does.
+            // They ran as Quillo's own, and a taken file's `exec_many` of an insert fired the main
+            // file's trigger writing `_quillo_mine` (FEEDBACK83.md, Q-1300, found by the coverage
+            // tests of 0038a97; branch feedback82-85). Its text is judged again for each row, the same
+            // text, as each SQL that comes to `exec_as` is; it commits nothing by itself (above).
+            it.db_on = on;
+            match exec_as(it, a, 0, false)? {
                 Value::Map(m) => total += match m.get("changes") { Some(Value::Int(n)) => *n, _ => 0 },
                 err => return Ok(err),
             }
@@ -3716,7 +4775,7 @@ fn query_as(it: &mut Interp, args: Vec<Value>, line: u32, limit: Option<usize>, 
         Err(e) => return Ok(db_err(e)),
     };
     let _own = own.then(OwnSql::enter);
-    if let Some(e) = (!own).then(|| own_tables_refused(it, &sql)).flatten() {
+    if let Some(e) = (!own).then(|| own_tables_refused(it, on, &b, &sql)).flatten() {
         return Ok(db_err(e));
     }
     let scan = crate::sql::scan(b.dialect(), &sql);
@@ -3756,6 +4815,9 @@ fn transaction(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             return fail(line, format!("`db.transaction` expects a function (after its options, if any), got {}", got));
         }
     };
+    if let Err(e) = program_conn(it, on) {
+        return Ok(db_err(e));
+    }
     crate::txn::run(it, on, &opts, line, &mut |it| it.call(&f, Vec::new(), line))
 }
 
@@ -4130,11 +5192,16 @@ fn shards(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         }
     }
     let n = list.len();
-    let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let label = format!("shards{}", conns.len());
-    conns.push((label, DbSlot::Shards(Arc::new(list))));
+    let at = {
+        let mut conns = it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let label = format!("shards{}", conns.len());
+        conns.push((label, DbSlot::Shards(Arc::new(list))));
+        conns.len() - 1
+    };
+    // Its shards' connections are judged each as its statements run (`conn_ok`).
+    opened_as(it, at, None, None);
     let mut m = Map::new();
-    m.insert(CONN_KEY.into(), Value::Int(conns.len() as i64 - 1));
+    m.insert(CONN_KEY.into(), Value::Int(at as i64));
     // `query` and the rest say what to call instead.
     let fns: &[(&'static str, BuiltinFn)] = &[
         ("db.on", shard_on),
@@ -4191,6 +5258,23 @@ fn shard_on(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn shard_all(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let list = shard_list(it, "all", line)?;
     let sql = sql_arg(&args, "all", line)?;
+    // The program's statement, judged as `db.query`'s is, as each shard's database reads it, before
+    // any shard runs it: it was not, and a kit confirmed to write the program's database read
+    // `_quillo_mine` through its shards and renamed its own table into `_quillo_kk`, a name SQLite's
+    // authorizer does not show (FEEDBACK83.md, Q-1300, found by the coverage tests of 0038a97;
+    // branch feedback82-85). Each shard's connection has the authorizer, as every one SQLite opens
+    // under a hold has (`connect`). One look at the hold where none is.
+    if crate::confirm::held() {
+        for i in list.iter() {
+            let refused = match backend_on(it, Some(*i)) {
+                Ok(b) => own_tables_refused(it, Some(*i), &b, &sql),
+                Err(e) => Some(e),
+            };
+            if let Some(e) = refused {
+                return Ok(db_err(e));
+            }
+        }
+    }
     let mut rows = Vec::new();
     for (k, i) in list.iter().enumerate() {
         match select(it, Some(*i), sql.clone(), args[1..].to_vec(), None) {
@@ -4331,7 +5415,7 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     }
     let mut parts: Vec<Part> = Vec::new();
     for on in ons {
-        let b = match backend_on(it, on) {
+        let b = match backend_on(it, on).and_then(|b| conn_ok(it, on).map(|_| b)) {
             Ok(b) => b,
             Err(e) => return Ok(db_err(e)),
         };

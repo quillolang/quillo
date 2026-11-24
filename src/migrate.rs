@@ -12,8 +12,14 @@ use crate::value::Value;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-/// The files to apply, in order: name and text.
-fn files(dir: &Path) -> Result<Vec<(String, String)>, String> {
+/// What judges each file a migration runs, by its path as listed, where it really is and its text,
+/// as it is read (`run`): db.rs's, which holds a taken file's migration as it holds its statements.
+pub type Judge<'a> = &'a (dyn Fn(&Path, &Path, &str) -> Result<(), String> + Sync);
+
+/// The files to apply, in order: name and text, each judged (`judge`) by the text read, which is the
+/// text that runs: judged by a first reading of its own, a file could be another by the time it ran
+/// (FEEDBACK83.md, Q-1300, found by the coverage tests of 0038a97; branch feedback82-85).
+fn files(dir: &Path, judge: Judge<'_>) -> Result<Vec<(String, String)>, String> {
     // A folder that is not there may be one git did not keep, as it keeps no empty folder: said,
     // with what to do (FEEDBACK34.md, Q-423; branch feedback27-35-fixes).
     let entries = std::fs::read_dir(dir).map_err(|e| match e.kind() {
@@ -28,7 +34,7 @@ fn files(dir: &Path) -> Result<Vec<(String, String)>, String> {
         let path = e.path();
         if path.extension().map_or(false, |x| x == "sql") && path.is_file() {
             let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+            let text = read_judged(&path, judge)?;
             // A file with no statement yet (an editor's new file, made empty before it is
             // written) waits: applied empty, it was recorded, and the SQL then written in it
             // never ran, under --watch at the first save (FEEDBACK62.md, Q-919, found in review).
@@ -41,6 +47,24 @@ fn files(dir: &Path) -> Result<Vec<(String, String)>, String> {
     }
     out.sort();
     Ok(out)
+}
+
+/// The text of the migration at `path`, read where it really is, and judged there with it (`judge`):
+/// its last part is read as no link (`O_NOFOLLOW`), so the file judged is the file read.
+fn read_judged(path: &Path, judge: Judge<'_>) -> Result<String, String> {
+    let cannot = |e: std::io::Error| format!("cannot read {}: {}", path.display(), e);
+    let real = std::fs::canonicalize(path).map_err(cannot)?;
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut o.open(&real).map_err(cannot)?, &mut text).map_err(cannot)?;
+    judge(path, &real, &text)?;
+    Ok(text)
 }
 
 fn digest(text: &str) -> String {
@@ -59,15 +83,16 @@ pub(crate) fn folders() -> Vec<std::path::PathBuf> {
 }
 
 /// Applies what `dir` has that the database has not; returns the names
-/// applied. Stops at the first file that fails, which is rolled back.
-pub fn run(db: &Backend, dir: &Path) -> Result<Vec<String>, String> {
+/// applied. Stops at the first file that fails, which is rolled back. Each file is judged as it is
+/// read (`judge`), all of them before any runs.
+pub fn run(db: &Backend, dir: &Path, judge: Judge<'_>) -> Result<Vec<String>, String> {
     {
         let mut f = FOLDERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if f.len() < 64 && !f.iter().any(|d| d == dir) {
             f.push(dir.to_path_buf());
         }
     }
-    let todo = files(dir)?;
+    let todo = files(dir, judge)?;
     match db {
         Backend::Sqlite(m) => {
             let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -128,7 +153,13 @@ pub fn run(db: &Backend, dir: &Path) -> Result<Vec<String>, String> {
 fn sqlite_one(c: &rusqlite::Connection, name: &str, text: &str, says: &SqliteSays, off: bool) -> Result<bool, String> {
     let hash = digest(text);
     c.execute_batch("begin immediate").map_err(|e| e.to_string())?;
-    let had: Option<String> = c.query_row("select sha256 from _quillo_migrations where name = ?1", [name], |r| r.get(0)).ok();
+    // Quillo's own table, read as its own: the file's code may not read it (db.rs `authorize`), and
+    // a taken file's second `c.migrate()` had found nothing and applied its files again
+    // (FEEDBACK83.md, Q-1300, found by tests/cover8285_confirm.rs; branch feedback82-85).
+    let had: Option<String> = {
+        let _own = crate::db::OwnSql::enter();
+        c.query_row("select sha256 from _quillo_migrations where name = ?1", [name], |r| r.get(0)).ok()
+    };
     if let Some(had) = had {
         let _ = c.execute_batch("commit");
         if had != hash {

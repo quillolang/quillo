@@ -174,10 +174,12 @@ const OWN_MAIN: &str = "import kit/k.qwe use Badge, steal\ndb.open(\"data/app.db
 /// Under a quillo.confirmed SQLite's authorizer refuses a taken file's statement that writes one
 /// of Quillo's own tables where the text names none: an insert that fires the main file's trigger
 /// writing one, an insert into a view whose `instead of` trigger writes one, a delete whose trigger
-/// empties one, and an insert into one through `db.shards(...).all`, which reads no text; each
-/// says why, and nothing lands. The kit's statements that fire nothing of Quillo's run, an `alter
-/// table` (a column renamed, a table renamed) too, as the main file's own trigger and `alter table`
-/// do (src/db.rs authorize, FEEDBACK83.md Q-1300; coverage of feedback82-85; branch feedback82-85).
+/// empties one; each says why, and nothing lands. An insert into one through `db.shards(...).all`
+/// is refused by its text, as `db.query`'s is (it read no text before the fix of Q-1300's
+/// shards.all, and this test had the authorizer's words for it). The kit's statements that fire
+/// nothing of Quillo's run, an `alter table` (a column renamed, a table renamed) too, as the main
+/// file's own trigger and `alter table` do (src/db.rs authorize, FEEDBACK83.md Q-1300; coverage of
+/// feedback82-85; branch feedback82-85).
 #[test]
 fn a_taken_files_statement_that_fires_a_write_to_quillos_own_tables_is_refused() {
     let d = dir("backstop");
@@ -194,7 +196,8 @@ fn a_taken_files_statement_that_fires_a_write_to_quillos_own_tables_is_refused()
     let (code, out) = run(&d, &[]);
     assert_eq!(code, 0, "{}", out);
     assert!(out.contains("main: { changes: 1, last_id: 1 }\nmain alter: { changes: 0, last_id: null }\n"), "{}", out);
-    let want = ["kit:", OWN_WRITE, OWN_WRITE, "ran", OWN_WRITE, "ran", "ran", "ran", OWN_WRITE].join("\n");
+    let shards = own_named("kit/k.qwe");
+    let want = ["kit:", OWN_WRITE, OWN_WRITE, "ran", OWN_WRITE, "ran", "ran", "ran", &shards].join("\n");
     assert!(out.contains(&format!("{}\n", want)), "{}", out);
     assert_eq!(mine_rows(&d.join("data/app.db")), ["main"]);
     assert_eq!(schema_names(&d.join("data/app.db")), ["_quillo_mine", "audit", "kit_gone", "kits2", "names", "users", "via_view"]);
@@ -217,7 +220,6 @@ fn a_taken_files_statement_that_fires_a_write_to_quillos_own_tables_is_refused()
 /// refused. What it should do: judge the statement for the file that runs it, as the one written
 /// anew is (coverage of feedback82-85; branch feedback82-85).
 #[test]
-#[ignore = "bug: a statement kept compiled for the main file is not judged again for a taken file"]
 fn a_statement_kept_compiled_for_the_main_file_is_judged_again_for_a_taken_file() {
     let d = dir("cached");
     std::fs::create_dir_all(d.join("data")).unwrap();
@@ -248,7 +250,6 @@ fn a_statement_kept_compiled_for_the_main_file_is_judged_again_for_a_taken_file(
 /// of Q-1300. What it should do: refuse both as `db.query` does (coverage of feedback82-85; branch
 /// feedback82-85).
 #[test]
-#[ignore = "bug: shards.all reads and renames into Quillo's own tables for a taken file"]
 fn shards_all_refuses_quillos_own_tables_to_a_taken_file() {
     let d = dir("shards");
     std::fs::create_dir_all(d.join("data")).unwrap();
@@ -275,7 +276,6 @@ fn shards_all_refuses_quillos_own_tables_to_a_taken_file() {
 /// What it should do: refuse a taken file's SQL that reaches one of Quillo's own tables on
 /// PostgreSQL too (coverage of feedback82-85; branch feedback82-85).
 #[test]
-#[ignore = "bug: on PostgreSQL a taken file reaches Quillo's own tables by another spelling"]
 fn on_postgresql_quillos_own_tables_are_refused_to_a_taken_file_in_any_spelling() {
     let Some(pg) = support::postgres("cov8285r2") else {
         eprintln!("PostgreSQL is not installed: skipped");
@@ -307,7 +307,6 @@ fn on_postgresql_quillos_own_tables_are_refused_to_a_taken_file_in_any_spelling(
 /// as a value to the file that took it, as `db.exec` is (coverage of feedback82-85; branch
 /// feedback82-85).
 #[test]
-#[ignore = "bug: a connection's function taken as a value is held to the helper's file"]
 fn a_connections_function_handed_to_a_helper_is_held_to_the_file_that_took_it() {
     let d = dir("conn-fn");
     std::fs::create_dir_all(d.join("data")).unwrap();
@@ -623,7 +622,6 @@ fn a_meta_whose_attribute_runs_to_its_end_has_no_name_and_is_left() {
 /// description leaves it in the head, so the page has two. What it should do: read an attribute
 /// as `tag_close` and the browser do, and cut it (coverage of feedback82-85; branch feedback82-85).
 #[test]
-#[ignore = "bug: a meta whose first attribute starts with = is not read as the browser reads it"]
 fn a_meta_whose_attribute_starts_with_an_equals_sign_is_read_as_the_browser_reads_it() {
     let h = said_head(&[("description", "D")]);
     let doc = |head: &str| format!("<!doctype html><html><head>{head}</head><body>b</body></html>");
