@@ -2337,3 +2337,118 @@ fn a_quillo_link_is_followed_part_by_part() {
     assert!(out.contains("leads where the system cannot tell yet (a `..` after a folder that is not there)"), "{}", out);
     assert!(!app2.join("q2").exists());
 }
+
+// Fix round 13
+
+const OWN_SOURCE: &str = "it is one of the program's own files";
+const APART_DATABASE: &str = "it is a database of a service or app of the program, which opens it in a process of its own";
+const APART_MIGRATIONS: &str = "it is in the migrations of a service or app of the program, which runs them in a process of its own";
+
+/// A write route and an upload route, answering the refusal or "saved".
+const WRITES: &str = "route writes GET /w/*p {\n  let r = write_file(p, \"EVIL\")\n  return is_err(r) ? r.error : \"saved\"\n}\nroute POST /u {\n  let r = save_upload(request.files.doc, request.form.to)\n  return is_err(r) ? r.error : \"saved\"\n}\n";
+
+/// A service's code that opens `data/s.db` and runs `migrations` at its start, and names
+/// `data/p.db` (by a pipe) and the folder `m2` in a function it never runs.
+const SERVICE_DB: &str = "let d = db.open(\"data/s.db\")\ndb.migrate()\nserver fn other() {\n  let x = \"data/p.db\" | db.open()\n  return db.migrate(\"m2\")\n}\nserver fn hello() {\n  return \"b\"\n}\n";
+
+fn upload(port: u16, to: &str) -> String {
+    let origin = format!("http://localhost:{}", port);
+    let body = format!("--B\r\nContent-Disposition: form-data; name=\"to\"\r\n\r\n{}\r\n--B\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"e.txt\"\r\nContent-Type: text/plain\r\n\r\nEVIL\r\n--B--\r\n", to);
+    send(port, "POST", "/u", &[("Content-Type", "multipart/form-data; boundary=B"), ("Origin", &origin), ("Sec-Fetch-Site", "same-origin")], &body).body
+}
+
+/// The service's files laid out under `app/svc`: its main file, a file it uses, its migrations.
+fn service_files(app: &Path) {
+    for f in ["svc/lib", "svc/data", "svc/migrations", "svc/m2"] {
+        std::fs::create_dir_all(app.join(f)).unwrap();
+    }
+    std::fs::write(app.join("svc/lib/h.qwe"), "let h = 1\n").unwrap();
+    std::fs::write(app.join("svc/b.qwe"), format!("use \"lib/h.qwe\"\n{}", SERVICE_DB)).unwrap();
+    std::fs::write(app.join("svc/migrations/001_a.sql"), "create table t (x int);\n").unwrap();
+    std::fs::write(app.join("svc/m2/001_a.sql"), "create table u (x int);\n").unwrap();
+}
+
+/// What the app may not write of its service's: each refused as in one process, the files as
+/// they were.
+fn app_keeps_the_services_files(app: &Path, port: u16) {
+    let refused = |p: &str, why: &str| format!("write_file: will not write {}: {}", p, why);
+    assert_eq!(upload(port, "svc/b.qwe"), format!("save_upload: will not write svc/b.qwe: {}; save uploads under a folder of their own, such as uploads/", OWN_SOURCE));
+    assert_eq!(send(port, "GET", "/w/svc/b.qwe", &[], "").body, refused("svc/b.qwe", OWN_SOURCE));
+    assert_eq!(send(port, "GET", "/w/svc/lib/h.qwe", &[], "").body, refused("svc/lib/h.qwe", OWN_SOURCE));
+    for p in ["svc/data/s.db", "svc/data/s.db-wal", "svc/data/p.db", "svc/quillo-system.db"] {
+        assert_eq!(send(port, "GET", &format!("/w/{}", p), &[], "").body, refused(p, APART_DATABASE), "{}", p);
+    }
+    for p in ["svc/migrations/002_b.sql", "svc/m2/002_b.sql"] {
+        assert_eq!(send(port, "GET", &format!("/w/{}", p), &[], "").body, refused(p, APART_MIGRATIONS), "{}", p);
+    }
+    assert_eq!(send(port, "GET", "/w/svc/notes.txt", &[], "").body, "saved");
+    assert_eq!(send(port, "GET", "/w/notes.txt", &[], "").body, "saved");
+    assert_eq!(std::fs::read_to_string(app.join("svc/b.qwe")).unwrap(), format!("use \"lib/h.qwe\"\n{}", SERVICE_DB));
+    assert_eq!(std::fs::read_to_string(app.join("svc/lib/h.qwe")).unwrap(), "let h = 1\n");
+    assert!(!app.join("svc/migrations/002_b.sql").exists() && !app.join("svc/data/p.db").exists());
+}
+
+/// Under `--split` the app keeps its service's own files as one process keeps them: an upload
+/// replaced the service's `svc/b.qwe` (which the next start ran), and `write_file` its
+/// `svc/lib/h.qwe`, its open `svc/data/s.db` and its migrations; the databases and migrations
+/// are those a read of the service's code finds (src/builtins.rs note_program_folders and
+/// apart_refused, src/service.rs split; FEEDBACK85.md Q-1340, found by the review of 8989870;
+/// branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn an_app_keeps_its_split_services_own_files() {
+    let d = Dir(support::temp_dir("cov8285r3-split-own").canonicalize().unwrap());
+    let app = d.0.join("app");
+    service_files(&app);
+    std::fs::write(app.join("main.qwe"), format!("service /b = \"svc/b.qwe\"\n{}", WRITES)).unwrap();
+    let (g, port) = serve_at(&app, &["main.qwe", "--split"], &d.0.join("a.log"));
+    app_keeps_the_services_files(&app, port);
+    drop(g);
+}
+
+/// A service another process serves (`--service-url`) whose source is here: the app keeps its
+/// files as it keeps a split service's (src/service.rs declare, src/builtins.rs
+/// note_program_folders; FEEDBACK85.md Q-1340, found by the review of 8989870; branch
+/// feedback82-85)
+#[cfg(unix)]
+#[test]
+fn an_app_keeps_the_own_files_of_a_service_served_elsewhere() {
+    let d = Dir(support::temp_dir("cov8285r3-svcurl-own").canonicalize().unwrap());
+    let app = d.0.join("app");
+    service_files(&app);
+    std::fs::write(app.join("main.qwe"), format!("service /b = \"svc/b.qwe\"\n{}", WRITES)).unwrap();
+    let (gs, sport) = serve_at(&app.join("svc"), &["b.qwe", "--as-service", "--service-name", "b"], &d.0.join("s.log"));
+    let url = format!("b=http://127.0.0.1:{}", sport);
+    let (g, port) = serve_at(&app, &["main.qwe", "--service-url", &url], &d.0.join("a.log"));
+    app_keeps_the_services_files(&app, port);
+    drop(g);
+    drop(gs);
+}
+
+/// A service `--split` starts at the app's root keeps the app's files as the app keeps its: it
+/// overwrote the app's `main.qwe` and `lib/m.qwe`; the app's database is kept too, and the
+/// service's own (`data/c.db`, which its code names and has not opened) is its own to write
+/// (src/main.rs, src/builtins.rs note_program_folders; FEEDBACK85.md Q-1340, found by the review
+/// of 8989870; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn a_split_service_keeps_its_apps_own_files() {
+    let d = Dir(support::temp_dir("cov8285r3-split-app-own").canonicalize().unwrap());
+    let app = d.0.join("app");
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+    std::fs::create_dir_all(app.join("data")).unwrap();
+    std::fs::write(app.join("lib/m.qwe"), "let m = 2\n").unwrap();
+    std::fs::write(app.join("c.qwe"), "server fn w(p) {\n  let r = write_file(p, \"EVIL\")\n  return is_err(r) ? r.error : \"saved\"\n}\nserver fn later() {\n  return db.open(\"data/c.db\")\n}\n").unwrap();
+    let main = "use \"lib/m.qwe\"\nlet d = db.open(\"data/app.db\")\nservice /c = \"c.qwe\"\nroute writes GET /cw/*p {\n  return c.w(p)\n}\n";
+    std::fs::write(app.join("main.qwe"), main).unwrap();
+    let (g, port) = serve_at(&app, &["main.qwe", "--split"], &d.0.join("a.log"));
+    let refused = |p: &str, why: &str| format!("write_file: will not write {}: {}", p, why);
+    assert_eq!(send(port, "GET", "/cw/main.qwe", &[], "").body, refused("main.qwe", OWN_SOURCE));
+    assert_eq!(send(port, "GET", "/cw/lib/m.qwe", &[], "").body, refused("lib/m.qwe", OWN_SOURCE));
+    assert_eq!(send(port, "GET", "/cw/data/app.db", &[], "").body, refused("data/app.db", APART_DATABASE));
+    assert_eq!(send(port, "GET", "/cw/data/c.db", &[], "").body, "saved");
+    assert_eq!(send(port, "GET", "/cw/notes.txt", &[], "").body, "saved");
+    drop(g);
+    assert_eq!(std::fs::read_to_string(app.join("main.qwe")).unwrap(), main);
+    assert_eq!(std::fs::read_to_string(app.join("lib/m.qwe")).unwrap(), "let m = 2\n");
+}

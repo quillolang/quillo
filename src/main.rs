@@ -1568,9 +1568,10 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
         }
         // Its app's files' `.quillo` folders, kept from this service's writes as the app keeps
         // the service's (FEEDBACK85.md, Q-1340, found by the re-review of 00e83c3; branch
-        // feedback82-85).
+        // feedback82-85), and the app's files themselves, its sources and databases, but this
+        // service's own databases, which are its own to write (found by the review of 8989870).
         if let Some(main) = std::env::var_os(quillo::service::APP_MAIN) {
-            quillo::builtins::note_program_folders(Path::new(&main));
+            quillo::builtins::note_program_folders(Path::new(&main), Some(path));
         }
     }
     let mut interp = Interp::new(base);

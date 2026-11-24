@@ -479,8 +479,14 @@ path is judged where it really leads, with its links followed:
   or from a file with a second hard link, and a `.quillo` that leads to the program's folder
   or above stops the start. The `.quillo` folders of every program the process runs, mounted
   ones and services too, are refused to all of them, and `file()` and `files()` answer 404
-  for anything in one or where one leads. Under `--split` an app and the services it starts keep each
-  other's `.quillo` folders too (each reads the other's files); with `--service-url` the app
+Under `--split` an app and the services it starts keep each
+  other's own files as one process keeps them: each reads the other's code at its start, and
+  its sources, its `.quillo` folders, the databases its code names as written
+  (`db.open("data/s.db")`, `db.connect`, `db.system`, `quillo-system.db`, `$QUILLO_DB`,
+  `$QUILLO_SYSTEM_DB`, with their `-wal`, `-shm` and `-journal`) and its migrations folders
+  are refused to the other's writes, deletes and uploads (not known: a database path the
+  other works out as it runs, or a file it starts using after the start: keep those in a
+  folder of its own); with `--service-url` the app
   keeps those of a service whose files are on this machine; a service started on its own
   (not by `--split`) does not know its app's, so keep its folder apart from the app's. A
   `.quillo` link is followed part by part; one that leads past a folder not made yet

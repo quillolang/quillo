@@ -3203,12 +3203,19 @@ fn own_target(it: &Interp, full: &Path, upload: bool, deleting: bool) -> Option<
     // One of them under another name: a second hard link writes into it (FEEDBACK55.md, Q-701;
     // branch feedback55).
     let mut a_folder = false;
+    // What each is, kept for the settings' and the key's paths below (`ids`), and which are not
+    // there (`absent`).
+    let (mut ids, mut absent) = (Vec::new(), Vec::new());
     for f in &both {
-        if let Ok(m) = std::fs::metadata(f) {
-            if let Some(why) = own_meta(&m) {
-                return Some(why);
+        match std::fs::metadata(f) {
+            Ok(m) => {
+                if let Some(why) = own_meta(&m) {
+                    return Some(why);
+                }
+                a_folder |= m.is_dir();
+                ids.extend(crate::statics::id_of(&m));
             }
-            a_folder |= m.is_dir();
+            Err(_) => absent.push(*f),
         }
     }
     // A folder is judged for what it holds only where it would go (`delete_file`): a file written
@@ -3221,6 +3228,15 @@ fn own_target(it: &Interp, full: &Path, upload: bool, deleting: bool) -> Option<
     // The file, or a folder that holds one (`delete_file("lib")`).
     if it.loaded.iter().any(|f| sys(&real_as_made(f)).starts_with(&folded_target)) {
         return Some(OWN_SOURCE);
+    }
+    // A file of a program the process runs beside in another process, as one of its own: a
+    // source, a database a read of its code finds, its migrations (`note_program_folders`). A
+    // process that runs none asks nothing more (FEEDBACK85.md, Q-1340, found by the review of
+    // 8989870; branch feedback82-85).
+    if APART_NOTED.load(std::sync::atomic::Ordering::Acquire) {
+        if let Some(why) = apart_refused(&folded_target, &it.base_dir) {
+            return Some(why);
+        }
     }
     // A folder that holds one of its files, by the folders themselves (`statics::holds_any`): by
     // the names alone, `/System/Volumes/Data` (which only the long name names), `/.nofollow/...`
@@ -3241,14 +3257,22 @@ fn own_target(it: &Interp, full: &Path, upload: bool, deleting: bool) -> Option<
     }
     // What a path of the settings or the TLS key leads to now, by any name (FEEDBACK55.md, Q-701;
     // branch feedback55).
-    if let Some(why) = both.iter().find_map(|f| std::fs::metadata(f).ok().and_then(|m| crate::statics::id_of(&m)).and_then(named_id)) {
+    // By the look taken above.
+    if let Some(why) = ids.into_iter().find_map(named_id) {
         return Some(why);
     }
     // And the paths themselves, while nothing is there: `--env-file`'s and `--tls-key`'s, as
-    // given or as they lead (FEEDBACK55.md, Q-701; branch feedback55).
-    let named: Vec<(std::path::PathBuf, &'static str)> = own().named.clone();
-    if let Some((_, why)) = named.iter().find(|(n, _)| [n.clone(), real_as_made(n)].iter().any(|n| both.iter().any(|f| sys(n) == sys(f)))) {
-        return Some(why);
+    // given or as they lead (FEEDBACK55.md, Q-701; branch feedback55). Only where the file written
+    // is not there either: one that is is what a path that leads to it now leads to, by its
+    // identity (`named_id`), and a path that leads to nothing is no file there. Each write of a
+    // file there resolved each path, two looks at the disk for a `.env` not made (found measuring
+    // the review of 8989870; FEEDBACK85.md, Q-1340; branch feedback82-85).
+    if !absent.is_empty() {
+        let named: Vec<(std::path::PathBuf, &'static str)> = own().named.clone();
+        let absent: Vec<std::path::PathBuf> = absent.iter().map(|f| sys(f)).collect();
+        if let Some((_, why)) = named.iter().find(|(n, _)| [n.clone(), real_as_made(n)].iter().any(|n| absent.contains(&sys(n)))) {
+            return Some(why);
+        }
     }
     // On Windows, a short name may be any file's (FEEDBACK55.md, Q-701; branch feedback55).
     #[cfg(windows)]
@@ -3330,35 +3354,201 @@ fn quillo_dirs(it: &Interp, loaded: &[std::path::PathBuf]) -> Vec<std::path::Pat
 /// feedback82-85). The app reads each service's (service.rs), a service its app's (main.rs, by
 /// `QUILLO_APP_MAIN`); a service that runs elsewhere is read where its file is here. 64 programs at
 /// most; a file that cannot be read is passed.
-pub fn note_program_folders(main: &Path) {
+///
+/// Each file found is the process's own too, as a file it loaded is (`protect`, by identity, and
+/// `APART`, by where it is), and so are the databases and migrations a read of the code finds
+/// (`apart_databases`), but those of `own`, the program this process runs itself: under `--split`
+/// the app replaced a service's `svc/b.qwe` by a visitor's upload (which the next start ran), its
+/// `svc/lib/h.qwe` and its open `svc/data/s.db` by `write_file`, and a service at the app's root
+/// the app's `main.qwe` and `lib/m.qwe`, all of which one process refuses (FEEDBACK85.md, Q-1340,
+/// found by the review of 8989870; branch feedback82-85).
+pub fn note_program_folders(main: &Path, own: Option<&Path>) {
+    let own = own.and_then(|o| o.canonicalize().ok());
     let mut todo = vec![main.to_path_buf()];
     let mut done: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
     while let Some(m) = todo.pop() {
-        if done.len() >= 64 || !done.insert(m.canonicalize().unwrap_or_else(|_| m.clone())) {
+        let key = m.canonicalize().unwrap_or_else(|_| m.clone());
+        if done.len() >= 64 || !done.insert(key.clone()) {
             continue;
         }
+        let its_own = own.as_ref() == Some(&key);
         if let Some(d) = m.parent() {
             note_quillo_folder(d);
         }
+        // Each file's program folder, where its databases' paths count from (`it.base_dir`): the
+        // main file's, or a mounted program's, as `walk_program` takes each `use` from its
+        // program's folder.
+        let dir_of = |p: &Path| p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
+        let main_dir = dir_of(&m);
+        let mut bases: std::collections::HashMap<std::path::PathBuf, (std::path::PathBuf, std::path::PathBuf)> = std::collections::HashMap::new();
+        bases.insert(m.clone(), (crate::modules::source_dir_or(&m, &main_dir), main_dir.clone()));
         let mut services = Vec::new();
+        let mut found: Vec<std::path::PathBuf> = Vec::new();
+        let mut dbs: Vec<(std::path::PathBuf, Vec<(String, bool)>)> = Vec::new();
         let rust = crate::native::walk_program(&m, &mut |f, stmts| {
             let dir = f.parent().unwrap_or(Path::new("."));
             note_quillo_folder(dir);
+            found.push(f.to_path_buf());
+            let (walk_base, db_base) = bases.get(f).cloned().unwrap_or_else(|| (main_dir.clone(), main_dir.clone()));
             for s in stmts {
-                if let crate::ast::Stmt::Service(_, _, file, _, _, _) = s {
-                    if !file.contains("://") {
-                        services.push(dir.join(file));
+                match s {
+                    crate::ast::Stmt::Service(_, _, file, _, _, _) if !file.contains("://") => services.push(dir.join(file)),
+                    crate::ast::Stmt::Use(p, _, _, o) if !crate::ast::is_script(p) => {
+                        bases.entry(walk_base.join(crate::modules::resolve_use(&walk_base, f, p, o.implied))).or_insert_with(|| (walk_base.clone(), db_base.clone()));
                     }
+                    crate::ast::Stmt::Mount(_, p, _) => {
+                        let full = walk_base.join(p);
+                        let d = full.parent().unwrap_or(&walk_base).to_path_buf();
+                        bases.entry(full).or_insert((d.clone(), d));
+                    }
+                    _ => {}
                 }
             }
+            if !its_own {
+                dbs.push((db_base, apart_databases(stmts)));
+            }
         });
-        for r in rust.unwrap_or_default() {
+        let rust = rust.unwrap_or_default();
+        for r in &rust {
             if let Some(d) = r.parent() {
                 note_quillo_folder(d);
             }
         }
+        for f in found.iter().chain(&rust) {
+            protect(f, OWN_SOURCE);
+        }
+        let mut a = APART.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let add = |list: &mut Vec<std::path::PathBuf>, p: &Path| {
+            let f = apart_form(p);
+            if !list.contains(&f) {
+                list.push(f);
+            }
+        };
+        for f in found.iter().chain(&rust) {
+            add(&mut a.sources, f);
+        }
+        if !its_own {
+            // The system database (`db.system`, and what outlives a restart), and the ones the
+            // settings name, are any program's (db.rs `system_on_for`).
+            let named: Vec<String> = ["QUILLO_SYSTEM_DB", "QUILLO_DB"].iter().filter_map(|v| std::env::var(v).ok()).filter(|v| !v.is_empty() && !v.contains("://") && !v.starts_with("file:") && v != ":memory:").collect();
+            let mut by_dir: Vec<std::path::PathBuf> = Vec::new();
+            for (base, found) in &dbs {
+                if !by_dir.contains(base) {
+                    by_dir.push(base.clone());
+                    for n in named.iter().map(String::as_str).chain(["quillo-system.db"]) {
+                        add(&mut a.databases, &base.join(n));
+                    }
+                }
+                for (p, folder) in found {
+                    if *folder {
+                        add(&mut a.migrations, &base.join(p));
+                    } else {
+                        add(&mut a.databases, &base.join(p));
+                    }
+                }
+            }
+        }
+        APART_NOTED.store(true, std::sync::atomic::Ordering::Release);
+        drop(a);
         todo.extend(services);
     }
+}
+
+/// The files of the programs the process runs beside, in other processes (`note_program_folders`):
+/// their sources, the databases and the migrations folders a read of their code finds, each
+/// resolved and folded as `own_target` folds a path it judges (`apart_form`). What their code
+/// works out as it runs (a database path made of values, a tenant's) is not known here
+/// (FEEDBACK85.md, Q-1340, found by the review of 8989870; branch feedback82-85).
+struct Apart {
+    sources: Vec<std::path::PathBuf>,
+    databases: Vec<std::path::PathBuf>,
+    migrations: Vec<std::path::PathBuf>,
+}
+
+static APART: std::sync::RwLock<Apart> = std::sync::RwLock::new(Apart { sources: Vec::new(), databases: Vec::new(), migrations: Vec::new() });
+/// Whether any is noted: a write of a process that runs no program apart asks nothing more.
+static APART_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Why a write of `folded` (`own_target`'s resolved, folded target) is refused as a file of a
+/// program the process runs beside (`APART`), if it is: one of its sources or a folder that holds
+/// one, one of its databases, its journal, log or shared memory, or a folder that holds one, or a
+/// file in its migrations (but in this program's own migrations folder, which `own_target` judges
+/// as it judges its own: an upload is refused there, a write of the program's is not). `base` is
+/// this program's folder.
+fn apart_refused(folded: &Path, base: &Path) -> Option<&'static str> {
+    let a = APART.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if a.sources.iter().any(|s| under(s, folded)) {
+        return Some(OWN_SOURCE);
+    }
+    let db = folded.to_str().and_then(|s| ["-wal", "-shm", "-journal"].iter().find_map(|j| s.strip_suffix(j))).map(Path::new);
+    if a.databases.iter().any(|d| under(d, folded) || db == Some(d.as_path())) {
+        return Some(APART_DATABASE);
+    }
+    if a.migrations.iter().any(|m| under(m, folded) || (under(folded, m) && !under(folded, &apart_form(&base.join("migrations"))))) {
+        return Some(APART_MIGRATIONS);
+    }
+    None
+}
+
+/// A path as `APART` keeps it: as it really is, in the system's form, folded.
+fn apart_form(p: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(fold_name(&crate::statics::sys_form_of(&real_as_made(p)).to_string_lossy()))
+}
+
+pub(crate) const APART_DATABASE: &str = "it is a database of a service or app of the program, which opens it in a process of its own";
+pub(crate) const APART_MIGRATIONS: &str = "it is in the migrations of a service or app of the program, which runs them in a process of its own";
+
+/// The databases a file's code names as written, each with whether it is a migrations folder:
+/// `db.open`, `db.connect` and `db.system` of a text (no server's address, no `:memory:`), a
+/// `db.system()` of none (`quillo-system.db`), and the folder of `db.migrate` or a connection's
+/// `migrate` (`migrations` by default), as `quillo confirm` reads them.
+fn apart_databases(stmts: &[crate::ast::Stmt]) -> Vec<(String, bool)> {
+    use crate::ast::{Expr, Lit};
+    let name = |c: &Expr| match c {
+        Expr::Ident(n, _) => n.to_string(),
+        Expr::Field(o, f, _) => match &**o {
+            Expr::Ident(m, _) => format!("{}.{}", m, f),
+            _ => String::new(),
+        },
+        _ => String::new(),
+    };
+    let mut out: Vec<(String, bool)> = Vec::new();
+    let seen = |n: &str, first: Option<&Expr>, out: &mut Vec<(String, bool)>| {
+        let text = match first {
+            Some(Expr::Lit(Lit::Str(s))) => Some(s.to_string()),
+            _ => None,
+        };
+        let item = match n {
+            "db.open" | "db.connect" | "db.system" => match (n, text) {
+                ("db.system", None) if first.is_none() => Some(("quillo-system.db".to_string(), false)),
+                (_, Some(t)) if !t.is_empty() && t != ":memory:" && !t.contains("://") && !t.starts_with("file:") && crate::db::server_hosts(&t).is_none() => Some((t, false)),
+                _ => None,
+            },
+            n if n == "db.migrate" || n.ends_with(".migrate") => match (first, text) {
+                (None, _) => Some(("migrations".to_string(), true)),
+                (_, Some(t)) if !t.is_empty() => Some((t, true)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(i) = item.filter(|i| !out.contains(i)) {
+            out.push(i);
+        }
+    };
+    // A call given its first argument by a pipe (`"data/s.db" | db.open()`), read with it, as
+    // `quillo confirm` reads one.
+    let mut piped: std::collections::HashSet<*const Expr> = std::collections::HashSet::new();
+    crate::check::each_expr_of(stmts, &mut |e| match e {
+        Expr::Pipe(lhs, rhs, _) => {
+            if let Expr::Call(c, _, _) = &**rhs {
+                piped.insert(&**rhs as *const Expr);
+                seen(&name(c), Some(&**lhs), &mut out);
+            }
+        }
+        Expr::Call(c, args, _) if !piped.contains(&(e as *const Expr)) => seen(&name(c), args.first(), &mut out),
+        _ => {}
+    });
+    out
 }
 
 /// The files any interpreter of this process loaded, resolved: `it`'s, and every other's, as each
@@ -3626,6 +3816,17 @@ pub fn quillo_layout_dir(dir: &Path) -> Result<(), String> {
 fn link_end(p: &Path) -> Option<std::path::PathBuf> {
     if let Ok(r) = p.canonicalize() {
         return Some(crate::statics::sys_form(r));
+    }
+    // What is not there, in a folder that is (a program's `.quillo` not made yet, the most common
+    // case): where it would be made, by one look at it and the folder resolved, which the walk
+    // below finds by a look at each part of the path, four times at each start (found measuring
+    // the review of 8989870; FEEDBACK85.md, Q-1340; branch feedback82-85).
+    if let (Some(Component::Normal(name)), Some(dir)) = (p.components().next_back(), p.parent().filter(|d| !d.as_os_str().is_empty())) {
+        if std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+            if let Ok(d) = dir.canonicalize() {
+                return Some(crate::statics::sys_form(d.join(name)));
+            }
+        }
     }
     // Part by part: each part there taken through its links (a link's own words read where it
     // leads to what is not there), and what follows the first part not there by its name. A `..`

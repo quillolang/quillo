@@ -2902,9 +2902,10 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
     if let Some(url) = url_of(&it.shared, name) {
         // Run in another process (`--split`, `--service-url`): its files' `.quillo` folders are kept
         // from this one's writes where its source is here (FEEDBACK85.md, Q-1340, found by the
-        // re-review of 00e83c3; branch feedback82-85).
+        // re-review of 00e83c3; branch feedback82-85), and its files themselves, its sources and
+        // the databases a read of its code finds (found by the review of 8989870).
         if full.exists() {
-            crate::builtins::note_program_folders(&full);
+            crate::builtins::note_program_folders(&full, None);
         }
         if let Some(p) = prefix {
             it.remote_mounts.retain(|(q, _)| q != p);
@@ -3490,8 +3491,10 @@ pub fn split(path: &Path, watch: bool, reload: bool, static_check: bool, checked
     for (name, prefix, file, port) in &copies {
         // Its folders' `.quillo` are the process's to keep from the app's writes, as a service in
         // the process is: its main file's and those of the files it uses (FEEDBACK85.md, Q-1340,
-        // found by the final review of a6cee54 and the re-review of 00e83c3; branch feedback82-85).
-        crate::builtins::note_program_folders(file);
+        // found by the final review of a6cee54 and the re-review of 00e83c3; branch feedback82-85),
+        // and those files, and the databases a read of its code finds (found by the review of
+        // 8989870).
+        crate::builtins::note_program_folders(file, None);
         let mut args: Vec<String> = vec!["run".into(), file.display().to_string(), "--port".into(), port.to_string(), "--as-service".into(), "--service-name".into(), name.clone()];
         // The app's folder, by argument: its quillo.confirmed holds the service, and its private
         // names' tags count from it (FEEDBACK83.md, Q-1300, found in review 2; FEEDBACK55.md,

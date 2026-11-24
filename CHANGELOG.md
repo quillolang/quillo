@@ -330,7 +330,14 @@ What a program may notice:
   (each reads the other's files: a visitor's upload planted a library where a split
   service's `.quillo` led), as an app does for a service served elsewhere whose source is on
   this machine; a `.quillo` link is followed part by part, and one that leads past a folder
-  not made yet stops the start (found by the re-review of 00e83c3). Deleting a folder no longer removes a link the program's code,
+  not made yet stops the start (found by the re-review of 00e83c3). They keep each other's own
+  files too: an upload replaced a split service's `svc/b.qwe`, which the next start ran,
+  `write_file` replaced its `svc/lib/h.qwe` and open `svc/data/s.db`, and a service at the
+  app's root overwrote the app's `main.qwe`; sources, the databases named in code and
+  migrations folders are refused to the other side, also for a `--service-url` service whose
+  source is on this machine (found by the review of 8989870). `write_file` of an existing
+  file no longer resolves the settings' paths on every write: about 21% fewer instructions a
+  write than 0.8.10. Deleting a folder no longer removes a link the program's code,
   `--env-file` or its database is used through, works on trees of any depth, and judges a
   FIFO beside a journal's name without waiting on it; `files()` no longer hangs on one.
 - **`read_file`, `write_file` and `delete_file`'s refusal of a path outside the folder** ends
