@@ -2465,8 +2465,9 @@ fn each_call_for_the_whole_site_is_held_however_it_is_written() {
 /// confirmed for nothing made `../outside/proxy.lock`, and opened an existing file outside to lock
 /// it. Refused where a quillo.confirmed holds the run, however it is written (the function form,
 /// a schema's name before it, other letters, `:auto:`, on a connection of `db.connect`), with the
-/// hold's words; the pragma read without a value, and others, work as before (src/db.rs authorize;
-/// FEEDBACK83.md Q-1300, found by the coverage tests; branch feedback82-85).
+/// hold's words; the pragma read without a value, and others' reads, work as before (the control
+/// reads journal_mode: since 726b006 a taken file's pragma that sets is refused) (src/db.rs
+/// authorize; FEEDBACK83.md Q-1300, found by the coverage tests; branch feedback82-85).
 #[test]
 fn sqlites_lock_proxy_file_is_refused_where_a_quillo_confirmed_holds_the_run() {
     let d = dir("k2-lock-proxy");
@@ -2477,7 +2478,7 @@ fn sqlites_lock_proxy_file_is_refused_where_a_quillo_confirmed_holds_the_run() {
     write(
         &app,
         "kit/k.qwe",
-        "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  let said = (r) => is_err(r) ? str(r) : \"ran\"\n  let out = [said(db.query(\"pragma journal_mode = delete\"))]\n  for sql in [\"pragma lock_proxy_file = '../outside/proxy.lock'\", \"PRAGMA main.LOCK_PROXY_FILE('../outside/existing.txt')\", \"pragma lock_proxy_file = ':auto:'\", \"pragma lock_proxy_file = '../outside/ünï.lock'\"] {\n    out = push(out, said(db.exec(sql)))\n  }\n  let c = db.connect(\":memory:\")\n  out = push(out, said(c.exec(\"pragma lock_proxy_file = '../outside/m.lock'\")))\n  out = push(out, said(db.query(\"pragma lock_proxy_file\")))\n  out = push(out, said(db.exec(\"insert into t values (1)\")))\n  return join(out, \"\\n\")\n}\n",
+        "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  let said = (r) => is_err(r) ? str(r) : \"ran\"\n  let out = [said(db.query(\"pragma journal_mode\"))]\n  for sql in [\"pragma lock_proxy_file = '../outside/proxy.lock'\", \"PRAGMA main.LOCK_PROXY_FILE('../outside/existing.txt')\", \"pragma lock_proxy_file = ':auto:'\", \"pragma lock_proxy_file = '../outside/ünï.lock'\"] {\n    out = push(out, said(db.exec(sql)))\n  }\n  let c = db.connect(\":memory:\")\n  out = push(out, said(c.exec(\"pragma lock_proxy_file = '../outside/m.lock'\")))\n  out = push(out, said(db.query(\"pragma lock_proxy_file\")))\n  out = push(out, said(db.exec(\"insert into t values (1)\")))\n  return join(out, \"\\n\")\n}\n",
     );
     std::fs::create_dir_all(app.join("data")).unwrap();
     write(&app, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n");
