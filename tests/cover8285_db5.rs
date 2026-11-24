@@ -604,6 +604,10 @@ fn kit_said(refused: &[&str], ran: usize, file: &str) -> String {
 /// Changed by review 6 of aebe60e's fixes (fail closed): `create schema` is refused for what it
 /// makes, a schema not being on what a taken file may make, before the trigger in it; and `copy`
 /// for reaching the server's files or programs, whatever it reaches.
+/// Changed by review 7 of 64df6c0's fixes: a sequence's function given one string runs, the name
+/// judged with the statement's others, and is refused given a name worked out as it runs (a
+/// concatenation, a parameter, a cast); `oid` as `pg_class`'s column is no longer a line that runs,
+/// `pg_...` names being refused.
 #[test]
 fn on_postgresql_a_taken_files_sql_run_from_text_is_refused() {
     let Some(pg) = support::postgres("cov8285db5b") else {
@@ -633,9 +637,9 @@ fn on_postgresql_a_taken_files_sql_run_from_text_is_refused() {
         ("db.query", r#"select U&"\0071uery_to_xml"('select 1', true, false, '')"#, None, "the function query_to_xml"),
         ("db.query", "select ts_stat('select 1')", None, "the function ts_stat"),
         ("db.query", "select dblink('host=x', 'select 1')", None, "the function dblink"),
-        ("db.query", "select nextval('kit_seq')", None, "the function nextval"),
-        ("db.query", "select SetVal('kit_seq', 1)", None, "the function setval"),
-        ("db.query", "select currval('kit_seq')", None, "the function currval"),
+        ("db.query", "select nextval('kit' || '_seq')", None, "the function nextval given a table's name worked out as it runs"),
+        ("db.query", "select SetVal($1, 1)", Some("kit_seq"), "the function setval given a table's name worked out as it runs"),
+        ("db.query", "select currval(kit_seq::text)", None, "the function currval given a table's name worked out as it runs"),
         ("db.query", "select to_regclass('kits')", None, "the function to_regclass"),
         ("db.query", "select 'kits'::regclass", None, "a table's name (regclass) worked out as it runs"),
         ("db.query", "select $1::regclass", Some("kits"), "a table's name (regclass) worked out as it runs"),
@@ -649,7 +653,8 @@ fn on_postgresql_a_taken_files_sql_run_from_text_is_refused() {
         ("db.query", "select $q$ do execute call regclass nextval( $q$ as s", None),
         ("db.query", "select 1 /* do execute call create function query_to_xml( ::regclass */ as one -- do\n", None),
         ("db.query", "select 1 as \"do\", 2 as \"execute\", 3 as \"call\", 4 as \"regclass\"", None),
-        ("db.query", "select count(*) as n from pg_class where oid > 0 and relname = 'kits'", None),
+        ("db.query", "select count(*) as n from kits where x is null or x > 0", None),
+        ("db.query", "select nextval('kit_seq') as n", None),
         ("db.exec", "create table if not exists kits2 (x int)", None),
         ("db.query", "select count(*) as n from kits", None),
     ];
@@ -983,7 +988,8 @@ fn on_postgresql_a_taken_files_statement_is_read_fail_closed() {
 /// - A definer, or `sql security`, before what `create` makes; `or replace function`;
 ///   `create database` and `create user`; `alter user` and `alter database`.
 /// - `into outfile`, `load_file`, `load data`.
-/// - performance_schema, the `sys` schema, `mysql.general_log` and the processlist.
+/// - performance_schema, the `sys` schema, `mysql.general_log` and the processlist (`mysql.` refused
+///   as the `mysql` schema since review 7 of 64df6c0's fixes, before its `general_log`).
 /// What a taken file may make runs: a table (`if not exists`, `or replace`), a unique index, a
 /// view with `algorithm = merge`, and `alter table`. So do `if()` and `case` in a select, `on
 /// duplicate key update`, a column named `` `execute` ``, and `/*!` in a string or `/* ! */`. The
@@ -1022,7 +1028,7 @@ fn on_mysql_a_taken_files_statement_is_read_fail_closed() {
         ("db.exec", "load data infile '/etc/hosts' into table kits", None, "reaches:`load`"),
         ("db.query", "select * from performance_schema.events_statements_history", None, "reads:the catalog performance_schema"),
         ("db.query", "select * from sys.statement_analysis", None, "reads:the `sys` schema"),
-        ("db.query", "select * from mysql.general_log", None, "reads:the catalog general_log"),
+        ("db.query", "select * from mysql.general_log", None, "reads:the `mysql` schema"),
         ("db.query", "select * from information_schema.processlist", None, "reads:the catalog processlist"),
     ];
     let ran: Vec<(&str, &str, Option<&str>)> = vec![
@@ -1162,4 +1168,206 @@ fn a_taken_files_migration_folder_by_a_link_is_read_where_it_is() {
     assert_ne!(code, 0, "{}", out);
     assert!(out.contains("db.migrate: ") && out.contains("not confirmed for kit/k.qwe"), "{}", out);
     assert!(column(&d.join("data/k.db"), "select name from sqlite_master where name = 'u'").is_empty());
+}
+
+// ---- round 4: a statement's first word, session state, engines, `pg_` (review 7 of 64df6c0) ----
+
+/// What the hold says when a taken file's statement begins with a word it may not begin with.
+fn begins(word: &str, file: &str) -> String {
+    format!("db: this statement begins with `{}`, which a taken file's statement may not begin with where a quillo.confirmed holds the run: it may begin with select, insert, update, delete, with, values, table, replace, explain, create, alter, drop or truncate ({}'s SQL). Run it from the main file's SQL, or from a migration the main file runs", word, file)
+}
+
+/// What the hold says when a taken file's SQL names one of PostgreSQL's `pg_...`.
+fn pg_name(name: &str, file: &str) -> String {
+    format!("db: {} is one of PostgreSQL's own catalogs and functions (`pg_...`), which hold or reach other tables and statements, and is refused for {}'s SQL where a quillo.confirmed holds the run. Run it from the main file's SQL, or from a migration the main file runs", name, file)
+}
+
+/// What the hold says of a character outside ASCII just before `\` or a backtick.
+const WIDE: &str = "unsure:a character outside ASCII just before a `\\` or a backtick, which a connection's GBK, SJIS or Big5 reads as one character with it";
+
+/// The refusals `steal()` gives for `refused`, each `begins:`, `pg:`, or what `refusal` takes.
+fn said_r4(refused: &[&str], ran: usize, file: &str) -> String {
+    let mut want = vec!["kit:".to_string()];
+    want.extend(refused.iter().map(|w| match (w.strip_prefix("begins:"), w.strip_prefix("pg:")) {
+        (Some(x), _) => begins(x, file),
+        (_, Some(x)) => pg_name(x, file),
+        _ => refusal(w, file),
+    }));
+    want.extend(std::iter::repeat_n("ran".to_string(), ran));
+    format!("{}\n", want.join("\n"))
+}
+
+/// Under a quillo.confirmed on PostgreSQL a taken file's statement may begin only with select,
+/// insert, update, delete, with, values, table, explain of one, create and alter of what it may
+/// make, drop of a table, an index, a view or a sequence, and truncate:
+/// - `grant`, `revoke`, `set` (`set local client_encoding = 'SJIS'` in a transaction, the way a
+///   kit made the server read its next string otherwise), `reset`, `show`, `comment`, `lock`,
+///   `vacuum`, `analyze`, `cluster`, `reindex`, `refresh`, `listen`, `notify`, `discard`,
+///   `checkpoint`, `drop schema`, `drop function`, and a statement in brackets are refused.
+/// - Any `pg_...` name (`pg_class`, `pg_prepared_statement()`, `pg_stat_get_activity(null)`,
+///   `pg_sequences`, `pg_relation_size(...)` by an implicit cast, a quoted `"pg_tables"`) is
+///   refused, `pg_catalog.` judged by the name after it.
+/// - `set_config` is refused.
+/// - A sequence's or a privilege's function given a name worked out as it runs is refused.
+/// - A character outside ASCII just before `\` or a backtick is refused.
+/// Run: `on conflict do update`, `with ... insert`, `explain select`, `table`, `values`, `drop
+/// table`, `truncate`, `nextval('kit_seq')`, `has_table_privilege('kits', 'select')`,
+/// `pg_catalog.now()`, and a non-ASCII string with no `\` or backtick after it (src/db.rs
+/// head_refused, after_wide, regclass_fn; FEEDBACK83.md Q-1300, found by review 7 of 64df6c0;
+/// branch feedback82-85).
+#[test]
+fn on_postgresql_a_taken_files_statement_may_begin_only_with_what_it_may_do() {
+    let Some(pg) = support::postgres("cov8285db5r4") else {
+        eprintln!("PostgreSQL is not installed: skipped");
+        return;
+    };
+    let url = pg.database("first_word");
+    let d = dir("pg-first");
+    let refused: Vec<(&str, &str, Option<&str>, &str)> = vec![
+        ("db.exec", "grant select on all tables in schema public to public", None, "begins:grant"),
+        ("db.exec", "revoke select on kits from public", None, "begins:revoke"),
+        ("db.exec", "set local client_encoding = 'SJIS'", None, "begins:set"),
+        ("db.exec", "SET standard_conforming_strings = off", None, "begins:set"),
+        ("db.exec", "reset all", None, "begins:reset"),
+        ("db.query", "show work_mem", None, "begins:show"),
+        ("db.exec", "comment on table kits is 'x'", None, "begins:comment"),
+        ("db.exec", "lock table kits", None, "begins:lock"),
+        ("db.exec", "vacuum kits", None, "begins:vacuum"),
+        ("db.exec", "analyze kits", None, "begins:analyze"),
+        ("db.exec", "cluster kits", None, "begins:cluster"),
+        ("db.exec", "reindex table kits", None, "begins:reindex"),
+        ("db.exec", "refresh materialized view kit_mv", None, "begins:refresh"),
+        ("db.exec", "listen kit", None, "begins:listen"),
+        ("db.exec", "notify kit", None, "begins:notify"),
+        ("db.exec", "discard all", None, "begins:discard"),
+        ("db.exec", "checkpoint", None, "begins:checkpoint"),
+        ("db.exec", "drop schema public cascade", None, "begins:drop schema"),
+        ("db.exec", "drop function main_f()", None, "begins:drop function"),
+        ("db.query", "(select 1 as one)", None, "begins:"),
+        ("db.query", "select relname from pg_class", None, "pg:pg_class"),
+        ("db.query", "select name, statement from pg_prepared_statement()", None, "pg:pg_prepared_statement"),
+        ("db.query", "select count(*) as n from pg_stat_get_activity(null)", None, "pg:pg_stat_get_activity"),
+        ("db.query", "select sequencename from pg_sequences", None, "pg:pg_sequences"),
+        ("db.query", "select pg_relation_size('_quil' || 'lo_mine') as s", None, "pg:pg_relation_size"),
+        ("db.query", "select * from pg_catalog.\"pg_tables\"", None, "pg:pg_tables"),
+        ("db.query", "select set_config('standard_conforming_strings', 'off', false)", None, "the function set_config"),
+        ("db.query", "select has_table_privilege('_quil' || 'lo_mine', 'select') as p", None, "the function has_table_privilege given a table's name worked out as it runs"),
+        ("db.query", "select nextval($1) as n", Some("kit_seq"), "the function nextval given a table's name worked out as it runs"),
+        ("db.query", "select E'\u{4e01}\\\\' as a", None, WIDE),
+        ("db.query", "select '\u{e9}`' as a", None, WIDE),
+    ];
+    let ran: Vec<(&str, &str, Option<&str>)> = vec![
+        ("db.exec", "insert into kits values (1) on conflict (x) do update set x = excluded.x", None),
+        ("db.exec", "with t as (select 2 as x) insert into kits select x from t on conflict do nothing", None),
+        ("db.query", "explain select * from kits", None),
+        ("db.query", "table kits", None),
+        ("db.query", "values (1), (2)", None),
+        ("db.exec", "create table if not exists kit_t (x int)", None),
+        ("db.exec", "truncate kit_t", None),
+        ("db.exec", "drop table kit_t", None),
+        ("db.query", "select nextval('kit_seq') as n", None),
+        ("db.query", "select has_table_privilege('kits', 'select') as p", None),
+        ("db.query", "select pg_catalog.now() is not null as t", None),
+        ("db.query", "select '\u{4e01}\u{e9} caf\u{e9}' || 'x' as s, 1 as pg", None),
+        ("db.exec", "update kits set x = x where x = 1", None),
+        ("db.exec", "delete from kits where x = 3", None),
+    ];
+    let mut calls: Vec<(&str, &str, Option<&str>)> = refused.iter().map(|(f, s, v, _)| (*f, *s, *v)).collect();
+    calls.extend(ran.iter().copied());
+    write(&d, "kit/k.qwe", &kit_with(&calls));
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\ndb.exec(\"create table if not exists kits (x int primary key)\")\ndb.exec(\"create sequence if not exists kit_seq\")\ndb.exec(\"create materialized view if not exists kit_mv as select 1 as x\")\ndb.exec(\"create or replace function main_f() returns trigger language plpgsql as $$ begin return new; end $$\")\nprint(\"main: \" + str(db.query(\"select relname from pg_class where relname = 'kits'\")))\nprint(steal())\nprint(\"schema: \" + str(db.query(\"select count(*) as n from pg_namespace where nspname = 'public'\")))\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("main: [{ relname: \"kits\" }]\n"), "{}", out);
+    let whats: Vec<&str> = refused.iter().map(|(_, _, _, w)| *w).collect();
+    assert!(out.contains(&said_r4(&whats, ran.len(), "kit/k.qwe").replace(&begins("", "kit/k.qwe"), &"db: this statement's first word cannot be placed, which a taken file's statement may not begin with where a quillo.confirmed holds the run: it may begin with select, insert, update, delete, with, values, table, replace, explain, create, alter, drop or truncate (kit/k.qwe's SQL). Run it from the main file's SQL, or from a migration the main file runs".to_string())), "{}", out);
+    assert!(out.contains("schema: [{ n: 1 }]\n"), "{}", out);
+}
+
+/// Under a quillo.confirmed on MySQL (MariaDB) a taken file's statement may begin only with select,
+/// insert, update, delete, with, values, replace, explain of one, create, alter, drop and
+/// truncate:
+/// - `set names gbk`, `set @x`, `charset`, `show` (`show engine innodb status`), `install soname`,
+///   `uninstall`, `handler`, `lock tables`, `rename`, `flush`, `kill`, `purge`, `xa`, `optimize`,
+///   `repair`, `checksum`, `use`, `help`, `describe`, and `explain` of a table are refused.
+/// - A table may take only InnoDB, Aria, MyISAM or MEMORY: CONNECT (which read `/etc/hosts`),
+///   FEDERATED and MERGE are refused, in `create` and `alter`, and so are `file_name`, `table_type`,
+///   `connection`, `union = (...)` and `data directory`.
+/// - information_schema's `innodb_*` and the `mysql` schema are refused.
+/// - A character outside ASCII just before `\` or a backtick is refused.
+/// Run: `replace into`, `explain select`, `with ... select`, `drop table`, `truncate table`, a
+/// table with `engine = InnoDB`, `engine=Aria`, `ENGINE MEMORY`, and a non-ASCII string with no `\`
+/// after it (src/db.rs head_refused, table_options_refused, after_wide; FEEDBACK83.md Q-1300, found
+/// by review 7 of 64df6c0; branch feedback82-85).
+#[test]
+fn on_mysql_a_taken_files_statement_may_begin_only_with_what_it_may_do() {
+    let Some(my) = support::mariadb("cov8285db5r4") else {
+        eprintln!("MariaDB is not installed: skipped");
+        return;
+    };
+    let url = my.url("first_word");
+    let d = dir("my-first");
+    let refused: Vec<(&str, &str, Option<&str>, &str)> = vec![
+        ("db.exec", "set names gbk", None, "begins:set"),
+        ("db.exec", "set @x = 1", None, "begins:set"),
+        ("db.exec", "charset gbk", None, "begins:charset"),
+        ("db.query", "show tables", None, "begins:show"),
+        ("db.query", "show engine innodb status", None, "begins:show"),
+        ("db.exec", "install soname 'ha_connect'", None, "begins:install"),
+        ("db.exec", "uninstall soname 'ha_connect'", None, "begins:uninstall"),
+        ("db.exec", "handler kits open", None, "begins:handler"),
+        ("db.exec", "lock tables kits read", None, "begins:lock"),
+        ("db.exec", "rename table kits to kits9", None, "begins:rename"),
+        ("db.exec", "flush tables", None, "begins:flush"),
+        ("db.exec", "kill 1", None, "begins:kill"),
+        ("db.exec", "purge binary logs before now()", None, "begins:purge"),
+        ("db.exec", "xa start 'x'", None, "begins:xa"),
+        ("db.exec", "optimize table kits", None, "begins:optimize"),
+        ("db.exec", "repair table kits", None, "begins:repair"),
+        ("db.exec", "checksum table kits", None, "begins:checksum"),
+        ("db.exec", "use mysql", None, "begins:use"),
+        ("db.exec", "help 'select'", None, "begins:help"),
+        ("db.query", "describe kits", None, "begins:describe"),
+        ("db.query", "explain kits", None, "begins:kits"),
+        ("db.exec", "create table kit_c (line varchar(500)) engine=CONNECT table_type=DOS file_name='/etc/hosts'", None, "reaches:`engine = connect`"),
+        ("db.exec", "create table kit_f (x int) engine = federated connection = 'mysql://root@127.0.0.1/x/t'", None, "reaches:`engine = federated`"),
+        ("db.exec", "create table kit_m (x int) engine = merge union = (kits)", None, "reaches:`engine = merge`"),
+        ("db.exec", "create table kit_u (x int) union = (kits)", None, "reaches:`union = (...)`"),
+        ("db.exec", "create table kit_t2 (x int) table_type = DOS", None, "reaches:`table_type`"),
+        ("db.exec", "create table kit_d (x int) data directory = '/tmp'", None, "reaches:`data directory`"),
+        ("db.exec", "alter table kits engine = connect", None, "reaches:`engine = connect`"),
+        ("db.query", "select * from information_schema.innodb_trx", None, "reads:the catalog innodb_trx"),
+        ("db.query", "select * from information_schema.INNODB_LOCK_WAITS", None, "reads:the catalog innodb_lock_waits"),
+        ("db.query", "select user from mysql.user", None, "reads:the `mysql` schema"),
+        ("db.query", "select '\u{4e01}\\\\' as a", None, WIDE),
+        ("db.query", "select 1 as `\u{e9}`", None, WIDE),
+    ];
+    let ran: Vec<(&str, &str, Option<&str>)> = vec![
+        ("db.exec", "replace into kits values (5)", None),
+        ("db.query", "explain select * from kits", None),
+        ("db.query", "with t as (select 1 as x) select x from t", None),
+        ("db.exec", "create table if not exists kit_i (x int) engine = InnoDB", None),
+        ("db.exec", "create table if not exists kit_a (x int) engine=Aria", None),
+        ("db.exec", "create table if not exists kit_mem (x int) ENGINE MEMORY", None),
+        ("db.exec", "truncate table kit_i", None),
+        ("db.exec", "drop table kit_a", None),
+        ("db.query", "select '\u{4e01}\u{e9} caf\u{e9}' as s", None),
+    ];
+    let mut calls: Vec<(&str, &str, Option<&str>)> = refused.iter().map(|(f, s, v, _)| (*f, *s, *v)).collect();
+    calls.extend(ran.iter().copied());
+    write(&d, "kit/k.qwe", &kit_with(&calls));
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\ndb.exec(\"create table if not exists kits (x int)\")\nprint(\"main: \" + str(db.query(\"show tables\")))\nprint(steal())\nprint(\"tables: \" + str(db.query(\"select table_name as t from information_schema.tables where table_schema = database() order by 1\")))\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("main: ["), "{}", out);
+    let whats: Vec<&str> = refused.iter().map(|(_, _, _, w)| *w).collect();
+    assert!(out.contains(&said_r4(&whats, ran.len(), "kit/k.qwe")), "{}", out);
+    // The tables made: the kit's InnoDB and MEMORY ones and the main file's, none of the refused.
+    let tables = out.lines().find(|l| l.starts_with("tables: ")).unwrap_or_default();
+    for t in ["\"kit_i\"", "\"kit_mem\"", "\"kits\""] {
+        assert!(tables.contains(t), "{}", out);
+    }
+    assert_eq!(tables.matches("t: ").count(), 3, "{}", out);
 }

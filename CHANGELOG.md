@@ -85,7 +85,14 @@ and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2
   server's files (`COPY`, `INTO OUTFILE`, `pg_read_file`), and the catalogs holding other
   tables' values or SQL text (`pg_stats`, `pg_prepared_statements`, `performance_schema`). A
   `--` comment ends at `\r` too, also for the main file's transaction check (`select 1 --\r;
-  begin` left a transaction open on a shared connection).
+  begin` left a transaction open on a shared connection). A taken file's statement begins
+  only with `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `WITH`, `VALUES`, `TABLE`, `REPLACE`,
+  `EXPLAIN`, a listed `CREATE` or `ALTER`, `DROP` of a table, index, view or sequence, or
+  `TRUNCATE` (`GRANT ... ON ALL TABLES IN SCHEMA`, `DROP SCHEMA ... CASCADE` and `INSTALL
+  SONAME` reached them); `SET` of any kind is refused, as `SET NAMES gbk` let a character
+  take the backslash after it, and so is a non-ASCII byte just before a `\` or a backtick; on
+  MariaDB only InnoDB, Aria, MyISAM and MEMORY tables, without file or connection options; on
+  PostgreSQL any `pg_` name; `nextval` and the like only with a written name.
 - **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
   of 2026-11-24): a name another file defines, used without taking it, is an error in
   `quillo check`, and the start refuses it with `--no-check` too, as the value under it

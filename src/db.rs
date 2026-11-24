@@ -1392,17 +1392,32 @@ fn tokens(r: Reading, t: &[u8]) -> (Vec<Tk<'_>>, Option<&'static str>) {
 /// The functions of PostgreSQL's, its own or a common extension's, that run SQL given as text, read
 /// a table it names by text or by a number, or reach another database: the `*_to_xml` family,
 /// `ts_stat`, `ts_rewrite`, `dblink*`, tablefunc's `crosstab*` and `connectby`, `to_regclass`, and a
-/// sequence's by its name (`nextval`, `setval`, `currval`). A kit confirmed for nothing made the
+/// session's setting (`set_config`, by which `standard_conforming_strings` or `client_encoding` change
+/// how the server reads what follows). A sequence's by its name is `regclass_fn`'s. A kit confirmed
+/// for nothing made the
 /// extension tablefunc and read Quillo's own table through `crosstab('select ... _quil' || 'lo_mine')`
 /// (FEEDBACK83.md, Q-1300, found by review 6 of aebe60e; branch feedback82-85).
 fn runs_text(name: &[u8]) -> bool {
-    const NAMES: &[&[u8]] = &[b"ts_stat", b"ts_rewrite", b"to_regclass", b"nextval", b"setval", b"currval", b"connectby"];
+    const NAMES: &[&[u8]] = &[b"ts_stat", b"ts_rewrite", b"to_regclass", b"connectby", b"set_config"];
     const STARTS: &[&[u8]] = &[b"query_to_xml", b"cursor_to_xml", b"table_to_xml", b"schema_to_xml", b"database_to_xml", b"dblink", b"crosstab"];
     NAMES.iter().any(|w| name.eq_ignore_ascii_case(w)) || starts_with_any(name, STARTS)
 }
 
 fn starts_with_any(name: &[u8], starts: &[&[u8]]) -> bool {
     starts.iter().any(|p| name.len() >= p.len() && name[..p.len()].eq_ignore_ascii_case(p))
+}
+
+/// PostgreSQL's functions that take a table by its name as a `regclass`, from text: a sequence's
+/// (`nextval`, `currval`, `setval`), the privileges' and the descriptions'. Given a name worked out
+/// as it runs (`pg_relation_size('_quil' || 'lo_mine')` was one), any table is reached: under a
+/// hold a taken file's call of one takes a string or a word as each argument, the name judged with
+/// the statement's other names (`own_table_named`), and nothing else (FEEDBACK83.md, Q-1300, found
+/// by review 7 of 64df6c0; branch feedback82-85). Those named `pg_...` are refused by their name.
+fn regclass_fn(name: &[u8]) -> bool {
+    const NAMES: &[&[u8]] = &[
+        b"nextval", b"currval", b"setval", b"has_table_privilege", b"has_column_privilege", b"has_sequence_privilege", b"has_any_column_privilege", b"obj_description", b"col_description", b"shobj_description",
+    ];
+    NAMES.iter().any(|w| name.eq_ignore_ascii_case(w))
 }
 
 /// The functions that reach the database server's own files or programs: PostgreSQL's
@@ -1424,7 +1439,9 @@ fn holds_others(name: &[u8]) -> bool {
         b"pg_stats", b"pg_statistic", b"pg_stats_ext", b"pg_stats_ext_exprs", b"pg_statistic_ext_data", b"pg_prepared_statements", b"pg_stat_statements", b"pg_stat_statements_info", b"pg_stat_activity",
         b"performance_schema", b"general_log", b"slow_log", b"processlist", b"innodb_trx",
     ];
-    NAMES.iter().any(|w| name.eq_ignore_ascii_case(w)) || starts_with_any(name, &[b"events_statements_"])
+    // information_schema's `innodb_*` too, of which `innodb_trx` shows each transaction's statement
+    // (found by review 7 of 64df6c0).
+    NAMES.iter().any(|w| name.eq_ignore_ascii_case(w)) || starts_with_any(name, &[b"events_statements_", b"innodb_"])
 }
 
 /// Whether `sql` may have what `text_run` looks for: a word of it (letters, digits, `_` and `$`,
@@ -1433,7 +1450,14 @@ fn holds_others(name: &[u8]) -> bool {
 /// reading: read whole, a taken file's every statement on PostgreSQL cost some 5,000 instructions
 /// (measured, 20,000 `db.one`).
 fn may_run_text(sql: &[u8]) -> bool {
-    if sql.iter().any(|&c| c == b'&' || c == 0) || sql.windows(3).any(|w| w == b"/*!" || w == b"/*M") {
+    if sql.iter().any(|&c| c == b'&' || c == 0 || c == b';') || sql.windows(3).any(|w| w == b"/*!" || w == b"/*M") || after_wide(sql) {
+        return true;
+    }
+    // One statement whose first word is a plain one, as written (no comment before it): one whose
+    // first word is another is read whole (`head_refused`).
+    let start = sql.iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(sql.len());
+    let first = sql[start..].iter().position(|&c| !c.is_ascii_alphabetic()).map_or(&sql[start..], |k| &sql[start..start + k]);
+    if !["select", "insert", "update", "delete", "with", "values"].iter().any(|w| first.eq_ignore_ascii_case(w.as_bytes())) {
         return true;
     }
     let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
@@ -1443,6 +1467,18 @@ fn may_run_text(sql: &[u8]) -> bool {
     })
 }
 
+/// Whether a byte outside ASCII comes just before a `\` or a backtick: under a connection's GBK,
+/// SJIS or Big5 the two are one character, the backslash no escape, and the quote after it ends the
+/// string for the server where it did not for this reading. Under `set names gbk` (MariaDB) and `set
+/// local client_encoding = 'SJIS'` (PostgreSQL) a kit hid a statement so (FEEDBACK83.md, Q-1300,
+/// found by review 7 of 64df6c0; branch feedback82-85). Quillo's own connections speak UTF-8
+/// (tokio-postgres's `client_encoding UTF8`, mysql_async's utf8mb4), and a taken file may set no
+/// session state (`head_refused`); this holds where the main file set another. Quotes are below
+/// 0x40, which no such character's second byte is.
+fn after_wide(sql: &[u8]) -> bool {
+    sql.windows(2).any(|w| w[0] >= 0x80 && (w[1] == b'\\' || w[1] == b'`'))
+}
+
 /// Whether `w` is a word `text_run` looks for (a keyword it judges, `runs_text`, `reaches_files`,
 /// `holds_others`), in any letters, past the digits of MySQL's `/*!50000call`: lowered once and matched as a whole, the families by their
 /// start only for a word that may begin one. Each word against each list cost a taken file's every
@@ -1450,7 +1486,7 @@ fn may_run_text(sql: &[u8]) -> bool {
 fn looked_for(w: &[u8]) -> bool {
     let mut buf = [0u8; 24];
     if w.len() > buf.len() {
-        return runs_text(w) || holds_others(w);
+        return runs_text(w) || holds_others(w) || starts_with_any(w, &[b"pg_"]);
     }
     for (b, c) in buf.iter_mut().zip(w) {
         *b = c.to_ascii_lowercase();
@@ -1463,6 +1499,8 @@ fn looked_for(w: &[u8]) -> bool {
         b"pg_read_file" | b"pg_read_binary_file" | b"pg_ls_dir" | b"pg_stat_file" | b"lo_import" | b"lo_export" | b"load_file" | b"pg_file_write" => true,
         b"pg_stats" | b"pg_statistic" | b"pg_stats_ext" | b"pg_stats_ext_exprs" | b"pg_statistic_ext_data" | b"pg_prepared_statements" | b"pg_stat_statements" | b"pg_stat_statements_info" | b"pg_stat_activity"
         | b"performance_schema" | b"general_log" | b"slow_log" | b"processlist" | b"innodb_trx" => true,
+        b"set_config" | b"mysql" | b"has_table_privilege" | b"has_column_privilege" | b"has_sequence_privilege" | b"has_any_column_privilege" | b"obj_description" | b"col_description" | b"shobj_description" => true,
+        _ if l.starts_with(b"pg_") || l.starts_with(b"innodb_") => true,
         _ => matches!(l[0], b'q' | b'c' | b't' | b's' | b'd' | b'e') && (runs_text(l) || holds_others(l)),
     }
 }
@@ -1478,6 +1516,11 @@ enum TextRun {
     Reads(String),
     /// It cannot be read for certain, as the server would read it.
     Unsure(&'static str),
+    /// It begins with a word a taken file's statement may not begin with (None: no word it can
+    /// place), `head_refused`.
+    Begins(Option<String>),
+    /// It names one of PostgreSQL's own catalogs or functions (`pg_...`).
+    Pg(String),
 }
 
 /// What in `sql`, read as the server `d` reads it, has the database run SQL from text or name a
@@ -1515,6 +1558,9 @@ fn text_run(d: crate::sql::Dialect, sql: &str) -> Option<TextRun> {
     }
     if b.contains(&0) {
         return Some(TextRun::Unsure("a NUL character"));
+    }
+    if after_wide(b) {
+        return Some(TextRun::Unsure("a character outside ASCII just before a `\\` or a backtick, which a connection's GBK, SJIS or Big5 reads as one character with it"));
     }
     let slash = b.contains(&b'\\');
     let readings: &[Reading] = match (d, slash) {
@@ -1597,6 +1643,11 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
                 return runs(kind.map_or("`create` of what this reading cannot place".into(), |k| format!("`create {}`", k)));
             }
         }
+        if my && (is(head, "create") || is(head, "alter")) {
+            if let Some(why) = table_options_refused(stmt) {
+                return Some(TextRun::Reaches(why));
+            }
+        }
         if is(head, "alter") {
             let mut k = h + 1;
             while ["online", "offline", "ignore"].iter().any(|w| is(stmt.get(k), w)) {
@@ -1644,6 +1695,9 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
                 if my && x.eq_ignore_ascii_case(b"sys") && matches!(stmt.get(k + 1), Some(Tk::Punct(b'.'))) {
                     return Some(TextRun::Reads("the `sys` schema".into()));
                 }
+                if my && x.eq_ignore_ascii_case(b"mysql") && matches!(stmt.get(k + 1), Some(Tk::Punct(b'.'))) {
+                    return Some(TextRun::Reads("the `mysql` schema".into()));
+                }
             }
             // A name, quoted or not, each way for a `U&` one.
             let (one, all): (&[u8], &[Vec<u8>]) = match t {
@@ -1666,11 +1720,28 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
                     return runs(format!("the function {}", String::from_utf8_lossy(n).to_ascii_lowercase()));
                 }
             }
-            // `regclass` or `oid` as a type: after `::` (`::pg_catalog.regclass` too) or a
-            // `cast(... as`, not an alias's `as`, before a string (`regclass 'x'`) or `(`.
             if !pg {
                 continue;
             }
+            // A function that takes a table by its name as text, given anything but a string or a
+            // word for each argument (`regclass_fn`).
+            if called {
+                if let Some(n) = names.clone().find(|n| regclass_fn(n)) {
+                    if !plain_arguments(&stmt[after + 1..]) {
+                        return runs(format!("the function {} given a table's name worked out as it runs", String::from_utf8_lossy(n).to_ascii_lowercase()));
+                    }
+                }
+            }
+            // PostgreSQL's own catalogs and functions, by their names (`pg_...`): `pg_catalog.` is a
+            // schema, judged by the name after it.
+            if let Some(n) = names.clone().find(|n| n.len() > 3 && n[..3].eq_ignore_ascii_case(b"pg_")) {
+                let schema = n.eq_ignore_ascii_case(b"pg_catalog") && matches!(stmt.get(k + 1), Some(Tk::Punct(b'.')));
+                if !schema {
+                    return Some(TextRun::Pg(String::from_utf8_lossy(n).to_ascii_lowercase()));
+                }
+            }
+            // `regclass` or `oid` as a type: after `::` (`::pg_catalog.regclass` too) or a
+            // `cast(... as`, not an alias's `as`, before a string (`regclass 'x'`) or `(`.
             if let Some(n) = names.clone().find(|n| n.eq_ignore_ascii_case(b"regclass") || n.eq_ignore_ascii_case(b"oid")) {
                 let mut before = before;
                 if matches!(before, Some(Tk::Punct(b'.'))) && k >= 3 {
@@ -1682,6 +1753,119 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
                     return runs(format!("a {} worked out as it runs", if n.eq_ignore_ascii_case(b"oid") { "table's number (oid)" } else { "table's name (regclass)" }));
                 }
             }
+        }
+        if let Some(why) = head_refused(my, stmt, h) {
+            return Some(why);
+        }
+    }
+    None
+}
+
+/// Whether the arguments of a call, the tokens after its `(` (`rest`), are each one string or one
+/// word, its `)` closing them: no parameter (`$1`, `?`), no operator, no call, no cast.
+fn plain_arguments(rest: &[Tk<'_>]) -> bool {
+    let mut one = false;
+    for t in rest {
+        match t {
+            Tk::Punct(b')') => return one,
+            Tk::Punct(b',') if one => one = false,
+            Tk::Str if !one => one = true,
+            Tk::Word(x) if !one && !x.starts_with(b"$") => one = true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// What a taken file's statement may begin with, where a quillo.confirmed holds the run, as its
+/// first word (`h`, past `explain`'s options): `select`, `insert`, `update`, `delete`, `with`,
+/// `values`, `table`, MySQL's `replace`, `explain` of one of these, `create` and `alter` of what
+/// `creates_ok` and its list take, `drop` of a table, an index, a view or a sequence, and
+/// `truncate`; a transaction's words are the transaction check's (`no_tx_control`). Anything else
+/// is refused, and a first word this reading cannot place: `set`, `set names` and MySQL's `charset`
+/// among them, session state by which the server reads what follows otherwise (`client_encoding`,
+/// `standard_conforming_strings`, `sql_mode`), and `grant`, `show`, `install`, `handler`, `lock`,
+/// `vacuum` and the rest. `install soname 'ha_connect'` and a `CONNECT` table read `/etc/hosts`
+/// (FEEDBACK83.md, Q-1300, found by review 7 of 64df6c0: fail closed, the coordinator's direction;
+/// branch feedback82-85).
+fn head_refused(my: bool, stmt: &[Tk<'_>], h: usize) -> Option<TextRun> {
+    let word = match stmt.get(h) {
+        None => return None,
+        Some(Tk::Word(x)) => x.to_ascii_lowercase(),
+        Some(_) => return Some(TextRun::Begins(None)),
+    };
+    let is = |k: usize, w: &str| matches!(stmt.get(k), Some(Tk::Word(x)) if x.eq_ignore_ascii_case(w.as_bytes()));
+    match word.as_slice() {
+        b"select" | b"insert" | b"update" | b"delete" | b"with" | b"values" | b"table" | b"truncate" | b"create" | b"alter" => None,
+        b"replace" if my => None,
+        b"begin" | b"commit" | b"rollback" | b"savepoint" | b"release" | b"start" | b"end" | b"abort" => None,
+        b"drop" => {
+            let mut k = h + 1;
+            while is(k, "temporary") || is(k, "materialized") {
+                k += 1;
+            }
+            match ["table", "index", "view", "sequence"].iter().any(|w| is(k, w)) {
+                true => None,
+                false => Some(TextRun::Begins(Some(match stmt.get(k) {
+                    Some(Tk::Word(x)) => format!("drop {}", String::from_utf8_lossy(x).to_ascii_lowercase()),
+                    _ => "drop".into(),
+                }))),
+            }
+        }
+        // MySQL's `explain [format = x] [extended | partitions | analyze]`, then what it explains.
+        b"explain" if my => {
+            let mut k = h + 1;
+            loop {
+                if is(k, "format") && matches!(stmt.get(k + 1), Some(Tk::Punct(b'='))) {
+                    k += 3;
+                } else if is(k, "extended") || is(k, "partitions") || is(k, "analyze") {
+                    k += 1;
+                } else {
+                    break;
+                }
+            }
+            match stmt.get(k) {
+                Some(Tk::Word(_)) if !is(k, "explain") => head_refused(my, stmt, k),
+                _ => Some(TextRun::Begins(Some("explain".into()))),
+            }
+        }
+        other => Some(TextRun::Begins(Some(String::from_utf8_lossy(other).into_owned()))),
+    }
+}
+
+/// Why MySQL's `create` or `alter` of a table (`stmt`) reaches beyond the database's own tables, if
+/// it does: an engine other than InnoDB, Aria, MyISAM or MEMORY (MariaDB's CONNECT read the server's
+/// `/etc/hosts` as a table, found by review 7 of 64df6c0), and the options that name another place:
+/// `connection`, `file_name`, `table_type`, a MERGE table's `union`, `data directory` and `index
+/// directory` (FEEDBACK83.md, Q-1300; branch feedback82-85).
+fn table_options_refused(stmt: &[Tk<'_>]) -> Option<String> {
+    let is = |t: Option<&Tk<'_>>, w: &str| matches!(t, Some(Tk::Word(x)) if x.eq_ignore_ascii_case(w.as_bytes()));
+    for (k, t) in stmt.iter().enumerate() {
+        let Tk::Word(x) = t else { continue };
+        let next = stmt.get(k + 1);
+        let valued = matches!(next, Some(Tk::Punct(b'=') | Tk::Str));
+        if x.eq_ignore_ascii_case(b"engine") {
+            let at = if matches!(next, Some(Tk::Punct(b'='))) { k + 2 } else { k + 1 };
+            let name = match stmt.get(at) {
+                Some(Tk::Word(v)) => Some(v.to_ascii_lowercase()),
+                Some(Tk::Names(v)) => v.first().map(|v| v.to_ascii_lowercase()),
+                _ => None,
+            };
+            match name {
+                Some(v) if [&b"innodb"[..], b"aria", b"myisam", b"memory"].contains(&v.as_slice()) => {}
+                v => return Some(format!("`engine = {}`", v.map_or(String::new(), |v| String::from_utf8_lossy(&v).into_owned()))),
+            }
+        }
+        for w in ["connection", "file_name", "table_type"] {
+            if x.eq_ignore_ascii_case(w.as_bytes()) && valued {
+                return Some(format!("`{}`", w));
+            }
+        }
+        if x.eq_ignore_ascii_case(b"union") && matches!(next, Some(Tk::Punct(b'=' | b'('))) {
+            return Some("`union = (...)`".into());
+        }
+        if (x.eq_ignore_ascii_case(b"data") || x.eq_ignore_ascii_case(b"index")) && is(next, "directory") {
+            return Some(format!("`{} directory`", String::from_utf8_lossy(x).to_ascii_lowercase()));
         }
     }
     None
@@ -1746,6 +1930,13 @@ fn taken_sql_refused(d: crate::sql::Dialect, sql: &str, file: impl Fn() -> Strin
         ),
         TextRun::Reaches(what) => format!("{} reaches the database server's own files or programs, or another database, which is refused for {}'s SQL where a quillo.confirmed holds the run. {}", what, file(), tail),
         TextRun::Reads(what) => format!("{} holds other tables' data or other statements' SQL, which is refused for {}'s SQL where a quillo.confirmed holds the run. {}", what, file(), tail),
+        TextRun::Begins(what) => format!(
+            "{}, which a taken file's statement may not begin with where a quillo.confirmed holds the run: it may begin with select, insert, update, delete, with, values, table, replace, explain, create, alter, drop or truncate ({}'s SQL). {}",
+            what.map_or("this statement's first word cannot be placed".to_string(), |w| format!("this statement begins with `{}`", w)),
+            file(),
+            tail
+        ),
+        TextRun::Pg(name) => format!("{} is one of PostgreSQL's own catalogs and functions (`pg_...`), which hold or reach other tables and statements, and is refused for {}'s SQL where a quillo.confirmed holds the run. {}", name, file(), tail),
         TextRun::Unsure(what) => format!(
             "this statement has {}, which this reading cannot read for certain as the server would, and what it cannot read is refused for {}'s SQL where a quillo.confirmed holds the run. {}",
             what,

@@ -11007,8 +11007,13 @@ for the site and the visitor.
   anything but a table, an index, a view or a sequence, SQL that reaches the server's files
   (`COPY`, `INTO OUTFILE`, `pg_read_file`, `LOAD`), and the catalogs that hold other tables'
   values or SQL text (`pg_stats`, `pg_prepared_statements`, `performance_schema`'s
-  statements, `sys.`, the process list). Other catalogs the database user can read
-  (`mysql.user`, other databases) are not.
+  statements, `sys.`, the process list, the `mysql` schema, and on PostgreSQL every
+  `pg_...` name). A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
+  `DELETE`, `WITH`, `VALUES`, `TABLE`, `REPLACE`, `EXPLAIN` of one of these, `CREATE` or
+  `ALTER` as above (a MySQL table's engine InnoDB, Aria, MyISAM or MEMORY), `DROP` of a table,
+  an index, a view or a sequence, or `TRUNCATE`; any other first word (`SET`, `GRANT`,
+  `SHOW`, `INSTALL` and the rest) is refused, as is a character outside ASCII just before a
+  `\` or a backtick. Tables of other databases the database user can read are not held.
 - **A connection is its maker's.** A connection `db.connect` (or `db.shards`) opened is
   held to the file that opened it: a taken file that builds a connection's map by hand
   reaches nothing through it, and one that connects to the same database is held to its own
