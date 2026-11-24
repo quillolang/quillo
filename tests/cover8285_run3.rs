@@ -1145,3 +1145,126 @@ fn files_never_waits_on_a_fifo_beside_a_journals_name() {
     assert_eq!(send(port, "GET", "/ping", &[], "").body, "pong");
     drop(g);
 }
+
+// Fix round 9
+
+/// What `own_file` says of a file in the program's `.quillo` folders.
+const OWN_QUILLO: &str = "it is in the program's .quillo folder, which holds its built plugins, their lock and its keys";
+
+/// A `.quillo` that is a link, or a link in one, is the program's by where it leads: with
+/// `.quillo -> qstore` and `lib/.quillo/native -> ../../build-native`, writing the lock, a library,
+/// the `--watch` session key by either name (case too, or not made yet), or deleting them or their
+/// folders, went through, as only the name `.quillo` was looked for in the path as it really is.
+/// A name beside it that only begins so is a file like others. Under the no-unlink sandbox
+/// (src/builtins.rs own_file and quillo_guard, FEEDBACK85.md Q-1340, found by the review of
+/// 0284f7c; branch feedback82-85)
+#[cfg(target_os = "macos")]
+#[test]
+fn a_quillo_folder_that_is_a_link_is_the_programs_where_it_leads() {
+    let Some((d, app, profile)) = sandboxed_app("cov8285r3-quillo-link") else { return };
+    for f in ["qstore/native", "build-native", "lib/.quillo"] {
+        std::fs::create_dir_all(app.join(f)).unwrap();
+    }
+    for (f, text) in [("qstore/native/libhi-1.dylib", "lib"), ("qstore/plugins.lock", "lock"), ("qstore/.quillo-secret", "key"), ("build-native/liby-1.dylib", "lib")] {
+        std::fs::write(app.join(f), text).unwrap();
+    }
+    std::os::unix::fs::symlink("qstore", app.join(".quillo")).unwrap();
+    std::os::unix::fs::symlink("../../build-native", app.join("lib/.quillo/native")).unwrap();
+    let writes = [".quillo/plugins.lock", ".QUILLO/native/libhi-1.dylib", "qstore/plugins.lock", "qstore/native/libhi-1.dylib", "qstore/native/new.dylib", ".quillo/.quillo-secret", "lib/.quillo/native/liby-1.dylib", "build-native/liby-1.dylib", "build-native/new.dylib"];
+    let deletes = [".quillo/plugins.lock", ".quillo/native", "qstore/native/libhi-1.dylib", "qstore", "build-native"];
+    let mut main = String::from("use \"lib/x.qwe\"\n");
+    for w in writes {
+        main.push_str(&format!("print(write_file(\"{}\", \"EVIL\"))\n", w));
+    }
+    for p in deletes {
+        main.push_str(&format!("print(delete_file(\"{}\"))\n", p));
+    }
+    main.push_str("print(write_file(\"qstore-notes.txt\", \"ok\") | is_err)\n");
+    std::fs::write(app.join("main.qwe"), &main).unwrap();
+    let mut want = String::new();
+    for w in writes {
+        want.push_str(&format!("err(\"write_file: will not write {}: {}\")\n", w, OWN_QUILLO));
+    }
+    for p in deletes {
+        want.push_str(&format!("err(\"delete_file: will not delete {}: {}\")\n", p, OWN_QUILLO));
+    }
+    want.push_str("false\n");
+    let (code, out) = sandboxed_at(&app, &profile, &["run", "main.qwe"], &[], &d.0.join("a.log"), 60);
+    assert_eq!((code, out.as_str()), (Some(0), want.as_str()));
+    for (f, text) in [("qstore/plugins.lock", "lock"), ("qstore/.quillo-secret", "key"), ("build-native/liby-1.dylib", "lib")] {
+        assert_eq!(std::fs::read_to_string(app.join(f)).unwrap(), text, "{}", f);
+    }
+    assert!(!app.join("qstore/native/new.dylib").exists() && !app.join("build-native/new.dylib").exists());
+}
+
+/// An upload saved by the name a visitor gave cannot reach a `.quillo` that is a link out of the
+/// folder into one `--allow-path` names: `.quillo/plugins.lock` replaced the lock and
+/// `.quillo/native/...` planted a library (src/builtins.rs own_file, FEEDBACK85.md Q-1340, found
+/// by the review of 0284f7c; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn an_upload_cannot_reach_a_quillo_folder_linked_out_of_the_program() {
+    let d = Dir(support::temp_dir("cov8285r3-quillo-upload").canonicalize().unwrap());
+    let (app, store) = (d.0.join("app"), d.0.join("data/qstore"));
+    std::fs::create_dir_all(store.join("native")).unwrap();
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(store.join("plugins.lock"), "lock").unwrap();
+    std::os::unix::fs::symlink("../data/qstore", app.join(".quillo")).unwrap();
+    std::fs::write(app.join("main.qwe"), "route POST /u {\n  let r = save_upload(request.files.doc, request.form.to)\n  return is_err(r) ? r.error : \"saved\"\n}\n").unwrap();
+    let (g, port) = serve_at(&app, &["main.qwe", "--allow-path", "../data"], &d.0.join("a.log"));
+    let origin = format!("http://localhost:{}", port);
+    for to in [".quillo/plugins.lock", ".quillo/native/libhi-1.dylib", ".QUILLO/native/libhi-2.dylib"] {
+        let body = format!("--B\r\nContent-Disposition: form-data; name=\"to\"\r\n\r\n{}\r\n--B\r\nContent-Disposition: form-data; name=\"doc\"; filename=\"e.txt\"\r\nContent-Type: text/plain\r\n\r\nEVIL\r\n--B--\r\n", to);
+        let a = send(port, "POST", "/u", &[("Content-Type", "multipart/form-data; boundary=B"), ("Origin", &origin), ("Sec-Fetch-Site", "same-origin")], &body);
+        assert_eq!(a.body, format!("save_upload: will not write {}: {}; save uploads under a folder of their own, such as uploads/", to, OWN_QUILLO), "{}", to);
+    }
+    drop(g);
+    assert_eq!(std::fs::read_to_string(store.join("plugins.lock")).unwrap(), "lock");
+    assert_eq!(std::fs::read_dir(store.join("native")).unwrap().count(), 0);
+}
+
+/// Deleting a folder that holds a link to a folder above the program's (`/`, the temporary folder,
+/// `..`) is refused, as naming the link is, saying so: it said "it is one of the program's own
+/// files", of a link to `/`. A link to a folder that holds nothing of the program's is let
+/// through, to the deletion the sandbox refuses (src/builtins.rs own_inside, FEEDBACK85.md Q-1340,
+/// found by the review of 0284f7c; branch feedback82-85)
+#[cfg(target_os = "macos")]
+#[test]
+fn deleting_a_folder_with_a_link_above_the_program_says_why() {
+    let Some((d, app, profile)) = sandboxed_app("cov8285r3-link-above") else { return };
+    for f in ["j_root", "j_up", "j_tmp", "j_none", "none"] {
+        std::fs::create_dir_all(app.join(f)).unwrap();
+    }
+    std::os::unix::fs::symlink("/", app.join("j_root/r")).unwrap();
+    std::os::unix::fs::symlink("..", app.join("j_up/up")).unwrap();
+    std::os::unix::fs::symlink(&d.0, app.join("j_tmp/t")).unwrap();
+    std::os::unix::fs::symlink("../none", app.join("j_none/n")).unwrap();
+    std::fs::write(app.join("main.qwe"), "for f in [\"j_root\", \"j_up\", \"j_tmp\", \"j_none\"] {\n  print(delete_file(f))\n}\n").unwrap();
+    let held = "it holds a link to a folder that holds the program's own files";
+    let want = format!(
+        "err(\"delete_file: will not delete j_root: {held}\")\nerr(\"delete_file: will not delete j_up: {held}\")\nerr(\"delete_file: will not delete j_tmp: {held}\")\nerr(\"delete_file: j_none: Operation not permitted (os error 1)\")\n"
+    );
+    let (code, out) = sandboxed_at(&app, &profile, &["run", "main.qwe"], &[], &d.0.join("a.log"), 60);
+    assert_eq!((code, out.as_str()), (Some(0), want.as_str()));
+}
+
+/// On macOS `.quıllo` (a dotless ı) is another name than `.quillo`, as APFS compares names: it was
+/// refused as the program's `.quillo`, the name folded by upper then lower case, which makes ı an
+/// i. `.QUILLO` still is the program's (src/builtins.rs fold_name, FEEDBACK85.md Q-1340, found by
+/// the review of 0284f7c; branch feedback82-85)
+#[cfg(target_os = "macos")]
+#[test]
+fn a_dotless_i_is_another_name_on_macos() {
+    let d = Dir(support::temp_dir("cov8285r3-dotless").canonicalize().unwrap());
+    let app = d.0.join("app");
+    std::fs::create_dir_all(app.join(".quillo")).unwrap();
+    std::fs::create_dir_all(app.join(".qu\u{131}llo")).unwrap();
+    if !app.join(".qu\u{131}llo").is_dir() || std::fs::read_dir(&app).unwrap().count() != 2 {
+        eprintln!("skipped: this file system takes .qu\u{131}llo for .quillo");
+        return;
+    }
+    std::fs::write(app.join("main.qwe"), "print(write_file(\".qu\u{131}llo/notes.txt\", \"ok\") | is_err)\nprint(write_file(\".QUILLO/plugins.lock\", \"x\"))\n").unwrap();
+    let (code, out) = quillo_at(&app, &["run", "main.qwe"], &[], &d.0.join("a.log"), 60);
+    assert_eq!((code, out.as_str()), (Some(0), format!("false\nerr(\"write_file: will not write .QUILLO/plugins.lock: {}\")\n", OWN_QUILLO).as_str()));
+    assert!(app.join(".qu\u{131}llo/notes.txt").exists() && !app.join(".quillo/plugins.lock").exists());
+}

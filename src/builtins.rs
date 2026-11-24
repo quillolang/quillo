@@ -1751,6 +1751,10 @@ pub const OWN_CONFIRMED: &str = "it is what the program was confirmed to reach (
 /// What Quillo keeps for the program beside its files (FEEDBACK85.md, Q-1340, found by the review
 /// of b7f7c26; branch feedback82-85).
 pub(crate) const OWN_QUILLO: &str = "it is in the program's .quillo folder, which holds its built plugins, their lock and its keys";
+/// Why a folder that holds a link to one that holds the program's files is not deleted
+/// (FEEDBACK85.md, Q-1340, found by the review of 0284f7c; branch feedback82-85).
+#[cfg_attr(not(unix), allow(dead_code))]
+const LINKED_FOLDER: &str = "it holds a link to a folder that holds the program's own files";
 
 /// Notes `p`, if it is there, as one of the program's own files. A source file's earlier
 /// versions at that path are let go, so `--watch` saving one again and again keeps one each; the
@@ -1922,6 +1926,14 @@ pub(crate) fn fold_name(name: &str) -> String {
         return name.to_ascii_lowercase();
     }
     use unicode_normalization::UnicodeNormalization;
+    // On macOS a dotless `ı` is a letter of its own: APFS folds case as Unicode's case folding does,
+    // which leaves it (and makes `ß` `ss`, `ſ` `s`, as this does), where upper then lower case makes
+    // it an `i`, and `.quıllo` was refused as the program's `.quillo` (FEEDBACK85.md, Q-1340, found
+    // by the review of 0284f7c; branch feedback82-85). Windows' table makes it `I`, as this does.
+    #[cfg(target_os = "macos")]
+    if name.contains('\u{131}') {
+        return name.nfc().map(|c| if c == '\u{131}' { c.to_string() } else { c.to_uppercase().collect::<String>().to_lowercase() }).collect();
+    }
     name.nfc().collect::<String>().to_uppercase().to_lowercase()
 }
 
@@ -3152,9 +3164,15 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
     // feedback82-85). Quillo writes them itself, never through here. Looked for only where the
     // path, as it really is, has a `.quillo` in it, the target is a folder, or it has a second
     // name: a write of another file looks at nothing more.
-    let quillo = std::cell::OnceCell::new();
-    let quillo = || quillo.get_or_init(|| quillo_dirs(it, &loaded));
-    if folded_target.components().any(|c| c.as_os_str() == ".quillo") && quillo().iter().any(|q| folded_target.starts_with(sys(q))) {
+    // By where they really lead too (`quillo_guard`): a `.quillo` that is a link (`.quillo ->
+    // qstore`, or out of the folder into one `--allow-path` names) or holds one (`native ->
+    // ../../build-native`) was the program's only by the name `.quillo`, which the path as it
+    // really is no longer has, and an upload named `.quillo/plugins.lock` replaced the lock
+    // (FEEDBACK85.md, Q-1340, found by the review of 0284f7c; branch feedback82-85). Their names and
+    // what is in them are kept, looked at again once a second at most: a write of another file
+    // compares names in memory.
+    let guard = quillo_guard(it);
+    if guard.names.iter().any(|q| under(&folded_target, q)) {
         return Some(OWN_QUILLO);
     }
     let folded = fold_name(taken);
@@ -3169,24 +3187,24 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
     // One of them under another name: a second hard link writes into it (FEEDBACK55.md, Q-701;
     // branch feedback55).
     let mut a_folder = false;
-    let mut linked = None;
+    let mut there = false;
     for f in &both {
         if let Ok(m) = std::fs::metadata(f) {
             if let Some(why) = own_meta(&m) {
                 return Some(why);
             }
             a_folder |= m.is_dir();
-            #[cfg(unix)]
-            if m.is_file() && std::os::unix::fs::MetadataExt::nlink(&m) > 1 {
-                linked = crate::statics::id_of(&m);
+            there = true;
+            // A file or folder of a `.quillo` by another name: a second hard link, a bind mount.
+            if crate::statics::id_of(&m).is_some_and(|id| guard.ids.contains(&id)) {
+                return Some(OWN_QUILLO);
             }
         }
     }
-    // A second name of a file in a `.quillo` folder: looked for there, as few files are.
-    if let Some(id) = linked {
-        if quillo().iter().any(|q| holds_file(q, id, 8)) {
-            return Some(OWN_QUILLO);
-        }
+    // A file not made yet, in a folder of a `.quillo` by another name: its folder looked at, only
+    // where the program has a `.quillo`.
+    if !there && !guard.ids.is_empty() && real.parent().is_some_and(|d| guard.holds_folder(d)) {
+        return Some(OWN_QUILLO);
     }
     // A folder that holds one of its files, by the folders themselves (`statics::holds_any`): by
     // the names alone, `/System/Volumes/Data` (which only the long name names), `/.nofollow/...`
@@ -3196,7 +3214,7 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
     if a_folder && crate::statics::holds_any(&real, loaded.iter().cloned()) {
         return Some(OWN_SOURCE);
     }
-    if a_folder && (quillo().iter().any(|q| sys(q).starts_with(&folded_target)) || crate::statics::holds_any(&real, quillo().iter().cloned())) {
+    if a_folder && (guard.names.iter().any(|q| q.starts_with(&folded_target)) || crate::statics::holds_any(&real, guard.dirs.iter().cloned())) {
         return Some(OWN_QUILLO);
     }
     // What a path of the settings or the TLS key leads to now, by any name (FEEDBACK55.md, Q-701;
@@ -3262,13 +3280,130 @@ fn quillo_dirs(it: &Interp, loaded: &[std::path::PathBuf]) -> Vec<std::path::Pat
     out
 }
 
-/// Whether the file `id` is in the folder `dir`, `depth` folders down at most, no link followed.
-fn holds_file(dir: &Path, id: crate::statics::FileId, depth: u32) -> bool {
-    std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| match std::fs::symlink_metadata(e.path()) {
-        Ok(m) if m.is_dir() => depth > 0 && holds_file(&e.path(), id, depth - 1),
-        Ok(m) => crate::statics::id_of(&m) == Some(id),
-        Err(_) => false,
-    })
+/// The program's `.quillo` folders as they really are, for `own_file` and `own_inside`: `names`,
+/// folded and in the system's form, each as the program's files name it (there or not) and as it
+/// resolves, and where each link in it leads; `dirs`, those that are there, resolved; and `ids`,
+/// every folder and file in them by device and inode, so another name (a hard link, a bind mount)
+/// is theirs too (FEEDBACK85.md, Q-1340, found by the review of 0284f7c; branch feedback82-85).
+struct QuilloGuard {
+    loaded: usize,
+    count: usize,
+    base: Arc<Path>,
+    at: std::time::Instant,
+    names: Vec<std::path::PathBuf>,
+    dirs: Vec<std::path::PathBuf>,
+    ids: std::collections::HashSet<crate::statics::FileId>,
+    /// The folders new files were written in, and whether each is one of `ids`: looked at once
+    /// for the guard's second, as a program writes many files into few folders.
+    folders: std::sync::Mutex<Vec<(std::path::PathBuf, bool)>>,
+}
+
+impl QuilloGuard {
+    /// Whether the folder `d` (resolved) is one of the `.quillo` folders' by its device and inode.
+    fn holds_folder(&self, d: &Path) -> bool {
+        if let Some((_, is)) = self.folders.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(|(p, _)| p == d) {
+            return *is;
+        }
+        let is = std::fs::metadata(d).ok().and_then(|m| crate::statics::id_of(&m)).is_some_and(|id| self.ids.contains(&id));
+        let mut f = self.folders.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if f.len() >= 16 {
+            f.remove(0);
+        }
+        f.push((d.to_path_buf(), is));
+        is
+    }
+}
+
+/// Whether `p` is `root` or in it, both resolved paths of one form (no `.`, `..` or `//` in them):
+/// by their bytes, as `Path::starts_with` takes each part apart, which a write paid for each
+/// `.quillo` folder (FEEDBACK85.md, Q-1340, found by the review of 0284f7c; branch feedback82-85).
+fn under(p: &Path, root: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let (p, r) = (p.as_os_str().as_bytes(), root.as_os_str().as_bytes());
+        let r = r.strip_suffix(b"/").filter(|r| !r.is_empty()).unwrap_or(r);
+        p.starts_with(r) && (p.len() == r.len() || p[r.len()] == b'/' || r == b"/")
+    }
+    #[cfg(not(unix))]
+    p.starts_with(root)
+}
+
+/// `QuilloGuard` of the program `it` runs, kept for the files it loaded and its folder, and made
+/// anew once it is a second old: a few programs (mounted, services) each keep their own.
+fn quillo_guard(it: &Interp) -> Arc<QuilloGuard> {
+    static GUARDS: std::sync::Mutex<Vec<Arc<QuilloGuard>>> = std::sync::Mutex::new(Vec::new());
+    let (loaded, count) = (Arc::as_ptr(&it.loaded) as *const () as usize, it.loaded.len());
+    let fresh = |g: &&Arc<QuilloGuard>| g.loaded == loaded && g.count == count && *g.base == *it.base_dir && g.at.elapsed() < std::time::Duration::from_secs(1);
+    if let Some(g) = GUARDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(fresh) {
+        return g.clone();
+    }
+    // Looked at off the lock.
+    let fold = |p: &Path| std::path::PathBuf::from(fold_name(&crate::statics::sys_form_of(p).to_string_lossy()));
+    let files: Vec<std::path::PathBuf> = it.loaded.iter().cloned().collect();
+    let (mut names, mut dirs, mut ids) = (Vec::new(), Vec::new(), std::collections::HashSet::new());
+    // A link that leads to the program's folder or one above it (`native -> /`, `.quillo -> ..`)
+    // is no folder of Quillo's: taken, it would have every write refused, and the whole disk
+    // walked each second. Its name stays the program's. At most 4,096 entries are looked at.
+    let programs: Vec<std::path::PathBuf> = files.iter().filter_map(|f| f.parent()).chain(crate::statics::real_dir(&it.base_dir).as_deref()).map(fold).collect();
+    let holds_program = |r: &Path| {
+        let r = fold(r);
+        programs.iter().any(|p| under(p, &r))
+    };
+    let mut todo: Vec<(std::path::PathBuf, u32, bool)> = Vec::new();
+    for q in quillo_dirs(it, &files) {
+        names.push(fold(&q));
+        if let Ok(r) = q.canonicalize().map(crate::statics::sys_form) {
+            if !holds_program(&r) {
+                todo.push((r, 0, true));
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut looked = 0usize;
+    while let Some((d, depth, root)) = todo.pop() {
+        if depth > 4 || looked > 4096 || !seen.insert(d.clone()) {
+            continue;
+        }
+        if root {
+            let n = fold(&d);
+            if !names.contains(&n) {
+                names.push(n);
+            }
+            dirs.push(d.clone());
+        }
+        ids.extend(std::fs::metadata(&d).ok().and_then(|m| crate::statics::id_of(&m)));
+        for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            looked += 1;
+            let p = e.path();
+            let Ok(m) = std::fs::symlink_metadata(&p) else { continue };
+            if m.file_type().is_symlink() {
+                // Where a link in it leads is theirs too, as Quillo writes through it.
+                let Ok(r) = p.canonicalize().map(crate::statics::sys_form) else { continue };
+                match std::fs::metadata(&r) {
+                    Ok(t) if t.is_dir() && holds_program(&r) => {}
+                    Ok(t) if t.is_dir() => todo.push((r, depth + 1, true)),
+                    Ok(t) => {
+                        names.push(fold(&r));
+                        ids.extend(crate::statics::id_of(&t));
+                    }
+                    Err(_) => {}
+                }
+            } else if m.is_dir() {
+                todo.push((p, depth + 1, false));
+            } else {
+                ids.extend(crate::statics::id_of(&m));
+            }
+        }
+    }
+    let g = Arc::new(QuilloGuard { loaded, count, base: it.base_dir.clone(), at: std::time::Instant::now(), names, dirs, ids, folders: std::sync::Mutex::new(Vec::new()) });
+    let mut gs = GUARDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    gs.retain(|x| !(x.loaded == loaded && x.count == count && *x.base == *it.base_dir));
+    if gs.len() >= 8 {
+        gs.remove(0);
+    }
+    gs.push(g.clone());
+    g
 }
 
 /// Where `p` is: the nearest part of it that is there, as it really is, and the names after it,
@@ -3606,10 +3741,8 @@ fn own_inside(it: &Interp, dir: &Path) -> std::io::Result<Option<&'static str>> 
             }
         }
     }
-    for q in quillo_dirs(it, &loaded) {
-        if let Some(id) = std::fs::metadata(&q).ok().and_then(|m| crate::statics::id_of(&m)) {
-            kept.entry(id).or_insert(OWN_QUILLO);
-        }
+    for id in quillo_guard(it).ids.iter() {
+        kept.entry(*id).or_insert(OWN_QUILLO);
     }
     let named: Vec<(std::path::PathBuf, &'static str)> = own().named.iter().map(|(n, why)| (std::path::PathBuf::from(fold_name(&crate::statics::sys_form_of(n).to_string_lossy())), *why)).collect();
     let said = |why: &'static str| if why == crate::db::OPEN { "it holds the database the program has open" } else { why };
@@ -3683,6 +3816,13 @@ fn walk_kept(dir: &Path, real: &Path, kept: &std::collections::HashMap<crate::st
             // Looked at where it leads (a look, which opens nothing); a link that leads nowhere,
             // by its own name, as `--env-file`'s path is kept while nothing is there.
             if let Some(to) = look(fd, &name, true) {
+                // A link to a folder that holds the program's files (`/`, `..`) goes alone, but is
+                // refused, as naming it is, saying so: it said "it is one of the program's own
+                // files" (FEEDBACK85.md, Q-1340, found by the review of 0284f7c; branch
+                // feedback82-85).
+                if to.st_mode & libc::S_IFMT == libc::S_IFDIR && kept.contains_key(&id(&to)) {
+                    return Ok(Some(LINKED_FOLDER));
+                }
                 if let Some(why) = own(&to) {
                     return Ok(Some(why));
                 }
