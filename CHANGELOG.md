@@ -336,7 +336,12 @@ What a program may notice:
   (Q-1285; found by the review of e181c7e: assembly whose `!` a macro hands apart, a doc
   comment's `#` given to `[link(...)]`). `dotenvy_macro` is refused with the crates that
   build files in, and `<T>::` after a keyword, `<T<>>`, an impl's const generics and a
-  macro's `impl X for $t` read as `T`.
+  macro's `impl X for $t` read as `T`. The linker's command line is judged as given and its list
+  of files resolved through every link (a path that cannot be resolved refuses the build), the
+  library built or pinned by its own SHA-256 loads only the system's libraries (its install
+  names and DT_NEEDED), and the reach check runs both ways, the toolchain trusted for its
+  `lib/rustlib` only (found by the review of a86f326: a framework named by a path past 1024
+  bytes, lld's list written with `..` removed by text, a library loaded by its install name).
 - **What `quillo.confirmed` does not confirm** is an error at its line, and so is a name used
   from another file and not taken, under one (see Security).
 - **`"""` and `'''`** say that text over several lines is a backtick string (FEEDBACK85.md,

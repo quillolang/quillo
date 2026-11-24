@@ -845,13 +845,15 @@ fn a_doc_comments_hash_handed_to_a_macro_links_nothing_under_a_hold() {
     let d = dir("fix7-doc");
     write(&d, "x.py", "print('x')\n");
     let lib = "`link(name = ...)`, which a macro can make `#[link(...)]` of: a library the linker reads in";
+    // A `[link(` after a doc comment (fix round 8, which names it so).
+    let group = "`[link(...)]` where a doc comment or a macro gives it its `#`: a library the linker reads in";
     let instead = "take that library through a crate instead, and write each attribute out";
     let verbatim = format!("{}/libevil.a", d.display());
     let cases: Vec<(&str, String, &str, u32, &str)> = vec![
-        ("group", "macro_rules! m { ($h:tt $d:tt $b:tt) => { $h $b extern \"C\" { fn evil_f() -> i32; } } }\nm!(/// x\n[link(name = \"evil\", kind = \"static\")]);".to_string(), lib, 5, instead),
+        ("group", "macro_rules! m { ($h:tt $d:tt $b:tt) => { $h $b extern \"C\" { fn evil_f() -> i32; } } }\nm!(/// x\n[link(name = \"evil\", kind = \"static\")]);".to_string(), group, 5, instead),
         ("inner", "macro_rules! m { ($h:tt $d:tt $($a:tt)*) => { $h [ $($a)* ] extern \"C\" { fn evil_f() -> i32; } } }\nm!(/// x\nlink(name = \"evil\", kind = \"static\"));".to_string(), lib, 5, instead),
-        ("verbatim", format!("macro_rules! m {{ ($h:tt $d:tt $b:tt) => {{ $h $b extern \"C\" {{ fn evil_f() -> i32; }} }} }}\nm!(/// x\n[link(name = {:?}, kind = \"static\", modifiers = \"+verbatim\")]);", verbatim), lib, 5, instead),
-        ("kindfirst", "macro_rules! m { ($h:tt $d:tt $b:tt) => { $h $b extern \"C\" { fn evil_f() -> i32; } } }\nm!(/** x */ [link(kind = \"static\", name = \"evil\")]);".to_string(), lib, 4, instead),
+        ("verbatim", format!("macro_rules! m {{ ($h:tt $d:tt $b:tt) => {{ $h $b extern \"C\" {{ fn evil_f() -> i32; }} }} }}\nm!(/// x\n[link(name = {:?}, kind = \"static\", modifiers = \"+verbatim\")]);", verbatim), group, 5, instead),
+        ("kindfirst", "macro_rules! m { ($h:tt $d:tt $b:tt) => { $h $b extern \"C\" { fn evil_f() -> i32; } } }\nm!(/** x */ [link(kind = \"static\", name = \"evil\")]);".to_string(), group, 4, instead),
         ("visualizer", "macro_rules! m { ($h:tt $d:tt $b:tt) => { $h $b mod v {} } }\nm!(/// x\n[debugger_visualizer(gdb_script_file = \"x.py\")]);".to_string(), "`#[debugger_visualizer(...)]`, a file rustc reads in", 5, "leave the visualizer out"),
     ];
     for (name, code, why, line, instead) in &cases {
@@ -864,9 +866,10 @@ fn a_doc_comments_hash_handed_to_a_macro_links_nothing_under_a_hold() {
 /// A held program whose plugin's text the reading reads as nothing, but whose build assembles or
 /// links another file in, does not load: the pinned build is judged by its own crate's LLVM IR
 /// (`m!(! asm)` under `use core::arch::*;`, which the reading does not see, calls inline
-/// assembly) and on macOS by what its linker read (a framework named through `../` from the
+/// assembly) and on macOS by what its linker was given (a framework named through `../` from the
 /// SDK's folder, by a `#` and a name a macro is given, linked a library of the test's folder,
-/// which the built plugin would load). `quillo confirm --yes` confirms each, as the reading sees
+/// which the built plugin would load; since fix round 8 refused by the linker's command line,
+/// before its list). `quillo confirm --yes` confirms each, as the reading sees
 /// nothing; the start says why it does not load, nothing is kept in `.quillo/native`, and the
 /// plugin's code never runs (src/native.rs build_private, assembled_in, linked_in, FEEDBACK83.md
 /// Q-1305, found by the coverage tests; branch feedback82-85).
@@ -886,7 +889,8 @@ fn a_held_build_is_judged_by_what_its_assembler_and_linker_read() {
         assert_eq!(ended(&mut cc, 120), Some(0));
         let name = format!("{}{}", "../".repeat(40), lib.display().to_string().trim_start_matches('/'));
         let src = plugin(&format!("macro_rules! m {{ ($h:tt $a:ident $n:literal $k:literal) => {{ $h [ $a (name = $n, kind = $k) ] extern \"C\" {{ fn evil_f() -> i32; }} }} }}\nm!(# link {:?} \"framework\");\npub fn hi() -> String {{ unsafe {{ evil_f() }}.to_string() }}", name));
-        cases.push(("link", src, "and its linker read ".to_string(), format!("{}, which is not the build's own, the Rust toolchain's or the system's, and which that hash does not cover: it does not load, and what was built is not kept (link only the system's libraries and what its crates build)", name.rsplit("../").next().unwrap())));
+        // Refused by the linker's command line, before its list (fix round 8, which judges it).
+        cases.push(("link", src, "and its linker was given the framework `".to_string(), format!("{}`, named by a path, which that hash does not cover: it does not load, and what was built is not kept (link only the system's libraries and what its crates build)", name)));
     }
     for (name, src, before, after) in &cases {
         write(&d, "hi.qwer", src);
@@ -903,8 +907,10 @@ fn a_held_build_is_judged_by_what_its_assembler_and_linker_read() {
 }
 
 /// The linker's list is judged file by file: the build's own objects, the toolchain's rlibs (its
-/// sysroot, as `rustc --print sysroot` says) and the system's files (root's, that no one else may
-/// write: `/bin/sh`) pass; a library of the test's folder, by its name or through `../` from a
+/// lib/rustlib, as `rustc --print sysroot` says) and a file of the system's library folders (root's,
+/// that no one else may write) pass; `/bin/sh`, root's but in no library folder, does not (fix round
+/// 8, which trusts the library folders and lib/rustlib, not all that is root's nor the whole
+/// sysroot); a library of the test's folder, by its name or through `../` from a
 /// system folder, is the one named; a list with nothing read in it is refused; a file looked for
 /// and not found, the output and the linker's version are not files read (macOS's records; Linux's
 /// make rule with `\` lines and `\ ` spaces) (src/native.rs linked_from, FEEDBACK83.md Q-1305, found
@@ -941,9 +947,11 @@ fn the_linkers_list_is_judged_file_by_file() {
             t.into_bytes()
         }
     };
-    let judged = |read: &[&Path]| quillo::native::linked_from(&list(read), &crate_dir, &target);
-    assert_eq!(judged(&[&own, &rlib, Path::new("/bin/sh")]), Ok(None));
-    assert_eq!(judged(&[&own, &rlib, &evil, Path::new("/bin/sh")]), Ok(Some(evil.clone())));
+    let judged = |read: &[&Path]| quillo::native::linked_judged(&list(read), &crate_dir, &target);
+    let system = system_library();
+    assert_eq!(judged(&[&own, &rlib, &system]), Ok(None));
+    assert_eq!(judged(&[&own, &rlib, &evil, &system]), Ok(Some(evil.clone())));
+    assert_eq!(judged(&[&own, Path::new("/bin/sh")]), Ok(Some(PathBuf::from("/bin/sh"))));
     assert_eq!(judged(&[&own, &through]), Ok(Some(through.clone())));
     assert_eq!(judged(&[Path::new("lib.rs")]), Ok(Some(crate_dir.join("lib.rs"))), "a relative name is from the crate's folder, which is not the build's target");
     assert!(judged(&[]).is_err());
@@ -1042,4 +1050,273 @@ fn attribute_forwarding_and_a_hash_in_a_macros_input_are_confirmed() {
         let src = plugin(code);
         assert_eq!(quillo::confirm::built_in_refused("hi.qwer", &src, true), Some(format!("hi.qwer builds another file into it ({} at line {}), which the SHA-256 its source is held to would not cover, so it does not load (take that library through a crate instead, and write each attribute out)", why, line)), "{}", name);
     }
+}
+
+// Fix round 8
+
+/// A file of the system's library folders, root's alone: on macOS `/usr/lib/dyld`, elsewhere the
+/// first such regular file in `/usr/lib` or a folder of it.
+#[cfg(unix)]
+fn system_library() -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let ok = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.is_file() && m.uid() == 0 && m.mode() & 0o022 == 0);
+    for d in ["/usr/lib", "/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64"] {
+        for e in std::fs::read_dir(d).into_iter().flatten().flatten() {
+            if ok(&e.path()) {
+                return e.path().canonicalize().unwrap();
+            }
+        }
+    }
+    panic!("no file of the system's library folders here");
+}
+
+/// `[link(` is refused where an attribute can be, after a doc comment or what a macro hands in
+/// (`$h [link(kind = .., name = ..)]` with `m!(#)`), and not in an array of calls of the plugin's
+/// own `link` (`vec![link("/a"), link("/b")]`), which was refused, said as `link(name = ...)`
+/// (src/confirm.rs builds_in, FEEDBACK83.md Q-1305, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn a_call_of_a_function_named_link_in_an_array_is_confirmed() {
+    let d = dir("fix8-link");
+    let fine = "pub fn link(p: &str) -> String { p.to_string() }\npub fn hi() -> String { vec![link(\"/a\"), link(\"/b\")].join(\",\") }\npub fn two() -> [String; 1] { [link(\"/c\")] }";
+    assert!(rustc_compiles(&d, "fine", fine));
+    let (code, out) = confirm_plugin(&d, fine);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(read(&d.join("quillo.confirmed")).contains("[\"hi.qwer\"]\nsha256 = "));
+    let given = "macro_rules! m { ($h:tt) => { $h [link(kind = \"static\", name = \"evil\")] extern \"C\" { fn f(); } } }\nm!(#);";
+    assert!(rustc_compiles(&d, "given", given));
+    assert_eq!(confirm_plugin(&d, given), (Some(1), built_in_said("`[link(...)]` where a doc comment or a macro gives it its `#`: a library the linker reads in", 3, "take that library through a crate instead, and write each attribute out")));
+}
+
+/// The linker's command line, as `--print link-args` prints it, is judged as it was given: what
+/// rustc gives it of the build's own folder, the toolchain's lib/rustlib and the system's (its
+/// objects, `-L`, `-lSystem`, `-o`, `-Wl,-Bstatic`, a temporary list gone after the link, a crate
+/// named `plugin`) passes; a search folder elsewhere (`-L /opt/evil`), a path with `..`
+/// (`-l:<t>/S/../../../bin/sh`, which lld lists as `/bin/sh`), a library elsewhere in `-Wl,` and
+/// past `-Xlinker`, a framework named by a path, a link inside the folder that leads out of it, an
+/// `-rpath` and a linker plugin are each refused, named; nothing printed is refused. `env -u`, the
+/// variables set and the quoted words are read as rustc writes them (src/native.rs
+/// link_args_refused, printed_args, FEEDBACK83.md Q-1305, found by the coverage tests; branch
+/// feedback82-85).
+#[cfg(unix)]
+#[test]
+fn the_linkers_command_line_is_judged_as_it_was_given() {
+    let d = dir("fix8-args");
+    write(&d, "t/release/deps/x.o", "");
+    write(&d, "rl/lib/libstd.rlib", "");
+    std::fs::create_dir_all(d.join("crate")).unwrap();
+    std::os::unix::fs::symlink("/etc", d.join("t/out")).unwrap();
+    let (t, rl) = (d.join("t").canonicalize().unwrap(), d.join("rl").canonicalize().unwrap());
+    let ok = |p: &Path| p.starts_with(&t) || p.starts_with(&rl);
+    let q = |a: &[String]| a.iter().map(|w| format!("{:?}", w)).collect::<Vec<_>>().join(" ");
+    let line = |extra: &[String]| format!("env -u IPHONEOS_DEPLOYMENT_TARGET LC_ALL=\"C\" PATH=\"/opt/evil/bin:/usr/bin\" VSLANG=\"1033\" \"cc\" {}", q(&[&[format!("{}/release/deps/x.o", t.display()), "-L".into(), format!("{}/lib", rl.display()), "-lSystem".into(), "-lc".into(), "-arch".into(), "arm64".into(), "-mmacosx-version-min=11.0.0".into(), "-o".into(), format!("{}/release/deps/libquillo_plugin_x_pinned.dylib", t.display()), "-Wl,-dead_strip".into(), "-Wl,-Bstatic".into(), format!("-Wl,--version-script={}/release/deps/rustcX1/list", t.display()), format!("{}/release/deps/quillo_plugin_x_pinned.o", t.display())], extra].concat()));
+    let judged = |extra: &[&str]| quillo::native::link_args_refused(&line(&extra.iter().map(|s| s.to_string()).collect::<Vec<_>>()), &d.join("crate"), &ok);
+    assert_eq!(judged(&[]), None);
+    assert_eq!(quillo::native::printed_args("env -u A -u B X=\"1 2\" \"cc\" \"-L\" \"/a b\" \"-x\\\"y\""), vec!["cc", "-L", "/a b", "-x\"y"]);
+    let t_ = t.display().to_string();
+    for (extra, said) in [
+        (vec!["-L", "/opt/evil"], "`/opt/evil`"),
+        (vec!["-L/opt/evil"], "`/opt/evil`"),
+        (vec![&format!("-l:{}/S/../../../bin/sh", t_) as &str], "a path with `..`"),
+        (vec!["-Wl,-force_load,/opt/evil/libx.a"], "`/opt/evil/libx.a`"),
+        (vec!["-Xlinker", "/opt/evil/libx.a"], "`/opt/evil/libx.a`"),
+        (vec!["-framework", "../../../x/E"], "the framework `../../../x/E`, named by a path"),
+        (vec![&format!("{}/out/passwd", t_) as &str], "/etc/passwd"),
+        (vec!["-Xlinker", "-rpath", "-Xlinker", "/opt/x"], "`-rpath`"),
+        (vec!["-Wl,-plugin=/opt/x.so"], "`-plugin=/opt/x.so`"),
+        (vec!["-B/opt/evil/bin"], "`/opt/evil/bin`"),
+    ] {
+        let why = judged(&extra).unwrap_or_else(|| panic!("{:?} passed", extra));
+        assert!(why.contains(said), "{:?}: {}", extra, why);
+    }
+    assert_eq!(quillo::native::link_args_refused("", &d.join("crate"), &ok), Some("rustc printed no linker command for it".to_string()));
+}
+
+/// lld's and GNU ld's `--dependency-file` is read as they write it: a space as `\ `, a `#` as
+/// `\#`, a `$` as `$$`, names over lines ended by ` \`, the output first and a rule of each name
+/// after, each name once; and a failed build's log is known for a linker that does not take
+/// `--dependency-file` (GNU ld before 2.35, lld's own words), not for another error (src/native.rs
+/// dep_file_inputs, linker_lists_not, FEEDBACK83.md Q-1305, found by the coverage tests; branch
+/// feedback82-85).
+#[test]
+fn a_dependency_file_is_read_as_lld_writes_it() {
+    let text = "/t/lib.so: \\\n /a/b\\ c.o \\\n /x/\\#y.a \\\n /p/$$q.rlib \\\n /plain.o\n\n/a/b\\ c.o:\n\n/x/\\#y.a:\n\n/p/$$q.rlib:\n\n/plain.o:\n";
+    assert_eq!(quillo::native::dep_file_inputs(text), vec!["/a/b c.o", "/x/#y.a", "/p/$q.rlib", "/plain.o"]);
+    assert_eq!(quillo::native::dep_file_inputs("/t/lib.so:\r\n"), Vec::<String>::new());
+    let gnu = "error: linking with `cc` failed: exit status: 1\n  = note: /usr/bin/ld: unrecognized option '--dependency-file=/t/linked.list'\n          /usr/bin/ld: use the --help option for usage information";
+    assert_eq!(quillo::native::linker_lists_not(gnu), Some("  = note: /usr/bin/ld: unrecognized option '--dependency-file=/t/linked.list'"));
+    assert!(quillo::native::linker_lists_not("ld.lld: error: unknown argument '--dependency-file=/t/x'").is_some());
+    assert_eq!(quillo::native::linker_lists_not("error: linking with `cc` failed\n  = note: ld: library 'evil' not found"), None);
+}
+
+/// A Mach-O image of these load commands (`(cmd, name)`), 64 bits, little-endian.
+fn macho(cmds: &[(u32, &str)]) -> Vec<u8> {
+    let mut lc = Vec::new();
+    for (cmd, name) in cmds {
+        let fixed = if *cmd == 0x8000_001c { 12 } else { 24 };
+        let size = (fixed + name.len() + 1 + 7) & !7;
+        lc.extend_from_slice(&cmd.to_le_bytes());
+        lc.extend_from_slice(&(size as u32).to_le_bytes());
+        lc.extend_from_slice(&(fixed as u32).to_le_bytes());
+        lc.resize(lc.len() + fixed - 12, 0);
+        lc.extend_from_slice(name.as_bytes());
+        lc.resize(lc.len() + size - fixed - name.len(), 0);
+    }
+    let mut b = vec![0xcf, 0xfa, 0xed, 0xfe];
+    for v in [0x0100_000cu32, 0, 6, cmds.len() as u32, lc.len() as u32, 0, 0] {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+    b.extend(lc);
+    b
+}
+
+/// An ELF image, 64 bits, little-endian, that needs `needed` and has a `DT_RUNPATH` if given.
+fn elf(needed: &[&str], runpath: Option<&str>) -> Vec<u8> {
+    let mut strtab = vec![0u8];
+    let mut offs = Vec::new();
+    for n in needed.iter().chain(runpath.iter()) {
+        offs.push(strtab.len() as u64);
+        strtab.extend_from_slice(n.as_bytes());
+        strtab.push(0);
+    }
+    let str_at = 64 + 2 * 56;
+    let dyn_at = (str_at + strtab.len() + 7) & !7;
+    let mut dynamic = Vec::new();
+    let mut entry = |t: u64, v: u64| {
+        dynamic.extend_from_slice(&t.to_le_bytes());
+        dynamic.extend_from_slice(&v.to_le_bytes());
+    };
+    for o in &offs[..needed.len()] {
+        entry(1, *o);
+    }
+    if runpath.is_some() {
+        entry(29, offs[needed.len()]);
+    }
+    entry(5, str_at as u64);
+    entry(0, 0);
+    let total = dyn_at + dynamic.len();
+    let mut b = vec![0u8; 64];
+    b[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    b[16..18].copy_from_slice(&3u16.to_le_bytes());
+    b[18..20].copy_from_slice(&62u16.to_le_bytes());
+    b[20..24].copy_from_slice(&1u32.to_le_bytes());
+    b[32..40].copy_from_slice(&64u64.to_le_bytes());
+    b[52..54].copy_from_slice(&64u16.to_le_bytes());
+    b[54..56].copy_from_slice(&56u16.to_le_bytes());
+    b[56..58].copy_from_slice(&2u16.to_le_bytes());
+    for (kind, off, size) in [(1u32, 0u64, total as u64), (2, dyn_at as u64, dynamic.len() as u64)] {
+        let mut h = vec![0u8; 56];
+        h[..4].copy_from_slice(&kind.to_le_bytes());
+        h[8..16].copy_from_slice(&off.to_le_bytes());
+        h[16..24].copy_from_slice(&off.to_le_bytes());
+        h[32..40].copy_from_slice(&size.to_le_bytes());
+        h[40..48].copy_from_slice(&size.to_le_bytes());
+        b.extend(h);
+    }
+    b.extend(strtab);
+    b.resize(dyn_at, 0);
+    b.extend(dynamic);
+    b
+}
+
+/// What a library has the system's loader load is judged: Mach-O (thin and fat) loads only the
+/// system's (`/usr/lib/`, `/System/Library/`), by its install name, with no `LC_RPATH`, `@rpath`
+/// or `..`; ELF needs only the C runtime's (libc, libgcc_s, the dynamic loader), by name, with no
+/// `DT_RUNPATH`; bytes that are no library are refused. And a library this machine linked, that
+/// loads one of the test's folder by its install name, is refused with its name (src/native.rs
+/// loads_refused, FEEDBACK83.md Q-1305, found by the coverage tests; branch feedback82-85).
+#[test]
+fn what_a_library_loads_is_the_systems_alone() {
+    let sys = (0xc, "/usr/lib/libSystem.B.dylib");
+    assert_eq!(quillo::native::loads_refused(&macho(&[sys, (0xc, "/System/Library/Frameworks/Security.framework/Versions/A/Security")])), None);
+    for (cmds, said) in [
+        (vec![sys, (0xc, "/tmp/x/libE.dylib")], "loads /tmp/x/libE.dylib by its install name, which is not the system's"),
+        (vec![sys, (0x8000_0018, "@rpath/libE.dylib")], "loads @rpath/libE.dylib by its install name"),
+        (vec![(0xc, "/usr/lib/../../tmp/libE.dylib")], "loads /usr/lib/../../tmp/libE.dylib"),
+        (vec![sys, (0x8000_001c, "/tmp/x")], "has an LC_RPATH (/tmp/x)"),
+    ] {
+        let why = quillo::native::loads_refused(&macho(&cmds)).unwrap_or_else(|| panic!("{:?} passed", cmds));
+        assert!(why.starts_with(said), "{:?}: {}", cmds, why);
+    }
+    // A fat library, its one slice the one that loads another.
+    let slice = macho(&[sys, (0xc, "/tmp/x/libE.dylib")]);
+    let mut fat = vec![0xca, 0xfe, 0xba, 0xbe, 0, 0, 0, 1];
+    for v in [0x0100_000cu32, 0, 64, slice.len() as u32, 3] {
+        fat.extend_from_slice(&v.to_be_bytes());
+    }
+    fat.resize(64, 0);
+    fat.extend(&slice);
+    assert!(quillo::native::loads_refused(&fat).is_some_and(|w| w.starts_with("loads /tmp/x/libE.dylib")));
+    assert_eq!(quillo::native::loads_refused(&elf(&["libc.so.6", "libgcc_s.so.1", "ld-linux-x86-64.so.2", "libm.so.6"], None)), None);
+    assert_eq!(quillo::native::loads_refused(&elf(&["libc.so.6", "libssl.so.3"], None)), Some("needs libssl.so.3, which is not the C runtime's".to_string()));
+    assert_eq!(quillo::native::loads_refused(&elf(&["/opt/x/libc.so.6"], None)), Some("needs /opt/x/libc.so.6, which is not the C runtime's".to_string()));
+    assert_eq!(quillo::native::loads_refused(&elf(&["libc.so.6"], Some("$ORIGIN/../lib"))), Some("has a DT_RUNPATH ($ORIGIN/../lib), where the loader looks for libraries".to_string()));
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        assert_eq!(quillo::native::loads_refused(b"not a library"), Some("cannot be read as a library".to_string()));
+        assert_eq!(quillo::native::loads_refused(&macho(&[sys])[..40]), Some("cannot be read as a library".to_string()));
+    }
+}
+
+/// The repro of the review of a86f326: a held plugin that links, by a `#` and a name a macro is
+/// given, a framework named through `../` from the SDK's folder to a library of the program's
+/// folder, whose install name is another file there (`rt/libE.dylib`), which the system's loader
+/// would load and whose code (31337) a change there would replace under the same SHA-256. The
+/// reading confirms it; the start is refused by the linker's command line (the framework named by
+/// a path), nothing is kept, and 31337 never prints (src/native.rs link_args_refused,
+/// resolved_strict, FEEDBACK83.md Q-1305, found by the coverage tests; branch feedback82-85).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_held_plugin_that_links_a_framework_by_a_path_does_not_load() {
+    let d = dir("fix8-framework");
+    write(&d, "main.qwe", "use \"hi.qwer\"\nprint(hi())\n");
+    write(&d, "w/s/e.c", "int evil_f(void) { return 31337; }\n");
+    write(&d, "w/s/E.framework/keep", "");
+    std::fs::create_dir_all(d.join("rt")).unwrap();
+    let (lib, rt) = (d.join("w/s/E"), d.join("rt/libE.dylib"));
+    for out in [&lib, &rt] {
+        let mut cc = Command::new("cc").args(["-dynamiclib", "-o"]).arg(out).arg(d.join("w/s/e.c")).arg("-install_name").arg(&rt).stdin(Stdio::null()).spawn().unwrap();
+        assert_eq!(ended(&mut cc, 120), Some(0));
+    }
+    let name = format!("{}{}", "../".repeat(40), lib.display().to_string().trim_start_matches('/'));
+    write(&d, "hi.qwer", &plugin(&format!("macro_rules! m {{ ($h:tt $a:ident $n:literal $k:literal) => {{ $h [ $a (name = $n, kind = $k) ] extern \"C\" {{ fn evil_f() -> i32; }} }} }}\nm!(# link {:?} \"framework\");\npub fn hi() -> String {{ unsafe {{ evil_f() }}.to_string() }}", name)));
+    let (code, out) = quillo(&d, &["confirm", "--yes"]);
+    assert_eq!(code, Some(0), "the reading refused it: {}", out);
+    let (code, out) = quillo(&d, &["run", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains(&format!("hi.qwer is held to its SHA-256, and its linker was given the framework `{}`, named by a path, which that hash does not cover: it does not load, and what was built is not kept", name)), "{}", out);
+    assert!(!out.contains("31337"), "{}", out);
+    assert_eq!(std::fs::read_dir(d.join(".quillo/native")).map(|r| r.count()).unwrap_or(0), 0);
+}
+
+/// A library pinned by its own SHA-256 (a provider's `QUILLO_POLICY_PATH` layer) in
+/// `.quillo/native`, which loads a library of the program's folder by its install name, does not
+/// load: its hash covers it, not what the system's loader loads for it (src/native.rs use_file,
+/// loads_refused, FEEDBACK83.md Q-1305, found by the coverage tests; branch feedback82-85).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_library_pinned_by_its_hash_that_loads_another_by_its_install_name_does_not_load() {
+    let d = dir("fix8-libpin");
+    write(&d, "main.qwe", "use \"hi.qwer\"\nprint(hi())\n");
+    write(&d, "hi.qwer", &plugin("pub fn hi() -> String { \"hi\".into() }"));
+    write(&d, "rt/e.c", "int evil_f(void) { return 31337; }\n");
+    write(&d, "rt/x.c", "extern int evil_f(void);\nint quillo_native_abi(void) { return evil_f(); }\n");
+    let rt = d.join("rt/libE.dylib");
+    let mut cc = Command::new("cc").args(["-dynamiclib", "-o"]).arg(&rt).arg(d.join("rt/e.c")).arg("-install_name").arg(&rt).stdin(Stdio::null()).spawn().unwrap();
+    assert_eq!(ended(&mut cc, 120), Some(0));
+    let lib = quillo::native::library_path(&d.join("hi.qwer")).unwrap();
+    std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+    let mut cc = Command::new("cc").args(["-dynamiclib", "-o"]).arg(&lib).arg(d.join("rt/x.c")).arg(&rt).stdin(Stdio::null()).spawn().unwrap();
+    assert_eq!(ended(&mut cc, 120), Some(0));
+    let bytes = std::fs::read(&lib).unwrap();
+    let lib_hash: String = { use sha2::Digest; sha2::Sha256::digest(&bytes).iter().map(|x| format!("{:02x}", x)).collect() };
+    write(&d, "pin.toml", &format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", lib_hash));
+    let mut c = quillo_cmd(&d, &["run", "main.qwe"]);
+    let log = d.join("pin.log");
+    let file = std::fs::File::create(&log).unwrap();
+    let mut child = c.env("QUILLO_POLICY_PATH", d.join("pin.toml")).stdout(file.try_clone().unwrap()).stderr(file).spawn().unwrap();
+    let code = ended(&mut child, 120);
+    let out = read(&log);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("hi.qwer is held to its SHA-256, and its library ") && out.contains(&format!(" loads {} by its install name, which is not the system's (/usr/lib, /System/Library), which that hash does not cover: it does not load", rt.display())), "{}", out);
+    assert!(!out.contains("31337"), "{}", out);
 }

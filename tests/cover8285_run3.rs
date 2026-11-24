@@ -1077,3 +1077,71 @@ fn a_tree_deeper_than_a_path_is_long_is_judged_and_deleted() {
     assert_eq!((code, out.as_str()), (Some(0), "false\nerr(\"delete_file: will not delete deep2: it is one of the program's own files\")\n"));
     assert!(!app.join("deep").exists() && app.join("deep2").exists() && app.join("main.qwe").exists());
 }
+
+// Fix round 8 (F3)
+
+/// A pinned build is refused where a folder the program can reach is inside what the build runs
+/// or reads, not only where one holds it: `--allow-path` of the cargo home's `registry` (the
+/// sources the build compiles), of rustup's home's `toolchains`, and of a folder inside one of its
+/// PATH's. The start says which, the folder inside it, and to pin the library instead; nothing is
+/// built (src/native.rs toolchain_reached, FEEDBACK82.md Q-1285, found by the coverage tests;
+/// branch feedback82-85).
+#[cfg(unix)]
+#[test]
+fn a_pinned_build_is_refused_a_folder_the_program_reaches_inside_its_toolchain() {
+    use sha2::Digest;
+    let d = Dir(support::temp_dir("cov8285r3-pin-inside").canonicalize().unwrap());
+    let (app, tmp, ch, rh, bin) = (d.0.join("app"), d.0.join("tmp"), d.0.join("cargo-home"), d.0.join("rustup-home"), d.0.join("bin"));
+    for f in [&app, &tmp, &ch.join("registry/src"), &rh.join("toolchains"), &bin.join("sub")] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    let src = "//! version: 1.0.0\n//! effects: none\npub fn hi() -> String { \"from the pin\".into() }\n";
+    std::fs::write(app.join("hi.qwer"), src).unwrap();
+    std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let hash: String = sha2::Sha256::digest(src.as_bytes()).iter().map(|b| format!("{:02x}", b)).collect();
+    std::fs::write(app.join("pin.toml"), format!("[plugins]\nallow = [\"hi@sha256:{}\"]\n", hash)).unwrap();
+    let (t, record) = (tmp.display().to_string(), d.0.join("record").display().to_string());
+    let path = format!("{}:{}", std::env::var("PATH").unwrap_or_default(), bin.display());
+    let cases = [
+        ("its cargo home (CARGO_HOME)", ch.join("registry"), vec![("CARGO_HOME", ch.display().to_string())]),
+        ("rustup's home (RUSTUP_HOME)", rh.join("toolchains"), vec![("RUSTUP_HOME", rh.display().to_string())]),
+        ("a folder of its PATH, whose programs it runs", bin.join("sub"), vec![("PATH", path.clone())]),
+    ];
+    for (what, inside, vars) in &cases {
+        let i = inside.display().to_string();
+        let mut all = vec![("TMPDIR", t.clone()), ("QUILLO_BUILT_RECORD_DIR", record.clone())];
+        all.extend(vars.iter().map(|(k, v)| (*k, v.clone())));
+        let all: Vec<(&str, &str)> = all.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check", "--policy", "pin.toml", "--allow-path", &i], &all, &d.0.join("run.log"), 120);
+        assert_eq!(code, Some(1), "{}: {}", what, out);
+        assert!(
+            out.contains(&format!("and the build would use {}, ", what)) && out.contains(&format!(", which holds {}, which the program can reach and so could steer what is built: it does not load (have the policy pin its library by its own SHA-256 instead", i)),
+            "{}: {}",
+            what,
+            out
+        );
+        assert!(!out.contains("building ") && !out.contains("from the pin"), "{}: {}", what, out);
+        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0, "{}: a private folder was made", what);
+    }
+}
+
+/// `files()` serving a journal's name (`q-wal`) whose database's name is a FIFO answers at once:
+/// judged a SQLite journal by `q`'s first bytes, it opened the FIFO and waited for a writer, and
+/// the request with it, for ever; the next request was answered (src/builtins.rs sqlite_journal,
+/// FEEDBACK85.md Q-1340, found by the review of b7f7c26; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn files_never_waits_on_a_fifo_beside_a_journals_name() {
+    let d = Dir(support::temp_dir("cov8285r3-fifo-serve").canonicalize().unwrap());
+    let app = d.0.join("app");
+    std::fs::create_dir_all(app.join("public")).unwrap();
+    assert!(Command::new("mkfifo").arg(app.join("public/q")).status().unwrap().success());
+    std::fs::write(app.join("public/q-wal"), "j").unwrap();
+    std::fs::write(app.join("main.qwe"), "route GET /s/*path = files(\"public\", path)\nroute GET /ping = \"pong\"\n").unwrap();
+    let (g, port) = serve_at(&app, &["main.qwe"], &d.0.join("a.log"));
+    let started = Instant::now();
+    let a = send(port, "GET", "/s/q-wal", &[], "");
+    assert_eq!((a.status, a.body.as_str()), (200, "j"), "after {:?}", started.elapsed());
+    assert_eq!(send(port, "GET", "/ping", &[], "").body, "pong");
+    drop(g);
+}

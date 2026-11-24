@@ -2021,7 +2021,9 @@ fn toolchain_reached(qwer: &Path) -> Result<(), String> {
         ("rustup's home (RUSTUP_HOME)", real("RUSTUP_HOME").or_else(|| home.as_ref().map(|h| h.join(".rustup")))),
         ("the cargo it runs", Some(cargo.clone()).filter(|c| c.is_absolute())),
         ("the rustc beside that cargo", Some(rustc).filter(|c| c.is_absolute())),
-        ("the Rust toolchain's sysroot", toolchain_sysroot()),
+        // Its lib/rustlib, which the build trusts (`Trusted`), not the whole sysroot: a
+        // distribution's Rust has `/usr` (found by the review of a86f326).
+        ("the Rust toolchain's lib/rustlib", toolchain_sysroot().map(|s| s.join("lib").join("rustlib"))),
     ];
     // And each folder of its PATH, whose programs it runs: rustc's linker `cc`, and what a
     // dependency's build script runs (found getting round this check; FEEDBACK82.md, Q-1285;
@@ -2050,6 +2052,18 @@ fn toolchain_reached(qwer: &Path) -> Result<(), String> {
         if let Some(r) = reached(&full, &reach) {
             return Err(format!(
                 "{} is held to its source's SHA-256 and built here, and the build would use {}, {}, which is inside {}, which the program can reach and so could steer what is built: it does not load (have the policy pin its library by its own SHA-256 instead, as .quillo/plugins.lock has it)",
+                qwer.display(),
+                what,
+                p.display(),
+                r.display()
+            ));
+        }
+        // And the other way: a folder the program reaches inside it, `--allow-path
+        // ~/.cargo/registry`, whose sources the build compiles (FEEDBACK82.md, Q-1285, found by
+        // the review of a86f326; branch feedback82-85).
+        if let Some((r, _)) = reach.iter().find(|(r, _)| crate::statics::holds(&full, r)) {
+            return Err(format!(
+                "{} is held to its source's SHA-256 and built here, and the build would use {}, {}, which holds {}, which the program can reach and so could steer what is built: it does not load (have the policy pin its library by its own SHA-256 instead, as .quillo/plugins.lock has it)",
                 qwer.display(),
                 what,
                 p.display(),
@@ -2206,7 +2220,11 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         // file it reads (`judged_args`), so the build is judged where the assembler and the linker
         // act, as `read_in` judges it where rustc reads (FEEDBACK83.md, Q-1305, found by the
         // review of e181c7e; branch feedback82-85).
-        let list = dir.join("linked.list");
+        // In the target, among what the linker may write (`link_args_refused` judges its name).
+        let list = target.join("linked.list");
+        if let Some(line) = NO_LINK_LIST.get() {
+            return Err(no_link_list(qwer, line));
+        }
         let out = cmd
             .args(["rustc", "--release", "--lib", "--message-format=short", "--manifest-path"])
             .arg(crate_dir.join("Cargo.toml"))
@@ -2218,6 +2236,13 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
             .map_err(|e| format!("cannot build {}: cargo did not run ({})", qwer.display(), e))?;
         if !out.status.success() {
             let log = String::from_utf8_lossy(&out.stderr);
+            // A linker that does not list what it reads (`judged_args`): said so, once a run, and
+            // the build is refused (FEEDBACK83.md, Q-1305, found by the review of a86f326; branch
+            // feedback82-85).
+            if let Some(line) = linker_lists_not(&log).filter(|_| cfg!(target_os = "linux")) {
+                let line = NO_LINK_LIST.get_or_init(|| line.trim().to_string());
+                return Err(no_link_list(qwer, line));
+            }
             let errors: Vec<&str> = log.lines().filter(|l| !l.trim_start().starts_with("Compiling") && !l.trim_start().starts_with("Updating") && !l.trim_start().starts_with("Locking")).collect();
             return Err(format!("cannot build {}:\n{}", qwer.display(), errors.join("\n")));
         }
@@ -2242,6 +2267,21 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
                 crate::confirm::escaped(&line)
             ));
         }
+        // Nor a linker's command line that names a library, a search folder or a file elsewhere
+        // than the build's own folder, the Rust toolchain's lib/rustlib or the system's library
+        // folders, or names one with `..` (`link_args_refused`), judged as it was given: lld lists
+        // what it read with `..` taken out by its text (FEEDBACK83.md, Q-1305, found by the review
+        // of a86f326; branch feedback82-85).
+        let trusted = Trusted::of(&target);
+        let printed = String::from_utf8_lossy(&out.stdout);
+        let line = printed.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+        if let Some(why) = link_args_refused(line, &crate_dir, &|p: &Path| trusted.may_read(p)) {
+            return Err(format!(
+                "{} is held to its SHA-256, and its linker was given {}, which that hash does not cover: it does not load, and what was built is not kept (link only the system's libraries and what its crates build)",
+                qwer.display(),
+                why
+            ));
+        }
         // Nor a library or an object file the linker read from elsewhere than the build's own
         // folder, the Rust toolchain or the system: `m!(/// x\n[link(name = "evil", kind =
         // "static")])`, a doc comment's `#` handed to a macro, linked libevil.a.
@@ -2255,6 +2295,11 @@ fn build_private(qwer: &Path) -> Result<(PathBuf, Parsed), String> {
         let built = target.join("release").join(format!("{}{}.{}", std::env::consts::DLL_PREFIX, crate_name, std::env::consts::DLL_EXTENSION));
         let lib = dir.join(format!("{}{}-{}.{}", std::env::consts::DLL_PREFIX, lib_stem(qwer), &hash[..16], std::env::consts::DLL_EXTENSION));
         let built_bytes = std::fs::read(&built).map_err(|e| format!("cannot read {}: {}", built.display(), e))?;
+        // Nor a library that has the system's loader load another one than the system's
+        // (`loads_refused`): what was linked is judged, and what the library loads by name too.
+        if let Some(why) = loads_refused(&built_bytes) {
+            return Err(format!("{} is held to its SHA-256, and its library {}, which that hash does not cover: it does not load, and what was built is not kept (link only the system's libraries)", qwer.display(), why));
+        }
         write(&lib, &built_bytes)?;
         let want = crate::crypto::hex(&<sha2::Sha256 as sha2::Digest>::digest(&built_bytes));
         // Its crate and target go; the library is opened by what was checked.
@@ -2312,6 +2357,19 @@ fn read_in(target: &Path, crate_name: &str, crate_dir: &Path, own: &[PathBuf]) -
     Ok(None)
 }
 
+/// The line of a failed build that said its linker does not take `--dependency-file`
+/// (`linker_lists_not`): no pinned build is tried again in this run.
+static NO_LINK_LIST: OnceLock<String> = OnceLock::new();
+
+/// What is said where the linker does not list what it reads.
+fn no_link_list(qwer: &Path, line: &str) -> String {
+    format!(
+        "{} is held to its SHA-256 and built here, and this build's linker does not take `--dependency-file`, the list of what it reads that judging the build needs ({}): it does not load (use lld, as Rust does by default on x86_64 Linux since 1.90, or GNU ld from binutils 2.35 on)",
+        qwer.display(),
+        crate::confirm::escaped(line)
+    )
+}
+
 /// Whether the linker of a pinned build lists what it read (`judged_args`): Apple's ld and the
 /// GNU ld (2.35 on), lld and mold of Linux do. Elsewhere the reading judges alone, and refuses
 /// more (`confirm::built_in_refused`'s `strict`).
@@ -2322,7 +2380,8 @@ const LINK_LISTED: bool = cfg!(any(target_os = "macos", target_os = "linux"));
 /// `list` (`linked_in`): Apple's ld's `-dependency_info`, Linux's linkers' `--dependency-file`
 /// (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch feedback82-85).
 fn judged_args(list: &Path) -> Vec<String> {
-    let mut args = vec!["--emit=llvm-ir,link".to_string()];
+    // And the linker's command line on stdout (`link_args_refused`).
+    let mut args = vec!["--emit=llvm-ir,link".to_string(), "--print".to_string(), "link-args".to_string()];
     let linker = |a: &str| ["-C".to_string(), format!("link-arg={}", a)];
     if cfg!(target_os = "macos") {
         for a in ["-Xlinker", "-dependency_info", "-Xlinker", &list.display().to_string()] {
@@ -2432,55 +2491,44 @@ fn ir_assembly(text: &str) -> Option<&str> {
 }
 
 /// The first file the linker of a pinned build read, as its list (`list`, `judged_args`) has
-/// them, that is not the build's own (in `target`), the Rust toolchain's (its sysroot, as the
-/// `rustc` beside the cargo that built it says) or the system's (each folder of its path and the
-/// file root's, that no one else may write; on macOS also the developer folder `xcode-select`
-/// names, whose SDK it links against): a library a `#[link]` named, from its search paths or a
-/// path, which its SHA-256 does not cover, however the attribute was made. A list that is not
-/// there, or has nothing in it, refuses the build. Where no list is known, nothing (`LINK_LISTED`)
-/// (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch feedback82-85).
+/// them, that is not one it may read (`trusted`): a library a `#[link]` named, from its search
+/// paths or a path, which its SHA-256 does not cover, however the attribute was made. A list that
+/// is not there, or has nothing in it, refuses the build. Where no list is known, nothing
+/// (`LINK_LISTED`) (FEEDBACK83.md, Q-1305, found by the review of e181c7e; branch feedback82-85).
 fn linked_in(list: &Path, crate_dir: &Path, target: &Path) -> Result<Option<PathBuf>, String> {
     if !LINK_LISTED {
         return Ok(None);
     }
     let bytes = std::fs::read(list).map_err(|e| format!("the linker's list of what it read is not in {} ({}): it does not load", list.display(), e))?;
-    linked_from(&bytes, crate_dir, target).map_err(|e| format!("{}, {}: it does not load", e, list.display()))
+    let trusted = Trusted::of(target);
+    linked_from(&bytes, crate_dir, &|p: &Path| trusted.may_read(p)).map_err(|e| format!("{}, {}: it does not load", e, list.display()))
+}
+
+/// `linked_in` of a list's bytes, judged as a pinned build in `target` is (`Trusted`). Public so
+/// the folders a build may read from are tested on their own.
+pub fn linked_judged(bytes: &[u8], crate_dir: &Path, target: &Path) -> Result<Option<PathBuf>, String> {
+    let trusted = Trusted::of(target);
+    linked_from(bytes, crate_dir, &|p: &Path| trusted.may_read(p))
 }
 
 /// `linked_in`, of a list's bytes as this system's linker writes them (`link_inputs`): the first
-/// file it names that is not the build's own (in `target`), the toolchain's or the system's.
-/// Public so its reading of a list is tested on its own.
-pub fn linked_from(bytes: &[u8], crate_dir: &Path, target: &Path) -> Result<Option<PathBuf>, String> {
+/// file it names that `may_read` does not take, as it is resolved through every link
+/// (`resolved_strict`). One that cannot be resolved is that file: before, it was taken as its
+/// text, and a framework named `<sdk>/System/Library/Frameworks/../../(x40)/w/s/E`, past what
+/// `realpath` reads, passed as inside the SDK (FEEDBACK83.md, Q-1305, found by the review of
+/// a86f326; branch feedback82-85). Public so its reading of a list is tested on its own.
+pub fn linked_from(bytes: &[u8], crate_dir: &Path, may_read: &dyn Fn(&Path) -> bool) -> Result<Option<PathBuf>, String> {
     let inputs = link_inputs(bytes, crate_dir);
     if inputs.is_empty() {
         return Err("the linker's list of what it read has nothing in it".to_string());
     }
-    let mut roots: Vec<PathBuf> = [target.canonicalize().ok(), toolchain_sysroot()].into_iter().flatten().collect();
-    let mut developer: Option<Option<PathBuf>> = None;
-    for p in inputs {
-        let real = p.canonicalize().unwrap_or_else(|_| p.clone());
-        if roots.iter().any(|r| crate::statics::holds(r, &real)) || system_owned(&real) {
-            continue;
-        }
-        // The developer folder, asked once and only for what is not otherwise the build's own.
-        if developer.is_none() {
-            let d = developer_dir();
-            roots.extend(d.clone());
-            developer = Some(d);
-            if roots.iter().any(|r| crate::statics::holds(r, &real)) {
-                continue;
-            }
-        }
-        return Ok(Some(p));
-    }
-    Ok(None)
+    Ok(inputs.into_iter().find(|p| !resolved_strict(p).is_some_and(|r| may_read(&r))))
 }
 
 /// The files a linker's list (`judged_args`) names as read: Apple's ld writes records of an
 /// opcode byte and a path ended by a NUL (`0x10` a file read; `0x11` one looked for and not
 /// found, `0x40` the output and `0x00` the linker's version, not read); Linux's linkers a make
-/// rule, the output then each file read (`\` ends a line that goes on, `\ ` is a space), and a
-/// rule of each file alone. A relative name is from the crate's folder, where cargo runs rustc.
+/// rule (`dep_file_inputs`). A relative name is from the crate's folder, where cargo runs rustc.
 fn link_inputs(bytes: &[u8], crate_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if cfg!(target_os = "macos") {
@@ -2494,16 +2542,420 @@ fn link_inputs(bytes: &[u8], crate_dir: &Path) -> Vec<PathBuf> {
             i = end + 1;
         }
     } else {
-        let text = String::from_utf8_lossy(bytes).replace("\\\n", " ").replace("\\\r\n", " ");
-        let mut output: Option<String> = None;
-        for line in text.lines() {
-            let names = make_names(line);
-            let Some(first) = names.first() else { continue };
-            let output = output.get_or_insert_with(|| first.clone());
-            out.extend(names.iter().filter(|n| *n != output).map(|n| crate_dir.join(n)));
-        }
+        out.extend(dep_file_inputs(&String::from_utf8_lossy(bytes)).into_iter().map(|n| crate_dir.join(n)));
     }
     out
+}
+
+/// The files a `--dependency-file` names as read, as lld and GNU ld write it: the output, `:`, each
+/// file read (` \` then a line break between them), then a rule of each file alone; in a name a
+/// space is `\ `, a `#` is `\#` and a `$` is `$$` (lld's `printFilename`), which a reading that
+/// undid only `\ ` took for other names. Each name but the output's, once. lld writes each name
+/// with its `..` taken out by its text (`remove_dots`), not as it was read through a link, so the
+/// list is the second judge; the first is the linker's command line (`link_args_refused`)
+/// (FEEDBACK83.md, Q-1305, found by the review of a86f326; branch feedback82-85). Public so it is
+/// tested on every system.
+pub fn dep_file_inputs(text: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut chars = text.chars().peekable();
+    let push = |cur: &mut String, names: &mut Vec<String>| {
+        let n = std::mem::take(cur);
+        let n = n.strip_suffix(':').map(str::to_string).unwrap_or(n);
+        if !n.is_empty() && !names.contains(&n) {
+            names.push(n);
+        }
+    };
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.peek() {
+                Some(' ' | '#') => cur.push(chars.next().unwrap_or(' ')),
+                Some('\n') => {
+                    chars.next();
+                    push(&mut cur, &mut names);
+                }
+                Some('\r') => {
+                    chars.next();
+                    if chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    push(&mut cur, &mut names);
+                }
+                _ => cur.push('\\'),
+            },
+            '$' if chars.peek() == Some(&'$') => {
+                chars.next();
+                cur.push('$');
+            }
+            c if c.is_whitespace() => push(&mut cur, &mut names),
+            c => cur.push(c),
+        }
+    }
+    push(&mut cur, &mut names);
+    // The first is the output.
+    if !names.is_empty() {
+        names.remove(0);
+    }
+    names
+}
+
+/// Where `p` is, resolved through every link: by `canonicalize`; for a path that is not there now
+/// (rustc's temporary folder, gone once it has linked), by its longest part that is there, resolved,
+/// and the rest, in which no `..` may be. None where it cannot be told (a path past what the system
+/// resolves, any other error), which refuses it: never its text (FEEDBACK83.md, Q-1305, found by
+/// the review of a86f326; branch feedback82-85).
+fn resolved_strict(p: &Path) -> Option<PathBuf> {
+    match p.canonicalize() {
+        Ok(r) => return Some(r),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return None,
+        Err(_) => {}
+    }
+    let mut rest = Vec::new();
+    let mut there = p;
+    loop {
+        // A last part that is `..` (or none) has no name: refused.
+        let (up, name) = (there.parent()?, there.file_name()?);
+        rest.push(name.to_os_string());
+        there = up;
+        match there.canonicalize() {
+            Ok(r) => return Some(rest.iter().rev().fold(r, |acc, n| acc.join(n))),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return None,
+            Err(_) => {}
+        }
+    }
+}
+
+/// What a pinned build's compiler and linker may read, and its library load (FEEDBACK83.md,
+/// Q-1305, found by the reviews of e181c7e and a86f326; branch feedback82-85): its own folder (the
+/// target), the Rust toolchain's `lib/rustlib` (its rlibs, its self-contained linker and C
+/// runtime), not the whole sysroot, which is `/usr` for a distribution's Rust; and the system's
+/// library folders, of each file that is root's alone (`system_owned`): `/usr/lib`, `/lib`,
+/// `/usr/lib64`, `/lib64`, `/usr/lib32`, `/lib32`, `/System/Library`, and on macOS the developer
+/// folder whose SDK the linker takes (`developer_dir`). Never what the program can reach
+/// (`program_reach`), whoever owns it: under `--allow-path /usr/share/nginx/html` that folder's
+/// files were root's.
+struct Trusted {
+    own: Vec<PathBuf>,
+    system: Vec<PathBuf>,
+    reach: Vec<(PathBuf, bool)>,
+}
+
+impl Trusted {
+    fn of(target: &Path) -> Trusted {
+        let own: Vec<PathBuf> = [target.canonicalize().ok(), toolchain_sysroot().and_then(|s| s.join("lib").join("rustlib").canonicalize().ok()), developer_dir()].into_iter().flatten().collect();
+        let mut system: Vec<PathBuf> = Vec::new();
+        for d in ["/usr/lib", "/lib", "/usr/lib64", "/lib64", "/usr/lib32", "/lib32", "/System/Library"] {
+            if let Some(r) = Path::new(d).canonicalize().ok().filter(|r| system_owned(r) && !system.contains(r)) {
+                system.push(r);
+            }
+        }
+        Trusted { own, system, reach: program_reach() }
+    }
+
+    /// Whether the resolved path `p` (`resolved_strict`) may be read.
+    fn may_read(&self, p: &Path) -> bool {
+        if reached(p, &self.reach).is_some() {
+            return false;
+        }
+        self.own.iter().any(|r| crate::statics::holds(r, p)) || (self.system.iter().any(|r| crate::statics::holds(r, p)) && system_owned(p))
+    }
+}
+
+/// The arguments of the linker rustc ran for the plugin's crate, as `--print link-args` prints
+/// them (`env -u X NAME="..." "cc" "-arg" ...`): each word, its quotes taken off (`\` keeps the
+/// character after it), past `env`, its `-u NAME` and the variables it sets, from the program on.
+pub fn printed_args(line: &str) -> Vec<String> {
+    let mut words: Vec<(String, bool)> = Vec::new();
+    let (mut cur, mut quoted, mut any, mut was_quoted) = (String::new(), false, false, false);
+    let mut chars = line.trim().chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+                was_quoted = true;
+            }
+            '\\' if quoted => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+            }
+            c if c.is_whitespace() && !quoted => {
+                if any || !cur.is_empty() {
+                    words.push((std::mem::take(&mut cur), was_quoted));
+                }
+                any = false;
+                was_quoted = false;
+            }
+            c => {
+                cur.push(c);
+                any = true;
+            }
+        }
+    }
+    if any || !cur.is_empty() {
+        words.push((cur, was_quoted));
+    }
+    let mut i = 0;
+    if words.first().is_some_and(|(w, q)| !q && w == "env") {
+        i = 1;
+        while words.get(i).is_some_and(|(w, q)| !q && w == "-u") {
+            i += 2;
+        }
+    }
+    let assignment = |w: &str| w.split_once('=').is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') && !n.as_bytes()[0].is_ascii_digit());
+    while words.get(i).is_some_and(|(w, _)| assignment(w)) {
+        i += 1;
+    }
+    words.into_iter().skip(i).map(|(w, _)| w).collect()
+}
+
+/// Why the linker's command line `printed` (`--print link-args`) may not build a pinned plugin, if
+/// it may not, judged as it was given, before the list of what the linker read, which lld writes
+/// with `..` taken out by its text (`/srv/app/S/../../../bin/sh` with `S` a link listed as
+/// `/bin/sh`): a search folder (`-L`, `-F`), a library (`-l`, `-l:`, a path), a framework named
+/// by a path, a folder its tools are taken from (`-B`, `-fuse-ld=`), and each other argument that
+/// names a file, inside `-Wl,` and `-Xlinker` too, each refused where it has a `..` or, resolved
+/// through every link (`resolved_strict`), `may_read` does not take it; and an `-rpath` or a
+/// linker plugin outright. A relative name is from `crate_dir`. The program itself (`cc`) is the
+/// one on PATH, which `toolchain_reached` judges (FEEDBACK83.md, Q-1305, found by the review of
+/// a86f326; branch feedback82-85). Public so it is tested on every system.
+pub fn link_args_refused(printed: &str, crate_dir: &Path, may_read: &dyn Fn(&Path) -> bool) -> Option<String> {
+    let words = printed_args(printed);
+    if words.len() < 2 {
+        return Some("rustc printed no linker command for it".to_string());
+    }
+    // The linker's own arguments, `-Wl,a,b` and `-Xlinker a`, among the driver's, each with
+    // whether it is the linker's (whose `-Bstatic` is no folder, where the driver's `-B` is one).
+    let mut args: Vec<(String, bool)> = Vec::new();
+    let mut i = 1;
+    while i < words.len() {
+        let w = &words[i];
+        if let Some(rest) = w.strip_prefix("-Wl,") {
+            args.extend(rest.split(',').map(|a| (a.to_string(), true)));
+        } else if w == "-Xlinker" {
+            args.extend(words.get(i + 1).map(|a| (a.clone(), true)));
+            i += 1;
+        } else {
+            args.push((w.clone(), false));
+        }
+        i += 1;
+    }
+    let path = |p: &str| -> Option<String> {
+        let pb = Path::new(p);
+        if pb.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+            return Some(format!("`{}`, a path with `..`", p));
+        }
+        let at = crate_dir.join(pb);
+        match resolved_strict(&at) {
+            Some(r) if may_read(&r) => None,
+            Some(r) => Some(format!("`{}` ({}), which is not the build's own, the Rust toolchain's or the system's", p, r.display())),
+            None => Some(format!("`{}`, which cannot be resolved", p)),
+        }
+    };
+    // Flags whose next argument is a path, a framework's name, or nothing to judge.
+    const PATH_NEXT: &[&str] = &["-L", "-F", "-B", "-o", "-isysroot", "-syslibroot", "-force_load", "-filelist", "-exported_symbols_list", "-unexported_symbols_list", "-dependency_info", "-order_file", "-map", "-T", "--version-script", "--dependency-file", "-reexport_library", "-weak_library", "-lazy_library", "-upward_library", "-sectcreate"];
+    const FRAMEWORK: &[&str] = &["-framework", "-weak_framework", "-needed_framework", "-reexport_framework", "-lazy_framework", "-upward_framework"];
+    let mut k = 0;
+    while k < args.len() {
+        let (a, linker) = (args[k].0.as_str(), args[k].1);
+        let next = args.get(k + 1).map(|(n, _)| n.as_str());
+        let plugin = ["-plugin", "--plugin", "-fplugin", "-lto_library", "--load-pass-plugin"].iter().any(|f| a == *f || a.starts_with(&format!("{}=", f)));
+        let why = if a == "-rpath" || a.starts_with("-rpath=") || a.starts_with("--rpath") || a == "-R" || plugin {
+            Some(format!("`{}`, which the reading of a pinned build takes from no one", a))
+        } else if FRAMEWORK.contains(&a) {
+            k += 1;
+            next.filter(|n| n.contains('/') || n.contains("..")).map(|n| format!("the framework `{}`, named by a path", n))
+        } else if PATH_NEXT.contains(&a) && !(linker && a == "-B") {
+            k += 1;
+            // `-sectcreate seg sect file`: its file is the third.
+            let n = if a == "-sectcreate" {
+                k += 2;
+                args.get(k).map(|(n, _)| n.as_str())
+            } else {
+                next
+            };
+            n.and_then(path)
+        } else if let Some(v) = ["-L", "-F", "-B"].iter().filter(|f| !(linker && **f == "-B")).find_map(|f| a.strip_prefix(f)).filter(|v| !v.is_empty()) {
+            path(v)
+        } else if let Some(v) = a.strip_prefix("-l") {
+            let v = v.strip_prefix(':').unwrap_or(v);
+            if v.contains('/') || v.contains("..") {
+                path(v)
+            } else {
+                None
+            }
+        } else if let Some(v) = a.strip_prefix('@') {
+            path(v)
+        } else if let Some((_, v)) = a.split_once('=').filter(|(_, v)| v.contains('/')) {
+            path(v)
+        } else if a.contains('/') {
+            path(a)
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            return Some(why);
+        }
+        k += 1;
+    }
+    None
+}
+
+/// Whether a failed pinned build's log says its linker does not take `--dependency-file` (GNU ld
+/// before binutils 2.35: RHEL 8, Ubuntu 20.04, Amazon Linux 2), which judging it needs: the line
+/// that says so (FEEDBACK83.md, Q-1305, found by the review of a86f326; branch feedback82-85).
+pub fn linker_lists_not(log: &str) -> Option<&str> {
+    log.lines().find(|l| l.contains("--dependency-file") && ["unrecognized", "unknown", "invalid", "unsupported"].iter().any(|w| l.contains(w)))
+}
+
+/// Why the library `bytes` may not load where a hold or a pin by hash holds it, if it may not: what
+/// it has the system's loader load besides it, which its SHA-256 does not cover. Mach-O (thin, or
+/// each slice of a fat one): each library it loads by its install name (`LC_LOAD_DYLIB`, weak,
+/// re-exported, lazy, upward) must be under `/usr/lib/` or `/System/Library/` (the dyld shared
+/// cache's), and it may have no `LC_RPATH`, no `@rpath`, `@loader_path` or `@executable_path`, no
+/// `..` and no `LC_DYLD_ENVIRONMENT`. ELF: each `DT_NEEDED` the C runtime's (libc, libm, libdl,
+/// libpthread, librt, libutil, libgcc_s, the dynamic loader), by its name alone, and no
+/// `DT_RPATH`, `DT_RUNPATH`, `DT_AUXILIARY` or `DT_FILTER`. Before, a plugin linked against a
+/// library by a framework's path loaded `rt/libE.dylib` by its install name, never judged, and a
+/// new libE.dylib ran under the same SHA-256; a library pinned by its own hash loads others by
+/// theirs too (FEEDBACK83.md, Q-1305, found by the review of a86f326; branch feedback82-85).
+/// Public so it is tested on every system.
+pub fn loads_refused(bytes: &[u8]) -> Option<String> {
+    let at = |o: usize, n: usize| bytes.get(o..o.checked_add(n)?);
+    let unreadable = || Some("cannot be read as a library".to_string());
+    match at(0, 4) {
+        Some([0xcf, 0xfa, 0xed, 0xfe]) | Some([0xce, 0xfa, 0xed, 0xfe]) => macho_loads(bytes),
+        Some([0xca, 0xfe, 0xba, 0xbe]) | Some([0xca, 0xfe, 0xba, 0xbf]) => {
+            let wide = bytes[3] == 0xbf;
+            let be = |o: usize, n: usize| -> Option<u64> { at(o, n).map(|b| b.iter().fold(0u64, |acc, x| (acc << 8) | *x as u64)) };
+            let Some(n) = be(4, 4) else { return unreadable() };
+            if n == 0 || n > 64 {
+                return unreadable();
+            }
+            for i in 0..n as usize {
+                let e = 8 + i * if wide { 32 } else { 20 };
+                let (off, size) = if wide { (be(e + 8, 8), be(e + 16, 8)) } else { (be(e + 8, 4), be(e + 12, 4)) };
+                let (Some(off), Some(size)) = (off, size) else { return unreadable() };
+                let Some(slice) = usize::try_from(off).ok().zip(usize::try_from(size).ok()).and_then(|(o, s)| at(o, s)) else { return unreadable() };
+                if let Some(why) = macho_loads(slice) {
+                    return Some(why);
+                }
+            }
+            None
+        }
+        Some([0x7f, b'E', b'L', b'F']) => elf_loads(bytes),
+        _ if cfg!(any(target_os = "macos", target_os = "linux")) => unreadable(),
+        _ => None,
+    }
+}
+
+/// `loads_refused` of one Mach-O image (little-endian, 32 or 64 bits).
+fn macho_loads(b: &[u8]) -> Option<String> {
+    let u32_at = |o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]));
+    let unreadable = || Some("cannot be read as a library".to_string());
+    let header = if b.first() == Some(&0xcf) { 32 } else { 28 };
+    let Some(ncmds) = u32_at(16) else { return unreadable() };
+    let mut off = header;
+    for _ in 0..ncmds {
+        let (Some(cmd), Some(size)) = (u32_at(off), u32_at(off + 4)) else { return unreadable() };
+        let size = size as usize;
+        if size < 8 || off + size > b.len() {
+            return unreadable();
+        }
+        let name = |name_at: usize| -> Option<String> {
+            let o = u32_at(off + name_at)? as usize;
+            let s = b.get(off + o..off + size)?;
+            let end = s.iter().position(|c| *c == 0).unwrap_or(s.len());
+            Some(String::from_utf8_lossy(&s[..end]).into_owned())
+        };
+        match cmd {
+            // LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LAZY_LOAD_DYLIB, LC_LOAD_UPWARD_DYLIB
+            0xc | 0x8000_0018 | 0x8000_001f | 0x20 | 0x8000_0023 => {
+                let Some(n) = name(8) else { return unreadable() };
+                let system = (n.starts_with("/usr/lib/") || n.starts_with("/System/Library/")) && !n.split('/').any(|c| c == "..");
+                if !system {
+                    return Some(format!("loads {} by its install name, which is not the system's (/usr/lib, /System/Library)", crate::confirm::escaped(&n)));
+                }
+            }
+            // LC_RPATH
+            0x8000_001c => return Some(format!("has an LC_RPATH ({}), where the loader looks for libraries", crate::confirm::escaped(&name(8).unwrap_or_default()))),
+            // LC_DYLD_ENVIRONMENT
+            0x27 => return Some("has an LC_DYLD_ENVIRONMENT".to_string()),
+            _ => {}
+        }
+        off += size;
+    }
+    None
+}
+
+/// `loads_refused` of an ELF image (32 or 64 bits, either byte order).
+fn elf_loads(b: &[u8]) -> Option<String> {
+    let unreadable = || Some("cannot be read as a library".to_string());
+    let (wide, big) = (b.get(4) == Some(&2), b.get(5) == Some(&2));
+    let num = |o: usize, n: usize| -> Option<u64> {
+        let s = b.get(o..o.checked_add(n)?)?;
+        Some(if big { s.iter().fold(0u64, |a, x| (a << 8) | *x as u64) } else { s.iter().rev().fold(0u64, |a, x| (a << 8) | *x as u64) })
+    };
+    let word = if wide { 8 } else { 4 };
+    let (phoff, phentsize, phnum) = if wide { (num(32, 8), num(54, 2), num(56, 2)) } else { (num(28, 4), num(42, 2), num(44, 2)) };
+    let (Some(phoff), Some(phentsize), Some(phnum)) = (phoff, phentsize, phnum) else { return unreadable() };
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new();
+    let mut dynamic: Option<(u64, u64)> = None;
+    for i in 0..phnum {
+        let h = (phoff + i * phentsize) as usize;
+        let Some(kind) = num(h, 4) else { return unreadable() };
+        let (offset, vaddr, filesz) = if wide { (num(h + 8, 8), num(h + 16, 8), num(h + 32, 8)) } else { (num(h + 4, 4), num(h + 8, 4), num(h + 16, 4)) };
+        let (Some(offset), Some(vaddr), Some(filesz)) = (offset, vaddr, filesz) else { return unreadable() };
+        match kind {
+            1 => loads.push((vaddr, offset, filesz)),
+            2 => dynamic = Some((offset, filesz)),
+            _ => {}
+        }
+    }
+    let Some((dyn_off, dyn_size)) = dynamic else { return None };
+    let entry = 2 * word;
+    let mut entries: Vec<(u64, u64)> = Vec::new();
+    let mut strtab = None;
+    let mut o = dyn_off;
+    while o + entry as u64 <= dyn_off + dyn_size {
+        let (Some(tag), Some(val)) = (num(o as usize, word), num(o as usize + word, word)) else { return unreadable() };
+        if tag == 0 {
+            break;
+        }
+        if tag == 5 {
+            strtab = Some(val);
+        }
+        entries.push((tag, val));
+        o += entry as u64;
+    }
+    let Some(strtab) = strtab.and_then(|v| loads.iter().find(|(va, _, sz)| v >= *va && v < va + sz).map(|(va, off, _)| v - va + off)) else {
+        return if entries.iter().any(|(t, _)| *t == 1) { unreadable() } else { None };
+    };
+    let string = |at: u64| -> Option<String> {
+        let s = b.get((strtab + at) as usize..)?;
+        let end = s.iter().position(|c| *c == 0)?;
+        Some(String::from_utf8_lossy(&s[..end]).into_owned())
+    };
+    const RUNTIME: &[&str] = &["libc", "libm", "libdl", "libpthread", "librt", "libutil", "libgcc_s"];
+    for (tag, val) in entries {
+        if !matches!(tag, 1 | 15 | 29 | 0x7fff_fffd | 0x7fff_ffff) {
+            continue;
+        }
+        let Some(n) = string(val) else { return unreadable() };
+        match tag {
+            1 => {
+                let stem = n.split(".so").next().unwrap_or(&n);
+                if n.contains('/') || !(RUNTIME.contains(&stem) || n.starts_with("ld-linux") || n.starts_with("ld64.so") || n.starts_with("libc.musl-")) {
+                    return Some(format!("needs {}, which is not the C runtime's", crate::confirm::escaped(&n)));
+                }
+            }
+            15 | 29 => return Some(format!("has a {} ({}), where the loader looks for libraries", if tag == 15 { "DT_RPATH" } else { "DT_RUNPATH" }, crate::confirm::escaped(&n))),
+            0x7fff_fffd | 0x7fff_ffff => return Some(format!("has a {} ({})", if tag == 0x7fff_fffd { "DT_AUXILIARY" } else { "DT_FILTER" }, crate::confirm::escaped(&n))),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The sysroot of the Rust toolchain a pinned build used: what the `rustc` beside its cargo says
@@ -2644,7 +3096,9 @@ fn build_confirmed(qwer: &Path, program: &Path) -> Result<(PathBuf, Parsed), Str
     // And by what its assembler and linker read (`assembled_in`, `linked_in`): one recorded as
     // judged before them is built and judged again once (FEEDBACK83.md, Q-1305, found by the
     // review of e181c7e; branch feedback82-85).
-    let key = format!("{} {} {}-{} read-asm-link-judged", source, lib_name(&lib), std::env::consts::ARCH, std::env::consts::OS);
+    // And by its linker's command line and the libraries it loads (`link_args_refused`,
+    // `loads_refused`; found by the review of a86f326).
+    let key = format!("{} {} {}-{} read-asm-link-load-judged", source, lib_name(&lib), std::env::consts::ARCH, std::env::consts::OS);
     let record = built_record(program);
     if lib.is_file() {
         // Opened by what was hashed, as a pinned build's is (`checked_lib`; found in review 2).
@@ -2781,6 +3235,20 @@ pub fn use_file(it: &mut Interp, qwer: &Path, only: Option<&[(String, String)]>,
         loaded(&lib_path);
         let by = it.cur_file.as_deref().map_or_else(|| format!("line {}", line), |f| format!("{}:{}", Path::new(f).strip_prefix(&*it.base_dir).map_or_else(|_| f.to_string(), |r| r.display().to_string()), line));
         return Err(Ctrl::Error(Box::new(crate::error::QuilloError::new(format!("{} (the `use` at {})", msg, by), *l).in_file(&qwer.display().to_string()))));
+    }
+    // Where a quillo.confirmed or a pin by hash holds it, nor a library that has the system's
+    // loader load another than the system's (`loads_refused`): a library pinned by its own
+    // SHA-256 loads others by their install names, which that hash does not cover (FEEDBACK83.md,
+    // Q-1305, found by the review of a86f326; branch feedback82-85).
+    if crate::confirm::held() || crate::policy::get().pins_by_hash() {
+        let why = match std::fs::read(&lib_path) {
+            Ok(bytes) => loads_refused(&bytes),
+            Err(e) => Some(format!("cannot be read ({})", e)),
+        };
+        if let Some(why) = why {
+            loaded(&lib_path);
+            return Err(Ctrl::Error(Box::new(crate::error::QuilloError::new(format!("{} is held to its SHA-256, and its library {} {}, which that hash does not cover: it does not load", qwer.display(), lib_path.display(), why), line))));
+        }
     }
     let lib = open(&lib_path, parsed.exports.len()).map_err(|e| {
         loaded(&lib_path);

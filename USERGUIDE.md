@@ -10990,7 +10990,16 @@ Asking, and who answers:
   as a dependency's macro that includes a file (`doc_comment::doctest!`) or a macro that
   hands assembly its `!` apart. Nor is a source pin built where the program can reach its
   cargo home, rustup's home, its `cargo` or `rustc`, a folder of its `PATH`, or the folder
-  Quillo runs in: the message names which, and the way out is to pin the built library. It is still a reading, not a proof: a crate can do what it does
+  Quillo runs in, or inside any of them: the message names which, and the way out is to pin
+  the built library. Its linker's command line is judged as given (search folders, libraries
+  and files only in the build's own folder, the Rust toolchain's `lib/rustlib` or the system's
+  library folders, no `..`, no rpath), then the files it read, each resolved through every
+  link (one that cannot be resolved refuses the build); and the library built, or one pinned
+  by its own SHA-256, loads only the system's libraries (macOS: `/usr/lib`,
+  `/System/Library`; Linux: the C runtime's). A Linux linker without `--dependency-file`
+  (binutils before 2.35) refuses the build: use lld. A pinned source's dependencies are not
+  locked: each fresh build takes the newest release their version allows, and their build
+  scripts and macros run as cargo runs them. It is still a reading, not a proof: a crate can do what it does
   unseen (`libc::kill` reads as the `libc` crate, which the file's `crates` list confirms by
   name), and a proc macro that reads a file without telling rustc, or a dependency's own
   macro that writes assembly into a function inlined into the plugin (refused, as assembly,

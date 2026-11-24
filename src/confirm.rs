@@ -1376,6 +1376,9 @@ struct RTok {
     spaced: bool,
     /// A string or a character that ends as rustc reads it (one that does not, does not build).
     closed: bool,
+    /// A doc comment came just before it (`///`, `//!`, `/** */`, `/*! */`), which rustc reads as a
+    /// `#` and a `[doc = ".."]` (`builds_in`).
+    doc: bool,
 }
 
 /// Rust's whitespace, its Pattern_White_Space, which separates tokens as `rustc` reads them: a
@@ -1488,7 +1491,7 @@ fn rust_tokens(src: &str) -> Vec<RTok> {
     let b = src.as_bytes();
     let mut out: Vec<RTok> = Vec::with_capacity(src.len() / 4);
     let (mut i, mut line) = (rust_code_start(src), 1u32);
-    let (mut gap_lines, mut spaced) = (0u32, false);
+    let (mut gap_lines, mut spaced, mut doc) = (0u32, false, false);
     let newlines = |from: usize, to: usize| src.as_bytes()[from..to].iter().filter(|x| **x == b'\n').count() as u32;
     while i < b.len() {
         let c = b[i];
@@ -1503,6 +1506,8 @@ fn rust_tokens(src: &str) -> Vec<RTok> {
             continue;
         }
         if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            let rest = &b[i..];
+            doc |= (rest.starts_with(b"///") && !rest.starts_with(b"////")) || rest.starts_with(b"//!");
             while i < b.len() && b[i] != b'\n' {
                 i += 1;
             }
@@ -1510,6 +1515,8 @@ fn rust_tokens(src: &str) -> Vec<RTok> {
             continue;
         }
         if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            let rest = &b[i..];
+            doc |= (rest.starts_with(b"/**") && !rest.starts_with(b"/**/") && !rest.starts_with(b"/***")) || rest.starts_with(b"/*!");
             let mut depth = 0u32;
             while i < b.len() {
                 if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
@@ -1561,12 +1568,13 @@ fn rust_tokens(src: &str) -> Vec<RTok> {
             kind = RKind::Punct;
             i += ch.len_utf8();
         }
-        out.push(RTok { kind, at, end: i, body, line, gap_lines, spaced, closed });
+        out.push(RTok { kind, at, end: i, body, line, gap_lines, spaced, closed, doc });
         if kind == RKind::Str || kind == RKind::Char {
             line += newlines(at, i);
         }
         gap_lines = 0;
         spaced = false;
+        doc = false;
     }
     out
 }
@@ -2941,12 +2949,19 @@ fn builds_in_toks(src: &str, toks: &[RTok], strict: bool) -> Option<(u32, String
         } else if w == "debugger_visualizer" {
             // However it is reached: its `#` can be a doc comment's, handed to a macro.
             Some(VISUALIZER.to_string())
-        } else if (w == "link" && punct(k + 1, "(") && is(k + 2, RKind::Ident, "name") && punct(k + 3, "=")) || (punct(k, "[") && is(k + 1, RKind::Ident, "link") && punct(k + 2, "(")) {
+        } else if w == "link" && punct(k + 1, "(") && is(k + 2, RKind::Ident, "name") && punct(k + 3, "=") {
             // A library linked whose `#` is not written: a doc comment is a `#` and a `[doc = ..]`
             // that a macro can take apart (`($h:tt $d:tt $b:tt) => { $h $b ... }` with
             // `m!(/// x\n[link(name = "evil")])`), and rustc linked libevil.a (FEEDBACK83.md,
             // Q-1305, found by the review of e181c7e; branch feedback82-85).
             Some(format!("`link(name = ...)`, which a macro can make `#[link(...)]` of: {}", LINKED))
+        } else if punct(k, "[") && is(k + 1, RKind::Ident, "link") && punct(k + 2, "(") && (t.doc || (k >= 1 && punct(k - 1, "#")) || (k >= 2 && punct(k - 1, "!") && punct(k - 2, "#")) || (k >= 2 && name(k - 1) && punct(k - 2, "$"))) {
+            // `[link(..)]` where an attribute can be: after a doc comment, a `#`, a `#!` or what a
+            // macro hands in (`$h [link(..)]`). Anywhere, it refused `vec![link("/a")]`, a
+            // function of the plugin's own; the pinned build judges what it links (`native::
+            // link_args_refused`) (FEEDBACK83.md, Q-1305, found by the review of a86f326; branch
+            // feedback82-85).
+            Some(format!("`[link(...)]` where a doc comment or a macro gives it its `#`: {}", LINKED))
         } else if strict && punct(k, "[") && punct(k + 1, "$") && name(k + 2) && punct(k + 3, "(") {
             Some(format!("a `[...]` a macro fills (`$h [ $a (...) ]`), which can be `#[link(...)]`: {}", LINKED))
         } else if punct(k, "!") && !punct(k + 1, "=") && k > 0 {
