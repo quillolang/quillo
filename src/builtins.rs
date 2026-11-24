@@ -3157,7 +3157,24 @@ fn allowed_path(it: &Interp, p: &str) -> Option<std::path::PathBuf> {
     // `../shared/a.txt`, which realpath names `/private/...` from a program there, telling the
     // program to give `--allow-path ../shared` (FEEDBACK85.md, Q-1340, found by the coverage tests;
     // branch feedback82-85). What may be written there is `own_file`'s, by either name too.
-    dirs.iter().any(|d| crate::statics::within(&real, d)).then_some(real)
+    if !dirs.iter().any(|d| crate::statics::within(&real, d)) {
+        return None;
+    }
+    // A path named through a `.quillo` keeps that name, for every writer to refuse by it as
+    // `own_file` does (`statics::quillo_part`): resolved, `../other/.quillo/plugins.lock` (with
+    // `other/.quillo -> store`) was `store/plugins.lock`, which `http.get`'s `save` and
+    // `image.convert` wrote, as only `write_file` looked at the name given. What precedes the
+    // `.quillo` is resolved; the rest is as given, which the system resolves to `real`, judged above
+    // (FEEDBACK85.md, Q-1340, found by the verdict review of 0cc8547; branch feedback82-85).
+    if crate::statics::quillo_part(Path::new(p)) {
+        let parts: Vec<Component> = full.components().collect();
+        if let Some(at) = parts.iter().position(|c| matches!(c, Component::Normal(n) if crate::statics::quillo_part(Path::new(n)))) {
+            let before: std::path::PathBuf = parts[..at].iter().collect();
+            let after: std::path::PathBuf = parts[at..].iter().collect();
+            return real_path(&before).map(|b| b.join(after));
+        }
+    }
+    Some(real)
 }
 
 /// Why `full` must not be written by the program, if it is one of its own files: a `.qwe` or
@@ -3652,18 +3669,131 @@ struct QuilloRoots {
     /// to themselves by the path asked for, with no look at the disk (`quillo_hidden`).
     inside: Vec<std::path::PathBuf>,
     bad: Option<String>,
+    /// Each noted folder's `.quillo` as a look found it when these were made (`look_again`).
+    looks: Vec<(std::path::PathBuf, Option<[i64; 4]>)>,
+}
+
+/// The `QuilloRoots` kept, a few programs' (mounted ones, services), each their own.
+static ROOTS_KEPT: std::sync::Mutex<Vec<Arc<QuilloRoots>>> = std::sync::Mutex::new(Vec::new());
+/// Counted up when a `.quillo` of a noted folder is not what it was when its roots were made.
+static ROOTS_GEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// When the noted folders' `.quillo` may be looked at again, in `ticks`.
+static NEXT_LOOK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What `QuilloRoots` are kept by besides the program: the folders noted and whether a `.quillo` of
+/// theirs changed. Kept by the files loaded alone, a `.quillo` made or pointed elsewhere while the
+/// program ran was not seen: with none at the start, `ln -s qstore .quillo` while it served let a
+/// write into `qstore/` and `files()` served it. Each noted folder's `.quillo` is looked at again at
+/// most once a second, by the first write, `file()` or `files()` past it, which costs each of them a
+/// read of the clock, some 20 instructions (FEEDBACK85.md, Q-1340, found by the verdict review of
+/// 0cc8547; branch feedback82-85).
+fn roots_seen() -> usize {
+    look_again();
+    let seen = QUILLO_FOLDERS_SEEN.load(std::sync::atomic::Ordering::Acquire);
+    seen ^ ROOTS_GEN.load(std::sync::atomic::Ordering::Acquire).rotate_left(usize::BITS / 2)
+}
+
+/// The noted folders' `.quillo` looked at again, if a second has passed since: a change from what
+/// any kept `QuilloRoots` found counts `ROOTS_GEN` up, so they are made anew.
+fn look_again() {
+    let now = ticks();
+    let next = NEXT_LOOK.load(std::sync::atomic::Ordering::Relaxed);
+    if now < next || NEXT_LOOK.compare_exchange(next, now.saturating_add(tick_second()), std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed).is_err() {
+        return;
+    }
+    let kept: Vec<Arc<QuilloRoots>> = ROOTS_KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let mut now_seen: Vec<(&Path, Option<[i64; 4]>)> = Vec::new();
+    for (q, was) in kept.iter().flat_map(|g| g.looks.iter()) {
+        let is = match now_seen.iter().find(|(p, _)| *p == q.as_path()) {
+            Some((_, l)) => *l,
+            None => {
+                let l = quillo_look(q);
+                now_seen.push((q, l));
+                l
+            }
+        };
+        if is != *was {
+            ROOTS_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+            return;
+        }
+    }
+}
+
+/// What is at `q`, not followed: None where nothing is; else its device, number and change time,
+/// which a link made anew changes.
+fn quillo_look(q: &Path) -> Option<[i64; 4]> {
+    match std::fs::symlink_metadata(q) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some([-1; 4]),
+        #[cfg(unix)]
+        Ok(m) => {
+            use std::os::unix::fs::MetadataExt;
+            Some([m.dev() as i64, m.ino() as i64, m.ctime(), m.ctime_nsec()])
+        }
+        #[cfg(not(unix))]
+        Ok(m) => Some([1, m.len() as i64, m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as i64), 0]),
+    }
+}
+
+/// A monotonic clock read cheaply: `mach_absolute_time` (some 20 instructions, where `Instant::now`
+/// costs 150), the coarse monotonic clock elsewhere.
+#[cfg(target_os = "macos")]
+fn ticks() -> u64 {
+    extern "C" {
+        fn mach_absolute_time() -> u64;
+    }
+    // SAFETY: it takes nothing and reads the clock.
+    unsafe { mach_absolute_time() }
+}
+
+/// `ticks` in a second.
+#[cfg(target_os = "macos")]
+fn tick_second() -> u64 {
+    static SECOND: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SECOND.get_or_init(|| {
+        #[repr(C)]
+        struct Timebase {
+            numer: u32,
+            denom: u32,
+        }
+        extern "C" {
+            fn mach_timebase_info(info: *mut Timebase) -> i32;
+        }
+        let mut t = Timebase { numer: 0, denom: 0 };
+        // SAFETY: it writes the two numbers it is given room for.
+        unsafe { mach_timebase_info(&mut t) };
+        if t.numer == 0 || t.denom == 0 { 1_000_000_000 } else { (1_000_000_000u64 * t.denom as u64 / t.numer as u64).max(1) }
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn ticks() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: it writes the time it is given room for.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut ts) };
+    (ts.tv_sec as u64).saturating_mul(1_000_000_000).saturating_add(ts.tv_nsec as u64)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "android")))]
+fn ticks() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tick_second() -> u64 {
+    1_000_000_000
 }
 
 /// `QuilloRoots` of the program `it` runs: made when the files it loaded or its folder change, and
 /// kept for them (a few programs, mounted or services, each their own).
 fn quillo_roots(it: &Interp) -> Arc<QuilloRoots> {
-    static ROOTS: std::sync::Mutex<Vec<Arc<QuilloRoots>>> = std::sync::Mutex::new(Vec::new());
     let (loaded, count) = (Arc::as_ptr(&it.loaded) as *const () as usize, it.loaded.len());
-    let seen = QUILLO_FOLDERS_SEEN.load(std::sync::atomic::Ordering::Acquire);
+    let seen = roots_seen();
     if let Some(g) = LAST_ROOTS.with(|l| l.borrow().as_ref().filter(|g| g.loaded == loaded && g.count == count && g.seen == seen && Arc::ptr_eq(&g.base, &it.base_dir)).cloned()) {
         return g;
     }
-    let g = quillo_roots_of(it, &ROOTS, loaded, count, seen);
+    let g = quillo_roots_of(it, &ROOTS_KEPT, loaded, count, seen);
     LAST_ROOTS.with(|l| *l.borrow_mut() = Some(g.clone()));
     g
 }
@@ -3679,7 +3809,7 @@ thread_local! {
 /// FEEDBACK85.md Q-1340; branch feedback82-85).
 fn under_quillo_root(it: &Interp, folded: &Path) -> bool {
     let (loaded, count) = (Arc::as_ptr(&it.loaded) as *const () as usize, it.loaded.len());
-    let seen = QUILLO_FOLDERS_SEEN.load(std::sync::atomic::Ordering::Acquire);
+    let seen = roots_seen();
     let hit = LAST_ROOTS.with(|l| l.borrow().as_ref().filter(|g| g.loaded == loaded && g.count == count && g.seen == seen && Arc::ptr_eq(&g.base, &it.base_dir)).map(|g| g.roots.iter().any(|r| under(folded, r))));
     hit.unwrap_or_else(|| quillo_roots(it).roots.iter().any(|r| under(folded, r)))
 }
@@ -3698,7 +3828,11 @@ fn quillo_roots_of(it: &Interp, roots_kept: &std::sync::Mutex<Vec<Arc<QuilloRoot
     // look at each folder's, by the name it was noted by, and no realpath; resolving each, twice,
     // cost a start 1.6M instructions and some twenty looks over 0.8.10 (found measuring the review
     // of efd9b8e; FEEDBACK85.md, Q-1340; branch feedback82-85).
-    let there = quillo_noted(it, &files).iter().any(|q| !quillo_absent(q));
+    let looks: Vec<(std::path::PathBuf, Option<[i64; 4]>)> = quillo_noted(it, &files).into_iter().map(|q| {
+        let l = quillo_look(&q);
+        (q, l)
+    }).collect();
+    let there = looks.iter().any(|(_, l)| l.is_some());
     let dirs = if there { quillo_dirs(it, &files) } else { Vec::new() };
     let folders: Vec<std::path::PathBuf> = dirs.iter().filter_map(|q| q.parent().map(Path::to_path_buf)).collect();
     let (mut roots, mut bad) = (Vec::new(), None);
@@ -3722,7 +3856,7 @@ fn quillo_roots_of(it: &Interp, roots_kept: &std::sync::Mutex<Vec<Arc<QuilloRoot
             }
         }
     }
-    let g = Arc::new(QuilloRoots { loaded, count, seen, base: it.base_dir.clone(), roots, inside, bad });
+    let g = Arc::new(QuilloRoots { loaded, count, seen, base: it.base_dir.clone(), roots, inside, bad, looks });
     let mut gs = roots_kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     gs.retain(|x| !(x.loaded == loaded && x.count == count && *x.base == *it.base_dir));
     if gs.len() >= 8 {

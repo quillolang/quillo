@@ -2452,3 +2452,139 @@ fn a_split_service_keeps_its_apps_own_files() {
     assert_eq!(std::fs::read_to_string(app.join("main.qwe")).unwrap(), main);
     assert_eq!(std::fs::read_to_string(app.join("lib/m.qwe")).unwrap(), "let m = 2\n");
 }
+
+// Fix round 15
+
+/// A 1x1 PNG.
+const PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53, 0xde,
+    0x00, 0x00, 0x00, 0x0c, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0x00, 0x00, 0x03, 0x01, 0x01, 0x00, 0xc9, 0xfe, 0x92, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+
+/// A path named through a `.quillo` in a folder `--allow-path` names keeps that name for every
+/// writer: resolved, `../other/.quillo/plugins.lock` (`other/.quillo -> store`) was
+/// `store/plugins.lock`, which `http.get`'s `save` and `image.convert` wrote, as only `write_file`
+/// looked at the name given (`save_upload` takes no `..`); reading it, and writing `store/` by its
+/// own name, are as they were (src/builtins.rs allowed_path; FEEDBACK85.md Q-1340, found by the verdict review of
+/// 0cc8547; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn a_path_named_through_a_quillo_in_an_allowed_folder_is_refused_to_every_writer() {
+    let d = Dir(support::temp_dir("cov8285r3-allow-quillo").canonicalize().unwrap());
+    let (app, other, srv) = (d.0.join("app"), d.0.join("other"), d.0.join("srv"));
+    for f in [&app, &other.join("store/native"), &srv] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    std::fs::write(other.join("store/plugins.lock"), "lock").unwrap();
+    std::os::unix::fs::symlink("store", other.join(".quillo")).unwrap();
+    std::fs::write(app.join("in.png"), PNG).unwrap();
+    std::fs::write(srv.join("main.qwe"), "route GET /x = \"EVIL\"\n").unwrap();
+    let (gs, sport) = serve_at(&srv, &["main.qwe"], &d.0.join("s.log"));
+    let u = format!("http://127.0.0.1:{}/x", sport);
+    let main = format!(
+        "print(http.get(\"{u}\", {{}}, {{ save: \"../other/.quillo/plugins.lock\", public_only: false }}))\nprint(image.convert(\"in.png\", \"../other/.quillo/native/libp-1.dylib\", {{ format: \"png\" }}))\nprint(image.convert(\"in.png\", \"../other/.quillo/p.png\"))\nprint(write_file(\"../other/.quillo/plugins.lock\", \"EVIL\"))\nprint(read_file(\"../other/.quillo/plugins.lock\"))\nprint(http.get(\"{u}\", {{}}, {{ save: \"../other/store/ok.bin\", public_only: false }}).bytes)\n"
+    );
+    std::fs::write(app.join("main.qwe"), main).unwrap();
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--allow-path", "../other"], &[], &d.0.join("a.log"), 60);
+    let refused = |what: &str, p: &str| format!("err(\"{}will not write {}: {}\")", what, p, OWN_QUILLO);
+    assert_eq!(
+        (code, out.lines().collect::<Vec<_>>()),
+        (
+            Some(0),
+            vec![
+                refused("http.get: save: ", "../other/.quillo/plugins.lock").as_str(),
+                refused("image: ", "../other/.quillo/native/libp-1.dylib").as_str(),
+                refused("image: ", "../other/.quillo/p.png").as_str(),
+                refused("write_file: ", "../other/.quillo/plugins.lock").as_str(),
+                "lock",
+                "4",
+            ]
+        ),
+        "{}",
+        out
+    );
+    drop(gs);
+    assert_eq!(std::fs::read_to_string(other.join("store/plugins.lock")).unwrap(), "lock");
+    assert_eq!(std::fs::read_dir(other.join("store/native")).unwrap().count(), 0);
+    assert!(!other.join("store/p.png").exists());
+    assert_eq!(std::fs::read_to_string(other.join("store/ok.bin")).unwrap(), "EVIL");
+}
+
+/// A `.quillo` made while the program runs is seen within a second: with none at the start,
+/// `ln -s qstore .quillo` while it served let `write_file` into `qstore/` and `files()` serve it,
+/// as the roots were kept by the files loaded alone (src/builtins.rs roots_seen and look_again;
+/// FEEDBACK85.md Q-1340, found by the verdict review of 0cc8547; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn a_quillo_made_while_the_program_runs_is_seen() {
+    let d = Dir(support::temp_dir("cov8285r3-quillo-later").canonicalize().unwrap());
+    let app = d.0.join("app");
+    std::fs::create_dir_all(app.join("qstore")).unwrap();
+    std::fs::write(app.join("qstore/plugins.lock"), "lock").unwrap();
+    std::fs::write(app.join("main.qwe"), format!("{}route GET /all/*p = files(\".\", p)\n", WRITES)).unwrap();
+    let (g, port) = serve_at(&app, &["main.qwe"], &d.0.join("a.log"));
+    assert_eq!(send(port, "GET", "/w/notes.txt", &[], "").body, "saved");
+    assert_eq!(send(port, "GET", "/all/qstore/plugins.lock", &[], "").body, "lock");
+    std::os::unix::fs::symlink("qstore", app.join(".quillo")).unwrap();
+    // Past the second the noted folders are looked at again within (at least, as a slower machine
+    // only waits longer).
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert_eq!(send(port, "GET", "/w/qstore/plugins.lock", &[], "").body, format!("write_file: will not write qstore/plugins.lock: {}", OWN_QUILLO));
+    assert_eq!(send(port, "GET", "/all/qstore/plugins.lock", &[], "").status, 404);
+    assert_eq!(send(port, "GET", "/w/notes.txt", &[], "").body, "saved");
+    drop(g);
+    assert_eq!(std::fs::read_to_string(app.join("qstore/plugins.lock")).unwrap(), "lock");
+}
+
+/// The layout is judged again as the program loads where a build (or a prompt) ran after the
+/// start judged it: a `.quillo -> .` made while the Rust files were built stopped the start only
+/// after the top level ran (src/main.rs run_program and load; FEEDBACK85.md Q-1340, found by the
+/// verdict review of 0cc8547; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn a_quillo_made_while_the_rust_files_build_stops_the_start_before_the_top_level() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = Dir(support::temp_dir("cov8285r3-quillo-prebuild").canonicalize().unwrap());
+    let app = d.0.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    // A cargo that makes the link and builds nothing.
+    let cargo = d.0.join("cargo");
+    std::fs::write(&cargo, format!("#!/bin/sh\nln -s . \"{}/.quillo\"\nexit 1\n", app.display())).unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(app.join("a.qwer"), "pub fn a() -> i64 { 1 }\n").unwrap();
+    std::fs::write(app.join("b.qwer"), "pub fn b() -> i64 { 2 }\n").unwrap();
+    std::fs::write(app.join("main.qwe"), "print(\"TOP\")\nuse \"a.qwer\"\nuse \"b.qwer\"\nprint(a())\n").unwrap();
+    let (code, out) = quillo_at(&app, &["run", "--no-check", "main.qwe"], &[("CARGO", cargo.to_str().unwrap())], &d.0.join("a.log"), 120);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("building b.qwer, a.qwer together") || out.contains("building a.qwer, b.qwer together"), "{}", out);
+    assert!(!out.lines().any(|l| l == "TOP"), "{}", out);
+    assert!(out.contains(".quillo leads to") && out.contains("so it must be a folder of its own"), "{}", out);
+}
+
+/// A `--watch` reload judges the layout as a start does: with `.quillo -> ..` made while the
+/// program served, a save reloaded it and ran its top level, where a start stops (src/server.rs
+/// reload_saying; FEEDBACK85.md Q-1340, found by the verdict review of 0cc8547; branch
+/// feedback82-85)
+#[cfg(unix)]
+#[test]
+fn a_reload_judges_the_layout_as_a_start_does() {
+    let d = Dir(support::temp_dir("cov8285r3-quillo-reload").canonicalize().unwrap());
+    let app = d.0.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("main.qwe"), "route GET /v = \"1\"\n").unwrap();
+    let log = d.0.join("a.log");
+    let (g, port) = serve_vars(&app, &["main.qwe", "--watch"], &[], &log);
+    assert_eq!(send(port, "GET", "/v", &[], "").body, "1");
+    std::os::unix::fs::symlink("..", app.join(".quillo")).unwrap();
+    std::fs::write(app.join("main.qwe"), "route GET /v = \"2\"\n").unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while !log_of(&log).contains("reloaded") && !log_of(&log).contains(".quillo leads to") {
+        assert!(std::time::Instant::now() < deadline, "{}", log_of(&log));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let said = log_of(&log);
+    assert!(said.contains(".quillo leads to") && said.contains("so it must be a folder of its own") && !said.contains("reloaded"), "{}", said);
+    assert_eq!(send(port, "GET", "/v", &[], "").body, "1");
+    drop(g);
+}

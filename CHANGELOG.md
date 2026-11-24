@@ -337,7 +337,11 @@ What a program may notice:
   migrations folders are refused to the other side, also for a `--service-url` service whose
   source is on this machine (found by the review of 8989870). `write_file` of an existing
   file no longer resolves the settings' paths on every write: about 21% fewer instructions a
-  write than 0.8.10. Deleting a folder no longer removes a link the program's code,
+  write than 0.8.10. A path named through a `.quillo` is refused to every writer by that name, also
+  through `--allow-path` (`http.get`'s `save` and `image.convert` wrote there); a `.quillo`
+  made or re-pointed while the program runs is seen within a second; the layout is judged
+  again as the program loads after a Rust build or a confirm prompt, and on every `--watch`
+  reload as at a start (found by the verdict review of 0cc8547). Deleting a folder no longer removes a link the program's code,
   `--env-file` or its database is used through, works on trees of any depth, and judges a
   FIFO beside a journal's name without waiting on it; `files()` no longer hangs on one.
 - **`read_file`, `write_file` and `delete_file`'s refusal of a path outside the folder** ends

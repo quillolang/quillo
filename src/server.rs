@@ -4496,7 +4496,16 @@ impl App {
         // as they load: FEEDBACK55.md, Q-701; branch feedback55).
         crate::builtins::protect_settings(&self.base_dir, None);
         let res = if problems.is_empty() {
-            let (res, read) = crate::error::noting_reads(|| it.load_file(&self.main_file));
+            // Laid out as at the start: a `.quillo` that leads to the program's folder or above
+            // stops a reload before its top level runs, as it stops a start, and one beside a file
+            // it loaded once it is loaded (FEEDBACK85.md, Q-1340, found by the verdict review of
+            // 0cc8547; branch feedback82-85).
+            let (res, read) = crate::error::noting_reads(|| {
+                crate::builtins::quillo_layout_dir(&self.base_dir)
+                    .map_err(|e| crate::error::QuilloError::new(e, 0))
+                    .and_then(|_| it.load_file(&self.main_file))
+                    .and_then(|v| crate::builtins::quillo_layout(&it).map(|_| v).map_err(|e| crate::error::QuilloError::new(e, 0)))
+            });
             tried.extend(read);
             res
         } else {

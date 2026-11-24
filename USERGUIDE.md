@@ -8141,7 +8141,8 @@ Under `--split` an app and the services it starts keep each
   keeps those of a service whose files are on this machine; a service started on its own
   (not by `--split`) does not know its app's, so keep its folder apart from the app's. A
   `.quillo` link is followed part by part; one that leads past a folder not made yet
-  (`qstore/../q2`) stops the start. Names are compared as the file system compares
+  (`qstore/../q2`) stops the start, and a `--watch` reload, as at a start. A `.quillo` made
+  or re-pointed while the program runs is seen within a second. Names are compared as the file system compares
   them: on macOS
   and Windows in any ASCII case, so `.QUILLO` is `.quillo` but `.quıllo` is not. Writing a
   file onto a folder fails as the system says; only `delete_file` judges what a folder

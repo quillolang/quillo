@@ -1583,15 +1583,16 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
     shared.service_urls.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(o.service_urls.iter().cloned());
     interp.base = o.base.clone().unwrap_or_default();
     interp.is_service = o.as_service;
+    // Judged by `before_the_program` a moment ago, for this start, and taken whether this load
+    // gets that far or not: one that failed its check under --watch left it, and the load after
+    // the fix ran unjudged (found by the verdict review of 0cc8547; FEEDBACK85.md, Q-1340; branch
+    // feedback82-85). Asked again at each reload (found measuring the review of efd9b8e).
+    let judged = LAYOUT_JUDGED.swap(false, std::sync::atomic::Ordering::Relaxed);
     let loaded = match checked.and_then(|tools| {
         // And laid out so Quillo's own files are not the program's to write: a `.quillo` that leads
         // to the program's folder or above stops the start (FEEDBACK85.md, Q-1340, found by the
         // review of 9da2632; branch feedback82-85).
         let (r, read) = quillo::error::noting_reads(|| {
-            // Judged by `before_the_program` a moment ago, for this start: asked again at each
-            // reload (found measuring the review of efd9b8e; FEEDBACK85.md, Q-1340; branch
-            // feedback82-85).
-            let judged = LAYOUT_JUDGED.swap(false, std::sync::atomic::Ordering::Relaxed);
             let r = if judged { Ok(()) } else { quillo::builtins::quillo_layout_dir(base) };
             let r = r.and_then(|_| interp.load_file(path).map_err(|e| format!("{:#}", e)));
             r.and_then(|_| quillo::builtins::quillo_layout(&interp))
@@ -2196,7 +2197,16 @@ fn run_program(file: &str, flags: &[String]) -> i32 {
     // The Rust files not built yet, in one cargo call before the program runs, rather than one
     // `use` after another (FEEDBACK37.md, Q-454; branch feedback36-39).
     if let Ok(files) = quillo::native::rust_files(Path::new(file)) {
+        // A prompt waited on the terminal, or a build ran: the layout is judged again as the
+        // program loads (`load`), as a `.quillo` made meanwhile stopped the start only after the
+        // top level ran (found by the verdict review of 0cc8547; FEEDBACK85.md, Q-1340; branch
+        // feedback82-85).
+        if ask || !files.is_empty() {
+            LAYOUT_JUDGED.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         quillo::native::prebuild(&files);
+    } else if ask {
+        LAYOUT_JUDGED.store(false, std::sync::atomic::Ordering::Relaxed);
     }
     let host = o.host.clone().unwrap_or_else(|| "127.0.0.1".into());
     let port = o.port.clone().unwrap_or_else(|| std::env::var("PORT").unwrap_or_else(|_| "8080".into()));
