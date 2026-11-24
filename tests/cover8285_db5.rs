@@ -1174,7 +1174,7 @@ fn a_taken_files_migration_folder_by_a_link_is_read_where_it_is() {
 
 /// What the hold says when a taken file's statement begins with a word it may not begin with.
 fn begins(word: &str, file: &str) -> String {
-    format!("db: this statement begins with `{}`, which a taken file's statement may not begin with where a quillo.confirmed holds the run: it may begin with select, insert, update, delete, with, values, table, replace, explain, create, alter, drop or truncate ({}'s SQL). Run it from the main file's SQL, or from a migration the main file runs", word, file)
+    format!("db: this statement begins with `{}`, which a taken file's statement may not begin with where a quillo.confirmed holds the run: it may begin with select, insert, update, delete, with, values, table, replace, merge, explain, create, alter, drop, truncate or refresh materialized view ({}'s SQL). Run it from the main file's SQL, or from a migration the main file runs", word, file)
 }
 
 /// What the hold says when a taken file's SQL names one of PostgreSQL's `pg_...`.
@@ -1202,7 +1202,7 @@ fn said_r4(refused: &[&str], ran: usize, file: &str) -> String {
 /// make, drop of a table, an index, a view or a sequence, and truncate:
 /// - `grant`, `revoke`, `set` (`set local client_encoding = 'SJIS'` in a transaction, the way a
 ///   kit made the server read its next string otherwise), `reset`, `show`, `comment`, `lock`,
-///   `vacuum`, `analyze`, `cluster`, `reindex`, `refresh`, `listen`, `notify`, `discard`,
+///   `vacuum`, `analyze`, `cluster`, `reindex`, `refresh` (but `refresh materialized view`, round 9), `listen`, `notify`, `discard`,
 ///   `checkpoint`, `drop schema`, `drop function`, and a statement in brackets are refused.
 /// - Any `pg_...` name (`pg_class`, `pg_prepared_statement()`, `pg_stat_get_activity(null)`,
 ///   `pg_sequences`, `pg_relation_size(...)` by an implicit cast, a quoted `"pg_tables"`) is
@@ -1236,7 +1236,6 @@ fn on_postgresql_a_taken_files_statement_may_begin_only_with_what_it_may_do() {
         ("db.exec", "analyze kits", None, "begins:analyze"),
         ("db.exec", "cluster kits", None, "begins:cluster"),
         ("db.exec", "reindex table kits", None, "begins:reindex"),
-        ("db.exec", "refresh materialized view kit_mv", None, "begins:refresh"),
         ("db.exec", "listen kit", None, "begins:listen"),
         ("db.exec", "notify kit", None, "begins:notify"),
         ("db.exec", "discard all", None, "begins:discard"),
@@ -1270,6 +1269,8 @@ fn on_postgresql_a_taken_files_statement_may_begin_only_with_what_it_may_do() {
         ("db.query", "select pg_catalog.now() is not null as t", None),
         ("db.query", "select '\u{4e01}\u{e9} caf\u{e9}' || 'x' as s, 1 as pg", None),
         ("db.exec", "update kits set x = x where x = 1", None),
+        // Round 9: `refresh materialized view`, which runs the view's own query again.
+        ("db.exec", "refresh materialized view kit_mv", None),
         ("db.exec", "delete from kits where x = 3", None),
     ];
     let mut calls: Vec<(&str, &str, Option<&str>)> = refused.iter().map(|(f, s, v, _)| (*f, *s, *v)).collect();
@@ -1281,7 +1282,7 @@ fn on_postgresql_a_taken_files_statement_may_begin_only_with_what_it_may_do() {
     assert_eq!(code, 0, "{}", out);
     assert!(out.contains("main: [{ relname: \"kits\" }]\n"), "{}", out);
     let whats: Vec<&str> = refused.iter().map(|(_, _, _, w)| *w).collect();
-    assert!(out.contains(&said_r4(&whats, ran.len(), "kit/k.qwe").replace(&begins("", "kit/k.qwe"), &"db: this statement's first word cannot be placed, which a taken file's statement may not begin with where a quillo.confirmed holds the run: it may begin with select, insert, update, delete, with, values, table, replace, explain, create, alter, drop or truncate (kit/k.qwe's SQL). Run it from the main file's SQL, or from a migration the main file runs".to_string())), "{}", out);
+    assert!(out.contains(&said_r4(&whats, ran.len(), "kit/k.qwe").replace(&begins("", "kit/k.qwe"), &"db: this statement's first word cannot be placed, which a taken file's statement may not begin with where a quillo.confirmed holds the run: it may begin with select, insert, update, delete, with, values, table, replace, merge, explain, create, alter, drop, truncate or refresh materialized view (kit/k.qwe's SQL). Run it from the main file's SQL, or from a migration the main file runs".to_string())), "{}", out);
     assert!(out.contains("schema: [{ n: 1 }]\n"), "{}", out);
 }
 
@@ -1434,8 +1435,9 @@ fn given_from_text(f: &str) -> String {
 /// in it, and a number only where the function takes a value:
 /// - A bare word is refused: `setval(n, 1000000)` and `nextval(n)` of
 ///   `(select '_quil' || 'lo_mine_id_seq' as n) t` moved Quillo's own sequence;
-///   `has_table_privilege(n, ...)`, `gin_clean_pending_list(n)`, `currval(kit_seq)`, a word as
-///   `setval`'s value and as `brin_summarize_range`'s block are refused too.
+///   `has_table_privilege(n, ...)`, `gin_clean_pending_list(n)` and `currval(kit_seq)` are refused
+///   too; a word as `setval`'s value and as `brin_summarize_range`'s block run (round 9: only the
+///   argument that takes the table is judged).
 /// - `row_security_active` and `brin_summarize_new_values` of a concatenation are refused, as the
 ///   others were.
 /// - A table by its number is refused: `nextval('16390')`, `col_description(16384, 1)`; and a
@@ -1462,8 +1464,6 @@ fn on_postgresql_a_function_that_takes_a_table_takes_it_by_a_literal() {
         ("db.query", "select brin_summarize_new_values('_quil' || 'lo_mine_pkey') as v", None, given_from_text("brin_summarize_new_values")),
         ("db.query", "select gin_clean_pending_list(n) as v from (select 'kit_brin' as n) t", None, given_from_text("gin_clean_pending_list")),
         ("db.query", "select currval(kit_seq) as v", None, given_from_text("currval")),
-        ("db.query", "select setval('kit_seq', n) as v from (select 5 as n) t", None, given_from_text("setval")),
-        ("db.query", "select brin_summarize_range('kit_brin', n) as v from (select 0 as n) t", None, given_from_text("brin_summarize_range")),
         ("db.query", "select nextval('16390') as v", None, given_from_text("nextval")),
         ("db.query", "select col_description(16384, 1) as v", None, given_from_text("col_description")),
         ("db.query", "select nextval(E'kit_seq') as v", None, given_from_text("nextval")),
@@ -1476,6 +1476,9 @@ fn on_postgresql_a_function_that_takes_a_table_takes_it_by_a_literal() {
         ("db.query", "select row_security_active('kits') as v", None),
         ("db.query", "select brin_summarize_new_values('kit_brin') as v", None),
         ("db.query", "select brin_summarize_range('kit_brin', 0) as v", None),
+        // Round 9: only the argument that takes the table is judged; a value may be anything.
+        ("db.query", "select setval('kit_seq', n) as v from (select 5 as n) t", None),
+        ("db.query", "select brin_summarize_range('kit_brin', n) as v from (select 0 as n) t", None),
         ("db.query", "select jsonb_path_query_first('[1, 2]', '$[0]') as v", None),
         ("db.query", "select '[' || 'nextval(n)' as s, 1 as x /* setval(n, 1) [ */", None),
     ];

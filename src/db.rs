@@ -750,7 +750,8 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
     // takes any path, and so may a statement: no statement pays for asking. SAFETY: the
     // connection is open, and the callback keeps no pointer: it is handed none.
     if crate::confirm::held() {
-        let rc = unsafe { rusqlite::ffi::sqlite3_set_authorizer(c.handle(), Some(authorize), std::ptr::null_mut()) };
+        // Handed the connection, whose transaction it looks at (`authorize`'s `foreign_keys`).
+        let rc = unsafe { rusqlite::ffi::sqlite3_set_authorizer(c.handle(), Some(authorize), c.handle() as *mut std::ffi::c_void) };
         if rc != rusqlite::ffi::SQLITE_OK {
             return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rc), Some("the database's statements could not be held".into())));
         }
@@ -1595,6 +1596,8 @@ fn looked_for(w: &[u8]) -> bool {
     match l {
         b"do" | b"prepare" | b"execute" | b"call" | b"deallocate" | b"create" | b"alter" | b"copy" | b"load" | b"import" | b"begin" | b"if" | b"while" | b"loop" | b"repeat" | b"case" | b"declare" | b"leave"
         | b"iterate" | b"regclass" | b"oid" | b"outfile" | b"dumpfile" | b"sys" => true,
+        b"regproc" | b"regprocedure" | b"regoper" | b"regoperator" | b"regtype" | b"regrole" | b"regnamespace" | b"regconfig" | b"regdictionary" | b"regcollation" => true,
+        _ if l.starts_with(b"_reg") && reg_type(l) => true,
         b"ts_stat" | b"ts_rewrite" | b"to_regclass" | b"nextval" | b"setval" | b"currval" | b"connectby" => true,
         // The extensions' of `runs_text`, by their names (`pgstat...` below).
         b"xpath_table" | b"get_raw_page" | b"bt_metap" | b"bt_page_items" | b"bt_page_stats" | b"bt_multi_page_stats" | b"brin_page_items" | b"gist_page_items" | b"hash_bitmap_info"
@@ -1789,13 +1792,21 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
             }
             let before = k.checked_sub(1).and_then(|b| stmt.get(b));
             if let Tk::Word(x) = t {
+                // Where a statement begins: its start, after `then`, `else`, `begin`, `do`, a label,
+                // or MariaDB's `set statement ... for`. `call`, `prepare` and `deallocate` are
+                // statements only there, and a word elsewhere is a name (a column named `call` was
+                // refused); `execute` is refused anywhere, as `create table t as execute s(...)`
+                // runs one inside another statement (FEEDBACK83.md, Q-1300, found by the live review
+                // of 726b006; branch feedback82-85).
+                let starts = k == h || ["then", "else", "begin", "do", "for"].iter().any(|w| is(before, w)) || matches!(before, Some(Tk::Punct(b':')));
                 for w in ["execute", "call", "prepare", "deallocate"] {
-                    if x.eq_ignore_ascii_case(w.as_bytes()) {
+                    if x.eq_ignore_ascii_case(w.as_bytes()) && (w == "execute" || starts) {
                         return runs(format!("`{}`", if w == "execute" && is(stmt.get(k + 1), "immediate") { "execute immediate" } else { w }));
                     }
                 }
-                // `do` where a statement begins; not `on conflict do nothing`.
-                if x.eq_ignore_ascii_case(b"do") && (k == h || ["then", "else", "begin"].iter().any(|w| is(before, w)) || matches!(before, Some(Tk::Punct(b':')))) {
+                // `do` where a statement begins; not `on conflict do nothing`, nor a `merge`'s
+                // `then do nothing`, which run no block (a `do` takes its code as a string).
+                if x.eq_ignore_ascii_case(b"do") && !is(stmt.get(k + 1), "nothing") && starts {
                     return runs("`do`".into());
                 }
                 if x.eq_ignore_ascii_case(b"create") && k != h {
@@ -1873,6 +1884,17 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
                     return runs(format!("a {} worked out as it runs", if n.eq_ignore_ascii_case(b"oid") { "table's number (oid)" } else { "table's name (regclass)" }));
                 }
             }
+            // And PostgreSQL's types that name a catalog object by text, by their names wherever
+            // they are (a column's type, a cast, quoted too): `create table kreg (r regclass)` then
+            // `insert into kreg select '_quil' || 'lo_jobs'` stored a table's name worked out from
+            // text (FEEDBACK83.md, Q-1300, found by the live review of 726b006; branch
+            // feedback82-85). `oid` is a column's name too often to be refused but as a type; a
+            // quoted one is a name as an alias (`as "regclass"`, outside a `cast(`), a type
+            // elsewhere (`r "regclass"`).
+            let alias = matches!(t, Tk::Names(_)) && is(before, "as") && casts.last() != Some(&true);
+            if let Some(n) = names.clone().find(|n| !alias && reg_type(n)) {
+                return runs(format!("the type {}, by which a text names a catalog object as it runs,", String::from_utf8_lossy(n).to_ascii_lowercase()));
+            }
         }
         if let Some(why) = head_refused(my, stmt, h) {
             return Some(why);
@@ -1881,42 +1903,56 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
     None
 }
 
-/// Whether the arguments of a call of a `regclass_fn` named `f`, the tokens after its `(`
-/// (`rest`), are literals its `)` closes: a table (or a user, a column, a privilege) by a plain
-/// string `'...'` with a letter in it and no backslash, judged with the statement's other names
-/// (`own_table_named`), for a string of digits is a table by its number (oid) and a backslash an
-/// escape under `standard_conforming_strings` off; a number, `true` or `false` only where `f` takes
-/// a value (`setval`'s, a range's block, `col_description`'s column; `has_column_privilege`'s
-/// column number is a `smallint`, which a number is not without a cast).
-/// A word (a column, `n` of a subquery), a parameter (`$1`, `?`), an operator, a call, a cast and
-/// any other string are refused (FEEDBACK83.md, Q-1300, found by review 8 of cb0ce59; branch
-/// feedback82-85).
+/// PostgreSQL's types whose value is a catalog object named by text (`'kits'::regclass`,
+/// `regprocedure`, `regrole`, ...), in any letters, and their arrays by the names PostgreSQL gives
+/// them (`_regclass`, which `'{kits}'::_regclass` takes for a list of tables).
+fn reg_type(n: &[u8]) -> bool {
+    const TYPES: &[&[u8]] = &[b"regclass", b"regproc", b"regprocedure", b"regoper", b"regoperator", b"regtype", b"regrole", b"regnamespace", b"regconfig", b"regdictionary", b"regcollation"];
+    let n = n.strip_prefix(b"_").unwrap_or(n);
+    TYPES.iter().any(|t| n.eq_ignore_ascii_case(t))
+}
+
+/// Whether the call of a `regclass_fn` named `f`, the tokens after its `(` (`rest`), closed by its
+/// `)`, takes its table (or tablespace, or object by its number) by a plain string `'...'` with a
+/// letter in it and no backslash, judged with the statement's other names (`own_table_named`): a
+/// string of digits is a table by its number (oid), a backslash an escape under
+/// `standard_conforming_strings` off, and a word (a column, `n` of a subquery), a parameter (`$1`,
+/// `?`), an operator, a call, a cast or any other string is a name worked out as it runs
+/// (FEEDBACK83.md, Q-1300, found by review 8 of cb0ce59; branch feedback82-85). Only that argument:
+/// the first, or the second of a `has_..._privilege` given a user first (three arguments, four for
+/// `has_column_privilege`); the others take values and may be anything, as the rest of the
+/// statement is judged on its own (`select setval('k_seq', ?)` was refused: found by the live
+/// review of 726b006). PostgreSQL's `binary_upgrade_...` take every argument so.
 fn plain_arguments(f: &[u8], rest: &[Tk<'_>]) -> bool {
-    let mut args: Vec<&Tk<'_>> = Vec::new();
-    let mut one = false;
-    let shut = 'read: {
-        for t in rest {
-            match t {
-                Tk::Punct(b')') => break 'read one,
-                Tk::Punct(b',') if one => one = false,
-                Tk::Str(_) | Tk::Word(_) if !one => {
-                    args.push(t);
-                    one = true;
-                }
-                _ => return false,
+    // The arguments, split at the commas outside brackets, to the `)` that closes the call.
+    let (mut args, mut depth, mut from) = (Vec::new(), 0usize, 0usize);
+    let mut shut = false;
+    for (k, t) in rest.iter().enumerate() {
+        match t {
+            Tk::Punct(b'(') => depth += 1,
+            Tk::Punct(b')') if depth == 0 => {
+                args.push(&rest[from..k]);
+                shut = true;
+                break;
             }
+            Tk::Punct(b')') => depth -= 1,
+            Tk::Punct(b',') if depth == 0 => {
+                args.push(&rest[from..k]);
+                from = k + 1;
+            }
+            _ => {}
         }
-        false
-    };
-    let value_at = |k: usize| {
-        let is = |w: &[u8]| f.eq_ignore_ascii_case(w);
-        (is(b"setval") && k >= 1) || ((is(b"brin_summarize_range") || is(b"brin_desummarize_range") || is(b"col_description")) && k == 1)
-    };
-    shut && args.iter().enumerate().all(|(k, t)| match t {
-        Tk::Str(s) => s.len() >= 2 && s[0] == b'\'' && !s.contains(&b'\\') && s.iter().any(|c| c.is_ascii_alphabetic() || *c == b'_'),
-        Tk::Word(x) => value_at(k) && (x.iter().all(u8::is_ascii_digit) || x.eq_ignore_ascii_case(b"true") || x.eq_ignore_ascii_case(b"false")),
-        _ => false,
-    })
+    }
+    let plain = |a: &[Tk<'_>]| matches!(a, [Tk::Str(s)] if s.len() >= 2 && s[0] == b'\'' && !s.contains(&b'\\') && s.iter().any(|c| c.is_ascii_alphabetic() || *c == b'_'));
+    if !shut {
+        return false;
+    }
+    if starts_with_any(f, &[b"binary_upgrade_"]) {
+        return args.iter().all(|a| plain(a));
+    }
+    let with_user = if f.eq_ignore_ascii_case(b"has_column_privilege") { 4 } else { 3 };
+    let table = if starts_with_any(f, &[b"has_"]) && args.len() == with_user { 1 } else { 0 };
+    args.get(table).is_some_and(|a| plain(a))
 }
 
 /// What a taken file's statement may begin with, where a quillo.confirmed holds the run, as its
@@ -1940,6 +1976,11 @@ fn head_refused(my: bool, stmt: &[Tk<'_>], h: usize) -> Option<TextRun> {
     match word.as_slice() {
         b"select" | b"insert" | b"update" | b"delete" | b"with" | b"values" | b"table" | b"truncate" | b"create" | b"alter" => None,
         b"replace" if my => None,
+        // PostgreSQL's `merge`, a statement of data as `insert` and `update` are, its parts judged
+        // as theirs are; and `refresh materialized view`, which runs the view's own query again
+        // (FEEDBACK83.md, Q-1300, found by the live review of 726b006; branch feedback82-85).
+        b"merge" if !my => None,
+        b"refresh" if !my && is(h + 1, "materialized") && is(h + 2, "view") => None,
         b"begin" | b"commit" | b"rollback" | b"savepoint" | b"release" | b"start" | b"end" | b"abort" => None,
         b"drop" => {
             let mut k = h + 1;
@@ -2190,7 +2231,7 @@ fn taken_sql_refused(d: crate::sql::Dialect, sql: &str, file: impl Fn() -> Strin
         TextRun::Reaches(what) => format!("{} reaches the database server's own files or programs, or another database, which is refused for {}'s SQL where a quillo.confirmed holds the run. {}", what, file(), tail),
         TextRun::Reads(what) => format!("{} holds other tables' data or other statements' SQL, which is refused for {}'s SQL where a quillo.confirmed holds the run. {}", what, file(), tail),
         TextRun::Begins(what) => format!(
-            "{}, which a taken file's statement may not begin with where a quillo.confirmed holds the run: it may begin with select, insert, update, delete, with, values, table, replace, explain, create, alter, drop or truncate ({}'s SQL). {}",
+            "{}, which a taken file's statement may not begin with where a quillo.confirmed holds the run: it may begin with select, insert, update, delete, with, values, table, replace, merge, explain, create, alter, drop, truncate or refresh materialized view ({}'s SQL). {}",
             what.map_or("this statement's first word cannot be placed".to_string(), |w| format!("this statement begins with `{}`", w)),
             file(),
             tail
@@ -2362,6 +2403,24 @@ fn pragma_reads(name: Option<&std::ffi::CStr>) -> bool {
     name.is_some_and(|n| READS.iter().any(|r| n.to_bytes().eq_ignore_ascii_case(r)))
 }
 
+/// `authorize`'s refusal of a taken file's temporary `kind` (table, view, index, virtual table)
+/// named `name`, said with the file's name: out of the way of the actions every statement asks for.
+#[cold]
+#[inline(never)]
+fn temp_refused(kind: &str, name: Option<&std::ffi::CStr>) -> std::ffi::c_int {
+    let name = name.map_or(String::new(), |t| t.to_string_lossy().into_owned());
+    let file = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| STATEMENTS_OF.with(|s| s.try_borrow().ok().map(|s| crate::confirm::held_name(s.file.as_deref()))))).ok().flatten().unwrap_or_else(|| "this file".into());
+    STATEMENTS_OF.with(|s| {
+        if let Ok(mut s) = s.try_borrow_mut() {
+            s.refused = Some(format!(
+                "a temporary {} (`{}`) stands for the program's of its name in every file's later statements on the shared connection, and is refused for {}'s SQL where a quillo.confirmed holds the run: a taken file makes its tables in the database. Run it from the main file's SQL, or from a migration the main file runs",
+                kind, name, file
+            ));
+        }
+    });
+    rusqlite::ffi::SQLITE_DENY
+}
+
 thread_local! {
     /// A migration runs on this thread (`migrate_as`), whose `foreign_keys` migrate.rs turns off
     /// and on again around a file that asks for it (`authorize`).
@@ -2379,7 +2438,7 @@ thread_local! {
 /// and the folder of SQLite's temporary files is not moved.
 /// Every other action is let through at once: a statement kept compiled (`prepare_cached`) is
 /// not asked again, and is kept for the code it was judged for alone (`compiled_as`).
-unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int, a1: *const std::ffi::c_char, a2: *const std::ffi::c_char, _: *const std::ffi::c_char, _: *const std::ffi::c_char) -> std::ffi::c_int {
+unsafe extern "C" fn authorize(conn: *mut std::ffi::c_void, action: std::ffi::c_int, a1: *const std::ffi::c_char, a2: *const std::ffi::c_char, schema: *const std::ffi::c_char, _: *const std::ffi::c_char) -> std::ffi::c_int {
     use rusqlite::ffi;
     let text = |p: *const std::ffi::c_char| (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) });
     // A write to one of Quillo's own tables by a taken file's statement, as SQLite names the table,
@@ -2435,6 +2494,29 @@ unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int
         // (FEEDBACK83.md, Q-1300, found trying to get round the fix of the coverage tests of 3117dea;
         // branch feedback82-85).
         let trigger = matches!(action, ffi::SQLITE_CREATE_TRIGGER | ffi::SQLITE_CREATE_TEMP_TRIGGER);
+        // And a temporary table, view or index of a taken file's (`create temp ...`, `create
+        // temporary ...`, `create table temp.x`, a virtual table in `temp`): it stands for the main
+        // file's table of its name in every file's later statements on the shared connection, as
+        // a pragma's setting does. A kit's `create temp table kits` had the main file read the
+        // kit's rows and a visitor's sign-up go into the temporary table, lost at the stop
+        // (FEEDBACK83.md, Q-1300, found by the live review of 726b006; branch feedback82-85).
+        // SQLite asks `create table temp.x` as a table's, in the schema `temp`: its name read for
+        // those alone, as a taken file's every action read it cost its `db.exec` 0.35% (measured,
+        // 200,000 statements compiled each).
+        let in_temp = || text(schema).is_some_and(|d| d.to_bytes().eq_ignore_ascii_case(b"temp"));
+        let temp = match action {
+            ffi::SQLITE_CREATE_TEMP_TABLE => Some("table"),
+            ffi::SQLITE_CREATE_TEMP_VIEW => Some("view"),
+            ffi::SQLITE_CREATE_TEMP_INDEX => Some("index"),
+            ffi::SQLITE_CREATE_TABLE if in_temp() => Some("table"),
+            ffi::SQLITE_CREATE_VIEW if in_temp() => Some("view"),
+            ffi::SQLITE_CREATE_INDEX if in_temp() => Some("index"),
+            ffi::SQLITE_CREATE_VTABLE if in_temp() => Some("virtual table"),
+            _ => None,
+        };
+        if let Some(kind) = temp.filter(|_| !writes && !over) {
+            return temp_refused(kind, text(a1));
+        }
         if writes || reads || mirrors || analyze || trigger || over {
             STATEMENTS_OF.with(|s| {
                 if let Ok(mut s) = s.try_borrow_mut() {
@@ -2485,7 +2567,16 @@ unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int
                 // `foreign_keys` around a migration that asks for it (migrate.rs), which SQLite
                 // takes for none inside the migration's transaction, goes on (FEEDBACK83.md, Q-1300,
                 // the coordinator's round 8 after the review of a65644e; branch feedback82-85).
-                Some(v) if OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_TAKEN.get() && !pragma_reads(text(a1)) && !(named(b"foreign_keys") && MIGRATING.get()) => {
+                // Quillo's own turn of `foreign_keys` around a migration (migrate.rs) is outside
+                // the file's transaction; the file's own, inside it, is refused: let through, a
+                // file's `commit; pragma foreign_keys = 00; begin;` left the keys off for the
+                // program (FEEDBACK83.md, Q-1300, found by the live review of 726b006; branch
+                // feedback82-85). SAFETY: `conn` is the connection SQLite asks for (`connect`).
+                Some(v) if OWN_SQL.with(|c| c.get()) == 0
+                    && STATEMENTS_TAKEN.get()
+                    && !pragma_reads(text(a1))
+                    && !(named(b"foreign_keys") && MIGRATING.get() && !conn.is_null() && unsafe { ffi::sqlite3_get_autocommit(conn as *mut ffi::sqlite3) } != 0) =>
+                {
                     let (name, value) = (text(a1).map_or(String::new(), |t| t.to_string_lossy().to_ascii_lowercase()), v.to_string_lossy().into_owned());
                     let file = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| STATEMENTS_OF.with(|s| s.try_borrow().ok().map(|s| crate::confirm::held_name(s.file.as_deref()))))).ok().flatten().unwrap_or_else(|| "this file".into());
                     STATEMENTS_OF.with(|s| {
@@ -4411,6 +4502,18 @@ fn migration_judge(code: (Option<Arc<str>>, Arc<Path>), d: crate::sql::Dialect, 
         if crate::confirm::held_taken(code.0.as_deref()) {
             if let Some(why) = taken_sql_refused(d, text, || crate::confirm::held_name(code.0.as_deref())) {
                 return Err(format!("{}: {}", shown, why));
+            }
+            // On SQLite each file runs in a transaction of Quillo's own (migrate.rs), which the
+            // file's `commit`, `end` or `rollback` would end, the rest of it then outside any:
+            // `commit; pragma foreign_keys = 00; begin;` ran its pragma where Quillo's own turn of
+            // the keys runs, and left them off (FEEDBACK83.md, Q-1300, found by the live review of
+            // 726b006; branch feedback82-85). A file's `begin` there is SQLite's error already.
+            if d == crate::sql::Dialect::Sqlite && crate::sql::scan(d, text).tx_control(true) {
+                return Err(format!(
+                    "{}: a taken file's migration begins or ends no transaction where a quillo.confirmed holds the run: each file runs in one of Quillo's own, which its `commit` or `rollback` would end ({}'s SQL). Run it from the main file's migrations",
+                    shown,
+                    crate::confirm::held_name(code.0.as_deref())
+                ));
             }
         }
         Ok(())

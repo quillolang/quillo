@@ -142,7 +142,7 @@ fn unsure(what: &str) -> String {
 
 /// What the hold says when a taken file's statement begins with a word it may not begin with.
 fn begins(word: &str) -> String {
-    format!("db: this statement begins with `{}`, which a taken file's statement may not begin with where a quillo.confirmed holds the run: it may begin with select, insert, update, delete, with, values, table, replace, explain, create, alter, drop or truncate (kit/k.qwe's SQL). {}", word, TAIL)
+    format!("db: this statement begins with `{}`, which a taken file's statement may not begin with where a quillo.confirmed holds the run: it may begin with select, insert, update, delete, with, values, table, replace, merge, explain, create, alter, drop, truncate or refresh materialized view (kit/k.qwe's SQL). {}", word, TAIL)
 }
 
 const NUL: &str = "a NUL character";
@@ -761,8 +761,6 @@ fn the_sql_a_kit_ordinarily_writes_runs_under_a_hold_on_each_database() {
         ("db.exec", "create view if not exists k_named as select name from k_users", ""),
         ("db.query", "select * from k_named", ""),
         ("db.exec", "drop view if exists k_named", ""),
-        ("db.exec", "create temp table if not exists k_tmp (x int)", ""),
-        ("db.exec", "insert into k_tmp values (1)", ""),
         ("db.exec", "replace into k_users (id, name, email, age) values (1, 'ann', 'ann@x', 30)", ""),
         ("db.exec", "create virtual table if not exists k_fts using fts5(body)", ""),
         ("db.exec", "insert into k_fts (body) values ('quillo holds the run')", ""),
@@ -851,6 +849,13 @@ fn the_sql_a_kit_ordinarily_writes_runs_under_a_hold_on_each_database() {
         ("db.exec", "insert into k_users (name, email, age) values (?, ?, ?)", "\"d\u{e9}e\", \"d@x\", 7"),
         ("db.query", "select 'a''b' as q, $$dollar$$ as d, E'tab\\there' as e", ""),
         ("db.exec", "drop table if exists k_like", ""),
+        // Round 9: `merge`, `refresh materialized view`, `setval` given a value, a column named `call`.
+        ("db.exec", "merge into k_users u using (select 'ann@x' as email, 99 as age) s on u.email = s.email when matched then update set age = s.age when not matched then do nothing", ""),
+        ("db.exec", "refresh materialized view k_mv", ""),
+        ("db.query", "select setval('k_seq', ?) as n", "100"),
+        ("db.exec", "create table if not exists k_calls (id int primary key, call text)", ""),
+        ("db.exec", "insert into k_calls (id, call) values (1, 'caf\u{e9}')", ""),
+        ("db.query", "select call from k_calls where call is not null", ""),
     ];
     let mysql: Vec<(&str, &str, &str)> = vec![
         ("db.exec", "create table if not exists k_users (id int auto_increment primary key, name varchar(50) not null, email varchar(80) unique, created timestamp default current_timestamp, age int check (age >= 0), meta json) engine=InnoDB default charset=utf8mb4", ""),
@@ -1009,11 +1014,13 @@ fn on_sqlite_a_taken_files_pragma_settings_are_refused_and_its_reads_run() {
 }
 
 /// Under a quillo.confirmed a taken file's SQLite migration that turns foreign keys off to rebuild
-/// a table, as SQLite's own steps do, is applied: Quillo turns them off around it and on again
-/// (migrate.rs), which the hold lets through while a migration runs, and the child's row stays.
-/// Its migration that sets another pragma (`user_version`) is refused, saying so after the
-/// migration's name, and `db.migrate` stops (src/db.rs authorize, migrate_as, MIGRATING;
-/// FEEDBACK83.md Q-1300, the coordinator's round 8; branch feedback82-85).
+/// a table, as SQLite's own steps do, is refused (round 9, which decides it: round 8 applied it):
+/// Quillo's own turn of the keys around the file, outside its transaction, goes on, and the file's
+/// own `pragma foreign_keys = off`, inside it, is refused, saying so after the migration's name;
+/// the parent is not rebuilt and the child's row stays. Its migration that sets another pragma
+/// (`user_version`) is refused the same way, and `db.migrate` stops (src/db.rs authorize,
+/// migrate_as, MIGRATING; FEEDBACK83.md Q-1300, the coordinator's rounds 8 and 9; branch
+/// feedback82-85).
 #[test]
 fn a_taken_files_migration_turns_foreign_keys_off_as_quillo_does_and_sets_no_other_pragma() {
     let d = dir("migpragma");
@@ -1029,13 +1036,183 @@ fn a_taken_files_migration_turns_foreign_keys_off_as_quillo_does_and_sets_no_oth
     write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/k.db\"]\nfiles = [\"kit/m/\"]\n");
     checked(&d);
     let (code, out) = run(&d, &[]);
-    assert_eq!(code, 0, "{}", out);
-    assert!(out.contains("kit: [\"001_a.sql\", \"002_rebuild.sql\"] [{ p: 1 }] [{ foreign_keys: 1 }]\n"), "{}", out);
+    assert_ne!(code, 0, "{}", out);
+    // 001 was applied (its own transaction committed), 002 refused inside its own.
+    assert!(out.contains(&format!("kit/k.qwe:6: db.migrate: migration 002_rebuild.sql failed: {}\n", &sets("foreign_keys", "off")["db: ".len()..])), "{}", out);
+    assert_eq!(column(&d.join("data/k.db"), "select name from pragma_table_info('parent') order by cid"), ["id"]);
+    assert_eq!(column(&d.join("data/k.db"), "select cast(p as text) from child"), ["1"]);
     // A migration that sets another pragma: refused, and the run stops.
     std::fs::remove_file(d.join("data/k.db")).unwrap();
+    std::fs::remove_file(d.join("kit/m/002_rebuild.sql")).unwrap();
     write(&d, "kit/m/003_v.sql", "pragma user_version = 9;\n");
     let (code, out) = run(&d, &[]);
     assert_ne!(code, 0, "{}", out);
     assert!(out.contains(&format!("kit/k.qwe:6: db.migrate: migration 003_v.sql failed: {}\n", &sets("user_version", "9")["db: ".len()..])), "{}", out);
     assert_eq!(column(&d.join("data/k.db"), "select name from sqlite_master where name = 'child'"), ["child"]);
+}
+
+// Fix round 9
+
+/// What the hold says when a taken file makes a temporary table, view or index on SQLite.
+fn temporary(kind: &str, name: &str) -> String {
+    format!("db: a temporary {} (`{}`) stands for the program's of its name in every file's later statements on the shared connection, and is refused for kit/k.qwe's SQL where a quillo.confirmed holds the run: a taken file makes its tables in the database. {}", kind, name, TAIL)
+}
+
+/// Under a quillo.confirmed on SQLite a taken file makes no temporary table, view or index, by
+/// every spelling (`create temp`, `create temporary`, `if not exists`, `as select`, `create table
+/// temp.x`, `"temp".x`, `TEMP.x`, a virtual table in `temp`, a unicode name): one stood for the
+/// main file's `kits` in every later statement on the shared connection, the main file reading
+/// the kit's rows and a visitor's sign-up lost at the stop. Run: an index of the kit's on the main
+/// file's table, a table in a database the kit attached. `pragma m2.journal_mode = off` of that
+/// database is refused as any setting is (decided: refusing it is the simpler rule). The main
+/// file reads its own `kits` after, and its insert goes there (src/db.rs authorize,
+/// SQLITE_CREATE_TEMP_*, temp_refused; FEEDBACK83.md Q-1300, found by the live review of 726b006;
+/// branch feedback82-85).
+#[test]
+fn on_sqlite_a_taken_file_makes_no_temporary_table_view_or_index() {
+    let d = dir("temps");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    let calls: Vec<(&str, &str, String)> = vec![
+        ("db.exec", "create temp table kits (x text)", temporary("table", "kits")),
+        ("db.exec", "create temporary table if not exists k2 (x text)", temporary("table", "k2")),
+        ("db.exec", "create table temp.kits (x text)", temporary("table", "kits")),
+        ("db.exec", "create table \"temp\".kits (x text)", temporary("table", "kits")),
+        ("db.exec", "create table TEMP.kits (x text)", temporary("table", "kits")),
+        ("db.exec", "create temp table \"k\u{ef}ts\" (x text)", temporary("table", "k\u{ef}ts")),
+        ("db.exec", "create temp table k3 as select * from kits", temporary("table", "k3")),
+        ("db.exec", "create temp view kits as select 'kit-view' as x", temporary("view", "kits")),
+        ("db.exec", "create temporary view kv2 as select 1 as one", temporary("view", "kv2")),
+        ("db.exec", "create view temp.kv3 as select 1 as one", temporary("view", "kv3")),
+        ("db.exec", "create virtual table temp.kf using fts5(body)", temporary("virtual table", "kf")),
+        ("db.exec", "create index if not exists k_i on kits (x)", "ran".into()),
+        ("db.exec", "attach ':memory:' as m2", "ran".into()),
+        ("db.exec", "create table m2.kits (x text)", "ran".into()),
+        ("db.exec", "pragma m2.journal_mode = off", sets("journal_mode", "off")),
+        ("db.query", "select x from kits", "ran".into()),
+    ];
+    let made: Vec<(&str, &str, &str)> = calls.iter().map(|(f, s, _)| (*f, *s, "")).collect();
+    write(&d, "kit/k.qwe", &kit_ran(&made));
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\ndb.open(\"data/app.db\")\ndb.exec(\"create table if not exists kits (x text)\")\ndb.exec(\"insert into kits values ('main-real')\")\nprint(steal())\nprint(\"main: \" + str(db.query(\"select x from kits\")) + \" \" + str(db.exec(\"insert into kits values ('visitor')\")))\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/app.db\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    let mut want = vec!["kit:".to_string()];
+    want.extend(calls.iter().map(|(_, _, w)| w.clone()));
+    assert!(out.contains(&format!("{}\nmain: [{{ x: \"main-real\" }}] {{ changes: 1, last_id: 2 }}\n", want.join("\n"))), "{}", out);
+    assert_eq!(column(&d.join("data/app.db"), "select x from kits order by rowid"), ["main-real", "visitor"]);
+}
+
+/// Under a quillo.confirmed a taken file's SQLite migration begins or ends no transaction: each
+/// file runs in one of Quillo's own, which its `commit` ended, and `commit; pragma foreign_keys =
+/// 00; begin;` then ran its pragma outside any, leaving the program's keys off. Refused before the
+/// file runs, saying so after its name, by every spelling (`commit`, `END TRANSACTION`, `rollback`
+/// after a comment, `savepoint`), and nothing of it is made. A word `commit` in a string or a
+/// comment, and in a table's name, is none; that file is applied and the keys are on (src/db.rs
+/// migration_judge; FEEDBACK83.md Q-1300, found by the live review of 726b006; branch
+/// feedback82-85).
+#[test]
+fn a_taken_files_sqlite_migration_begins_or_ends_no_transaction() {
+    let d = dir("migtx");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    write(
+        &d,
+        "kit/k.qwe",
+        "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  let k = db.connect(\"data/app.db\")\n  return \"kit: \" + str(k.migrate(\"kit/m\")) + \" \" + str(k.query(\"pragma foreign_keys\"))\n}\n",
+    );
+    write(&d, "main.qwe", "import kit/k.qwe use Badge, steal\ndb.open(\"data/app.db\")\nprint(steal())\nprint(\"main: \" + str(db.query(\"pragma foreign_keys\")))\n");
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/app.db\"]\nfiles = [\"kit/m/\"]\n");
+    let refused = "kit/k.qwe:6: db.migrate: kit/m/001_a.sql: a taken file's migration begins or ends no transaction where a quillo.confirmed holds the run: each file runs in one of Quillo's own, which its `commit` or `rollback` would end (kit/k.qwe's SQL). Run it from the main file's migrations\n";
+    for tail in ["commit;\npragma foreign_keys = 00;\nbegin;\n", "END TRANSACTION;\n", "/* x */ rollback;\n", "savepoint s;\nrelease s;\n"] {
+        let _ = std::fs::remove_file(d.join("data/app.db"));
+        write(&d, "kit/m/001_a.sql", &format!("create table if not exists kp (id integer primary key);\n{}", tail));
+        let (code, out) = run(&d, &[]);
+        assert_ne!(code, 0, "{}: {}", tail, out);
+        assert!(out.contains(refused), "{}: {}", tail, out);
+        assert!(column(&d.join("data/app.db"), "select name from sqlite_master where name = 'kp'").is_empty(), "{}", tail);
+    }
+    let _ = std::fs::remove_file(d.join("data/app.db"));
+    write(&d, "kit/m/001_a.sql", "create table if not exists kcommit (x text);\ninsert into kcommit values ('commit; caf\u{e9}'); -- commit\n/* rollback */\n");
+    checked(&d);
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("kit: [\"001_a.sql\"] [{ foreign_keys: 1 }]\nmain: [{ foreign_keys: 1 }]\n"), "{}", out);
+    assert_eq!(column(&d.join("data/app.db"), "select x from kcommit"), ["commit; caf\u{e9}"]);
+}
+
+/// Under a quillo.confirmed on PostgreSQL a taken file's SQL names none of the types whose value
+/// is a catalog object named by text, wherever they are: a column `regclass` (a table's name then
+/// stored from `'_quil' || 'lo_jobs'`), quoted, schema-qualified `regtype`, casts to `regtype`,
+/// `REGPROC`, `regrole`, the array `_regclass`, a quoted `"regclass"` in a cast (and `::regclass`,
+/// said as before); a quoted `"regclass"` as an alias is a name and runs. It writes `merge` (an insert, an
+/// update, `then do nothing`; `then do $$...$$` refused), `refresh materialized view` (plain,
+/// `concurrently`, `with [no] data`; `refresh` alone refused), `setval` given a value (a
+/// parameter, an expression, a subquery; a parameter as the sequence refused),
+/// `has_table_privilege` given a user first (a parameter as the table refused), and columns named
+/// `call`, `prepare` and `deallocate`; `call`, `prepare` and `deallocate` as statements are refused,
+/// and `execute` anywhere (`explain analyze execute`, `create table ... as execute`) (src/db.rs
+/// text_run_in, reg_type, head_refused, plain_arguments; FEEDBACK83.md Q-1300, found by the live
+/// review of 726b006; branch feedback82-85).
+#[test]
+fn on_postgresql_the_reg_types_are_refused_and_merge_refresh_setval_and_a_column_named_call_run() {
+    let Some(pg) = support::postgres("cov8285db7r9") else {
+        eprintln!("PostgreSQL is not installed: skipped");
+        return;
+    };
+    let url = pg.database("round9");
+    let d = dir("pgr9");
+    let reg = |t: &str| runs(&format!("the type {}, by which a text names a catalog object as it runs,", t));
+    let calls: Vec<(&str, &str, &str, String)> = vec![
+        ("db.exec", "create table if not exists kreg (r regclass)", "", reg("regclass")),
+        ("db.exec", "create table if not exists kreg2 (r \"regclass\")", "", reg("regclass")),
+        ("db.exec", "create table if not exists kreg3 (r pg_catalog.regtype)", "", reg("regtype")),
+        ("db.query", "select 'int4'::regtype as t", "", reg("regtype")),
+        ("db.query", "select cast('kits' as REGPROC) as p", "", reg("regproc")),
+        ("db.query", "select 'x'::regrole as r", "", reg("regrole")),
+        ("db.query", "select 'kits'::regclass as c", "", runs("a table's name (regclass) worked out as it runs")),
+        ("db.query", "select '{kits}'::_regclass as a", "", reg("_regclass")),
+        ("db.query", "select cast('kits' as \"regclass\") as c", "", runs("a table's name (regclass) worked out as it runs")),
+        ("db.query", "select 1 as \"regclass\", 2 as \"call\"", "", "ran".into()),
+        ("db.exec", "merge into kk using (select 'm' as x) s on kk.x = s.x when not matched then insert values (s.x) when matched then do nothing", "", "ran".into()),
+        ("db.exec", "merge into kk using (select 'm' as x) s on kk.x = s.x when matched then update set x = s.x || '\u{e9}'", "", "ran".into()),
+        ("db.exec", "merge into kk using (select 'm' as x) s on kk.x = s.x when matched then do $$ begin end $$", "", runs("`do`")),
+        ("db.exec", "refresh materialized view k_mv", "", "ran".into()),
+        ("db.exec", "refresh materialized view concurrently k_mvu", "", "ran".into()),
+        ("db.exec", "refresh materialized view k_mv with no data", "", "ran".into()),
+        ("db.exec", "refresh materialized view k_mv with data", "", "ran".into()),
+        ("db.exec", "refresh k_mv", "", begins("refresh")),
+        ("db.query", "select setval('k_seq', ?) as n", "100", "ran".into()),
+        ("db.query", "select setval('k_seq', ? + 1, true) as n", "100", "ran".into()),
+        ("db.query", "select setval('k_seq', (select 7)) as n", "", "ran".into()),
+        ("db.query", "select setval(?, 5) as n", "\"k_seq\"", runs("the function setval given a table's name worked out as it runs")),
+        ("db.query", "select has_table_privilege(current_user, 'kits', 'select') as p", "", "ran".into()),
+        ("db.query", "select has_table_privilege(current_user, ?, 'select') as p", "\"kits\"", runs("the function has_table_privilege given a table's name worked out as it runs")),
+        ("db.exec", "create table if not exists kc (id int primary key, call text, prepare text, deallocate text)", "", "ran".into()),
+        ("db.exec", "insert into kc (id, call, prepare, deallocate) values (1, 'c', 'p', 'd')", "", "ran".into()),
+        ("db.query", "select call, prepare, deallocate from kc where call = 'c'", "", "ran".into()),
+        ("db.exec", "call kp()", "", runs("`call`")),
+        ("db.exec", "prepare kps as select 1", "", runs("`prepare`")),
+        ("db.exec", "deallocate kps", "", runs("`deallocate`")),
+        ("db.query", "explain analyze execute kps", "", runs("`execute`")),
+        ("db.exec", "create table kx as execute kps", "", runs("`execute`")),
+    ];
+    let made: Vec<(&str, &str, &str)> = calls.iter().map(|(f, s, v, _)| (*f, *s, *v)).collect();
+    write(&d, "kit/k.qwe", &kit_ran(&made));
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\ndb.exec(\"create table if not exists kits (x text)\")\ndb.exec(\"create table if not exists kk (x text)\")\ndb.exec(\"create sequence if not exists k_seq\")\ndb.exec(\"create materialized view if not exists k_mv as select 1 as n\")\ndb.exec(\"create materialized view if not exists k_mvu as select 1 as n\")\ndb.exec(\"create unique index if not exists k_mvu_n on k_mvu (n)\")\nprint(steal())\nprint(\"kk: \" + str(db.query(\"select x from kk\")) + \" made: \" + str(db.query(\"select relname as n from pg_class where relname like 'kreg%' or relname = 'kx' order by 1\")))\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    let mut want = vec!["kit:".to_string()];
+    want.extend(calls.iter().map(|(_, _, _, w)| w.clone()));
+    assert!(out.contains(&format!("{}\n", want.join("\n"))), "{}", out);
+    assert!(out.contains("kk: [{ x: \"m\u{e9}\" }] made: []\n"), "{}", out);
 }

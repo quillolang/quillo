@@ -111,7 +111,12 @@ and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2
   MariaDB, as a test of 151 statements shows. On SQLite a taken file's pragma that sets (`=
   v`, `(v)`, quoted, `main.`) is refused and its reads run: a kit left the main file's
   connection with its journal off and `query_only` on; Quillo's read-only transactions and
-  its foreign-keys turn in migrations set theirs as its own.
+  its foreign-keys turn in migrations set theirs as its own. A taken file makes no SQLite temporary table, view or
+  index (a kit's `create temp table kits` stood for the main file's `kits`, and a visitor's
+  insert landed in it), its SQLite migrations begin or end no transaction and set no
+  `foreign_keys` (a kit's migration left them off for the main file), and its PostgreSQL SQL
+  names no `reg*` type (`'{kits}'::_regclass` too); `merge`, `refresh materialized view`,
+  `setval('s', ?)` and a column named `call` run (found by the live review of 726b006).
 - **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
   of 2026-11-24): a name another file defines, used without taking it, is an error in
   `quillo check`, and the start refuses it with `--no-check` too, as the value under it
