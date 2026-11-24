@@ -1566,6 +1566,12 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
         if let Some(dir) = o.program_root.as_ref() {
             quillo::privacy::set_root(Path::new(&dir));
         }
+        // Its app's files' `.quillo` folders, kept from this service's writes as the app keeps
+        // the service's (FEEDBACK85.md, Q-1340, found by the re-review of 00e83c3; branch
+        // feedback82-85).
+        if let Some(main) = std::env::var_os(quillo::service::APP_MAIN) {
+            quillo::builtins::note_program_folders(Path::new(&main));
+        }
     }
     let mut interp = Interp::new(base);
     let shared = interp.shared.clone();

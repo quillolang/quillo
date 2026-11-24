@@ -538,18 +538,15 @@ pub fn quillo_part(p: &Path) -> bool {
     {
         use std::os::unix::ffi::OsStrExt;
         let b = p.as_os_str().as_bytes();
-        // A part starts at the beginning or after a `/`; only one that begins with `.` is looked at.
-        let mut at = 0;
-        while at + 7 <= b.len() {
-            if b[at] == b'.' && (at == 0 || b[at - 1] == b'/') && (at + 7 == b.len() || b[at + 7] == b'/') {
+        // Each `.` found by `memchr` (a few a path), and only a part that begins with one, of seven
+        // bytes, is compared: a write asks this of two paths (found measuring the re-review of
+        // 00e83c3, FEEDBACK85.md Q-1340; branch feedback82-85).
+        memchr::memchr_iter(b'.', b).any(|at| {
+            (at == 0 || b[at - 1] == b'/') && (at + 7 == b.len() || b.get(at + 7) == Some(&b'/')) && at + 7 <= b.len() && {
                 let part = &b[at..at + 7];
-                if if cfg!(target_os = "macos") { part.eq_ignore_ascii_case(b".quillo") } else { part == b".quillo" } {
-                    return true;
-                }
+                if cfg!(target_os = "macos") { part.eq_ignore_ascii_case(b".quillo") } else { part == b".quillo" }
             }
-            at += 1;
-        }
-        false
+        })
     }
     #[cfg(not(unix))]
     {

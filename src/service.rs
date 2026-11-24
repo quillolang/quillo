@@ -2900,6 +2900,12 @@ pub fn declare(it: &mut Interp, name: &str, prefix: Option<&str>, file: &str, op
     }
     let ns = namespace(it, name, &defs, line)?;
     if let Some(url) = url_of(&it.shared, name) {
+        // Run in another process (`--split`, `--service-url`): its files' `.quillo` folders are kept
+        // from this one's writes where its source is here (FEEDBACK85.md, Q-1340, found by the
+        // re-review of 00e83c3; branch feedback82-85).
+        if full.exists() {
+            crate::builtins::note_program_folders(&full);
+        }
         if let Some(p) = prefix {
             it.remote_mounts.retain(|(q, _)| q != p);
             it.remote_mounts.push((p.to_string(), url));
@@ -3334,6 +3340,10 @@ fn free_port() -> std::io::Result<u16> {
 /// closes (main.rs's `stop_with_app`).
 pub const STOP_WITH_APP: &str = "QUILLO_STOP_WITH_APP";
 
+/// Set for the services `--split` starts: their app's main file, whose files' `.quillo` folders
+/// each keeps from its own writes (main.rs).
+pub const APP_MAIN: &str = "QUILLO_APP_MAIN";
+
 /// Starts a service's process, its log lines marked with its name.
 fn start_service(exe: &Path, args: &[String], name: &str) -> Result<std::process::Child, String> {
     let mut command = std::process::Command::new(exe);
@@ -3437,6 +3447,12 @@ fn supervise(services: Arc<Mutex<Vec<Running>>>, stop: Arc<std::sync::atomic::At
 /// its own, taking calls in turn and sharing its database (FEEDBACK10.md,
 /// Q-075; branch feedback10-fixes).
 pub fn split(path: &Path, watch: bool, reload: bool, static_check: bool, checked: bool, scale: &[(String, usize)], app_url: &str) -> Result<Split, String> {
+    // The app's main file, for each service it starts to keep its `.quillo` folders from its own
+    // writes (`builtins::note_program_folders`; FEEDBACK85.md, Q-1340, found by the re-review of
+    // 00e83c3; branch feedback82-85).
+    if let Ok(main) = path.canonicalize() {
+        std::env::set_var(APP_MAIN, main);
+    }
     let services = declared(path)?;
     let _ = APP_URL.set(app_url.to_string());
     if let Some((name, _)) = scale.iter().find(|(n, _)| !services.iter().any(|(s, _, _)| s == n)) {
@@ -3472,12 +3488,10 @@ pub fn split(path: &Path, watch: bool, reload: bool, static_check: bool, checked
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut running = Vec::new();
     for (name, prefix, file, port) in &copies {
-        // Its folder's `.quillo` is the process's to keep from the app's writes, as a service in
-        // the process is (FEEDBACK85.md, Q-1340, found by the final review of a6cee54; branch
-        // feedback82-85).
-        if let Some(d) = file.canonicalize().ok().and_then(|f| f.parent().map(Path::to_path_buf)) {
-            crate::builtins::note_quillo_folder(&d);
-        }
+        // Its folders' `.quillo` are the process's to keep from the app's writes, as a service in
+        // the process is: its main file's and those of the files it uses (FEEDBACK85.md, Q-1340,
+        // found by the final review of a6cee54 and the re-review of 00e83c3; branch feedback82-85).
+        crate::builtins::note_program_folders(file);
         let mut args: Vec<String> = vec!["run".into(), file.display().to_string(), "--port".into(), port.to_string(), "--as-service".into(), "--service-name".into(), name.clone()];
         // The app's folder, by argument: its quillo.confirmed holds the service, and its private
         // names' tags count from it (FEEDBACK83.md, Q-1300, found in review 2; FEEDBACK55.md,

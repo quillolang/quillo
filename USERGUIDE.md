@@ -8130,7 +8130,12 @@ path is judged where it really leads, with its links followed:
   or from a file with a second hard link, and a `.quillo` that leads to the program's folder
   or above stops the start. The `.quillo` folders of every program the process runs, mounted
   ones and services too, are refused to all of them, and `file()` and `files()` answer 404
-  for anything in one or where one leads. Names are compared as the file system compares
+  for anything in one or where one leads. Under `--split` an app and the services it starts keep each
+  other's `.quillo` folders too (each reads the other's files); with `--service-url` the app
+  keeps those of a service whose files are on this machine; a service started on its own
+  (not by `--split`) does not know its app's, so keep its folder apart from the app's. A
+  `.quillo` link is followed part by part; one that leads past a folder not made yet
+  (`qstore/../q2`) stops the start. Names are compared as the file system compares
   them: on macOS
   and Windows in any ASCII case, so `.QUILLO` is `.quillo` but `.quıllo` is not. Writing a
   file onto a folder fails as the system says; only `delete_file` judges what a folder

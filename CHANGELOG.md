@@ -324,7 +324,11 @@ What a program may notice:
   mounted one's and a service's too (the main program wrote a mounted program's `.quillo`
   through its link, and a planted library's constructor ran at the next start), and `file()`
   and `files()` serve nothing in a `.quillo` or where one leads (found by the final review of
-  a6cee54). Deleting a folder no longer removes a link the program's code,
+  a6cee54). Under `--split` an app and its services keep each other's `.quillo` folders
+  (each reads the other's files: a visitor's upload planted a library where a split
+  service's `.quillo` led), as an app does for a service served elsewhere whose source is on
+  this machine; a `.quillo` link is followed part by part, and one that leads past a folder
+  not made yet stops the start (found by the re-review of 00e83c3). Deleting a folder no longer removes a link the program's code,
   `--env-file` or its database is used through, works on trees of any depth, and judges a
   FIFO beside a journal's name without waiting on it; `files()` no longer hangs on one.
 - **`read_file`, `write_file` and `delete_file`'s refusal of a path outside the folder** ends

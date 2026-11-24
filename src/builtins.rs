@@ -3188,7 +3188,7 @@ fn own_target(it: &Interp, full: &Path, upload: bool, deleting: bool) -> Option<
     // 0284f7c and 9da2632; branch feedback82-85). A look at the names in memory: what is in a
     // `.quillo` is judged where Quillo reads it (`statics::open_below`). Quillo writes them itself,
     // never through here.
-    if crate::statics::quillo_part(full) || crate::statics::quillo_part(&real) || quillo_roots(it).roots.iter().any(|r| under(&folded_target, r)) {
+    if crate::statics::quillo_part(full) || crate::statics::quillo_part(&real) || under_quillo_root(it, &folded_target) {
         return Some(OWN_QUILLO);
     }
     let folded = fold_name(taken);
@@ -3320,6 +3320,47 @@ fn quillo_dirs(it: &Interp, loaded: &[std::path::PathBuf]) -> Vec<std::path::Pat
     out
 }
 
+/// Notes the folders of every file the program `main` would load (its `use`s, Rust files too, its
+/// mounted programs, its services), read from its source as `native::walk_program` reads it, whose
+/// `.quillo` the process keeps then (`note_quillo_folder`): for a program that runs in another
+/// process, which this one judges writes beside. Under `--split` the app knew a service only by
+/// its main file's folder, and a service the app not at all: a service's `lib/.quillo -> ../q3`
+/// took a visitor's library and lock through the app, and a service wrote where the app's
+/// `lib/.quillo` leads (found by the re-review of 00e83c3; FEEDBACK85.md, Q-1340; branch
+/// feedback82-85). The app reads each service's (service.rs), a service its app's (main.rs, by
+/// `QUILLO_APP_MAIN`); a service that runs elsewhere is read where its file is here. 64 programs at
+/// most; a file that cannot be read is passed.
+pub fn note_program_folders(main: &Path) {
+    let mut todo = vec![main.to_path_buf()];
+    let mut done: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    while let Some(m) = todo.pop() {
+        if done.len() >= 64 || !done.insert(m.canonicalize().unwrap_or_else(|_| m.clone())) {
+            continue;
+        }
+        if let Some(d) = m.parent() {
+            note_quillo_folder(d);
+        }
+        let mut services = Vec::new();
+        let rust = crate::native::walk_program(&m, &mut |f, stmts| {
+            let dir = f.parent().unwrap_or(Path::new("."));
+            note_quillo_folder(dir);
+            for s in stmts {
+                if let crate::ast::Stmt::Service(_, _, file, _, _, _) = s {
+                    if !file.contains("://") {
+                        services.push(dir.join(file));
+                    }
+                }
+            }
+        });
+        for r in rust.unwrap_or_default() {
+            if let Some(d) = r.parent() {
+                note_quillo_folder(d);
+            }
+        }
+        todo.extend(services);
+    }
+}
+
 /// The files any interpreter of this process loaded, resolved: `it`'s, and every other's, as each
 /// was noted as one of the process's own by its identity (`protect`) (FEEDBACK85.md, Q-1340, found
 /// by the final review of a6cee54; branch feedback82-85).
@@ -3384,8 +3425,34 @@ fn quillo_roots(it: &Interp) -> Arc<QuilloRoots> {
     static ROOTS: std::sync::Mutex<Vec<Arc<QuilloRoots>>> = std::sync::Mutex::new(Vec::new());
     let (loaded, count) = (Arc::as_ptr(&it.loaded) as *const () as usize, it.loaded.len());
     let seen = QUILLO_FOLDERS_SEEN.load(std::sync::atomic::Ordering::Acquire);
+    if let Some(g) = LAST_ROOTS.with(|l| l.borrow().as_ref().filter(|g| g.loaded == loaded && g.count == count && g.seen == seen && Arc::ptr_eq(&g.base, &it.base_dir)).cloned()) {
+        return g;
+    }
+    let g = quillo_roots_of(it, &ROOTS, loaded, count, seen);
+    LAST_ROOTS.with(|l| *l.borrow_mut() = Some(g.clone()));
+    g
+}
+
+thread_local! {
+    /// The thread's last `QuilloRoots`, by the same key, with no lock: a write asks for it.
+    static LAST_ROOTS: std::cell::RefCell<Option<Arc<QuilloRoots>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Whether `folded` (a resolved path, folded as `own_target` folds it) is under where one of the
+/// process's `.quillo` folders leads: the thread's last roots looked at in place, with no lock and
+/// no count of a reference taken, as each write asks (found measuring the re-review of 00e83c3,
+/// FEEDBACK85.md Q-1340; branch feedback82-85).
+fn under_quillo_root(it: &Interp, folded: &Path) -> bool {
+    let (loaded, count) = (Arc::as_ptr(&it.loaded) as *const () as usize, it.loaded.len());
+    let seen = QUILLO_FOLDERS_SEEN.load(std::sync::atomic::Ordering::Acquire);
+    let hit = LAST_ROOTS.with(|l| l.borrow().as_ref().filter(|g| g.loaded == loaded && g.count == count && g.seen == seen && Arc::ptr_eq(&g.base, &it.base_dir)).map(|g| g.roots.iter().any(|r| under(folded, r))));
+    hit.unwrap_or_else(|| quillo_roots(it).roots.iter().any(|r| under(folded, r)))
+}
+
+/// `quillo_roots` past the thread's last: those of the process, made where none is kept.
+fn quillo_roots_of(it: &Interp, roots_kept: &std::sync::Mutex<Vec<Arc<QuilloRoots>>>, loaded: usize, count: usize, seen: usize) -> Arc<QuilloRoots> {
     let same = |g: &&Arc<QuilloRoots>| g.loaded == loaded && g.count == count && g.seen == seen && (Arc::ptr_eq(&g.base, &it.base_dir) || *g.base == *it.base_dir);
-    if let Some(g) = ROOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(same) {
+    if let Some(g) = roots_kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().find(same) {
         return g.clone();
     }
     // Looked at off the lock.
@@ -3395,7 +3462,7 @@ fn quillo_roots(it: &Interp) -> Arc<QuilloRoots> {
     let folders: Vec<std::path::PathBuf> = dirs.iter().filter_map(|q| q.parent().map(Path::to_path_buf)).collect();
     let (mut roots, mut bad) = (Vec::new(), None);
     for q in &dirs {
-        let r = fold(&link_end(q));
+        let r = link_end(q).map_or_else(|| fold(q), |e| fold(&e));
         if bad.is_none() {
             bad = bad_quillo(q, &folders);
         }
@@ -3414,7 +3481,7 @@ fn quillo_roots(it: &Interp) -> Arc<QuilloRoots> {
         }
     }
     let g = Arc::new(QuilloRoots { loaded, count, seen, base: it.base_dir.clone(), roots, inside, bad });
-    let mut gs = ROOTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut gs = roots_kept.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     gs.retain(|x| !(x.loaded == loaded && x.count == count && *x.base == *it.base_dir));
     if gs.len() >= 8 {
         gs.remove(0);
@@ -3517,7 +3584,12 @@ fn quillo_hidden(it: &Interp, rel: &Path, led: Option<&Path>) -> bool {
 /// program's) or a folder above one.
 fn bad_quillo(q: &Path, folders: &[std::path::PathBuf]) -> Option<String> {
     let fold = |p: &Path| std::path::PathBuf::from(fold_name(&crate::statics::sys_form_of(p).to_string_lossy()));
-    let to = link_end(q);
+    let Some(to) = link_end(q) else {
+        return Some(format!(
+            "{} leads where the system cannot tell yet (a `..` after a folder that is not there): Quillo keeps the program's built plugins, their lock and its keys in .quillo, so it must lead to a folder of its own",
+            q.display()
+        ));
+    };
     let r = fold(&to);
     folders.iter().find(|f| under(&fold(f), &r)).map(|f| {
         format!(
@@ -3551,18 +3623,75 @@ pub fn quillo_layout_dir(dir: &Path) -> Result<(), String> {
 /// to what is not there yet, read as the link says (forty links at most), so a `.quillo -> qstore`
 /// made before `qstore` is `qstore` (FEEDBACK85.md, Q-1340, found by the review of 9da2632; branch
 /// feedback82-85).
-fn link_end(p: &Path) -> std::path::PathBuf {
-    let mut at = p.to_path_buf();
-    for _ in 0..40 {
-        if let Ok(r) = at.canonicalize() {
-            return crate::statics::sys_form(r);
+fn link_end(p: &Path) -> Option<std::path::PathBuf> {
+    if let Ok(r) = p.canonicalize() {
+        return Some(crate::statics::sys_form(r));
+    }
+    // Part by part: each part there taken through its links (a link's own words read where it
+    // leads to what is not there), and what follows the first part not there by its name. A `..`
+    // after a part not there cannot be told (the system resolves none past it) and gives None:
+    // taken as written, `.quillo -> sub/qstore` with `sub -> missing` was left as
+    // `sub/qstore`, and `.quillo -> qstore/../q2` as `q2`, and writes there went through (found by
+    // the re-review of 00e83c3; FEEDBACK85.md, Q-1340; branch feedback82-85).
+    let mut todo: std::collections::VecDeque<std::ffi::OsString> = std::collections::VecDeque::new();
+    let mut at = std::path::PathBuf::new();
+    let push = |todo: &mut std::collections::VecDeque<std::ffi::OsString>, at: &mut std::path::PathBuf, p: &Path, front: bool| {
+        let parts: Vec<std::ffi::OsString> = p
+            .components()
+            .filter_map(|c| match c {
+                Component::RootDir => {
+                    at.clear();
+                    at.push("/");
+                    None
+                }
+                Component::Prefix(x) => {
+                    at.clear();
+                    at.push(x.as_os_str());
+                    None
+                }
+                Component::CurDir => None,
+                Component::ParentDir => Some(std::ffi::OsString::from("..")),
+                Component::Normal(n) => Some(n.to_os_string()),
+            })
+            .collect();
+        if front {
+            for part in parts.into_iter().rev() {
+                todo.push_front(part);
+            }
+        } else {
+            todo.extend(parts);
         }
-        match std::fs::read_link(&at) {
-            Ok(to) => at = at.parent().map_or(to.clone(), |d| d.join(&to)),
-            Err(_) => break,
+    };
+    push(&mut todo, &mut at, p, false);
+    let (mut missing, mut hops) = (false, 0);
+    while let Some(part) = todo.pop_front() {
+        if part == ".." {
+            if missing {
+                return None;
+            }
+            at.pop();
+            continue;
+        }
+        let next = at.join(&part);
+        if missing {
+            at = next;
+            continue;
+        }
+        match std::fs::symlink_metadata(&next) {
+            Ok(m) if m.file_type().is_symlink() => {
+                hops += 1;
+                let to = std::fs::read_link(&next).ok().filter(|_| hops <= 40)?;
+                push(&mut todo, &mut at, &to, true);
+            }
+            Ok(_) => at = next,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                missing = true;
+                at = next;
+            }
+            Err(_) => return None,
         }
     }
-    crate::statics::sys_form(real_as_made(&at))
+    Some(crate::statics::sys_form(real_as_made(&at)))
 }
 
 /// Why the program `it` may not run as laid out, if it may not: a `.quillo` beside its main file

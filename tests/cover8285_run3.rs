@@ -2239,3 +2239,101 @@ fn a_pinned_build_is_refused_where_the_program_reaches_a_folder_its_c_compiler_s
     let said = format!("and the build would use a folder its C compiler searches on its own (for headers, libraries or the programs it runs), /usr/local/include, which is inside {}", inc.display());
     assert!(out.contains(&said) && !out.contains("building "), "{}", out);
 }
+
+// Fix round 12
+
+/// An app and the services `--split` starts each keep the other's `.quillo` folders: the app knew a
+/// service only by its main file's folder, so `svc/lib/.quillo -> ../q3` (a file the service uses)
+/// took the app's write of the service's lock, and `files()` served it; a service at the app's
+/// root wrote where the app's `lib/.quillo -> ../q4` leads. The app reads its services' files, a
+/// service its app's (src/builtins.rs note_program_folders, src/service.rs split, src/main.rs;
+/// FEEDBACK85.md Q-1340, found by the re-review of 00e83c3; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn an_app_and_its_split_services_keep_each_others_quillo_folders() {
+    let d = Dir(support::temp_dir("cov8285r3-quillo-split").canonicalize().unwrap());
+    let app = d.0.join("app");
+    for f in ["svc/lib", "svc/q3/native", "lib", "q4/native"] {
+        std::fs::create_dir_all(app.join(f)).unwrap();
+    }
+    for f in ["svc/q3/plugins.lock", "q4/plugins.lock"] {
+        std::fs::write(app.join(f), "lock").unwrap();
+    }
+    std::os::unix::fs::symlink("../q3", app.join("svc/lib/.quillo")).unwrap();
+    std::os::unix::fs::symlink("../q4", app.join("lib/.quillo")).unwrap();
+    std::fs::write(app.join("svc/lib/h.qwe"), "let h = 1\n").unwrap();
+    std::fs::write(app.join("lib/m.qwe"), "let m = 2\n").unwrap();
+    let w = "server fn w(p) {\n  let r = write_file(p, \"EVIL\")\n  return is_err(r) ? r.error : \"saved\"\n}\n";
+    std::fs::write(app.join("svc/b.qwe"), format!("use \"lib/h.qwe\"\n{}", w)).unwrap();
+    std::fs::write(app.join("c.qwe"), w).unwrap();
+    std::fs::write(
+        app.join("main.qwe"),
+        "use \"lib/m.qwe\"\nservice /b = \"svc/b.qwe\"\nservice /c = \"c.qwe\"\nroute writes GET /w/*p {\n  let r = write_file(p, \"EVIL\")\n  return is_err(r) ? r.error : \"saved\"\n}\nroute writes GET /cw/*p {\n  return c.w(p)\n}\nroute GET /all/*p = files(\".\", p)\n",
+    )
+    .unwrap();
+    let (g, port) = serve_at(&app, &["main.qwe", "--split"], &d.0.join("a.log"));
+    let refused = |p: &str| format!("write_file: will not write {}: {}", p, OWN_QUILLO);
+    assert_eq!(send(port, "GET", "/w/svc/q3/plugins.lock", &[], "").body, refused("svc/q3/plugins.lock"));
+    assert_eq!(send(port, "GET", "/w/svc/q3/native/libhi-1.dylib", &[], "").body, refused("svc/q3/native/libhi-1.dylib"));
+    assert_eq!(send(port, "GET", "/all/svc/q3/plugins.lock", &[], "").status, 404);
+    assert_eq!(send(port, "GET", "/cw/q4/plugins.lock", &[], "").body, refused("q4/plugins.lock"));
+    assert_eq!(send(port, "GET", "/w/notes.txt", &[], "").body, "saved");
+    drop(g);
+    for f in ["svc/q3/plugins.lock", "q4/plugins.lock"] {
+        assert_eq!(std::fs::read_to_string(app.join(f)).unwrap(), "lock", "{}", f);
+    }
+}
+
+/// A service another process serves (`--service-url`) is read where its source is here: the app
+/// wrote `svc/qs2/plugins.lock` (`svc/.quillo -> qs2`) and served it (src/service.rs,
+/// src/builtins.rs note_program_folders; FEEDBACK85.md Q-1340, found by the re-review of 00e83c3;
+/// branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn a_service_served_elsewhere_keeps_its_quillo_where_its_source_is_here() {
+    let d = Dir(support::temp_dir("cov8285r3-quillo-svcurl").canonicalize().unwrap());
+    let app = d.0.join("app");
+    for f in ["svc/qs2/native", "svc/lib"] {
+        std::fs::create_dir_all(app.join(f)).unwrap();
+    }
+    std::fs::write(app.join("svc/qs2/plugins.lock"), "lock").unwrap();
+    std::os::unix::fs::symlink("qs2", app.join("svc/.quillo")).unwrap();
+    std::fs::write(app.join("svc/b.qwe"), "server fn hello() {\n  return \"b\"\n}\n").unwrap();
+    std::fs::write(app.join("main.qwe"), "service /b = \"svc/b.qwe\"\nroute writes GET /w/*p {\n  let r = write_file(p, \"EVIL\")\n  return is_err(r) ? r.error : \"saved\"\n}\nroute GET /all/*p = files(\".\", p)\n").unwrap();
+    // The service itself, served apart, for the app to reach.
+    let (gs, sport) = serve_at(&app.join("svc"), &["b.qwe", "--as-service", "--service-name", "b"], &d.0.join("s.log"));
+    let url = format!("b=http://127.0.0.1:{}", sport);
+    let (g, port) = serve_at(&app, &["main.qwe", "--service-url", &url], &d.0.join("a.log"));
+    assert_eq!(send(port, "GET", "/w/svc/qs2/plugins.lock", &[], "").body, format!("write_file: will not write svc/qs2/plugins.lock: {}", OWN_QUILLO));
+    assert_eq!(send(port, "GET", "/all/svc/qs2/plugins.lock", &[], "").status, 404);
+    drop(g);
+    drop(gs);
+    assert_eq!(std::fs::read_to_string(app.join("svc/qs2/plugins.lock")).unwrap(), "lock");
+}
+
+/// A `.quillo` link is followed part by part: `.quillo -> sub/qstore` with `sub -> missing` leads
+/// to `missing/qstore` (where it leads once `missing` is made), which was left as `sub/qstore` and
+/// written; `.quillo -> qstore/../q2` with no `qstore` leads where the system cannot tell yet, and
+/// stops the start (src/builtins.rs link_end, FEEDBACK85.md Q-1340, found by the re-review of
+/// 00e83c3; branch feedback82-85)
+#[cfg(unix)]
+#[test]
+fn a_quillo_link_is_followed_part_by_part() {
+    let d = Dir(support::temp_dir("cov8285r3-quillo-chain").canonicalize().unwrap());
+    let app = d.0.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::os::unix::fs::symlink("sub/qstore", app.join(".quillo")).unwrap();
+    std::os::unix::fs::symlink("missing", app.join("sub")).unwrap();
+    std::fs::write(app.join("main.qwe"), "print(write_file(\"missing/qstore/plugins.lock\", \"EVIL\"))\nprint(write_file(\"missing/other.txt\", \"ok\") | is_err)\n").unwrap();
+    let (code, out) = quillo_at(&app, &["run", "main.qwe"], &[], &d.0.join("a.log"), 60);
+    assert_eq!((code, out.as_str()), (Some(0), format!("err(\"write_file: will not write missing/qstore/plugins.lock: {}\")\nfalse\n", OWN_QUILLO).as_str()));
+    assert!(!app.join("missing/qstore").exists());
+    let app2 = d.0.join("app2");
+    std::fs::create_dir_all(&app2).unwrap();
+    std::os::unix::fs::symlink("qstore/../q2", app2.join(".quillo")).unwrap();
+    std::fs::write(app2.join("main.qwe"), "print(write_file(\"q2/plugins.lock\", \"EVIL\"))\n").unwrap();
+    let (code, out) = quillo_at(&app2, &["run", "main.qwe"], &[], &d.0.join("b.log"), 60);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("leads where the system cannot tell yet (a `..` after a folder that is not there)"), "{}", out);
+    assert!(!app2.join("q2").exists());
+}
