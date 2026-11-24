@@ -1216,3 +1216,113 @@ fn on_postgresql_the_reg_types_are_refused_and_merge_refresh_setval_and_a_column
     assert!(out.contains(&format!("{}\n", want.join("\n"))), "{}", out);
     assert!(out.contains("kk: [{ x: \"m\u{e9}\" }] made: []\n"), "{}", out);
 }
+
+// Fix round 10
+
+/// Under a quillo.confirmed a taken file's SQLite migration is judged where SQLite runs it. Its
+/// text is read as SQLite reads a parameter (`:a(...)`, `@a(...)`, `#a(...)`, `$a(...)`, `:a::b(...)`,
+/// to the first `)` or space, a `'` and a `;` in it): `select :a(x');commit;pragma foreign_keys=off;
+/// begin;select :b(');` was one statement to that reading and a `commit` to SQLite, and the keys
+/// were left off for the program; each is refused before the file runs. And SQLite's authorizer
+/// refuses the file's own transaction statements, `explain commit`, `explain savepoint s` and
+/// `explain release s`, which no reading of the text takes for one, where Quillo's own `begin`
+/// and `commit` around the file run as its own. Nothing of a refused file is made; a file with
+/// `:a(x)` in a string and a comment is applied, and the keys are on (src/sql.rs sqlite_var_end,
+/// src/db.rs authorize, tx_refused, src/migrate.rs own; FEEDBACK83.md Q-1300, found by the live
+/// review of b3a2998; branch feedback82-85).
+#[test]
+fn a_taken_files_sqlite_migration_is_judged_where_sqlite_runs_it() {
+    let d = dir("migtcl");
+    std::fs::create_dir_all(d.join("data")).unwrap();
+    write(&d, "kit/k.qwe", "component Badge() {\n  return <b>b</b>\n}\nfn steal() {\n  return \"kit: \" + str(db.migrate(\"kit/m\")) + \" \" + str(db.query(\"pragma foreign_keys\"))\n}\n");
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\ndb.open(\"data/app.db\")\ndb.exec(\"create table if not exists parent (id integer primary key)\")\ndb.exec(\"create table if not exists child (id integer primary key, p integer not null references parent(id))\")\nprint(steal())\nprint(\"main: \" + str(db.query(\"pragma foreign_keys\")) + \" \" + db.exec(\"insert into child (id, p) values (1, 999)\").error)\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\nwrites = [\"data/\"]\n\n[\"kit/k.qwe\"]\nwrites = [\"data/app.db\"]\nfiles = [\"kit/m/\"]\nsite = [\"db.migrate\"]\n");
+    let by_text = "kit/k.qwe:5: db.migrate: kit/m/001_a.sql: a taken file's migration begins or ends no transaction where a quillo.confirmed holds the run: each file runs in one of Quillo's own, which its `commit` or `rollback` would end (kit/k.qwe's SQL). Run it from the main file's migrations\n";
+    let as_run = |what: &str| format!("kit/k.qwe:5: db.migrate: migration 001_a.sql failed: `{}` in a taken file's migration is refused where a quillo.confirmed holds the run: each file runs in a transaction of Quillo's own, which it would begin or end (kit/k.qwe's SQL). Run it from the main file's migrations\n", what);
+    let cases: Vec<(&str, String)> = vec![
+        ("create table kk (x text);\nselect :a(x');commit;pragma foreign_keys=off;begin;select :b(');\n", by_text.to_string()),
+        ("create table kk (x text);\nselect :a::b(x');commit;pragma foreign_keys=off;begin;select :c(');\n", by_text.to_string()),
+        ("create table kk (x text);\nselect @a(x');end;select :b(');\n", by_text.to_string()),
+        ("create table kk (x text);\nselect #a(x');rollback;select :b(');\n", by_text.to_string()),
+        ("create table kk (x text);\nselect $caf\u{e9}(x');commit;select :b(');\n", by_text.to_string()),
+        ("create table kk (x text);\nexplain commit;\n", as_run("commit")),
+        ("create table kk (x text);\nexplain savepoint s;\n", as_run("savepoint")),
+        ("create table kk (x text);\nexplain release s;\n", as_run("release")),
+    ];
+    for (file, refused) in &cases {
+        let _ = std::fs::remove_file(d.join("data/app.db"));
+        write(&d, "kit/m/001_a.sql", file);
+        let (code, out) = run(&d, &[]);
+        assert_ne!(code, 0, "{}: {}", file, out);
+        assert!(out.contains(refused.as_str()), "{}: {}", file, out);
+        assert!(column(&d.join("data/app.db"), "select name from sqlite_master where name = 'kk'").is_empty(), "{}", file);
+    }
+    let _ = std::fs::remove_file(d.join("data/app.db"));
+    write(&d, "kit/m/001_a.sql", "create table kk (x text);\ninsert into kk values (':a(x'');commit;'); -- :a(x');commit;\n");
+    checked(&d);
+    let (code, out) = run(&d, &[]);
+    assert_eq!(code, 0, "{}", out);
+    assert!(out.contains("kit: [\"001_a.sql\"] [{ foreign_keys: 1 }]\nmain: [{ foreign_keys: 1 }] db: FOREIGN KEY constraint failed\n"), "{}", out);
+    assert_eq!(column(&d.join("data/app.db"), "select x from kk"), [":a(x');commit;"]);
+}
+
+/// Under a quillo.confirmed on PostgreSQL a function that takes a table is judged by its table's
+/// argument, its arguments counted at the commas outside brackets of every kind: `array['a','b']`
+/// in `has_table_privilege('quillo', case when array['a','b'] ... then '_quil' || 'lo_jobs' end,
+/// 'select')` had the user judged as the table; the same in `has_column_privilege` with four
+/// arguments, `has_sequence_privilege` with a `'{a,b}'` cast, a count it takes none of, and a bracket
+/// closed by another kind, are refused. Run: the user and a plain table, the table alone, an array's
+/// element as `setval`'s value. And a reg* value made without its type named is refused by the
+/// function's name: `regclassin(textout(...))` (and `create table ... as select` of it),
+/// `regprocedurein`, `to_regtype`, `to_regtypemod`, `regtypeout`, quoted and in capitals,
+/// `regclassrecv`; `textout` and `get_current_ts_config` run. No `kreg` is made (src/db.rs
+/// plain_arguments, reg_named; FEEDBACK83.md Q-1300, found by the live review of b3a2998; branch
+/// feedback82-85).
+#[test]
+fn on_postgresql_a_tables_argument_is_counted_past_every_bracket_and_the_reg_functions_are_refused() {
+    let Some(pg) = support::postgres("cov8285db7r10") else {
+        eprintln!("PostgreSQL is not installed: skipped");
+        return;
+    };
+    let url = pg.database("round10");
+    let d = dir("pgr10");
+    let given = |f: &str| runs(&format!("the function {} given a table's name worked out as it runs", f));
+    let reg = |f: &str| runs(&format!("the function {}, by which a text names a catalog object as it runs,", f));
+    let calls: Vec<(&str, &str, String)> = vec![
+        ("db.query", "select has_table_privilege('quillo', case when array['a','b'] is not null then '_quil' || 'lo_jobs' end, 'select') as p", given("has_table_privilege")),
+        ("db.query", "select has_column_privilege('quillo', case when array['a','b'] is not null then '_quil' || 'lo_jobs' end, 'name', 'select') as p", given("has_column_privilege")),
+        ("db.query", "select has_sequence_privilege('quillo', case when '{a,b}'::text[] is not null then 'k_seq' end, 'usage') as p", given("has_sequence_privilege")),
+        ("db.query", "select has_table_privilege('kits', 'select', 'x', 'y') as p", given("has_table_privilege")),
+        ("db.query", "select has_table_privilege('kits', 'select']) as p", given("has_table_privilege")),
+        ("db.query", "select has_table_privilege(current_user, 'kits', 'select') as p", "ran".into()),
+        ("db.query", "select has_table_privilege('kits', 'select') as p", "ran".into()),
+        ("db.query", "select setval('k_seq', (array[5, 6])[1]) as n", "ran".into()),
+        ("db.query", "select regclassin(textout('_quil' || 'lo_jobs')) as r", reg("regclassin")),
+        ("db.exec", "create table kreg as select regclassin(textout('kits')) as r", reg("regclassin")),
+        ("db.query", "select regprocedurein(textout('now()')) as p", reg("regprocedurein")),
+        ("db.query", "select to_regtype('int4') as t", reg("to_regtype")),
+        ("db.query", "select to_regtypemod('int4') as t", reg("to_regtypemod")),
+        ("db.query", "select regtypeout('int4') as t", reg("regtypeout")),
+        ("db.query", "select \"regclassin\"(textout('kits')) as r", reg("regclassin")),
+        ("db.query", "select RegClassRecv(null) as r", reg("regclassrecv")),
+        ("db.query", "select textout('caf\u{e9}') is not null as t, get_current_ts_config() is not null as c", "ran".into()),
+    ];
+    let made: Vec<(&str, &str, &str)> = calls.iter().map(|(f, s, _)| (*f, *s, "")).collect();
+    write(&d, "kit/k.qwe", &kit_ran(&made));
+    write(
+        &d,
+        "main.qwe",
+        "import kit/k.qwe use Badge, steal\ndb.exec(\"create table if not exists kits (x text)\")\ndb.exec(\"create sequence if not exists k_seq\")\ndb.exec(\"create table if not exists _quillo_jobs (name text primary key)\")\nprint(steal())\nprint(\"made: \" + str(db.query(\"select relname as n from pg_class where relname = 'kreg'\")))\n",
+    );
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    checked(&d);
+    let (code, out) = run(&d, &[("QUILLO_DB", &url)]);
+    assert_eq!(code, 0, "{}", out);
+    let mut want = vec!["kit:".to_string()];
+    want.extend(calls.iter().map(|(_, _, w)| w.clone()));
+    assert!(out.contains(&format!("{}\nmade: []\n", want.join("\n"))), "{}", out);
+}

@@ -11041,10 +11041,11 @@ for the site and the visitor.
   PostgreSQL or MySQL/MariaDB that has the database run SQL, or name a table, from text is
   refused: `DO`, `PREPARE` and `EXECUTE` (`EXECUTE IMMEDIATE`), `CALL`, `CREATE FUNCTION`,
   `PROCEDURE`, `TRIGGER`, `RULE` or `EVENT`, the `*_to_xml` functions, the `reg*` types
-  (`regclass`, `regtype`, `regproc`, ...) by name, `to_regclass`, and a function that takes
-  a table (`nextval`, `setval`, `has_table_privilege`, `row_security_active`, ...) given the
-  table by anything but a plain string such as `'kit_seq'` (its other arguments may be
-  anything). A word inside a string, a comment or a quoted name
+  (`regclass`, `regtype`, `regproc`, ...) by name and the functions that make one
+  (`regclassin`, `to_regclass`, `to_regtype`, ...), and a function that takes a table
+  (`nextval`, `setval`, `has_table_privilege`, `row_security_active`, ...) given the table by
+  anything but a plain string such as `'kit_seq'` (its other arguments may be anything; the
+  table's is found counting past every bracket). A word inside a string, a comment or a quoted name
   is not one. A statement with values is read as written and as its server is sent it, each
   `?`, `?1` and `:name` written `$1` (PostgreSQL) or `?` (MySQL). The refusal says to run it from the main file's SQL, or a migration the main
   file runs; the main file's SQL, and a program without a `quillo.confirmed`, are not read
@@ -11074,7 +11075,9 @@ for the site and the visitor.
   PostgreSQL and MySQL; Quillo's own turn of foreign keys around a migration that asks for
   it still happens. It makes no temporary table, view or index (`create temp ...`,
   `temp.x`), which would stand for the program's table of its name in every file's later
-  statements, and its migrations begin or end no transaction. A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
+  statements, and its migrations begin or end no transaction, judged as SQLite runs each
+  statement (its parameters read as SQLite reads them, `:a(...)` too); Quillo's own
+  transaction and its foreign-keys switch around the file are its own. A taken file's statement begins with `SELECT`, `INSERT`, `UPDATE`,
   `DELETE`, `MERGE`, `WITH`, `VALUES`, `TABLE`, `REPLACE`, `REFRESH MATERIALIZED VIEW`,
   `EXPLAIN` of one of these (MySQL's in
   brackets too), `CREATE` or `ALTER` as above (a MySQL table's engine InnoDB, Aria, MyISAM

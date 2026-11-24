@@ -157,11 +157,11 @@ pub fn run(db: &Backend, dir: &Path, judge: Judge<'_>) -> Result<Vec<String>, St
                 let says = sqlite_says(text);
                 let off = says.keys_off && c.query_row("pragma foreign_keys", [], |r| r.get::<_, i64>(0)).map_or(false, |v| v == 1);
                 if off {
-                    c.execute_batch("pragma foreign_keys = off").map_err(|e| e.to_string())?;
+                    own(&c, "pragma foreign_keys = off").map_err(|e| e.to_string())?;
                 }
                 let r = sqlite_one(&c, name, text, &says, off);
                 if off {
-                    let _ = c.execute_batch("pragma foreign_keys = on");
+                    let _ = own(&c, "pragma foreign_keys = on");
                 }
                 if r? {
                     applied.push(name.clone());
@@ -193,9 +193,19 @@ pub fn run(db: &Backend, dir: &Path, judge: Judge<'_>) -> Result<Vec<String>, St
 
 /// One file on SQLite, in a transaction of its own: whether it was applied (false when it
 /// was already). `off` is that foreign keys were turned off for it.
+/// One of Quillo's own statements around a SQLite migration's file (its transaction, its turn of
+/// the foreign keys), run as Quillo's own (`db::OwnSql`): under a quillo.confirmed a taken file's
+/// migration begins or ends no transaction and sets no pragma, which SQLite's authorizer judges as
+/// it runs, and these are not the file's (FEEDBACK83.md, Q-1300, found by the live review of
+/// b3a2998; branch feedback82-85).
+fn own(c: &rusqlite::Connection, sql: &str) -> rusqlite::Result<()> {
+    let _own = crate::db::OwnSql::enter();
+    c.execute_batch(sql)
+}
+
 fn sqlite_one(c: &rusqlite::Connection, name: &str, text: &str, says: &SqliteSays, off: bool) -> Result<bool, String> {
     let hash = digest(text);
-    c.execute_batch("begin immediate").map_err(|e| e.to_string())?;
+    own(c, "begin immediate").map_err(|e| e.to_string())?;
     // Quillo's own table, read as its own: the file's code may not read it (db.rs `authorize`), and
     // a taken file's second `c.migrate()` had found nothing and applied its files again
     // (FEEDBACK83.md, Q-1300, found by tests/cover8285_confirm.rs; branch feedback82-85).
@@ -204,7 +214,7 @@ fn sqlite_one(c: &rusqlite::Connection, name: &str, text: &str, says: &SqliteSay
         c.query_row("select sha256 from _quillo_migrations where name = ?1", [name], |r| r.get(0)).ok()
     };
     if let Some(had) = had {
-        let _ = c.execute_batch("commit");
+        let _ = own(c, "commit");
         if had != hash {
             eprintln!("quillo: warning: migration {} changed after it was applied; it is not run again", name);
         }
@@ -221,7 +231,7 @@ fn sqlite_one(c: &rusqlite::Connection, name: &str, text: &str, says: &SqliteSay
     let before = match before {
         Ok(b) => b,
         Err(e) => {
-            let _ = c.execute_batch("rollback");
+            let _ = own(c, "rollback");
             return Err(e);
         }
     };
@@ -237,14 +247,14 @@ fn sqlite_one(c: &rusqlite::Connection, name: &str, text: &str, says: &SqliteSay
         // A deferred constraint fails at the commit, which leaves the file open
         // (FEEDBACK16.md, Q-143; branch feedback20-fixes).
         Ok(()) => {
-            if let Err(e) = c.execute_batch("commit") {
-                let _ = c.execute_batch("rollback");
+            if let Err(e) = own(c, "commit") {
+                let _ = own(c, "rollback");
                 return Err(format!("migration {} failed: {}", name, e));
             }
             Ok(true)
         }
         Err(e) => {
-            let _ = c.execute_batch("rollback");
+            let _ = own(c, "rollback");
             Err(format!("migration {} failed: {}", name, e))
         }
     }

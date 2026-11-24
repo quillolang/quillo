@@ -193,6 +193,35 @@ fn ident(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80
 }
 
+/// Where SQLite's parameter at `i` (`:`, `@`, `#` or `$`, then a name) ends, as its tokenizer
+/// (`sqlite3GetToken`) reads it: the name's letters, digits, `_`, `$` and bytes past ASCII, `::`
+/// between its parts, and after a letter of it a `(` to the first `)`, which ends it, or to a space
+/// (SQLite's error), what is between taken whole, quotes and `;` too (`:a(x')`, TCL's `$a(x)`).
+/// None where no name follows (SQLite's error too).
+fn sqlite_var_end(b: &[u8], i: usize) -> Option<usize> {
+    let (mut j, mut named) = (i + 1, false);
+    while let Some(&c) = b.get(j) {
+        if ident(c) {
+            named = true;
+            j += 1;
+        } else if c == b'(' && named {
+            j += 1;
+            while b.get(j).is_some_and(|&c| !matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r' | b')')) {
+                j += 1;
+            }
+            if b.get(j) == Some(&b')') {
+                j += 1;
+            }
+            break;
+        } else if c == b':' && b.get(j + 1) == Some(&b':') {
+            j += 2;
+        } else {
+            break;
+        }
+    }
+    named.then_some(j)
+}
+
 fn ident_end(b: &[u8], mut i: usize) -> usize {
     while i < b.len() && ident(b[i]) {
         i += 1;
@@ -385,10 +414,12 @@ pub(crate) fn lex(d: Dialect, s: &str) -> (Vec<Tok>, usize) {
     // MySQL: inside `/*! ... */`, whose text it runs.
     let mut hint = false;
     let mut open = 0;
-    let (pg, my) = (d == Dialect::Postgres, d == Dialect::Mysql);
+    let (pg, my, lite) = (d == Dialect::Postgres, d == Dialect::Mysql, d == Dialect::Sqlite);
     while i < n {
         let c = b[i];
         let start = i;
+        // SQLite's parameter here, read once (`sqlite_var_end`).
+        let var = if lite && matches!(c, b':' | b'@' | b'#' | b'$') { sqlite_var_end(b, i) } else { None };
         let kind = match c {
             b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c => {
                 i += 1;
@@ -471,14 +502,21 @@ pub(crate) fn lex(d: Dialect, s: &str) -> (Vec<Tok>, usize) {
                 i += 1;
                 Kind::Dot
             }
+            // SQLite's parameters, as its tokenizer reads them (`sqlite_var_end`): `:a(x');commit`
+            // is one, whose `'` this reading took for a string's start, and the `commit` after it
+            // for none of the statement's: a kit's migration ended Quillo's transaction around it
+            // (FEEDBACK83.md, Q-1300, found by the live review of b3a2998; branch feedback82-85).
+            b':' | b'@' | b'#' | b'$' if var.is_some() => {
+                i = var.unwrap_or(i + 1);
+                Kind::Param(Mark::Named)
+            }
             b':' if b.get(i + 1) == Some(&b':') => {
                 i += 2;
                 Kind::Cast
             }
-            // A name; SQLite's may be digits (`:1`). In PostgreSQL's brackets, after a value it
-            // is a slice's bound (`a[lo:hi]`), else a name (`array[:a, :b]`; found in review).
-            b':' if b.get(i + 1).map_or(false, |&c| ident_start(c) || (d == Dialect::Sqlite && ident(c) && c != b'$'))
-                && !(pg && brackets > 0 && value_ends(&out)) =>
+            // A name (SQLite's above). In PostgreSQL's brackets, after a value it is a slice's
+            // bound (`a[lo:hi]`), else a name (`array[:a, :b]`; found in review).
+            b':' if b.get(i + 1).map_or(false, |&c| ident_start(c)) && !(pg && brackets > 0 && value_ends(&out)) =>
             {
                 i = ident_end(b, i + 1);
                 Kind::Param(Mark::Named)
@@ -491,11 +529,6 @@ pub(crate) fn lex(d: Dialect, s: &str) -> (Vec<Tok>, usize) {
                     (Some(n), true) => Kind::Param(Mark::Numbered(n)),
                     (None, true) => Kind::Op,
                 }
-            }
-            // SQLite's `@AAAA` and `#AAAA` (digits too: found in review).
-            b'@' | b'#' if d == Dialect::Sqlite && b.get(i + 1).map_or(false, |&c| ident(c) && c != b'$') => {
-                i = ident_end(b, i + 1);
-                Kind::Param(Mark::Named)
             }
             b'@' if my => {
                 i += 1;
@@ -511,10 +544,6 @@ pub(crate) fn lex(d: Dialect, s: &str) -> (Vec<Tok>, usize) {
                     }
                 }
                 Kind::Var
-            }
-            b'$' if d == Dialect::Sqlite && b.get(i + 1).map_or(false, |&c| ident(c) && c != b'$') => {
-                i = ident_end(b, i + 1);
-                Kind::Param(Mark::Named)
             }
             b'$' if pg && b.get(i + 1).map_or(false, u8::is_ascii_digit) => {
                 let (num, e) = digits(b, i + 1);
@@ -2328,5 +2357,41 @@ mod tests {
         assert_eq!(lossy("alter table t add column fee decimal; alter table t add tax money; alter table t rename to v"), ["t.fee decimal", "t.tax money"]);
         assert!(lossy("create table v (a text default ', x money', /* , y money */ b int)").is_empty());
         assert!(lossy("create index i on t (price)").is_empty() && lossy("").is_empty() && lossy("create table").is_empty());
+    }
+
+    // SQLite's parameters as its tokenizer reads them: TCL's `(...)` suffix to the first `)` or
+    // space, quotes and `;` in it, `::` between a name's parts, `$` and digits in the name, after any
+    // of `:`, `@`, `#` and `$`; and no name, no parameter (FEEDBACK83.md, Q-1300, found by the live
+    // review of b3a2998; branch feedback82-85). PostgreSQL's and MySQL's are as they were.
+    #[test]
+    fn sqlites_parameters_are_read_as_sqlite_reads_them() {
+        use Dialect::*;
+        let hidden = "select :a(x');commit;pragma foreign_keys=off;begin;select :b(');";
+        let s = Scan::new(Sqlite, hidden);
+        assert_eq!((s.count, s.stmts.len(), s.tx_control(true)), (2, 5, true));
+        for (sql, count) in [
+            ("select @a(x') as y", 1),
+            ("select #a(x') as y", 1),
+            ("select $a(x') as y", 1),
+            ("select :a::b(x') as y", 1),
+            ("select :a::b as y", 1),
+            ("select :$a as y", 1),
+            ("select $a$b as y", 1),
+            ("select :1(x) as y", 1),
+            ("select :caf\u{e9}(\u{e9}) as y", 1),
+            ("select * from t where x in (:a, :b)", 2),
+            ("select ':a(x' as s, :b as t", 1),
+            ("select 1 as a -- :a(x'\n, 2 as b", 0),
+        ] {
+            assert_eq!(Scan::new(Sqlite, sql).count, count, "{}", sql);
+        }
+        // A `(` without a name, or not closed before a space: SQLite's error; no `'` opens a string.
+        assert_eq!(Scan::new(Sqlite, "select :(x)").count, 0);
+        assert_eq!(Scan::new(Sqlite, "select :a(x y') as s").stmts.len(), 1);
+        assert_eq!(native(Sqlite, "select :a(x');commit;select 1"), "select :a(x');commit;select 1");
+        // PostgreSQL: `:a` then `(`; MySQL: `@a` a variable.
+        assert_eq!(Scan::new(Postgres, "select :a(1)").count, 1);
+        assert!(!Scan::new(Postgres, "select 1 as a, :a(x');commit;").tx_control(true));
+        assert_eq!(Scan::new(Mysql, "select @a(x') as y").count, 0);
     }
 }

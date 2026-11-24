@@ -750,8 +750,7 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
     // takes any path, and so may a statement: no statement pays for asking. SAFETY: the
     // connection is open, and the callback keeps no pointer: it is handed none.
     if crate::confirm::held() {
-        // Handed the connection, whose transaction it looks at (`authorize`'s `foreign_keys`).
-        let rc = unsafe { rusqlite::ffi::sqlite3_set_authorizer(c.handle(), Some(authorize), c.handle() as *mut std::ffi::c_void) };
+        let rc = unsafe { rusqlite::ffi::sqlite3_set_authorizer(c.handle(), Some(authorize), std::ptr::null_mut()) };
         if rc != rusqlite::ffi::SQLITE_OK {
             return Err(rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(rc), Some("the database's statements could not be held".into())));
         }
@@ -1597,7 +1596,7 @@ fn looked_for(w: &[u8]) -> bool {
         b"do" | b"prepare" | b"execute" | b"call" | b"deallocate" | b"create" | b"alter" | b"copy" | b"load" | b"import" | b"begin" | b"if" | b"while" | b"loop" | b"repeat" | b"case" | b"declare" | b"leave"
         | b"iterate" | b"regclass" | b"oid" | b"outfile" | b"dumpfile" | b"sys" => true,
         b"regproc" | b"regprocedure" | b"regoper" | b"regoperator" | b"regtype" | b"regrole" | b"regnamespace" | b"regconfig" | b"regdictionary" | b"regcollation" => true,
-        _ if l.starts_with(b"_reg") && reg_type(l) => true,
+        _ if (l.starts_with(b"_reg") || l.starts_with(b"reg") || l.starts_with(b"to_reg")) && reg_named(l) => true,
         b"ts_stat" | b"ts_rewrite" | b"to_regclass" | b"nextval" | b"setval" | b"currval" | b"connectby" => true,
         // The extensions' of `runs_text`, by their names (`pgstat...` below).
         b"xpath_table" | b"get_raw_page" | b"bt_metap" | b"bt_page_items" | b"bt_page_stats" | b"bt_multi_page_stats" | b"brin_page_items" | b"gist_page_items" | b"hash_bitmap_info"
@@ -1891,9 +1890,14 @@ fn text_run_in(r: Reading, toks: &[Tk<'_>]) -> Option<TextRun> {
             // feedback82-85). `oid` is a column's name too often to be refused but as a type; a
             // quoted one is a name as an alias (`as "regclass"`, outside a `cast(`), a type
             // elsewhere (`r "regclass"`).
+            // And the functions that make one from text, by their names: `regclassin(textout('_quil'
+            // || 'lo_jobs'))` made a regclass with no type named, and `create table kreg as select`
+            // of it a regclass column (FEEDBACK83.md, Q-1300, found by the live review of b3a2998;
+            // branch feedback82-85).
             let alias = matches!(t, Tk::Names(_)) && is(before, "as") && casts.last() != Some(&true);
-            if let Some(n) = names.clone().find(|n| !alias && reg_type(n)) {
-                return runs(format!("the type {}, by which a text names a catalog object as it runs,", String::from_utf8_lossy(n).to_ascii_lowercase()));
+            if let Some(n) = names.clone().find(|n| !alias && reg_named(n)) {
+                let what = if reg_type(n) { "type" } else { "function" };
+                return runs(format!("the {} {}, by which a text names a catalog object as it runs,", what, String::from_utf8_lossy(n).to_ascii_lowercase()));
             }
         }
         if let Some(why) = head_refused(my, stmt, h) {
@@ -1912,6 +1916,17 @@ fn reg_type(n: &[u8]) -> bool {
     TYPES.iter().any(|t| n.eq_ignore_ascii_case(t))
 }
 
+/// Whether `n` names a `reg_type` or a function that makes one from text or a value: each type's
+/// own (`regclassin`, `regclassrecv`, `regclassout`, `regclasssend`, ... as PostgreSQL 17's
+/// `pg_proc` has them for every one) and the `to_reg...` family (`to_regclass`, `to_regtype`,
+/// `to_regtypemod`, ...).
+fn reg_named(n: &[u8]) -> bool {
+    if reg_type(n) || starts_with_any(n, &[b"to_reg"]) {
+        return true;
+    }
+    [&b"in"[..], b"out", b"recv", b"send"].iter().any(|s| n.len() > s.len() && n[n.len() - s.len()..].eq_ignore_ascii_case(s) && reg_type(&n[..n.len() - s.len()]))
+}
+
 /// Whether the call of a `regclass_fn` named `f`, the tokens after its `(` (`rest`), closed by its
 /// `)`, takes its table (or tablespace, or object by its number) by a plain string `'...'` with a
 /// letter in it and no backslash, judged with the statement's other names (`own_table_named`): a
@@ -1924,19 +1939,32 @@ fn reg_type(n: &[u8]) -> bool {
 /// statement is judged on its own (`select setval('k_seq', ?)` was refused: found by the live
 /// review of 726b006). PostgreSQL's `binary_upgrade_...` take every argument so.
 fn plain_arguments(f: &[u8], rest: &[Tk<'_>]) -> bool {
-    // The arguments, split at the commas outside brackets, to the `)` that closes the call.
-    let (mut args, mut depth, mut from) = (Vec::new(), 0usize, 0usize);
+    // The arguments, split at the commas outside brackets of every kind, `()`, `[]` (`array[...]`)
+    // and `{}`, to the `)` that closes the call: by `()` alone, `array['a','b']` was two arguments,
+    // and `has_table_privilege('quillo', case when array['a','b'] ... then '_quil' || 'lo_jobs'
+    // end, 'select')` was judged by its user (FEEDBACK83.md, Q-1300, found by the live review of
+    // b3a2998; branch feedback82-85). A bracket closed by another kind is not read for certain.
+    let (mut args, mut open, mut from) = (Vec::new(), Vec::new(), 0usize);
     let mut shut = false;
     for (k, t) in rest.iter().enumerate() {
         match t {
-            Tk::Punct(b'(') => depth += 1,
-            Tk::Punct(b')') if depth == 0 => {
+            Tk::Punct(c @ (b'(' | b'[' | b'{')) => open.push(*c),
+            Tk::Punct(b')') if open.is_empty() => {
                 args.push(&rest[from..k]);
                 shut = true;
                 break;
             }
-            Tk::Punct(b')') => depth -= 1,
-            Tk::Punct(b',') if depth == 0 => {
+            Tk::Punct(c @ (b')' | b']' | b'}')) => {
+                let opened = match c {
+                    b')' => b'(',
+                    b']' => b'[',
+                    _ => b'{',
+                };
+                if open.pop() != Some(opened) {
+                    return false;
+                }
+            }
+            Tk::Punct(b',') if open.is_empty() => {
                 args.push(&rest[from..k]);
                 from = k + 1;
             }
@@ -1950,8 +1978,18 @@ fn plain_arguments(f: &[u8], rest: &[Tk<'_>]) -> bool {
     if starts_with_any(f, &[b"binary_upgrade_"]) {
         return args.iter().all(|a| plain(a));
     }
-    let with_user = if f.eq_ignore_ascii_case(b"has_column_privilege") { 4 } else { 3 };
-    let table = if starts_with_any(f, &[b"has_"]) && args.len() == with_user { 1 } else { 0 };
+    // A `has_..._privilege`'s table is its second argument given a user first, its first else; given
+    // any other count, it is not placed for certain.
+    let table = if starts_with_any(f, &[b"has_"]) {
+        let (bare, with_user) = if f.eq_ignore_ascii_case(b"has_column_privilege") { (3, 4) } else { (2, 3) };
+        match args.len() {
+            n if n == bare => 0,
+            n if n == with_user => 1,
+            _ => return false,
+        }
+    } else {
+        0
+    };
     args.get(table).is_some_and(|a| plain(a))
 }
 
@@ -2421,9 +2459,33 @@ fn temp_refused(kind: &str, name: Option<&std::ffi::CStr>) -> std::ffi::c_int {
     rusqlite::ffi::SQLITE_DENY
 }
 
+/// `authorize`'s refusal of a taken file's migration's transaction statement (`BEGIN`, `COMMIT`,
+/// `ROLLBACK`, as SQLite names it, a savepoint's `BEGIN`, `RELEASE` or `ROLLBACK` its `savepoint`,
+/// `release` and `rollback to`), out of the way of the actions every statement asks for.
+#[cold]
+#[inline(never)]
+fn tx_refused(savepoint: bool, what: Option<&std::ffi::CStr>) -> std::ffi::c_int {
+    let what = what.map_or(String::new(), |t| t.to_string_lossy().to_ascii_lowercase());
+    let what = match (savepoint, what.as_str()) {
+        (true, "begin") => "savepoint".to_string(),
+        (true, "rollback") => "rollback to".to_string(),
+        _ => what,
+    };
+    let file = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| STATEMENTS_OF.with(|s| s.try_borrow().ok().map(|s| crate::confirm::held_name(s.file.as_deref()))))).ok().flatten().unwrap_or_else(|| "this file".into());
+    STATEMENTS_OF.with(|s| {
+        if let Ok(mut s) = s.try_borrow_mut() {
+            s.refused = Some(format!(
+                "`{}` in a taken file's migration is refused where a quillo.confirmed holds the run: each file runs in a transaction of Quillo's own, which it would begin or end ({}'s SQL). Run it from the main file's migrations",
+                what, file
+            ));
+        }
+    });
+    rusqlite::ffi::SQLITE_DENY
+}
+
 thread_local! {
-    /// A migration runs on this thread (`migrate_as`), whose `foreign_keys` migrate.rs turns off
-    /// and on again around a file that asks for it (`authorize`).
+    /// A migration runs on this thread (`migrate_as`): a taken file's statements there begin or
+    /// end no transaction (`authorize`).
     static MIGRATING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -2438,7 +2500,7 @@ thread_local! {
 /// and the folder of SQLite's temporary files is not moved.
 /// Every other action is let through at once: a statement kept compiled (`prepare_cached`) is
 /// not asked again, and is kept for the code it was judged for alone (`compiled_as`).
-unsafe extern "C" fn authorize(conn: *mut std::ffi::c_void, action: std::ffi::c_int, a1: *const std::ffi::c_char, a2: *const std::ffi::c_char, schema: *const std::ffi::c_char, _: *const std::ffi::c_char) -> std::ffi::c_int {
+unsafe extern "C" fn authorize(_: *mut std::ffi::c_void, action: std::ffi::c_int, a1: *const std::ffi::c_char, a2: *const std::ffi::c_char, schema: *const std::ffi::c_char, _: *const std::ffi::c_char) -> std::ffi::c_int {
     use rusqlite::ffi;
     let text = |p: *const std::ffi::c_char| (!p.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(p) });
     // A write to one of Quillo's own tables by a taken file's statement, as SQLite names the table,
@@ -2517,6 +2579,14 @@ unsafe extern "C" fn authorize(conn: *mut std::ffi::c_void, action: std::ffi::c_
         if let Some(kind) = temp.filter(|_| !writes && !over) {
             return temp_refused(kind, text(a1));
         }
+        // And a transaction's statement of a taken file's migration, which runs in one of
+        // Quillo's own (migrate.rs, whose `begin`, `commit` and `rollback` run as its own), judged
+        // as SQLite runs it: its text read `select :a(x');commit;...` as one statement where SQLite
+        // runs a `commit`, and the file's rest then ran outside any transaction (FEEDBACK83.md,
+        // Q-1300, found by the live review of b3a2998; branch feedback82-85).
+        if MIGRATING.get() && matches!(action, ffi::SQLITE_TRANSACTION | ffi::SQLITE_SAVEPOINT) {
+            return tx_refused(action == ffi::SQLITE_SAVEPOINT, text(a1));
+        }
         if writes || reads || mirrors || analyze || trigger || over {
             STATEMENTS_OF.with(|s| {
                 if let Ok(mut s) = s.try_borrow_mut() {
@@ -2567,16 +2637,12 @@ unsafe extern "C" fn authorize(conn: *mut std::ffi::c_void, action: std::ffi::c_
                 // `foreign_keys` around a migration that asks for it (migrate.rs), which SQLite
                 // takes for none inside the migration's transaction, goes on (FEEDBACK83.md, Q-1300,
                 // the coordinator's round 8 after the review of a65644e; branch feedback82-85).
-                // Quillo's own turn of `foreign_keys` around a migration (migrate.rs) is outside
-                // the file's transaction; the file's own, inside it, is refused: let through, a
-                // file's `commit; pragma foreign_keys = 00; begin;` left the keys off for the
-                // program (FEEDBACK83.md, Q-1300, found by the live review of 726b006; branch
-                // feedback82-85). SAFETY: `conn` is the connection SQLite asks for (`connect`).
-                Some(v) if OWN_SQL.with(|c| c.get()) == 0
-                    && STATEMENTS_TAKEN.get()
-                    && !pragma_reads(text(a1))
-                    && !(named(b"foreign_keys") && MIGRATING.get() && !conn.is_null() && unsafe { ffi::sqlite3_get_autocommit(conn as *mut ffi::sqlite3) } != 0) =>
-                {
+                // Quillo's own turn of `foreign_keys` around a migration runs as its own (migrate.rs
+                // `own`); the file's, anywhere, is refused. Let through where no transaction was
+                // open, a file's `select :a(x');commit;pragma foreign_keys=off;begin;...` left the
+                // keys off for the program (FEEDBACK83.md, Q-1300, found by the live reviews of
+                // 726b006 and b3a2998; branch feedback82-85).
+                Some(v) if OWN_SQL.with(|c| c.get()) == 0 && STATEMENTS_TAKEN.get() && !pragma_reads(text(a1)) => {
                     let (name, value) = (text(a1).map_or(String::new(), |t| t.to_string_lossy().to_ascii_lowercase()), v.to_string_lossy().into_owned());
                     let file = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| STATEMENTS_OF.with(|s| s.try_borrow().ok().map(|s| crate::confirm::held_name(s.file.as_deref()))))).ok().flatten().unwrap_or_else(|| "this file".into());
                     STATEMENTS_OF.with(|s| {

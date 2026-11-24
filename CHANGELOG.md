@@ -116,7 +116,13 @@ and a stop from 0.8.12; under a `quillo.confirmed`, a name not taken an error (2
   insert landed in it), its SQLite migrations begin or end no transaction and set no
   `foreign_keys` (a kit's migration left them off for the main file), and its PostgreSQL SQL
   names no `reg*` type (`'{kits}'::_regclass` too); `merge`, `refresh materialized view`,
-  `setval('s', ?)` and a column named `call` run (found by the live review of 726b006).
+  `setval('s', ?)` and a column named `call` run (found by the live review of 726b006). A
+  taken file's SQLite migration is held where SQLite runs it: no transaction statement of its
+  own runs (`select :a(x');commit;pragma foreign_keys=off;begin;...` hid a commit from the
+  reading: parameters are read as SQLite reads them now), and Quillo's own transaction and
+  foreign-keys switch are its own SQL; on PostgreSQL the functions that make a `reg*` value
+  are refused by name and a table's argument is counted past `[]` and `{}` (found by the
+  live review of b3a2998).
 - **Under a `quillo.confirmed`, each file uses only the names it takes** (the user's decision
   of 2026-11-24): a name another file defines, used without taking it, is an error in
   `quillo check`, and the start refuses it with `--no-check` too, as the value under it
