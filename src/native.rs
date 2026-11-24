@@ -4233,10 +4233,21 @@ pub fn walk_program(main: &Path, visit: &mut dyn FnMut(&Path, &[crate::ast::Stmt
     // one of its own (FEEDBACK19.md, Q-154; branch feedback19-fixes).
     // Through a link, from the folder of the file it leads to (FEEDBACK55.md, Q-817).
     let mut todo = vec![(main.to_path_buf(), crate::modules::source_dir_or(main, main.parent().unwrap_or(Path::new("."))))];
+    // The main file's own name is asked for only once another file is to be told from it: a
+    // program of one file costs no realpath here, which each start paid (found measuring the
+    // review of efd9b8e; FEEDBACK85.md, Q-1340; branch feedback82-85).
+    let mut first: Option<PathBuf> = None;
     while let Some((f, base)) = todo.pop() {
-        let key = f.canonicalize().unwrap_or_else(|_| f.clone());
-        if !seen.insert(key) {
-            continue;
+        if seen.is_empty() && first.is_none() {
+            first = Some(f.clone());
+        } else {
+            if let Some(m) = first.take() {
+                seen.insert(m.canonicalize().unwrap_or(m));
+            }
+            let key = f.canonicalize().unwrap_or_else(|_| f.clone());
+            if !seen.insert(key) {
+                continue;
+            }
         }
         // In any case (Q-820).
         if is_rust(&f.to_string_lossy()) {

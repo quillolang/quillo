@@ -1822,15 +1822,25 @@ pub fn protect_settings(dir: &Path, named: Option<&Path>) {
     if let Some(f) = named {
         *kept = Some(f.to_path_buf());
     }
+    // The folder made absolute once, and each file in it named from there: each made absolute on
+    // its own asked the system where Quillo runs, and `--env-file`'s `.env` (the default) was the
+    // folder's `.env` again, two looks more at each start (found measuring the review of efd9b8e;
+    // FEEDBACK85.md, Q-1340; branch feedback82-85).
+    let abs = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut env_there = false;
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let n = fold_name(&e.file_name().to_string_lossy());
         if n == ".env" || n.starts_with(".env.") {
-            protect_named(&e.path(), OWN_SETTINGS);
+            env_there |= e.file_name() == ".env";
+            protect_named(&abs.join(e.file_name()), OWN_SETTINGS);
         }
     }
     // `.env` too when it is not there yet: one made later is judged by its path.
-    protect_named(&dir.join(".env"), OWN_SETTINGS);
-    if let Some(f) = &*kept {
+    if !env_there {
+        protect_named(&abs.join(".env"), OWN_SETTINGS);
+    }
+    let plain = |p: &Path| p.components().filter(|c| !matches!(c, Component::CurDir)).collect::<std::path::PathBuf>();
+    if let Some(f) = kept.as_ref().filter(|f| plain(f) != plain(&dir.join(".env")) && plain(f) != plain(&abs.join(".env"))) {
         protect_named(f, OWN_SETTINGS);
     }
 }
@@ -3335,6 +3345,7 @@ fn own_target(it: &Interp, full: &Path, upload: bool, deleting: bool) -> Option<
 fn quillo_dirs(it: &Interp, loaded: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
     let mut out: Vec<std::path::PathBuf> = Vec::new();
     let process = QUILLO_FOLDERS.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let process = process.into_iter().map(|d| crate::statics::real_dir(&d).unwrap_or(d));
     for d in crate::statics::real_dir(&it.base_dir).into_iter().chain(crate::privacy::root()).chain(loaded.iter().filter_map(|f| f.parent().map(Path::to_path_buf))).chain(process) {
         let q = crate::statics::sys_form(d).join(".quillo");
         if !out.contains(&q) {
@@ -3342,6 +3353,37 @@ fn quillo_dirs(it: &Interp, loaded: &[std::path::PathBuf]) -> Vec<std::path::Pat
         }
     }
     out
+}
+
+/// `quillo_dirs` by the names the folders were noted by, none resolved: for a look at whether any
+/// `.quillo` is there (`quillo_absent`), each name once.
+fn quillo_noted(it: &Interp, loaded: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    let process = QUILLO_FOLDERS.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let base = noted_form(&it.base_dir);
+    for d in std::iter::once(base).chain(crate::privacy::root()).chain(loaded.iter().filter_map(|f| f.parent().map(Path::to_path_buf))).chain(process) {
+        let q = d.join(".quillo");
+        if !out.contains(&q) {
+            out.push(q);
+        }
+    }
+    out
+}
+
+/// Whether nothing is at `q`, not even a link: one look.
+fn quillo_absent(q: &Path) -> bool {
+    std::fs::symlink_metadata(q).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// A folder as `QUILLO_FOLDERS` keeps it: by its name, in the system's form, its links not resolved
+/// (that is for when a `.quillo` is there: `quillo_dirs`), and a relative one relative (asking the
+/// system where Quillo runs is a look too, and the debugger moves it).
+fn noted_form(dir: &Path) -> std::path::PathBuf {
+    let plain: std::path::PathBuf = dir.components().filter(|c| !matches!(c, Component::CurDir)).collect();
+    if plain.as_os_str().is_empty() {
+        return std::path::PathBuf::from(".");
+    }
+    crate::statics::sys_form(plain)
 }
 
 /// Notes the folders of every file the program `main` would load (its `use`s, Rust files too, its
@@ -3577,7 +3619,10 @@ static QUILLO_FOLDERS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::
 /// loaded file's (`protect`), the main program's (`protect_settings`) and a service's started apart
 /// (service.rs). A look only where it is not noted yet.
 pub(crate) fn note_quillo_folder(dir: &Path) {
-    let real = crate::statics::sys_form(dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()));
+    // By its name, made absolute: resolved only where a `.quillo` is there (`quillo_dirs`), as a
+    // realpath of each loaded file's folder cost every start (found measuring the review of
+    // efd9b8e; FEEDBACK85.md, Q-1340; branch feedback82-85).
+    let real = noted_form(dir);
     if QUILLO_FOLDERS.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&real) {
         return;
     }
@@ -3648,19 +3693,26 @@ fn quillo_roots_of(it: &Interp, roots_kept: &std::sync::Mutex<Vec<Arc<QuilloRoot
     // Looked at off the lock.
     let fold = |p: &Path| std::path::PathBuf::from(fold_name(&crate::statics::sys_form_of(p).to_string_lossy()));
     let files: Vec<std::path::PathBuf> = it.loaded.iter().cloned().collect();
-    let dirs = quillo_dirs(it, &files);
+    // A `.quillo` that is not there leads nowhere but to its own name, which is refused by its name
+    // (`statics::quillo_part`): only those there are resolved, so a program with none (most) pays a
+    // look at each folder's, by the name it was noted by, and no realpath; resolving each, twice,
+    // cost a start 1.6M instructions and some twenty looks over 0.8.10 (found measuring the review
+    // of efd9b8e; FEEDBACK85.md, Q-1340; branch feedback82-85).
+    let there = quillo_noted(it, &files).iter().any(|q| !quillo_absent(q));
+    let dirs = if there { quillo_dirs(it, &files) } else { Vec::new() };
     let folders: Vec<std::path::PathBuf> = dirs.iter().filter_map(|q| q.parent().map(Path::to_path_buf)).collect();
     let (mut roots, mut bad) = (Vec::new(), None);
-    for q in &dirs {
-        let r = link_end(q).map_or_else(|| fold(q), |e| fold(&e));
+    for q in dirs.iter().filter(|q| !quillo_absent(q)) {
+        let to = link_end(q);
+        let r = to.as_ref().map_or_else(|| fold(q), |e| fold(e));
         if bad.is_none() {
-            bad = bad_quillo(q, &folders);
+            bad = bad_quillo_to(q, to.as_deref(), &folders);
         }
         if !roots.contains(&r) {
             roots.push(r);
         }
     }
-    let program = crate::statics::real_dir(&it.base_dir).map(|d| fold(&d));
+    let program = if roots.is_empty() { None } else { crate::statics::real_dir(&it.base_dir).map(|d| fold(&d)) };
     let inside: Vec<std::path::PathBuf> = roots.iter().filter_map(|r| program.as_ref().and_then(|p| r.strip_prefix(p).ok()).filter(|rel| !rel.as_os_str().is_empty()).map(Path::to_path_buf)).collect();
     {
         let mut all = ALL_ROOTS.write().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3773,8 +3825,17 @@ fn quillo_hidden(it: &Interp, rel: &Path, led: Option<&Path>) -> bool {
 /// Why the `.quillo` at `q` may not be Quillo's, if it may not: it leads to one of `folders` (the
 /// program's) or a folder above one.
 fn bad_quillo(q: &Path, folders: &[std::path::PathBuf]) -> Option<String> {
+    // One that is not there leads to no folder of the program's (one look).
+    if quillo_absent(q) {
+        return None;
+    }
+    bad_quillo_to(q, link_end(q).as_deref(), folders)
+}
+
+/// `bad_quillo`, where `q` leads to `to` (`link_end`).
+fn bad_quillo_to(q: &Path, to: Option<&Path>, folders: &[std::path::PathBuf]) -> Option<String> {
     let fold = |p: &Path| std::path::PathBuf::from(fold_name(&crate::statics::sys_form_of(p).to_string_lossy()));
-    let Some(to) = link_end(q) else {
+    let Some(to) = to else {
         return Some(format!(
             "{} leads where the system cannot tell yet (a `..` after a folder that is not there): Quillo keeps the program's built plugins, their lock and its keys in .quillo, so it must lead to a folder of its own",
             q.display()
@@ -3795,6 +3856,9 @@ fn bad_quillo(q: &Path, folders: &[std::path::PathBuf]) -> Option<String> {
 /// is in or one above it, where the program writes (native.rs asks it before it reads a library or
 /// a lock there, as a plugin's folder can be laid out so after the start was judged).
 pub(crate) fn quillo_not_its_own(q: &Path) -> Option<String> {
+    if quillo_absent(q) {
+        return None;
+    }
     let dir = q.parent().and_then(crate::statics::real_dir)?;
     bad_quillo(q, std::slice::from_ref(&dir))
 }
@@ -3802,6 +3866,11 @@ pub(crate) fn quillo_not_its_own(q: &Path) -> Option<String> {
 /// `quillo_layout` of the folder of a program's main file, before it is loaded, so none of it
 /// runs (FEEDBACK85.md, Q-1340, found by the review of 9da2632; branch feedback82-85).
 pub fn quillo_layout_dir(dir: &Path) -> Result<(), String> {
+    // Most programs have none: one look, and the folder is not resolved (found measuring the
+    // review of efd9b8e; FEEDBACK85.md, Q-1340; branch feedback82-85).
+    if quillo_absent(&dir.join(".quillo")) {
+        return Ok(());
+    }
     let Some(real) = crate::statics::real_dir(dir) else { return Ok(()) };
     match bad_quillo(&real.join(".quillo"), std::slice::from_ref(&real)) {
         Some(why) => Err(why),

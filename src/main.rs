@@ -1542,6 +1542,10 @@ fn run_options(flags: &[String]) -> Result<RunOptions, i32> {
     Ok(o)
 }
 
+/// Whether `before_the_program` judged the layout of the program's folder (`quillo_layout_dir`)
+/// for the first `load` of this start, which then asks no more.
+static LAYOUT_JUDGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Checks and loads the program, ready to serve. `Ok(None)`: it ran and
 /// declared no routes, so there is nothing to serve. `Err` is the exit code.
 fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
@@ -1584,7 +1588,12 @@ fn load(path: &Path, o: &RunOptions) -> Result<Option<App>, i32> {
         // to the program's folder or above stops the start (FEEDBACK85.md, Q-1340, found by the
         // review of 9da2632; branch feedback82-85).
         let (r, read) = quillo::error::noting_reads(|| {
-            let r = quillo::builtins::quillo_layout_dir(base).and_then(|_| interp.load_file(path).map_err(|e| format!("{:#}", e)));
+            // Judged by `before_the_program` a moment ago, for this start: asked again at each
+            // reload (found measuring the review of efd9b8e; FEEDBACK85.md, Q-1340; branch
+            // feedback82-85).
+            let judged = LAYOUT_JUDGED.swap(false, std::sync::atomic::Ordering::Relaxed);
+            let r = if judged { Ok(()) } else { quillo::builtins::quillo_layout_dir(base) };
+            let r = r.and_then(|_| interp.load_file(path).map_err(|e| format!("{:#}", e)));
             r.and_then(|_| quillo::builtins::quillo_layout(&interp))
         });
         tried.extend(read);
@@ -1971,6 +1980,7 @@ fn before_the_program(file: &str, o: &RunOptions) -> Result<(), i32> {
         eprintln!("quillo: {}", why);
         return Err(1);
     }
+    LAYOUT_JUDGED.store(true, std::sync::atomic::Ordering::Relaxed);
     if o.watch && !refused && std::env::var("QUILLO_SECRET").map_or(true, |s| s.is_empty()) {
         let kept = Path::new(file).parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).join(".quillo");
         match quillo::embed::keep_secret(&kept) {
