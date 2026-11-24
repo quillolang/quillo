@@ -1446,7 +1446,7 @@ fn file_once(it: &mut Interp, args: &[Value], line: u32, hosted: Option<&Path>, 
     let sent = hosted.map(|served| crate::statics::Hosted { served: served.to_path_buf(), program: it.base_dir.to_path_buf(), etag: info.etag.clone(), id: info.id });
     let mut copy: Option<Arc<[u8]>> = None;
     if let Some(h) = &sent {
-        if info.id.is_some_and(|id| own_id(id, info.links, info.born).is_some()) || crate::db::journal_of(&full).is_some_and(|db| crate::db::sqlite_file(&db)) {
+        if info.id.is_some_and(|id| own_id(id, info.links, info.born).is_some()) || sqlite_journal(&full) {
             return Ok(Some(not_found()));
         }
         if crate::statics::small(&info) {
@@ -1748,6 +1748,9 @@ pub const OWN_TLS_KEY: &str = "it is the server's TLS key";
 pub const OWN_POLICY: &str = "it is the program's policy";
 /// What the program's files were confirmed to reach (FEEDBACK83.md, Q-1300; branch feedback82-85).
 pub const OWN_CONFIRMED: &str = "it is what the program was confirmed to reach (quillo.confirmed)";
+/// What Quillo keeps for the program beside its files (FEEDBACK85.md, Q-1340, found by the review
+/// of b7f7c26; branch feedback82-85).
+pub(crate) const OWN_QUILLO: &str = "it is in the program's .quillo folder, which holds its built plugins, their lock and its keys";
 
 /// Notes `p`, if it is there, as one of the program's own files. A source file's earlier
 /// versions at that path are let go, so `--watch` saving one again and again keeps one each; the
@@ -1880,10 +1883,20 @@ pub(crate) fn open_hosted(served: &Path, program: &Path, full: &Path) -> Result<
     if !(crate::statics::within(&real, &program) || allowed_dir(&real).is_some()) || hidden_target(&program, &served, &real) {
         return Err(Refused);
     }
-    if crate::db::journal_of(&real).is_some_and(|db| crate::db::sqlite_file(&db)) {
+    if sqlite_journal(&real) {
         return Err(Refused);
     }
     Ok((f, m))
+}
+
+/// Whether `p`, by its name a `-wal`, `-shm` or `-journal`, is a SQLite database's, by the first
+/// bytes of the file beside it (`db::sqlite_file`), read only where a look (which opens nothing)
+/// finds that a file of bytes: a FIFO there, or a link to one, is no database, and opening it
+/// waited for a writer for ever, a request to `files()` for `q-wal` with it (FEEDBACK85.md,
+/// Q-1340, found by the review of b7f7c26; branch feedback82-85). A name of no journal costs a
+/// look at its letters.
+fn sqlite_journal(p: &Path) -> bool {
+    crate::db::journal_of(p).is_some_and(|db| std::fs::metadata(&db).is_ok_and(|m| m.is_file()) && crate::db::sqlite_file(&db))
 }
 
 /// Whether the file opened begins as a SQLite database, its log or its journal: for an answer of
@@ -3128,8 +3141,21 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
     let sys = |p: &Path| folded_path(&crate::statics::sys_form_of(p));
     // The file, or a folder that holds one (`delete_file("lib")`).
     let folded_target = sys(&target);
-    if it.loaded.iter().any(|f| sys(&real_as_made(f)).starts_with(&folded_target)) {
+    let loaded: Vec<std::path::PathBuf> = it.loaded.iter().map(|f| real_as_made(f)).collect();
+    if loaded.iter().any(|f| sys(f).starts_with(&folded_target)) {
         return Some(OWN_SOURCE);
+    }
+    // Its `.quillo` folders, and what is in them, there yet or not, or a folder that holds one:
+    // the libraries of its plugins, their lock and its session key were files like others, and a
+    // program, or an upload by the name a visitor gave, put another library in for the next start,
+    // as Q-361 closed for main.qwe (FEEDBACK85.md, Q-1340, found by the review of b7f7c26; branch
+    // feedback82-85). Quillo writes them itself, never through here. Looked for only where the
+    // path, as it really is, has a `.quillo` in it, the target is a folder, or it has a second
+    // name: a write of another file looks at nothing more.
+    let quillo = std::cell::OnceCell::new();
+    let quillo = || quillo.get_or_init(|| quillo_dirs(it, &loaded));
+    if folded_target.components().any(|c| c.as_os_str() == ".quillo") && quillo().iter().any(|q| folded_target.starts_with(sys(q))) {
+        return Some(OWN_QUILLO);
     }
     let folded = fold_name(taken);
     if folded == ".env" || folded.starts_with(".env.") {
@@ -3143,12 +3169,23 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
     // One of them under another name: a second hard link writes into it (FEEDBACK55.md, Q-701;
     // branch feedback55).
     let mut a_folder = false;
+    let mut linked = None;
     for f in &both {
         if let Ok(m) = std::fs::metadata(f) {
             if let Some(why) = own_meta(&m) {
                 return Some(why);
             }
             a_folder |= m.is_dir();
+            #[cfg(unix)]
+            if m.is_file() && std::os::unix::fs::MetadataExt::nlink(&m) > 1 {
+                linked = crate::statics::id_of(&m);
+            }
+        }
+    }
+    // A second name of a file in a `.quillo` folder: looked for there, as few files are.
+    if let Some(id) = linked {
+        if quillo().iter().any(|q| holds_file(q, id, 8)) {
+            return Some(OWN_QUILLO);
         }
     }
     // A folder that holds one of its files, by the folders themselves (`statics::holds_any`): by
@@ -3156,8 +3193,11 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
     // or a bind mount held none, and `delete_file` removed the program with it; 0.8.10 refused the
     // first for a program started by the long name (FEEDBACK85.md, Q-1340, found by the review of
     // 3e793e3; branch feedback82-85). A file costs nothing more: the look above said what it is.
-    if a_folder && crate::statics::holds_any(&real, it.loaded.iter().map(|f| real_as_made(f))) {
+    if a_folder && crate::statics::holds_any(&real, loaded.iter().cloned()) {
         return Some(OWN_SOURCE);
+    }
+    if a_folder && (quillo().iter().any(|q| sys(q).starts_with(&folded_target)) || crate::statics::holds_any(&real, quillo().iter().cloned())) {
+        return Some(OWN_QUILLO);
     }
     // What a path of the settings or the TLS key leads to now, by any name (FEEDBACK55.md, Q-701;
     // branch feedback55).
@@ -3183,7 +3223,12 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
         let (short, long) = (crate::statics::sys_form_of(p).into_owned(), crate::statics::long_form(p));
         if short == long { vec![short] } else { vec![short, long] }
     };
-    if let Some(why) = both.iter().flat_map(|f| names(f)).find_map(|f| crate::db::database_file(&f)) {
+    // Judged without opening anything: for a journal's name db.rs reads the first bytes of the file
+    // it is of (`sqlite_file`), and a FIFO there, or a link to one, had that open wait for a writer,
+    // under the interpreter's lock, for ever. What is no file of bytes is no database (FEEDBACK85.md,
+    // Q-1340, found by the review of b7f7c26; branch feedback82-85).
+    let unopened = |f: &Path| crate::db::journal_of(f).map_or(true, |db| std::fs::metadata(&db).map_or(true, |m| m.is_file()));
+    if let Some(why) = both.iter().flat_map(|f| names(f)).filter(|f| unopened(f)).find_map(|f| crate::db::database_file(&f)) {
         return Some(why);
     }
     let targets: Vec<std::path::PathBuf> = names(&target).iter().map(|t| folded_path(t)).collect();
@@ -3200,6 +3245,30 @@ pub(crate) fn own_file(it: &Interp, full: &Path, upload: bool) -> Option<&'stati
         return Some("it is where a tenant's database is");
     }
     None
+}
+
+/// The program's `.quillo` folders, there or not, by the names the system gives: beside its main
+/// file (`base_dir`) and beside each file it loaded, as a plugin's `.quillo/native` and
+/// `plugins.lock` are beside its source (FEEDBACK85.md, Q-1340, found by the review of b7f7c26;
+/// branch feedback82-85).
+fn quillo_dirs(it: &Interp, loaded: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for d in crate::statics::real_dir(&it.base_dir).into_iter().chain(loaded.iter().filter_map(|f| f.parent().map(Path::to_path_buf))) {
+        let q = crate::statics::sys_form(d).join(".quillo");
+        if !out.contains(&q) {
+            out.push(q);
+        }
+    }
+    out
+}
+
+/// Whether the file `id` is in the folder `dir`, `depth` folders down at most, no link followed.
+fn holds_file(dir: &Path, id: crate::statics::FileId, depth: u32) -> bool {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| match std::fs::symlink_metadata(e.path()) {
+        Ok(m) if m.is_dir() => depth > 0 && holds_file(&e.path(), id, depth - 1),
+        Ok(m) => crate::statics::id_of(&m) == Some(id),
+        Err(_) => false,
+    })
 }
 
 /// Where `p` is: the nearest part of it that is there, as it really is, and the names after it,
@@ -3489,7 +3558,7 @@ fn delete_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     // `remove_dir_all` walks it (FEEDBACK85.md, Q-1340, found by the review of 3e793e3; branch
     // feedback82-85).
     if std::fs::symlink_metadata(&full).is_ok_and(|m| m.is_dir()) {
-        match own_inside(&full) {
+        match own_inside(it, &full) {
             Ok(None) => {}
             Ok(Some(why)) => return Ok(Value::err(Value::str(format!("delete_file: will not delete {}: {}", p, why)))),
             Err(e) => return Ok(Value::err(Value::str(format!("delete_file: {}: {}", p, e)))),
@@ -3504,31 +3573,164 @@ fn delete_file(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 }
 
 /// Why the folder `dir`, which `delete_file` would delete whole, holds one of the program's own
-/// files, if it does: each file in it judged by itself, its device and inode (`own_meta`: its
-/// sources, settings, policy and key, and a database it has open), and a journal of a database it
-/// has open (`db::database_file`), walked as `remove_dir_all` walks it, no link followed. By the
-/// folder's name, `own_file` asks db.rs by the names it keeps a database by, which a database
-/// opened by another (`/.nofollow/...`, a bind mount) is not: its folder went with it
-/// (FEEDBACK85.md, Q-1340, found by the review of 3e793e3; branch feedback82-85). A folder in it
-/// that cannot be read is an error, and nothing is deleted: `remove_dir_all` deleted what it
-/// could and stopped there. A look at each file, as the deletion would make.
-fn own_inside(dir: &Path) -> std::io::Result<Option<&'static str>> {
+/// files, if it does: each file in it judged by itself, its device and inode (`own_id`: its
+/// sources, settings, policy and key, and a database it has open), a journal by the database it
+/// is of, and a folder that holds a file the program loaded or is one of its `.quillo` folders
+/// (`kept`), walked as `remove_dir_all` walks it. By the folder's name, `own_file` asks db.rs by
+/// the names it keeps a database by, which a database opened by another (`/.nofollow/...`, a bind
+/// mount) is not: its folder went with it (FEEDBACK85.md, Q-1340, found by the review of 3e793e3;
+/// branch feedback82-85). And, found by the review of b7f7c26 (FEEDBACK85.md, Q-1340; branch
+/// feedback82-85):
+/// - Nothing is opened to be judged, only looked at: a journal's database read by its first bytes
+///   (`db::database_file`) waited for ever on a FIFO, under the interpreter's lock.
+/// - A link is judged by what it leads to, as naming it is (`own_file`): one the program's code was
+///   used through, the file `--env-file` names, or the database opened through it went with its
+///   folder, and the next start read what was put in its place. Only the link goes, as before.
+/// - The walk is by each folder opened (`openat`, `fstatat`), as `remove_dir_all` deletes: by a
+///   path, a tree deeper than a path may be long was "File name too long" and stayed.
+/// A folder in it that cannot be read is an error, and nothing is deleted: `remove_dir_all`
+/// deleted what it could and stopped there. A look at each file, as the deletion makes.
+fn own_inside(it: &Interp, dir: &Path) -> std::io::Result<Option<&'static str>> {
+    let loaded: Vec<std::path::PathBuf> = it.loaded.iter().map(|f| real_as_made(f)).collect();
+    let mut kept: std::collections::HashMap<crate::statics::FileId, &'static str> = std::collections::HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    for f in &loaded {
+        for chain in [crate::statics::long_form(f), f.clone()] {
+            for a in chain.ancestors().skip(1) {
+                if !seen.insert(a.to_path_buf()) {
+                    break;
+                }
+                if let Some(id) = std::fs::metadata(a).ok().and_then(|m| crate::statics::id_of(&m)) {
+                    kept.insert(id, OWN_SOURCE);
+                }
+            }
+        }
+    }
+    for q in quillo_dirs(it, &loaded) {
+        if let Some(id) = std::fs::metadata(&q).ok().and_then(|m| crate::statics::id_of(&m)) {
+            kept.entry(id).or_insert(OWN_QUILLO);
+        }
+    }
+    let named: Vec<(std::path::PathBuf, &'static str)> = own().named.iter().map(|(n, why)| (std::path::PathBuf::from(fold_name(&crate::statics::sys_form_of(n).to_string_lossy())), *why)).collect();
+    let said = |why: &'static str| if why == crate::db::OPEN { "it holds the database the program has open" } else { why };
+    walk_kept(dir, &real_as_made(dir), &kept, &named).map(|w| w.map(said))
+}
+
+/// `own_inside`'s walk, on systems that open a folder by its parent's descriptor.
+#[cfg(unix)]
+fn walk_kept(dir: &Path, real: &Path, kept: &std::collections::HashMap<crate::statics::FileId, &'static str>, named: &[(std::path::PathBuf, &'static str)]) -> std::io::Result<Option<&'static str>> {
+    use std::ffi::{CStr, CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    struct Opened(*mut libc::DIR);
+    impl Drop for Opened {
+        fn drop(&mut self) {
+            // SAFETY: a stream fdopendir gave, closed once.
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    let open = |at: libc::c_int, name: &CStr| -> std::io::Result<Opened> {
+        // SAFETY: a descriptor of a folder open here (or AT_FDCWD) and a NUL-ended name.
+        let fd = unsafe { libc::openat(at, name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor just opened, which the stream then owns.
+        let d = unsafe { libc::fdopendir(fd) };
+        if d.is_null() {
+            let e = std::io::Error::last_os_error();
+            // SAFETY: the descriptor no stream took.
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        Ok(Opened(d))
+    };
+    let look = |at: libc::c_int, name: &CStr, follow: bool| -> Option<libc::stat> {
+        // SAFETY: an all-zero stat is a valid value to be written over.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as `open`; the stat is this frame's.
+        (unsafe { libc::fstatat(at, name.as_ptr(), &mut st, if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW }) } == 0).then_some(st)
+    };
+    let id = |st: &libc::stat| (st.st_dev as u64, st.st_ino as u64);
+    let own = |st: &libc::stat| own_id(id(st), st.st_nlink as u64, None).or_else(|| kept.get(&id(st)).copied());
+    let top = CString::new(dir.as_os_str().as_bytes()).map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let mut stack = vec![(open(libc::AT_FDCWD, &top)?, real.to_path_buf())];
+    while let Some(last) = stack.last() {
+        let (d, at) = (last.0 .0, last.1.clone());
+        // SAFETY: the stream is open while it is on the stack.
+        let e = unsafe { libc::readdir(d) };
+        if e.is_null() {
+            stack.pop();
+            continue;
+        }
+        // SAFETY: readdir's entry holds a NUL-ended name, valid until the next readdir of `d`.
+        let name = unsafe { CStr::from_ptr((*e).d_name.as_ptr()) }.to_owned();
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        // SAFETY: the stream's own descriptor.
+        let fd = unsafe { libc::dirfd(d) };
+        let Some(st) = look(fd, &name, false) else {
+            // Gone since it was listed: nothing of it to delete.
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::NotFound {
+                continue;
+            }
+            return Err(e);
+        };
+        let here = at.join(OsStr::from_bytes(name.to_bytes()));
+        let kind = st.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFLNK {
+            // Looked at where it leads (a look, which opens nothing); a link that leads nowhere,
+            // by its own name, as `--env-file`'s path is kept while nothing is there.
+            if let Some(to) = look(fd, &name, true) {
+                if let Some(why) = own(&to) {
+                    return Ok(Some(why));
+                }
+                if to.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                    if let Ok(r) = here.canonicalize() {
+                        let forms = [crate::statics::sys_form_of(&r).into_owned(), crate::statics::long_form(&r)];
+                        if forms.iter().any(|f| crate::db::opened_under(Path::new(&fold_name(&f.to_string_lossy())))) {
+                            return Ok(Some(crate::db::OPEN));
+                        }
+                    }
+                }
+            }
+            let folded = std::path::PathBuf::from(fold_name(&crate::statics::sys_form_of(&here).to_string_lossy()));
+            if let Some((_, why)) = named.iter().find(|(n, _)| *n == folded) {
+                return Ok(Some(why));
+            }
+            continue;
+        }
+        if let Some(why) = own(&st) {
+            return Ok(Some(why));
+        }
+        if kind == libc::S_IFDIR {
+            let next = open(fd, &name)?;
+            stack.push((next, here));
+        } else if let Some(stem) = crate::db::journal_of(Path::new(OsStr::from_bytes(name.to_bytes()))) {
+            let stem = CString::new(stem.as_os_str().as_bytes()).unwrap_or_default();
+            if look(fd, &stem, true).is_some_and(|s| s.st_mode & libc::S_IFMT == libc::S_IFREG && crate::db::open_id(id(&s))) {
+                return Ok(Some(crate::db::OPEN));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// `own_inside`'s walk elsewhere, by paths.
+#[cfg(not(unix))]
+fn walk_kept(dir: &Path, _: &Path, kept: &std::collections::HashMap<crate::statics::FileId, &'static str>, _: &[(std::path::PathBuf, &'static str)]) -> std::io::Result<Option<&'static str>> {
     let mut todo = vec![dir.to_path_buf()];
     while let Some(d) = todo.pop() {
         for e in std::fs::read_dir(&d)? {
             let path = e?.path();
             let m = std::fs::symlink_metadata(&path)?;
-            // A link goes, not what it leads to.
-            if m.file_type().is_symlink() {
-                continue;
-            }
-            if let Some(why) = own_meta(&m) {
-                return Ok(Some(if why == crate::db::OPEN { "it holds the database the program has open" } else { why }));
+            let followed = if m.file_type().is_symlink() { std::fs::metadata(&path).ok() } else { Some(m.clone()) };
+            if let Some(why) = followed.as_ref().and_then(own_meta).or_else(|| followed.as_ref().and_then(crate::statics::id_of).and_then(|id| kept.get(&id).copied())) {
+                return Ok(Some(why));
             }
             if m.is_dir() {
                 todo.push(path);
-            } else if crate::db::database_file(&path) == Some(crate::db::OPEN) {
-                return Ok(Some("it holds the database the program has open"));
             }
         }
     }

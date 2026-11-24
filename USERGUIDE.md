@@ -8119,8 +8119,11 @@ path is judged where it really leads, with its links followed:
 - A folder is judged as itself, whatever its name *(since 0.8.11)*: on macOS
   `/System/Volumes/Data/Users/x` is `/Users/x`, and either name works in `--allow-path`, a
   policy's `[fs] paths`, a link, and the path the program is started by.
-- `delete_file` of a folder is refused when the folder holds one of the program's own files
-  or a database it has open, judged by the files themselves; a folder in it that cannot be
+- The program's own files are refused by any name: its sources, `.env`, the database it has
+  open, and its `.quillo` folders (beside its main file and beside each plugin: built
+  plugins, their lock, its keys) *(since 0.8.11: `.quillo` was writable)*.
+- `delete_file` of a folder is refused when the folder holds one of the program's own files,
+  a link to one, or a database it has open, judged by the files themselves; a folder in it that cannot be
   read is an error, and nothing is deleted *(since 0.8.11: what could be deleted was)*.
   `/.nofollow/...` names what its plain name names; under it the system follows no link, so
   a path with a link in it is refused.

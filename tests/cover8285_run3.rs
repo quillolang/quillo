@@ -926,3 +926,154 @@ fn a_pinned_build_is_refused_a_cargo_home_toolchain_or_cargo_the_program_reaches
     assert_eq!(code, Some(0), "{}", out);
     assert!(out.ends_with("from the pin\n"), "{}", out);
 }
+
+// Fix round 8
+
+/// A folder that is the program's (its main file and a used one under `lib/`), in a test's
+/// folder that is removed at its end, and the no-unlink sandbox profile; None, said, where the
+/// sandbox is not there.
+#[cfg(target_os = "macos")]
+fn sandboxed_app(name: &str) -> Option<(Dir, PathBuf, PathBuf)> {
+    let d = Dir(support::temp_dir(name).canonicalize().unwrap());
+    let profile = no_unlink(&d.0)?;
+    let app = d.0.join("app");
+    std::fs::create_dir_all(app.join("lib")).unwrap();
+    std::fs::write(app.join("lib/x.qwe"), "let lib_value = 1\n").unwrap();
+    Some((d, app, profile))
+}
+
+/// Judging a journal's name looks at its database without opening it: `spool/q` a FIFO (or a link
+/// to one outside), `write_file("spool/q-wal")` and `delete_file("spool")` opened `q` to read its
+/// first bytes, and waited for a writer, under the interpreter's lock, for ever: a FIFO is no
+/// database. Run with a deadline, under the no-unlink sandbox (src/builtins.rs own_file and
+/// own_inside, FEEDBACK85.md Q-1340, found by the review of b7f7c26; branch feedback82-85)
+#[cfg(target_os = "macos")]
+#[test]
+fn a_fifo_beside_a_journals_name_is_no_database_and_is_never_opened() {
+    let Some((d, app, profile)) = sandboxed_app("cov8285r3-fifo") else { return };
+    for f in [app.join("spool"), app.join("unpacked"), d.0.join("outside")] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    for fifo in [app.join("spool/q"), d.0.join("outside/fifo")] {
+        assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    }
+    std::os::unix::fs::symlink(d.0.join("outside/fifo"), app.join("unpacked/q")).unwrap();
+    for j in ["spool/q-wal", "unpacked/q-wal"] {
+        std::fs::write(app.join(j), "j").unwrap();
+    }
+    std::fs::write(
+        app.join("main.qwe"),
+        "print(write_file(\"spool/q-wal\", \"x\") | is_err)\nprint(write_file(\"unpacked/q-shm\", \"x\") | is_err)\nprint(delete_file(\"spool\"))\nprint(delete_file(\"unpacked\"))\n",
+    )
+    .unwrap();
+    let (code, out) = sandboxed_at(&app, &profile, &["run", "main.qwe"], &[], &d.0.join("a.log"), 30);
+    assert_eq!(
+        (code, out.as_str()),
+        (Some(0), "false\nfalse\nerr(\"delete_file: spool: Operation not permitted (os error 1)\")\nerr(\"delete_file: unpacked: Operation not permitted (os error 1)\")\n"),
+        "it waited on the FIFO"
+    );
+}
+
+/// The program's `.quillo` folders (beside its main file and beside each file it loaded: built
+/// plugins, their lock, the session key) are its own: written, by any name (case, a link, a
+/// hard link, not made yet), or deleted, they were ordinary files, and a program or an upload's
+/// name could put another library in for the next start. Another project's `.quillo`, and a name
+/// that only begins so, are files like others (src/builtins.rs own_file, FEEDBACK85.md Q-1340 as
+/// FEEDBACK30.md Q-361 closed it for main.qwe, found by the review of b7f7c26; branch feedback82-85)
+#[cfg(target_os = "macos")]
+#[test]
+fn the_programs_quillo_folders_are_its_own_by_any_name() {
+    let Some((d, app, profile)) = sandboxed_app("cov8285r3-dotquillo") else { return };
+    for f in [app.join(".quillo/native"), app.join("lib/.quillo/native"), app.join("other/.quillo")] {
+        std::fs::create_dir_all(f).unwrap();
+    }
+    for (f, text) in [(".quillo/native/libhi-0123.dylib", "lib"), (".quillo/plugins.lock", "lock"), (".quillo/.quillo-secret", "key"), ("lib/.quillo/native/liby.dylib", "lib")] {
+        std::fs::write(app.join(f), text).unwrap();
+    }
+    std::os::unix::fs::symlink(".quillo", app.join("ql")).unwrap();
+    std::fs::hard_link(app.join(".quillo/plugins.lock"), app.join("hl.bin")).unwrap();
+    let writes = [".quillo/plugins.lock", ".QUILLO/native/libhi-0123.dylib", ".quillo/native/new.dylib", "lib/.quillo/native/liby.dylib", "ql/plugins.lock", "hl.bin", ".quillo"];
+    let mut main = String::from("use \"lib/x.qwe\"\n");
+    for w in writes {
+        main.push_str(&format!("print(write_file(\"{}\", \"x\"))\n", w));
+    }
+    main.push_str("print(delete_file(\".quillo\"))\nprint(delete_file(\"lib/.quillo/native\"))\nprint(delete_file(\"ql\"))\n");
+    main.push_str("print(write_file(\".quillo-notes.txt\", \"ok\") | is_err)\nprint(write_file(\"other/.quillo/x.txt\", \"ok\") | is_err)\n");
+    std::fs::write(app.join("main.qwe"), &main).unwrap();
+    let why = "it is in the program's .quillo folder, which holds its built plugins, their lock and its keys";
+    let mut want = String::new();
+    for w in writes {
+        want.push_str(&format!("err(\"write_file: will not write {}: {}\")\n", w, why));
+    }
+    for p in [".quillo", "lib/.quillo/native", "ql"] {
+        want.push_str(&format!("err(\"delete_file: will not delete {}: {}\")\n", p, why));
+    }
+    want.push_str("false\nfalse\n");
+    let (code, out) = sandboxed_at(&app, &profile, &["run", "main.qwe"], &[], &d.0.join("a.log"), 60);
+    assert_eq!((code, out.as_str()), (Some(0), want.as_str()));
+    assert_eq!(std::fs::read_to_string(app.join(".quillo/plugins.lock")).unwrap(), "lock");
+}
+
+/// Deleting a folder judges a link in it by what it leads to, as naming the link does: a link
+/// the program's code was used through (`lib/util.qwe -> ../vendor/util.qwe`), the file
+/// `--env-file` names (`config/app.env` a link), and the database it opened through a link
+/// (`data/app.db -> ../store/app.db`) went with their folders, and the next start would have read
+/// what was put in their place. A folder whose links lead to nothing of the program's is let
+/// through to the deletion, which the sandbox refuses (src/builtins.rs own_inside, FEEDBACK85.md
+/// Q-1340, found by the review of b7f7c26; branch feedback82-85)
+#[cfg(target_os = "macos")]
+#[test]
+fn deleting_a_folder_judges_its_links_by_what_they_lead_to() {
+    let Some((d, app, profile)) = sandboxed_app("cov8285r3-links-in") else { return };
+    for f in ["vendor", "uses", "secrets", "config", "store", "data", "plain", "elsewhere"] {
+        std::fs::create_dir_all(app.join(f)).unwrap();
+    }
+    std::fs::write(app.join("vendor/util.qwe"), "let util_value = 2\n").unwrap();
+    std::os::unix::fs::symlink("../vendor/util.qwe", app.join("uses/util.qwe")).unwrap();
+    std::fs::write(app.join("secrets/app.env"), "X=1\n").unwrap();
+    std::os::unix::fs::symlink("../secrets/app.env", app.join("config/app.env")).unwrap();
+    std::os::unix::fs::symlink("../store/app.db", app.join("data/app.db")).unwrap();
+    std::fs::write(app.join("elsewhere/n.txt"), "n").unwrap();
+    std::os::unix::fs::symlink("../elsewhere/n.txt", app.join("plain/n.txt")).unwrap();
+    std::fs::write(
+        app.join("main.qwe"),
+        "use \"uses/util.qwe\"\ndb.open(\"data/app.db\")\ndb.exec(\"create table if not exists t (x int)\")\nfor f in [\"uses\", \"config\", \"data\", \"plain\"] {\n  print(delete_file(f))\n}\n",
+    )
+    .unwrap();
+    let (code, out) = sandboxed_at(&app, &profile, &["run", "main.qwe", "--env-file", "config/app.env"], &[], &d.0.join("a.log"), 60);
+    assert_eq!(
+        (code, out.as_str()),
+        (
+            Some(0),
+            "err(\"delete_file: will not delete uses: it is one of the program's own files\")\nerr(\"delete_file: will not delete config: it is the program's settings (.env)\")\n\
+             err(\"delete_file: will not delete data: it holds the database the program has open\")\nerr(\"delete_file: plain: Operation not permitted (os error 1)\")\n"
+        )
+    );
+}
+
+/// A tree deeper than a path can be long (60 folders of 30 letters, 1,900 bytes) is walked by its
+/// folders, as `remove_dir_all` deletes it: judged by a path, it was "File name too long" and
+/// stayed. It is deleted; one with a second name of the main file at its bottom is refused
+/// (src/builtins.rs own_inside, FEEDBACK85.md Q-1340, found by the review of b7f7c26; branch
+/// feedback82-85)
+#[cfg(unix)]
+#[test]
+fn a_tree_deeper_than_a_path_is_long_is_judged_and_deleted() {
+    let d = Dir(support::temp_dir("cov8285r3-deep").canonicalize().unwrap());
+    let app = d.0.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(app.join("main.qwe"), "print(delete_file(\"deep\") | is_err)\nprint(delete_file(\"deep2\"))\n").unwrap();
+    let level = "f".repeat(30);
+    let main = app.join("main.qwe").display().to_string();
+    let script = format!(
+        "set -e; for t in deep deep2; do mkdir $t; cd $t; i=0; while [ $i -lt 60 ]; do mkdir {l}; cd {l}; i=$((i+1)); done; echo bottom > b.txt; cd {app}; done; \
+         cd deep2; i=0; while [ $i -lt 60 ]; do cd {l}; i=$((i+1)); done; ln {main} again.qwe",
+        l = level,
+        app = app.display(),
+        main = main
+    );
+    assert!(Command::new("sh").arg("-c").arg(&script).current_dir(&app).status().unwrap().success());
+    let (code, out) = quillo_at(&app, &["run", "main.qwe"], &[], &d.0.join("a.log"), 60);
+    assert_eq!((code, out.as_str()), (Some(0), "false\nerr(\"delete_file: will not delete deep2: it is one of the program's own files\")\n"));
+    assert!(!app.join("deep").exists() && app.join("deep2").exists() && app.join("main.qwe").exists());
+}

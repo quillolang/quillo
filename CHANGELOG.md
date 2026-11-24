@@ -284,7 +284,13 @@ What a program may notice:
   by the files themselves: a folder holding the program's files or a database it has open is
   refused whatever name it is given (`/System/Volumes/Data`, `/.nofollow/...`, a bind
   mount), and a folder in it that cannot be read stops it before anything is deleted (it
-  deleted what it could). `/.nofollow/x` names `/x`.
+  deleted what it could). `/.nofollow/x` names `/x`. The program's `.quillo` folders (built
+  plugins, `plugins.lock`, the session key) are its own files: `write_file`, `delete_file`,
+  `save_upload` and the save options refuse them by any name, as they refuse `main.qwe`
+  (found by the review of b7f7c26; an upload path a visitor steers could plant a library for
+  the next start). Deleting a folder no longer removes a link the program's code,
+  `--env-file` or its database is used through, works on trees of any depth, and judges a
+  FIFO beside a journal's name without waiting on it; `files()` no longer hangs on one.
 - **`read_file`, `write_file` and `delete_file`'s refusal of a path outside the folder** ends
   with the way out: ``; `--allow-path ..` (on `quillo run` or `quillo mcp`) lets the program
   read it`` (Q-1341). Refused for a link, it names the link and where it leads, with the
