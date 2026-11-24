@@ -2796,7 +2796,7 @@ fn dec_op(op: BinOp, a: &Value, b: &Value, line: u32) -> Result<Value, Ctrl> {
 /// Two ints, for the operators where nothing can go otherwise: None for all else, which
 /// `binop` works out or refuses. Inside `eval`, it is a third of what a loop's sum costs.
 #[inline(always)]
-fn int_op(op: BinOp, x: i64, y: i64) -> Option<Value> {
+pub(crate) fn int_op(op: BinOp, x: i64, y: i64) -> Option<Value> {
     Some(match op {
         BinOp::Add => Value::Int(x.checked_add(y)?),
         BinOp::Sub => Value::Int(x.checked_sub(y)?),
@@ -5365,7 +5365,22 @@ impl Interp {
                 Some(i) => m[i].clone(),
                 None => start,
             };
-            let now = binop(op, old, more, line)?;
+            // Two ints as `eval` takes them first (`int_op`; `binop` where it has no answer): the
+            // map's look-up took 16 instructions more since indexmap's table code went to a unit
+            // of its own, which 75 of `binop`'s fewer make up (bench/vs-python's `word frequency`;
+            // the speed round 2 of 0.8.11; FEEDBACK83.md, Q-1300; branch feedback82-85).
+            let ints = match (&old, &more) {
+                (Value::Int(x), Value::Int(y)) => int_op(op, *x, *y),
+                _ => None,
+            };
+            let now = match ints {
+                Some(v) => {
+                    // Ints have nothing to let go of.
+                    std::mem::forget((old, more));
+                    v
+                }
+                None => binop(op, old, more, line)?,
+            };
             let m = crate::value::sole(m);
             match at {
                 Some(i) => m[i] = now,

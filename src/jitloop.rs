@@ -843,7 +843,26 @@ unsafe extern "C" fn map_count(map: *mut Value, key: i64, op: u64, st: u64, sb: 
             return failed(cx, stop.at(line as u32));
         }
     }
-    match binop(OPS[op as usize], old, value_of(of_tag(mt), mb), line as u32) {
+    // Two ints as the interpreter's `eval` takes them first (`int_op`, `binop` where it has no
+    // answer, an overflow's included): 75 instructions of `binop` a round fewer, which more than
+    // make up the 16 the map's look-up took more since its table's code (indexmap's `Core`) went to
+    // a unit of its own, as nothing in this file had changed: `int histogram` was +2.3% (the speed
+    // round 2 of 0.8.11; FEEDBACK83.md, Q-1300; FEEDBACK55.md, string speed; branch feedback82-85).
+    let by = value_of(of_tag(mt), mb);
+    let opn = OPS[op as usize];
+    let ints = match (&old, &by) {
+        (Value::Int(x), Value::Int(y)) => crate::interp::int_op(opn, *x, *y),
+        _ => None,
+    };
+    let now = match ints {
+        Some(v) => {
+            // Ints have nothing to let go of.
+            std::mem::forget((old, by));
+            Ok(v)
+        }
+        None => binop(opn, old, by, line as u32),
+    };
+    match now {
         Ok(now) => {
             let m = value::sole(m);
             match at {

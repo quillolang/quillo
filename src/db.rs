@@ -356,8 +356,15 @@ pub const CONN_KEY: &str = "$db";
 /// The connection `recv.name(...)` is a `db` function of, if it is one.
 pub(crate) fn conn_of(recv: &Value, name: &str) -> Option<usize> {
     let Value::Map(m) = recv else { return None };
-    match (m.get(name), m.get(CONN_KEY)) {
-        (Some(Value::Builtin(b, f)), Some(Value::Int(id))) if b.starts_with("db.") => {
+    // The connection's number looked for first: a map that has none, as `db` and every map that is
+    // no connection, is told so by one look of its keys, where the name called was looked for too.
+    // Each look hashes its key, some 200 instructions of every method called on a map: `db.exec`
+    // and `db.one` took 98 and 104 more a call than 0.8.10, their maps' look-ups in a unit of their
+    // own since this file grew (the speed round 2 of 0.8.11; FEEDBACK83.md, Q-1300; branch
+    // feedback82-85).
+    let Some(Value::Int(id)) = m.get(CONN_KEY) else { return None };
+    match m.get(name) {
+        Some(Value::Builtin(b, f)) if b.starts_with("db.") => {
             // Under a hold a stand-in runs on the connection it was made for, none for `db.query`
             // as a file names it, whatever number the map it is in says (`interp::stand_in_conn`):
             // a kit's `{ "$db": 0, query: q }`, `q` the main file's `db.query` handed to it, ran as
