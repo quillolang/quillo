@@ -2355,15 +2355,21 @@ fn memfd_library(bytes: &[u8], name: &str) -> Result<Option<PathBuf>, String> {
     // MFD_EXEC (6.3 on), where `vm.memfd_noexec` makes a memfd one no library can be mapped
     // from; an older kernel does not know it, and is asked again without it.
     const MFD_EXEC: libc::c_uint = 0x0010;
-    // SAFETY: memfd_create takes a NUL-ended name and flags, and returns a new descriptor or -1.
-    let mut fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | MFD_EXEC) };
+    // By the system call itself, not glibc's memfd_create: the Linux downloads are linked
+    // against glibc 2.17, which has no such function (it came in 2.27), and v0.8.11's first
+    // Linux builds failed to link on it; a kernel without the call (before 3.17) says ENOSYS,
+    // and the copy is then a private file, as where EACCES says memfds cannot be mapped
+    // (FEEDBACK83.md, Q-1305, found by the release build of ff565c6; branch feedback82-85).
+    // SAFETY: the memfd_create system call takes a NUL-ended name and flags, and returns a new
+    // descriptor or -1.
+    let memfd = |flags: libc::c_uint| unsafe { libc::syscall(libc::SYS_memfd_create, cname.as_ptr(), flags) as libc::c_int };
+    let mut fd = memfd(libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING | MFD_EXEC);
     let err = std::io::Error::last_os_error().raw_os_error();
-    if fd < 0 && err == Some(libc::EACCES) {
+    if fd < 0 && matches!(err, Some(libc::EACCES) | Some(libc::ENOSYS)) {
         return Ok(None);
     }
     if fd < 0 && err == Some(libc::EINVAL) {
-        // SAFETY: as above.
-        fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+        fd = memfd(libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING);
     }
     if fd < 0 {
         return Err(format!("cannot make a private copy of {}: {}", name, std::io::Error::last_os_error()));
