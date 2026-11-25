@@ -14,7 +14,7 @@ cargo build --release
 cargo test
 ```
 
-This guide is for Quillo 0.8.10, and [CHANGELOG.md](CHANGELOG.md) says what it changed.
+This guide is for Quillo 0.8.11, and [CHANGELOG.md](CHANGELOG.md) says what it changed.
 Features marked *(since 0.8.11)* are built and not released yet: they come in the next
 release, and its "Unreleased" part of the changelog lists them. Features marked *(since 0.7)* came in 0.7.0. On an older release, read that release's guide:
 https://github.com/quillolang/quillo/blob/v0.7.0/USERGUIDE.md or
