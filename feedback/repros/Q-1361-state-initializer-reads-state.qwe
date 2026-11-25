@@ -1,0 +1,21 @@
+// Q-1361 A `state` whose initializer reads another state, or a `let` that does, is set once and never follows it, and check says ok (it warns of the same thing written as an assignment, Q-764)
+// mode: check
+// fixed-when: /:11: warning/
+// fixed-when: /:13: warning/
+// From FEEDBACK86.md §Q-1361 (found on 61997ab).
+
+// On the page, +1 shows a=2 b=2 c=4 d=3: b and d stay as they started. `state s = start`
+// (a prop, read once as documented) should stay unwarned.
+component C(start: int) {
+    state a = 1
+    state b = a * 2
+    let c = a * 2
+    state d = c + 1
+    state s = start
+    <div>
+        <button id="go" onclick={() => { a += 1 }}>+1</button>
+        <p id="out">a={a} b={b} c={c} d={d} s={s}</p>
+    </div>
+}
+
+route GET / = <html><body><C start={7}/></body></html>

@@ -1,0 +1,13 @@
+service ledger = "ledger.qwe"
+db.open("billing.db")
+db.exec("create table if not exists invoices (id integer primary key, name text not null, cents int not null)")
+let pause = int(env("BILLING_PAUSE", "0"))
+server fn invoice(name: str, cents: int) -> map ! str with db, http, time {
+    idempotent(() => {
+        let inv = db.one("insert into invoices (name, cents) values (?, ?) returning id, name, cents", name, cents)
+        ledger.post(`inv-${inv.id}`, cents)?
+        if pause > 0 { sleep(pause) }
+        inv
+    })
+}
+server fn total() -> int with db = db.one("select count(*) as n from invoices").n

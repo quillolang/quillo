@@ -1,0 +1,9 @@
+// Q-1390 A field read straight off a call that may give an error value (`-> map ! str`, a service's call, `?` and `??` both left out) passes quillo check; when the error comes, the route is a 500 "error has no field `id`"
+// mode: check
+// fixed-when: /:8: (error|warning)/
+// From FEEDBACK89.md §Q-1390 (found on 61997ab).
+fn invoice(name: str) -> map ! str = if name == "" { err("An invoice is for someone") } else { { id: 1, name } }
+route GET / {
+    let inv = invoice("")
+    <p>Invoice #{inv.id}</p>
+}

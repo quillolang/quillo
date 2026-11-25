@@ -1,0 +1,10 @@
+// Q-1371 An attribute's `{` left open after a lambda's block (`onclick={() => { n += 1 }>`) is reported as the button's text, "unexpected character `♥`" with the newer-Quillo note, or "expected an expression, found `+`", not as the missing `}`
+// mode: check
+// open-when: unexpected character `♥`
+// fixed-when: `}`
+// From FEEDBACK87.md §Q-1371 (found on 61997ab).
+component Like() {
+    state n = 0
+    <button onclick={() => { n += 1 }>♥ {n}</button>
+}
+route GET / = <Like/>

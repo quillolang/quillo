@@ -1,0 +1,2 @@
+service ledger = "ledger.qwe"
+server fn count() -> int = 2

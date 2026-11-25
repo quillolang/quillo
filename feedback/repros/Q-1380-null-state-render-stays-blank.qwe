@@ -1,0 +1,30 @@
+// Q-1380 A page whose server-fn state is null while it loads, and which passes a field of it to a typed view, stays blank after a tap for good, though the answer comes; check says ok
+// mode: browser
+// page: /
+// probe: document.getElementById("go").click(); await new Promise((r) => setTimeout(r, 1500)); const h = document.querySelector("#page h1"); return { h1: h ? h.textContent : "(none)" }
+// open-when: "h1": "(none)"
+// fixed-when: "h1": "Lantern Ridge"
+// From FEEDBACK88.md §Q-1380 (found on 61997ab, 0.8.10).
+
+// A script's click() is a tap: no hover, so no prefetch. With a mouse resting on the link, the prefetched page
+// shows whole and this never happens. The console says: argument `level` of `Level` must be str, got null null.
+let trails = [{ id: 5, name: "Lantern Ridge", level: "hard" }]
+
+server fn load_trail(id: int) -> map? = find(trails, (t) => t.id == id)
+
+view Level(level: str) = <span>{level}</span>
+
+component TrailPage(id: int) {
+    state trail = load_trail(id)
+    <main>
+        <h1>{trail.name}</h1>
+        <Level level={trail.level}/>
+    </main>
+}
+
+component App() {
+    let path = url().path
+    <div id="page">{path == "/" ? <a #go href="/trails/5">Open the trail</a> : <TrailPage id={5}/>}</div>
+}
+
+route GET /*rest = <html><body><App/></body></html>

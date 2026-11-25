@@ -1,0 +1,8 @@
+service billing = "billing.qwe" { timeout: "5s", retries: 0 }
+service ledger = "ledger.qwe"
+db.open("shop.db")
+route POST /buy with http, db = idempotent({ transaction: false }, () => {
+    let inv = billing.invoice("Ada", 1200) ?? reply 503 "busy"
+    `Invoice #${inv.id}`
+})
+route GET /counts with http = `invoices ${billing.total() ?? -1}, postings ${ledger.total() ?? -1}`

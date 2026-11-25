@@ -1,0 +1,3 @@
+service billing = "billing.qwe"
+service ledger = "ledger.qwe"
+route GET / = "ok"

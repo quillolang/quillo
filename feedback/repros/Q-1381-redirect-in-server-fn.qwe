@@ -1,0 +1,23 @@
+// Q-1381 `redirect()` at the end of a server fn called from a component answers the call 303, and the page stays where it is without a word; check says ok
+// mode: browser
+// page: /
+// probe: document.getElementById("save").click(); await new Promise((r) => setTimeout(r, 1200)); return { path: location.pathname, shown: document.getElementById("out").textContent }
+// open-when: "path": "/"
+// fixed-when: /redirect|warning/
+// From FEEDBACK88.md §Q-1381 (found on 61997ab, 0.8.10; first seen on 0.8.8).
+
+// A route may end with redirect("/hikes/7"). A server fn is called by the page's code, not followed by the
+// browser, so the 303 goes nowhere: the page stays at /, and `r` is whatever the call gave back.
+server fn log_hike(name: str) {
+    redirect("/hikes/7")
+}
+
+component Form() {
+    state r = "not saved"
+    <div>
+        <button #save onclick={() => { r = str(log_hike("Lantern Ridge")) }}>Save</button>
+        <p #out>{r}</p>
+    </div>
+}
+
+route GET /*rest = <html><body><Form/></body></html>

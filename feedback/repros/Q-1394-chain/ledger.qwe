@@ -1,0 +1,5 @@
+// The ledger as first written: idempotent, keyed by the call's id (the double posting comes from here).
+db.open("ledger.db")
+db.exec("create table if not exists postings (id integer primary key, ref text not null, cents int not null)")
+server fn post(ref: str, cents: int) -> map with db = idempotent(() => db.one("insert into postings (ref, cents) values (?, ?) returning id, ref", ref, cents))
+server fn total() -> int with db = db.one("select count(*) as n from postings").n

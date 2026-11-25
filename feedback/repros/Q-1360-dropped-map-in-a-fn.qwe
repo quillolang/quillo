@@ -1,0 +1,23 @@
+// Q-1360 A dropped `map` or `filter` is never warned of: in a component's fn, as `xs | map(f)` or `map(xs, f)`, check says ok and the click does nothing, while a dropped `push` or `set` there is warned of (Q-505 and Q-1267, part way)
+// mode: check
+// fixed-when: /:10: warning/
+// fixed-when: /:11: warning/
+// fixed-when: /:12: warning/
+// From FEEDBACK86.md §Q-1360 (found on 61997ab).
+
+component G() {
+    state xs = [1, 2, 3]
+    fn m1() { xs | map((x) => x * 2) }
+    fn m2() { map(xs, (x) => x * 2) }
+    fn f1() { xs | filter((x) => x > 1) }
+    fn p1() { xs | push(4) }
+    <div>
+        <button id="m1" onclick={m1}>m1</button>
+        <button id="m2" onclick={m2}>m2</button>
+        <button id="f1" onclick={f1}>f1</button>
+        <button id="p1" onclick={p1}>p1</button>
+        <p id="out">{str(xs)}</p>
+    </div>
+}
+
+route GET / = <html><body><G/></body></html>

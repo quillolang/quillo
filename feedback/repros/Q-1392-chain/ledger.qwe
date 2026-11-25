@@ -1,0 +1,7 @@
+db.open("ledger.db")
+db.exec("create table if not exists postings (id integer primary key, ref text not null unique, cents int not null)")
+server fn post(ref: str, cents: int) -> map with db {
+    db.exec("insert into postings (ref, cents) values (?, ?) on conflict (ref) do nothing", ref, cents)
+    db.one("select id, ref from postings where ref = ?", ref)
+}
+server fn total() -> int with db = db.one("select count(*) as n from postings").n

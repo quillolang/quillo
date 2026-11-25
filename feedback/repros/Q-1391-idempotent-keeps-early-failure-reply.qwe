@@ -1,0 +1,12 @@
+// Q-1391 With idempotent({ transaction: false }, ...), an early `?? reply 503` (the call to a service failed) is kept like a success: the same form sent again after the service is back replays the 503 until the key expires, though the docs' own advice for a form is to send it again
+// mode: run
+// From FEEDBACK89.md §Q-1391 (found on 61997ab). To see it: quillo run this file with nothing on 8251
+// (--service-url billing=http://127.0.0.1:8251, QUILLO_SERVICE_SECRET set), POST / with Idempotency-Key: k1 (503),
+// start billing, POST again with k1: 503, idempotent-replayed: true; with Idempotency-Key: k2: 200.
+// The video's apps: ~/dev/quillo-videos/videos/224-idempotent-services/app (main.qwe, billing.qwe).
+service billing = "billing.qwe"
+db.open("shop.db")
+route POST / with http, db = idempotent({ transaction: false }, () => {
+    let inv = billing.invoice("Ada", 1200) ?? reply 503 "Billing is busy"
+    `Invoice #${inv.id}`
+})

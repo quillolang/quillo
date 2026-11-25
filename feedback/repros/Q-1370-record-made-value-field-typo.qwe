@@ -1,0 +1,10 @@
+// Q-1370 A field typo on a value made by a record type's constructor (`Lamp({...})`), or returned by a fn declared `-> Lamp`, passes quillo check, and the page shows "null"; on a plain map or a parameter typed `Lamp` the same typo is an error
+// mode: check
+// fixed-when: /:9: error/
+// fixed-when: /:10: error/
+// From FEEDBACK87.md §Q-1370 (found on 61997ab).
+type Lamp = { name: str, watts: int }
+fn make() -> Lamp = Lamp({ name: "Desk", watts: 40 })
+let desk = Lamp({ name: "Desk", watts: 40 })
+route GET /a = `${desk.wats}`
+route GET /b = `${make().wats}`
