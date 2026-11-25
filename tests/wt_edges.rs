@@ -329,32 +329,10 @@ fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
 }
 
-/// A session at `path` (or with a ticket of the program's), asked again only when wtransport's
-/// own driver dropped the attempt before Quillo was asked: wtransport 0.7.2 reads a page's
-/// SETTINGS frame inside a `select!` it rebuilds whenever another stream comes, so a frame split
-/// across packets is read again from its middle and the server closes the connection at the HTTP/3
-/// level (0x105, 0x107) or never answers, on 0.8.8 as on this branch, and it reddened CI once
-/// (FEEDBACK75.md, Q-1124; branch feedback75). Such an attempt is neither a session nor a refusal;
-/// at most five tries, and any other error, refusal or session is returned as it is.
+/// A session at `path` (or with a ticket of the program's), asked for once: the tests asked again
+/// around wtransport's split-SETTINGS race until the patched copy fixed it (FEEDBACK75.md, Q-1124;
+/// branch feedback86-89).
 async fn connect(r: &Run, path: Option<&str>) -> Result<Connection, String> {
-    let mut last = String::new();
-    for _ in 0..5 {
-        match tokio::time::timeout(Duration::from_secs(10), connect_once(r, path)).await {
-            Ok(Err(e)) if dropped_by_wtransport(&e) => last = e,
-            Ok(answer) => return answer,
-            Err(_) => last = "no answer within 10 s".to_string(),
-        }
-    }
-    Err(last)
-}
-
-/// Whether the server closed a connection at the HTTP/3 level (0x100 to 0x10f), as wtransport's
-/// driver does on the race `connect` asks again for (Q-1124).
-fn dropped_by_wtransport(e: &str) -> bool {
-    e.strip_prefix("connection closed by peer: ").and_then(|c| c.split_whitespace().next()).and_then(|c| c.parse::<u64>().ok()).is_some_and(|c| (0x100..0x110).contains(&c))
-}
-
-async fn connect_once(r: &Run, path: Option<&str>) -> Result<Connection, String> {
     let t = r.ticket();
     let port = t["port"].as_u64().expect("no port");
     let hex = t["hash"].as_str().expect("no hash");
@@ -365,7 +343,12 @@ async fn connect_once(r: &Run, path: Option<&str>) -> Result<Connection, String>
         Some(p) => format!("https://127.0.0.1:{}{}", port, p),
         None => format!("https://127.0.0.1:{}/_quillo/wt?t={}", port, t["ticket"].as_str().unwrap()),
     };
-    Endpoint::client(c).unwrap().connect(url).await.map_err(|e| e.to_string())
+    // One attempt with a deadline, so that a regression fails instead of hanging (Q-1124's
+    // retries had one; branch feedback86-89).
+    match tokio::time::timeout(Duration::from_secs(60), Endpoint::client(c).unwrap().connect(url)).await {
+        Ok(answer) => answer.map_err(|e| e.to_string()),
+        Err(_) => Err("no session within 60 s".to_string()),
+    }
 }
 
 fn framed(t: &str) -> Vec<u8> {

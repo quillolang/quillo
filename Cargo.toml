@@ -114,3 +114,10 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# wtransport 0.7.2 (still the newest) with its HTTP/3 control streams read so that the driver's
+# `select!` can drop a read and take it up again: a peer's SETTINGS frame or capsule split across
+# packets broke or stalled the session (FEEDBACK75.md, Q-1124; branch feedback86-89). The changes
+# and why are in vendor/wtransport-0.7.2/README-QUILLO.md; drop this once upstream fixes it.
+[patch.crates-io]
+wtransport = { path = "vendor/wtransport-0.7.2" }
