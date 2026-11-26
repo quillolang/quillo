@@ -599,7 +599,7 @@ fn statements(path: &Path, base: &Path, seen: &mut HashSet<PathBuf>, out: &mut V
 /// What a running service says its `server fn`s are: a call of `_contracts`, made as its calls
 /// are (its `auth`, each address in turn), whose answer is each function's header and contract.
 fn functions_of(it: &mut Interp, name: &str, urls: &[String]) -> Result<(Vec<Arc<FnDef>>, Vec<String>), String> {
-    let list = match remote(it, urls, name, CONTRACTS, Vec::new(), None, None, new_id(16)) {
+    let list = match remote(it, urls, name, CONTRACTS, Vec::new(), None, None, new_id(16), None) {
         Outcome::Ran(Value::List(l)) => l,
         Outcome::Ran(other) => return Err(format!("its answer is not a list of functions: {}", short(&other))),
         Outcome::Missed(why) | Outcome::Refused(_, why) => return Err(why),
@@ -844,6 +844,36 @@ impl Outcome {
 /// not given: the same id for each try, so the call runs once).
 #[allow(clippy::too_many_arguments)]
 fn make(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: Option<String>, line: u32) -> Outcome {
+    // In a chain, derived from its place in the run (FEEDBACK89.md, Q-1394; branch feedback86-89).
+    // A run at the top derives its calls' ids only with the program's own secret (`Link::derive`);
+    // without one, new ids, as in 0.8.11, the run still in its chain for Q-1391.
+    let (id, link, chained) = match call {
+        Some(c) => (c, None, false),
+        None => match next_call(it, name, f) {
+            Some(Some((id, root, caller))) => (id, Some((root, caller)), true),
+            Some(None) => (call_id(it), None, true),
+            None => (call_id(it), None, false),
+        },
+    };
+    let mut sent = false;
+    let out = make_as(it, name, f, args, tenant, rid, id, link, line, &mut sent);
+    // Sent, answered or not, it marks the run, in a `parallel` task the run it was forked from, as
+    // what a builtin sends outside does (`effect`; a call run in this process marks it in `local`).
+    // Never sent (refused before it left, an open circuit), an `idempotent` that ends in its place
+    // and sent nothing else is not kept (FEEDBACK89.md, Q-1391; branch feedback86-89).
+    if sent {
+        outbound(it);
+    } else if chained && matches!(out, Outcome::Missed(_)) {
+        call_never_sent(it);
+    }
+    out
+}
+
+/// `make`, with its id, and in a chain its root and the name its caller gives: `sent`, whether a try
+/// of it left this process.
+#[allow(clippy::too_many_arguments)]
+fn make_as(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, id: String, link: Option<(Arc<str>, Arc<str>)>, line: u32, sent: &mut bool) -> Outcome {
+    let root = link.as_ref().map(|(r, _)| r.clone());
     let configured = configured_urls(&it.shared, name);
     let joined = joined_urls(name);
     if configured.is_empty() {
@@ -851,23 +881,21 @@ fn make(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<A
         // load off the app, so while one answers the app runs none itself, and it runs a call
         // when no copy answers it (FEEDBACK32.md, Q-399; branch feedback27-35-fixes).
         if joined.is_empty() {
-            return local(it, name, f, args, tenant, rid, call.unwrap_or_else(|| call_id(it)), line);
+            return local(it, name, f, args, tenant, rid, id, link, line);
         }
-        let id = call.unwrap_or_else(|| call_id(it));
-        let mut sent = false;
-        return match remote_hop(it, &joined, name, f, args.clone(), tenant.clone(), rid.clone(), id.clone(), None, &mut sent) {
+        return match remote_hop(it, &joined, name, f, args.clone(), tenant.clone(), rid.clone(), id.clone(), root.clone(), None, sent, false) {
             // In a tool's call that may ask, one sent and not answered may have run there: it is
             // not run again here, where one yes would be used twice, and it is a change
             // (`remote_hop`; FEEDBACK56.md, Part F, second review). Outside one, as before.
-            Outcome::Missed(why) if sent && it.asking.is_some() => Outcome::Missed(format!("the call to {} got no answer: it may have run ({})", name, why)),
-            Outcome::Missed(_) => local(it, name, f, args, tenant, rid, id, line),
+            Outcome::Missed(why) if *sent && it.asking.is_some() => Outcome::Missed(format!("the call to {} got no answer: it may have run ({})", name, why)),
+            Outcome::Missed(_) => local(it, name, f, args, tenant, rid, id, link, line),
             ran => ran,
         };
     }
     // The addresses the app was given and the copies that joined, all taken in turn.
     let mut urls = configured;
     urls.extend(joined.into_iter().filter(|u| !urls.contains(u)).collect::<Vec<_>>());
-    remote(it, &urls, name, f, args, tenant, rid, call.unwrap_or_else(|| call_id(it)))
+    remote_hop(it, &urls, name, f, args, tenant, rid, id, root, None, sent, false)
 }
 
 /// The first character of the id of a call made in a tool's call that has no asking
@@ -883,6 +911,546 @@ fn call_id(it: &Interp) -> String {
     match it.asking.is_none() && it.in_tool {
         true => format!("{}{}", UNSEEN_CALL, new_id(15)),
         false => new_id(16),
+    }
+}
+
+// ---- chained retries (FEEDBACK89.md, Q-1394; branch feedback86-89) ----------------------------
+
+/// The links an interpreter is in (`Interp::chain`), innermost last: a run whose calls are part of a
+/// chain, an `idempotent` run with a key or the answering of a call such a run made. Each call it
+/// makes gets an id derived from its link's seed and the call's place in the run (the n-th call of
+/// that service's function), by an HMAC under the program's own secret (`chain_key`): running the
+/// same request with the same key again sends the same ids down every link, and each link answers
+/// from its record, where a new id had it run again (the user's design, 2026-11-24). Another
+/// request with the key gets other ids: a laptop bought with the key a pen was first tried with
+/// was answered the pen's invoice (the security review's P1).
+/// Kept on the interpreter, not in a table every request locks, nor the thread's (a request is a
+/// coroutine, and its thread runs others while it waits); `None` there until a link is entered.
+#[derive(Default)]
+pub(crate) struct ChainCell {
+    /// The chain of the run a `parallel` task was forked from (`forked`): what the task sends
+    /// outside marks that run too. The task's own calls are not chained (documented).
+    parent: Option<Arc<ChainCell>>,
+    /// The run whose interpreter holds it has ended (`leave`): a fork made in the run, which may
+    /// outlive it, stops marking it and looking at its builtins (`effect`; the review's LOW).
+    /// Read with no lock.
+    ended: std::sync::atomic::AtomicBool,
+    chain: Mutex<Chain>,
+}
+
+/// What a `ChainCell` holds under its lock.
+#[derive(Default)]
+pub(crate) struct Chain {
+    links: Vec<Link>,
+    /// The names of services and functions its links were entered with, each made once for the
+    /// run: a run that calls one function a hundred times makes its names once.
+    names: Vec<Arc<str>>,
+}
+
+impl Chain {
+    fn name(&mut self, s: &str) -> Arc<str> {
+        if let Some(n) = self.names.iter().find(|n| ***n == *s) {
+            return n.clone();
+        }
+        let n: Arc<str> = Arc::from(s);
+        self.names.push(n.clone());
+        n
+    }
+}
+
+/// One place a link's run calls: a service's function, and how often it was called.
+struct Place {
+    name: Box<str>,
+    f: Box<str>,
+    n: u64,
+    /// SHA-256 of the service's name and of the function's, made at its first call.
+    digests: [u8; 64],
+}
+
+struct Link {
+    seed: Seed,
+    /// The HMAC of the seed, made at the link's first call: a keyed run that calls no service does no
+    /// chain work.
+    parent: Option<[u8; 32]>,
+    /// The chain's root, the same at every link, sent signed with each of its calls (`ROOT_WORD`):
+    /// a call's, as it came; at the top, made from `parent` at the first call.
+    root: Option<Arc<str>>,
+    /// The program whose code runs in the link, the name its calls give as their caller.
+    program: Arc<str>,
+    /// How many calls of each service's function the run has made.
+    made: Vec<Place>,
+    /// Its last call to a service was never sent: refused before it left, an open circuit
+    /// (FEEDBACK89.md, Q-1391; branch feedback86-89).
+    unsent: bool,
+    /// It has made a call that is not to a Quillo service (`http.*`, a push, udp): from then on how
+    /// it ends is kept (Q-1391). Never cleared in the run.
+    outbound: bool,
+    /// Its calls' ids are derived: a run at the top only where the program has its own secret
+    /// (`own_secret`), a run in another link as that link's are, a call answered always (q1).
+    derive: bool,
+}
+
+/// What a link's ids come from.
+enum Seed {
+    /// A keyed run at the top: its row and its request's fingerprint, 64 hex digits each, held in
+    /// place: a keyed run that makes no call allocates nothing for it (the review's L1).
+    Top { row: [u8; 64], print: [u8; 64] },
+    /// A keyed run in another link (a service's `idempotent`, in a call it answers): that link's
+    /// seed and the run's line, as the run's own key has its call and line.
+    Nested(u32),
+    /// A call answered: its caller, its function, its tenant and its id, made into one text at the
+    /// link's first call.
+    Call { caller: Arc<str>, f: Arc<str>, tenant: Option<Arc<str>>, call: String },
+}
+
+/// The program's own secret (`QUILLO_SECRET`), if it has one: only then are its calls' ids derived.
+fn own_secret_text() -> &'static Option<String> {
+    static S: OnceLock<Option<String>> = OnceLock::new();
+    S.get_or_init(|| std::env::var("QUILLO_SECRET").ok().filter(|s| !s.is_empty()))
+}
+
+/// Whether the program has its own secret (`own_secret_text`).
+#[inline]
+fn own_secret() -> bool {
+    own_secret_text().is_some()
+}
+
+/// The key of the HMACs that make a link's ids: the program's own secret (`QUILLO_SECRET`), else
+/// the services' secret, which the program's copies share as they do a key, else a random one, the
+/// chain then holding while the process runs. A run at the top derives with it only when it is the
+/// program's own (`Link::derive`): two programs sharing the services' secret derived each other's
+/// ids, and one's payment was the other's (the security review's q1). A link of a call answered
+/// derives from the call's id, which no other caller sends. Without a secret of the program's, a
+/// visitor computed the ids its key would send (P6).
+fn chain_key() -> &'static ring::hmac::Key {
+    static K: OnceLock<ring::hmac::Key> = OnceLock::new();
+    K.get_or_init(|| {
+        let own = own_secret_text().clone().or_else(secret);
+        let base = own.map_or_else(|| crate::crypto::secret_bytes(32), String::into_bytes);
+        let k = ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &base), b"quillo chain key 1");
+        ring::hmac::Key::new(ring::hmac::HMAC_SHA256, k.as_ref())
+    })
+}
+
+fn mac(parts: &[&[u8]]) -> [u8; 32] {
+    let mut c = ring::hmac::Context::with_key(chain_key());
+    for p in parts {
+        c.update(p);
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(c.sign().as_ref());
+    out
+}
+
+fn lock(c: &ChainCell) -> std::sync::MutexGuard<'_, Chain> {
+    c.chain.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// While it lives the interpreter is in a link (the `.1`-th of its chain); it leaves it as it goes,
+/// at a panic too.
+pub(crate) struct InChain(Arc<ChainCell>, usize);
+
+impl Drop for InChain {
+    fn drop(&mut self) {
+        lock(&self.0).links.truncate(self.1);
+    }
+}
+
+thread_local! {
+    /// A chain no interpreter is in any longer, kept for the thread's next keyed run: a run, its
+    /// link and the chain are made without an allocation (the review's L1). Taken and put back
+    /// with no wait between, so the coroutines a thread runs never see one half done.
+    static SPARE: std::cell::Cell<Option<Arc<ChainCell>>> = const { std::cell::Cell::new(None) };
+}
+
+/// `it` leaves the link `c` holds it in: out of every link, it is in no chain again (`None`), so the
+/// builtins it calls after look at nothing, as before the run (FEEDBACK89.md, Q-1391, the review's
+/// L1; branch feedback86-89).
+pub(crate) fn leave(it: &mut Interp, c: InChain) {
+    drop(c);
+    let Some(ch) = &it.chain else { return };
+    if ch.parent.is_some() {
+        return;
+    }
+    let mut g = lock(ch);
+    if !g.links.is_empty() {
+        return;
+    }
+    g.names.clear();
+    drop(g);
+    ch.ended.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(ch) = it.chain.take() {
+        // Kept only when nothing else holds it: a `parallel` task's chain, or a service in this
+        // process, still marking it, keeps its own.
+        if Arc::strong_count(&ch) == 1 {
+            SPARE.with(|s| s.set(Some(ch)));
+        }
+    }
+}
+
+fn enter(it: &mut Interp, seed: Seed, root: Option<Arc<str>>, program: Arc<str>) -> InChain {
+    let c = match &it.chain {
+        Some(c) => c.clone(),
+        None => {
+            // A spare one is held by nothing else: no fork sees its `ended` set back.
+            let c = SPARE.with(|s| s.take()).unwrap_or_default();
+            c.ended.store(false, std::sync::atomic::Ordering::Relaxed);
+            it.chain = Some(c.clone());
+            c
+        }
+    };
+    let mut g = lock(&c);
+    let derive = match seed {
+        Seed::Top { .. } => own_secret(),
+        Seed::Nested(_) => g.links.last().is_some_and(|l| l.derive),
+        Seed::Call { .. } => true,
+    };
+    g.links.push(Link { seed, parent: None, root, program, made: Vec::new(), unsent: false, outbound: false, derive });
+    let at = g.links.len() - 1;
+    drop(g);
+    InChain(c, at)
+}
+
+/// The answering, by `svc`, the service `program` in this process, of a call `it`'s run makes in
+/// a chain: on `it`'s own chain, which `svc` shares while it answers (the call runs on `it`'s
+/// behalf, and returns before `it` goes on), so that answering one makes nothing new.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn enter_local_call(it: &mut Interp, svc: &mut Interp, program: &str, caller: Arc<str>, f: &str, tenant: Option<Arc<str>>, call: String, root: Arc<str>) -> InChain {
+    let c = it.chain.clone().unwrap_or_default();
+    let mut g = lock(&c);
+    let (program, f) = (g.name(program), g.name(f));
+    g.links.push(Link { seed: Seed::Call { caller, f, tenant, call }, parent: None, root: Some(root), program, made: Vec::new(), unsent: false, outbound: false, derive: true });
+    let at = g.links.len() - 1;
+    drop(g);
+    svc.chain = Some(c.clone());
+    InChain(c, at)
+}
+
+/// `f` of the innermost link `it` is in, if any. A call in no chain looks at `Interp::chain` alone,
+/// in place; the rest is out of line, so that what a plain call goes through stays as it was.
+#[inline(always)]
+fn in_link<T>(it: &mut Interp, f: impl FnOnce(&mut [Link]) -> T) -> Option<T> {
+    it.chain.as_ref()?;
+    in_link_held(it, f)
+}
+
+#[inline(never)]
+fn in_link_held<T>(it: &mut Interp, f: impl FnOnce(&mut [Link]) -> T) -> Option<T> {
+    let mut g = lock(it.chain.as_ref()?);
+    if !g.links.is_empty() {
+        return Some(f(&mut g.links));
+    }
+    // Out of every link: the interpreter goes back to none (a task's keeps its parent's marks).
+    drop(g);
+    let clear = it.chain.as_ref().is_some_and(|c| c.parent.is_none());
+    if clear {
+        it.chain = None;
+    }
+    None
+}
+
+/// The chain a fork of `c`'s interpreter starts with (`Interp::fork`): none, or for a `parallel`
+/// task of a run, one whose outside calls mark that run (Q-1391).
+#[inline]
+pub(crate) fn forked(c: &Option<Arc<ChainCell>>) -> Option<Arc<ChainCell>> {
+    forked_held(c.as_ref()?)
+}
+
+#[inline(never)]
+fn forked_held(c: &Arc<ChainCell>) -> Option<Arc<ChainCell>> {
+    if c.parent.is_none() && lock(c).links.is_empty() {
+        return None;
+    }
+    Some(Arc::new(ChainCell { parent: Some(c.clone()), ..Default::default() }))
+}
+
+/// A keyed `idempotent` run of `it`, its row `row`, its request's fingerprint `print`, at `line`:
+/// nothing worked out until it makes a call.
+#[inline(never)]
+pub(crate) fn enter_run(it: &mut Interp, row: &str, print: &str, line: u32) -> InChain {
+    let outer = in_link(it, |l| l.last().map(|l| l.program.clone())).flatten();
+    match outer {
+        Some(program) => enter(it, Seed::Nested(line), None, program),
+        None => {
+            static APP: OnceLock<Arc<str>> = OnceLock::new();
+            let program = APP.get_or_init(|| Arc::from(served_as().unwrap_or("app"))).clone();
+            enter(it, Seed::Top { row: hex64(row), print: hex64(print) }, None, program)
+        }
+    }
+}
+
+/// `s` as the 64 bytes a top seed holds: itself when it is 64 long (a row and a fingerprint are
+/// SHA-256s in hex), else its SHA-256 in hex, so nothing is cut off.
+fn hex64(s: &str) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    match s.len() {
+        64 => out.copy_from_slice(s.as_bytes()),
+        _ => out.copy_from_slice(crate::crypto::hex(ring::digest::digest(&ring::digest::SHA256, s.as_bytes()).as_ref()).as_bytes()),
+    }
+    out
+}
+
+/// The answering by `it`, the service `program`, of call `call` from `caller` to its `f` for
+/// `tenant`, the call having come as part of chain `root`: in this process (`local`) or signed
+/// (`answer`), the same, so that the ids it sends on are the same whichever way it runs. Its
+/// caller, function and tenant go into the seed: another caller with the call's id is another
+/// link (P4).
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn enter_call(it: &mut Interp, program: &str, caller: &str, f: &str, tenant: &str, call: &str, root: Arc<str>) -> InChain {
+    let tenant = (!tenant.is_empty()).then(|| Arc::from(tenant));
+    enter(it, Seed::Call { caller: Arc::from(caller), f: Arc::from(f), tenant, call: call.to_string() }, Some(root), Arc::from(program))
+}
+
+/// The parent and the root of link `i`, made if not yet.
+fn resolve(links: &mut [Link], i: usize) -> ([u8; 32], Arc<str>) {
+    if let (Some(p), Some(r)) = (links[i].parent, links[i].root.clone()) {
+        return (p, r);
+    }
+    let (parent, root) = match &links[i].seed {
+        Seed::Top { row, print } => {
+            let p = mac(&[b"top\0", row, b"\0", print]);
+            (p, Arc::from(&crate::crypto::hex(&mac(&[b"root\0", &p]))[..32]))
+        }
+        Seed::Call { caller, f, tenant, call } => {
+            let p = mac(&[b"call\0", caller.as_bytes(), b"\0", f.as_bytes(), b"\0", tenant.as_deref().unwrap_or("").as_bytes(), b"\0", call.as_bytes()]);
+            (p, links[i].root.clone().unwrap_or_else(|| Arc::from("")))
+        }
+        Seed::Nested(line) => {
+            let line = *line;
+            let (p, r) = if i > 0 { resolve(links, i - 1) } else { ([0; 32], Arc::from("")) };
+            (mac(&[b"nested\0", &p, &line.to_be_bytes()]), r)
+        }
+    };
+    links[i].parent = Some(parent);
+    links[i].root = Some(root.clone());
+    (parent, root)
+}
+
+/// The root of the chain `it` is in, if any.
+fn chain_root(it: &mut Interp) -> Option<Arc<str>> {
+    in_link(it, |l| {
+        let i = l.len() - 1;
+        resolve(l, i).1
+    })
+}
+
+/// The run's calls counted again from the first: its function runs again (its transaction tried
+/// again), and its calls are the same calls.
+pub(crate) fn chain_again(it: &mut Interp) {
+    in_link(it, |l| {
+        let last = l.len() - 1;
+        l[last].made.clear();
+        l[last].unsent = false;
+    });
+}
+
+/// Whether the run's end is not to be kept (Q-1391): its last service call was never sent, and it
+/// has sent nothing outside.
+pub(crate) fn end_not_kept(it: &mut Interp) -> bool {
+    in_link(it, |l| l.last().is_some_and(|l| l.unsent && !l.outbound)).unwrap_or(false)
+}
+
+/// The run's last service call was never sent (`next_call` cleared the mark as it began).
+#[cold]
+#[inline(never)]
+fn call_never_sent(it: &mut Interp) {
+    in_link(it, |l| {
+        let last = l.len() - 1;
+        l[last].unsent = true;
+    });
+}
+
+/// The builtin `name`, about to be called by `it`, which is in a chain (`Interp::call` looks at
+/// `Interp::chain` alone first, one branch for a request in none): when what it does reaches past
+/// the program's own database, the run is marked, and its end kept (FEEDBACK89.md, Q-1391, the
+/// reviews' boundary; branch feedback86-89). Marked where effects are checked, not by each
+/// builtin, so that no way out is missed: `http.*`, a site's call, a `.qwer` plugin's function
+/// that declares `http`, `net`, `run` or `fs` (every one, for a plugin that declares nothing),
+/// a file written, `net`'s packets, channels and media, a push, a call made later. A service's
+/// call marks its run once it is sent (`make`): one never sent is what lets an end go.
+#[inline(never)]
+pub(crate) fn effect(it: &mut Interp, name: &str) {
+    // A fork made in a run that has ended: out of it for good (`ChainCell::ended`).
+    if run_ended(it.chain.as_deref()) {
+        it.chain = None;
+        return;
+    }
+    if name != "__service" && (goes_outside(name) || (it.db_on.is_some() && writes(name))) {
+        outbound(it);
+    }
+}
+
+/// Whether `c` is a fork's chain whose run (or its run's run) has ended.
+fn run_ended(c: Option<&ChainCell>) -> bool {
+    let mut p = c.and_then(|c| c.parent.as_deref());
+    while let Some(cell) = p {
+        if cell.ended.load(std::sync::atomic::Ordering::Acquire) {
+            return true;
+        }
+        p = cell.parent.as_deref();
+    }
+    false
+}
+
+/// Whether the `db` function `name`, called on a connection of `db.connect` (or shards), a database
+/// that is not the program's own, which the run's `idempotent` record is not kept with, may write
+/// there: every one but those that read no table (the security reviews' q2 and q3: `one` and
+/// `query` run any statement, `insert ... returning` too).
+fn writes(name: &str) -> bool {
+    name.starts_with("db.") && !matches!(name, "db.sql_name" | "db.tenants" | "db.tenant_exists" | "db.error_kind")
+}
+
+/// Whether the builtin `name` does something outside the program's own database.
+fn goes_outside(name: &str) -> bool {
+    static MASKS: OnceLock<(crate::ast::Effects, crate::ast::Effects)> = OnceLock::new();
+    let (far, fs) = *MASKS.get_or_init(|| {
+        let bit = crate::ast::effect_bit;
+        (bit("http") | bit("net") | bit("run"), bit("fs"))
+    });
+    let need = crate::ast::builtin_effect(name);
+    need & far != 0
+        || (need & fs != 0 && (name.starts_with("native:") || matches!(name, "write_file" | "delete_file" | "save_upload" | "image.convert")))
+        // A push, and a value published to the pages watching it: no effect is declared for them.
+        || matches!(name, "notification.send" | "publish")
+}
+
+/// Something sent outside (a call of a service that left, or ran here, a builtin's, `effect`):
+/// from now on the end of every run `it` is in is kept, and of the run a `parallel` task of it was
+/// forked from (FEEDBACK89.md, Q-1391; branch feedback86-89). In no chain, nothing to do.
+#[inline]
+pub(crate) fn outbound(it: &mut Interp) {
+    if let Some(c) = it.chain.clone() {
+        mark_outbound(&c);
+    }
+}
+
+#[inline(never)]
+fn mark_outbound(c: &Arc<ChainCell>) {
+    let parent = {
+        let mut g = lock(c);
+        let mut boundary = false;
+        // The innermost links, up to the call they answer: a service answering in this process
+        // shares its caller's chain, and what it sends outside is its own, not its caller's.
+        for l in g.links.iter_mut().rev() {
+            l.outbound = true;
+            if matches!(l.seed, Seed::Call { .. }) {
+                boundary = true;
+                break;
+            }
+        }
+        if boundary {
+            None
+        } else {
+            c.parent.clone()
+        }
+    };
+    if let Some(p) = parent {
+        mark_outbound(&p);
+    }
+}
+
+/// The id of a call of service `name`'s `f` that the run `it` is in makes, and the chain's root: an
+/// HMAC under the program's key of its link's parent and the call's place there, 16 hex digits as a
+/// new id's are (`UNSEEN_CALL` first as `call_id` puts it). In no chain, none.
+#[inline(always)]
+fn next_call(it: &mut Interp, name: &str, f: &str) -> Option<Option<(String, Arc<str>, Arc<str>)>> {
+    it.chain.as_ref()?;
+    next_call_held(it, name, f)
+}
+
+/// `next_call`: `Some(None)` in a link whose ids are not derived (`Link::derive`).
+#[inline(never)]
+fn next_call_held(it: &mut Interp, name: &str, f: &str) -> Option<Option<(String, Arc<str>, Arc<str>)>> {
+    // The input of the id's hash, at a fixed length: the link's parent (32 bytes), the SHA-256 of the
+    // service's name and of the function's (32 each) and the call's count among that function's
+    // calls in the run (8, big-endian), 104 bytes in all.
+    let mut input = [0u8; 104];
+    let derived = in_link(it, |l| {
+        let i = l.len() - 1;
+        l[i].unsent = false;
+        if !l[i].derive {
+            return None;
+        }
+        let (parent, root) = resolve(l, i);
+        let link = &mut l[i];
+        let at = match link.made.iter().position(|p| *p.name == *name && *p.f == *f) {
+            Some(at) => at,
+            None => {
+                let mut digests = [0u8; 64];
+                digests[..32].copy_from_slice(ring::digest::digest(&ring::digest::SHA256, name.as_bytes()).as_ref());
+                digests[32..].copy_from_slice(ring::digest::digest(&ring::digest::SHA256, f.as_bytes()).as_ref());
+                link.made.push(Place { name: name.into(), f: f.into(), n: 0, digests });
+                link.made.len() - 1
+            }
+        };
+        let place = &mut link.made[at];
+        place.n += 1;
+        input[..32].copy_from_slice(&parent);
+        input[32..96].copy_from_slice(&place.digests);
+        input[96..].copy_from_slice(&place.n.to_be_bytes());
+        Some((root, link.program.clone()))
+    })?;
+    let Some((root, program)) = derived else { return Some(None) };
+    // One SHA-256 of a secret prefix, as a derivation: the parent is an HMAC under the program's own
+    // secret (`chain_key`), unknown to whoever does not hold it, so the id is too. Every input is
+    // exactly 104 bytes; a length extension only makes longer inputs (its glue padding included),
+    // so it can never make another valid one, and a secret-prefixed SHA-256 at a fixed length is
+    // sound here. It costs a call in a chain one hash, where an HMAC was two and their contexts'
+    // copies (measured).
+    let id = crate::crypto::hex(&ring::digest::digest(&ring::digest::SHA256, &input).as_ref()[..8]);
+    match it.asking.is_none() && it.in_tool {
+        true => Some(Some((format!("{}{}", UNSEEN_CALL, &id[..15]), root, program))),
+        false => Some(Some((id, root, program))),
+    }
+}
+
+/// The header a call made in a chain carries the chain's root in, `<root>;sig=<hex>`: signed with
+/// the key the call is signed with, and bound to the call (its time, service, function, tenant and
+/// id), so that it is neither changed on its way nor moved to another call. A service in another
+/// language takes part with it; a Quillo before 0.8.12 does not read it, and the call's own
+/// signature does not cover it, so such a service takes the call as before.
+pub const ROOT_WORD: &str = "x-quillo-root";
+
+/// A call's `ROOT_WORD`, `<root>;sig=<hex>`.
+#[inline(never)]
+fn signed_root(key: &str, to: &str, f: &str, tenant: &str, call: &str, root: &str) -> String {
+    format!("{};sig={}", root, root_sig(key, to, f, tenant, call, root))
+}
+
+/// What signs a call's `ROOT_WORD`: HMAC-SHA256 of its service, function, tenant, id and root, its
+/// key's pads hashed once (`root_key`), by `ring`, as the processor's SHA instructions run it. Once a
+/// call, for all its tries: not their times, which the call's own signature binds its id to.
+#[inline(never)]
+pub fn root_sig(key: &str, to: &str, f: &str, tenant: &str, call: &str, root: &str) -> String {
+    crate::crypto::hex(ring::hmac::sign(&root_key(key), format!("quillo-root-1\n{}\n{}\n{}\n{}\n{}", to, f, tenant, call, root).as_bytes()).as_ref())
+}
+
+/// The HMAC key of a call's key, made once: the services' secret and the callers' own keys are few.
+fn root_key(key: &str) -> ring::hmac::Key {
+    static KEYS: Mutex<Vec<(String, ring::hmac::Key)>> = Mutex::new(Vec::new());
+    let mut keys = KEYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, k)) = keys.iter().find(|(s, _)| s == key) {
+        return k.clone();
+    }
+    let k = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key.as_bytes());
+    if keys.len() >= 16 {
+        keys.remove(0);
+    }
+    keys.push((key.to_string(), k.clone()));
+    k
+}
+
+/// The root in a call's `ROOT_WORD`, when it is signed with `key` for that call; an error when it is
+/// not, or is no root.
+#[inline(never)]
+fn root_of_word(word: &str, key: &str, to: &str, f: &str, tenant: &str, call: &str) -> Result<Arc<str>, ()> {
+    let (root, sig) = word.split_once(";sig=").ok_or(())?;
+    let plain = !root.is_empty() && root.len() <= 64 && root.bytes().all(|b| b.is_ascii_alphanumeric());
+    match plain && crate::crypto::same(root_sig(key, to, f, tenant, call, root).as_bytes(), sig.as_bytes()) {
+        true => Ok(Arc::from(root)),
+        false => Err(()),
     }
 }
 
@@ -940,12 +1508,16 @@ fn from_wire(j: &serde_json::Value) -> Value {
 /// `request` in a function a service answers with: the id of the request it
 /// came from, as far as it goes with the call, and the call's own, the same
 /// for each try (FEEDBACK23.md, Q-188; branch feedback23-fixes).
-fn step_request(rid: Option<&str>, call: &str) -> Value {
+fn step_request(rid: Option<&str>, call: &str, body: Option<Value>) -> Value {
     let mut m = Map::new();
     if let Some(id) = rid {
         m.insert("id".into(), Value::str(id));
     }
     m.insert("call".into(), Value::str(call));
+    // A chained call's arguments, as sent: its `idempotent`'s fingerprint holds them (Q-1394).
+    if let Some(b) = body {
+        m.insert("body".into(), b);
+    }
     Value::map(m)
 }
 
@@ -974,7 +1546,7 @@ pub(crate) fn from_answer(j: &serde_json::Value) -> Value {
 /// where it stopped, the call stops (`Outcome::Stopped`). Before, the service's handle had none,
 /// and its `confirm` gave true with nobody asked (FEEDBACK56.md, Part F; branch feedback56).
 #[allow(clippy::too_many_arguments)]
-fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String, line: u32) -> Outcome {
+fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String, link: Option<(Arc<str>, Arc<str>)>, line: u32) -> Outcome {
     let found = it.services.loaded.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(name).map(|(_, s)| s.fork());
     let Some(mut svc) = found else {
         return Outcome::Missed(format!("service {}: not running here, and no address for it ({} or --service-url)", name, env_name(name)));
@@ -982,20 +1554,32 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
     let Some(Value::Func(c)) = lookup(&svc.globals, f).filter(|_| svc.server_fns.iter().any(|n| n == f)) else {
         return Outcome::Refused(404, format!("service {}: no server fn `{}`", name, f));
     };
-    let args: Vec<Value> = args.iter().map(crossed).collect();
+    // Run here: what it does outside is the caller's run's too (Q-1391; the review's probe 7).
+    outbound(it);
+    let crossed_args: Vec<Value> = args.iter().map(crossed).collect();
+    // In a chain, its arguments, for its `idempotent`'s fingerprint, which reads them only if it
+    // runs: the same call's id with other arguments is another request (FEEDBACK89.md, Q-1394;
+    // branch feedback86-89).
+    let body = link.as_ref().map(|_| Value::list(args));
+    let args = crossed_args;
     let args = match crate::server::take_args(&mut svc, &c.def, args) {
         Ok(a) => a,
         Err(msg) => return Outcome::Refused(400, format!("service {}: {}", name, msg)),
     };
     svc.tenant = Some(tenant.clone());
     svc.tenant_named = tenant.is_some();
-    svc.current_request = Some(step_request(rid.as_deref(), &call));
+    svc.current_request = Some(step_request(rid.as_deref(), &call, body));
     svc.request_id = rid;
     let err = |msg: String| Outcome::Refused(500, msg);
     let Some(carried) = carry_in(it, &mut svc, name, it.in_tool || call.starts_with(UNSEEN_CALL)) else { return Outcome::Stopped };
+    // A call made in a chain is answered as part of it, as where the service runs apart (`answer`):
+    // the calls it makes in turn get ids derived from this one's (FEEDBACK89.md, Q-1394; branch
+    // feedback86-89).
+    let link = link.map(|(root, caller)| enter_local_call(it, &mut svc, name, caller, f, tenant.clone(), call, root));
     // Its arguments made by `take_args`, not checked again (FEEDBACK75.md, Q-1080, found in
     // review; branch feedback75).
     let r = svc.call_made(&c, args, line);
+    drop(link);
     let label = format!("{}.{}", name, f);
     match (carry_back(it, &mut svc, carried, name, &label), r) {
         // Stopped to ask, or at a question refused there, said in its log as a builtin's error is.
@@ -1012,6 +1596,11 @@ fn local(it: &mut Interp, name: &str, f: &str, args: Vec<Value>, tenant: Option<
             v => Outcome::Ran(crossed(&v)),
         },
         (_, Err(Ctrl::Reply(_))) => err(format!("service {}: `{}` replied with a page, not a value", name, f)),
+        // Its `idempotent` record is held by a try still running: said as `answer` says it
+        // (FEEDBACK89.md, Q-1394; branch feedback86-89).
+        (_, Err(Ctrl::Error(e))) if e.msg == crate::idempotency::RUNNING => Outcome::Refused(503, format!("service {}: 503 {}", name, STILL_RUNNING)),
+        // Its `idempotent` record holds the call's id with other arguments (Q-1394).
+        (_, Err(Ctrl::Error(e))) if e.msg == crate::idempotency::OTHER_REQUEST => Outcome::Refused(422, format!("service {}: 422 {}", name, OTHER_ARGUMENTS)),
         (_, Err(Ctrl::Error(e))) => {
             eprintln!("quillo: service {}: error in `{}`: {:#}", name, f, e);
             err(format!("service {}: internal error in `{}`", name, f))
@@ -1104,6 +1693,8 @@ fn carry_back(it: &mut Interp, svc: &mut Interp, carried: Carried, name: &str, l
 /// token or the cookie checked once, here), and runs with the call's asking, as `local` and
 /// `remote_hop` carry it. A service out of reach is `internal error`, the reason in the log.
 pub(crate) fn call_tool(it: &mut Interp, name: &str, tool: &crate::mcp::Tool, args: Vec<Option<Value>>, given: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    // A service's tool, here or there: the run it is made in keeps its end (Q-1391).
+    outbound(it);
     let configured = configured_urls(&it.shared, name);
     // Only the copies that proved they hold billing's app key (second review).
     let joined = joined_proved_urls(name);
@@ -1123,7 +1714,8 @@ pub(crate) fn call_tool(it: &mut Interp, name: &str, tool: &crate::mcp::Tool, ar
         let tenant = it.tenant();
         let rid = it.request_id.clone();
         let mut sent = false;
-        match remote_hop(it, &urls, name, tool.own_name(), Vec::new(), tenant, rid, new_id(16), Some(&hop), &mut sent) {
+        let root = chain_root(it);
+        match remote_hop(it, &urls, name, tool.own_name(), Vec::new(), tenant, rid, new_id(16), root, Some(&hop), &mut sent, false) {
             // The copies that joined first, and this process when none could be reached (`make`).
             // One sent that got no answer may have run there: never run again here, where it
             // would charge twice (FEEDBACK56.md, Part F, security review).
@@ -1158,7 +1750,7 @@ fn mcp_client(it: &mut Interp) -> Value {
 /// `request` in a service's tool: as a service call's (`step_request`), and `mcp`, who the client
 /// says it is, as at its app's door.
 fn tool_request(rid: Option<&str>, call: &str, client: Value) -> Value {
-    let mut m = match step_request(rid, call) {
+    let mut m = match step_request(rid, call, None) {
         Value::Map(m) => (*m).clone(),
         _ => Map::new(),
     };
@@ -1493,8 +2085,8 @@ fn forwarded(it: &mut Interp, names: &[String]) -> Vec<(String, String)> {
 /// server remembers, so the function runs once. It proves who makes it as
 /// the declaration's `auth` says (src/svcauth.rs).
 #[allow(clippy::too_many_arguments)]
-fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String) -> Outcome {
-    remote_hop(it, urls, name, f, args, tenant, rid, call, None, &mut false)
+fn remote(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String, root: Option<Arc<str>>) -> Outcome {
+    remote_hop(it, urls, name, f, args, tenant, rid, call, root, None, &mut false, false)
 }
 
 /// A call of a service's tool, made by its app's door (FEEDBACK56.md, Part F; branch feedback56):
@@ -1517,10 +2109,10 @@ pub(crate) struct ToolHop {
 /// 500, none in time) may have come after it ran, and is a change, so that no question comes
 /// after it (security review). `sent`: some try of it was sent.
 #[allow(clippy::too_many_arguments)]
-fn remote_hop(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String, tool: Option<&ToolHop>, sent: &mut bool) -> Outcome {
+fn remote_hop(it: &mut Interp, urls: &[String], name: &str, f: &str, args: Vec<Value>, tenant: Option<Arc<str>>, rid: Option<Arc<str>>, call: String, root: Option<Arc<str>>, tool: Option<&ToolHop>, sent: &mut bool, probe: bool) -> Outcome {
     let carried = it.asking.as_ref().map(|a| a.for_service(name));
     let mut back = None;
-    let out = remote_tries(it, urls, name, f, args, tenant, rid, call, tool, carried.as_ref(), &mut back, sent);
+    let out = remote_tries(it, urls, name, f, args, tenant, rid, call, root, tool, carried.as_ref(), &mut back, sent, probe);
     // Made in a tool's call with no asking (`UNSEEN_CALL`): a question the service refused stops
     // this call too, as its signed answer says.
     if carried.is_none() {
@@ -1665,10 +2257,14 @@ fn remote_tries(
     tenant: Option<Arc<str>>,
     rid: Option<Arc<str>>,
     call: String,
+    root: Option<Arc<str>>,
     tool: Option<&ToolHop>,
     carried: Option<&serde_json::Value>,
     back: &mut Option<serde_json::Value>,
     sent: &mut bool,
+    // The question asked before a chained call (`may_chain`): one try, and nothing of it counted in
+    // the address's health or logged as a call (the review's LOW 3).
+    probe: bool,
 ) -> Outcome {
     let a = crate::svcauth::auth_of(name);
     // A tool's call is signed with its app's key too, and its answer signed back with it: only
@@ -1713,7 +2309,11 @@ fn remote_tries(
         Err(e) => return Outcome::Missed(format!("service {}: its `mtls`: {}", name, e)),
     };
     let passed = forwarded(it, &a.forward);
-    let o = opts(name);
+    let mut o = opts(name);
+    if probe {
+        o.retries = 0;
+        o.timeout = o.timeout.min(QUESTION_TIMEOUT);
+    }
     // A call that carries a tool's call sends an object, which a service of a Quillo before this
     // one refuses rather than runs without it (FEEDBACK56.md, Part F; branch feedback56).
     let listed = serde_json::Value::Array(args.iter().map(to_wire).collect());
@@ -1727,6 +2327,21 @@ fn remote_tries(
     let tenant = tenant.map(|t| t.to_string()).unwrap_or_default();
     let rid = rid.map(|r| r.to_string()).unwrap_or_default();
     let caller = caller_name(&a);
+    // A call made in a chain says its root, signed with the call's key, once for all its tries: with
+    // no key to sign it (a token, a certificate) it is not sent (FEEDBACK89.md, Q-1394; branch
+    // feedback86-89).
+    // A derived id goes only with its root, signed, and only to a service each of whose addresses
+    // said in a signed answer that it keeps chained calls' records (`CHAIN_MARK`): a call no key
+    // signs (a token, a certificate) sends no root, and a Quillo before 0.8.12 reads none and keeps
+    // no arguments in its `idempotent`'s fingerprint, so neither could tell the same place of a run
+    // with other arguments (the checkout's laptop billed at the pen's price, the security review's
+    // n5b). Such a call gets a new id, and no root, as in 0.8.11 (Q-1394).
+    let (call, root) = match root {
+        Some(r) if sign_key.is_some() && may_chain(it, name, urls) => (call, Some(r)),
+        Some(_) => (call_id(it), None),
+        None => (call, None),
+    };
+    let root_word = root.as_ref().zip(sign_key.as_ref()).map(|(r, k)| signed_root(k, name, f, &tenant, &call, r));
     let mut tried: Vec<String> = Vec::new();
     let mut same: Option<String> = None;
     let mut why = String::new();
@@ -1752,15 +2367,33 @@ fn remote_tries(
             Some(l) if l < o.timeout => (l, true),
             _ => (o.timeout, false),
         };
-        let t = now_secs();
-        let deadline = timeout.as_millis().to_string();
+        // A chained call never signs the same bytes twice from here: a try, or a run of the same key
+        // again, within the same second sends a deadline a millisecond less than its last, never
+        // taken for a replay of the first, while captured bytes sent again still are (the reviews'
+        // L3, probe 12 and j1). Nothing new on the wire. A plain call, which no callee checks for
+        // replays, as before.
+        let ms = timeout.as_millis() as u64;
+        let (t, deadline) = match root_word {
+            Some(_) => match signed_moment(&call, now_secs(), ms) {
+                Some((t, d)) => (t, d.to_string()),
+                // Its deadline down to 1 ms in this second (a timeout of a millisecond or two): sent
+                // in the next second, at its whole timeout.
+                None => {
+                    let wait = Duration::from_millis(1000 - (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_millis() as u64).min(999));
+                    it.unlocked(move || std::thread::sleep(wait));
+                    let t = now_secs();
+                    signed_moment(&call, t, ms).map_or((t, ms.to_string()), |(t, d)| (t, d.to_string()))
+                }
+            },
+            None => (now_secs(), ms.to_string()),
+        };
         let mine = contracts().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&(name.to_string(), f.to_string())).cloned().unwrap_or_default();
         let covered = format!("{}\n{}", mine, crate::svcauth::forwarded_text(passed.iter().map(|(k, v)| (k.as_str(), v.as_str()))));
         let sig = sign_key.as_ref().map(|k| format!("v=3,kid={},t={},sig={}", kid, t, crate::svcauth::sign3(k, t, name, f, &tenant, &call, &kid, &caller, &deadline, &covered, &body)));
         let app_sig = app_key.as_ref().map(|(k, _)| format!("t={},sig={}", t, sign_app(k, t, name, f, &tenant, &call, &caller, &deadline, &covered, &body)));
         let endpoint = format!("{}/_quillo/service/{}", url, f);
         let (b, tn, r, c, cl, to, app) = (body.clone(), tenant.clone(), rid.clone(), call.clone(), caller.clone(), name.to_string(), app_sig.clone());
-        let (ag, oauth, bearer, passed) = (agent.clone(), a.oauth.clone(), bearer.clone(), passed.clone());
+        let (ag, oauth, bearer, passed, root_word) = (agent.clone(), a.oauth.clone(), bearer.clone(), passed.clone(), root_word.clone());
         let got = it.unlocked(move || -> Try {
             let send = |token: Option<&str>| -> Try {
                 let mut rq = ag
@@ -1776,6 +2409,9 @@ fn remote_tries(
                 }
                 if let Some(s) = &app {
                     rq = rq.set("x-quillo-app", s);
+                }
+                if let Some(w) = &root_word {
+                    rq = rq.set(ROOT_WORD, w);
                 }
                 if let Some(tk) = token {
                     rq = rq.set("authorization", &format!("Bearer {}", tk));
@@ -1827,14 +2463,18 @@ fn remote_tries(
         });
         match got {
             Try::Answer(status @ (502..=504), text, ..) => {
-                went_wrong(&url, &o);
+                if !probe {
+                    went_wrong(&url, &o);
+                }
                 *sent = true;
                 why = format!("service {}: {} at {} ({})", name, status, url, reason(&text));
                 // A proxy's 502 or 504 may come after the copy behind it ran the call: only a
                 // function that is safe to run twice goes to another copy, where it ran on both
                 // (FEEDBACK49.md, Q-595; branch main). A 503 was not taken.
                 if status != 503 && !repeatable().lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&(name.to_string(), f.to_string())) {
-                    log_call(name, f, &url, status, start, attempt + 1, &rid);
+                    if !probe {
+                        log_call(name, f, &url, status, start, attempt + 1, &rid);
+                    }
                     // Refused, not missed: a call missed is run here when the service's only
                     // copies are ones that joined, and this one may have run there (found in
                     // review).
@@ -1847,9 +2487,11 @@ fn remote_tries(
                 }
             }
             Try::Answer(status, text, signed, by_app) => {
-                went_well(&url);
+                if !probe {
+                    went_well(&url);
+                    log_call(name, f, &url, status, start, attempt + 1, &rid);
+                }
                 *sent = true;
-                log_call(name, f, &url, status, start, attempt + 1, &rid);
                 // The answer is the service's: signed back with the key the call was signed
                 // with. A call with a key of its own takes no answer without it (Q-459), nor one
                 // under the shared secret, where an unsigned answer from whatever was at the
@@ -1888,6 +2530,13 @@ fn remote_tries(
                     *back = read.as_ref().and_then(|j| j.get("refused")).filter(|r| r.is_string()).map(|r| serde_json::json!({ "refused": r }));
                 }
                 let answer = read.filter(|_| status == 200);
+                // The signed answer to a chained call, or to the question asked before one
+                // (`may_chain`): whether this address keeps chained calls' records, as it says now;
+                // one that stopped saying it (an older Quillo put back) is sent new ids again from
+                // its next call (Q-1394). A plain call's answer says nothing of it.
+                if let Some(j) = answer.as_ref().filter(|j| verified && (probe || root.is_some() && sign_key.is_some()) && (j.get("ok").is_some() || j.get("err").is_some())) {
+                    said_chains(name, &url, j.get(CHAIN_MARK) == Some(&serde_json::json!(1)));
+                }
                 // What the call published there is announced here too, for
                 // pages of this program watching it (FEEDBACK4.md, Q-038;
                 // branch bank-fixes).
@@ -1909,12 +2558,16 @@ fn remote_tries(
                 };
             }
             Try::NotSent(e) => {
-                went_wrong(&url, &o);
+                if !probe {
+                    went_wrong(&url, &o);
+                }
                 why = format!("service {}: unreachable at {} ({})", name, url, e);
                 tried.push(url);
             }
             Try::NoAnswer(e) => {
-                went_wrong(&url, &o);
+                if !probe {
+                    went_wrong(&url, &o);
+                }
                 *sent = true;
                 why = if e.contains("timed out") {
                     let secs = timeout.as_secs_f64();
@@ -1932,8 +2585,41 @@ fn remote_tries(
             eprintln!("quillo: {}; trying again{}", why, if rid.is_empty() { String::new() } else { format!(" (request {})", rid) });
         }
     }
-    log_call(name, f, tried.last().map_or("", |u| u.as_str()), 0, start, o.retries + 1, &rid);
+    if !probe {
+        log_call(name, f, tried.last().map_or("", |u| u.as_str()), 0, start, o.retries + 1, &rid);
+    }
     Outcome::Missed(why)
+}
+
+/// The time and deadline a chained call with id `call` is signed with, at second `now` with `ms`
+/// left: its whole time at its first send in a second, then a millisecond less than its last each
+/// send in the same second, so that its own sends never repeat (the review's j1: a count shared by
+/// the process's sends wrapped for a short timeout). `None` when its deadline would go under 1 ms.
+#[inline(never)]
+fn signed_moment(call: &str, now: u64, ms: u64) -> Option<(u64, u64)> {
+    static SENT: OnceLock<Mutex<HashMap<String, (u64, u64)>>> = OnceLock::new();
+    let mut m = SENT.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Only this second's matter.
+    if m.len() >= 4096 {
+        m.retain(|_, (t, _)| *t >= now);
+    }
+    match m.get_mut(call) {
+        Some((t, d)) if *t == now => {
+            if *d <= 1 {
+                return None;
+            }
+            *d = (*d - 1).min(ms);
+            Some((now, *d))
+        }
+        Some(e) => {
+            *e = (now, ms);
+            Some((now, ms))
+        }
+        None => {
+            m.insert(call.to_string(), (now, ms));
+            Some((now, ms))
+        }
+    }
 }
 
 /// What an error answer says.
@@ -2145,6 +2831,24 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
         },
         false => None,
     };
+    // A call made in a chain: its root, believed only signed with the key the call was proved with
+    // and bound to it. One that is not is refused, as a call changed on its way is; one on a call
+    // no key signed (a token, a certificate) could not be, and is not read (FEEDBACK89.md, Q-1394;
+    // branch feedback86-89).
+    let root = match (header(ROOT_WORD), &answer_key) {
+        (Some(w), Some(k)) => match root_of_word(w, k, to, f, tenant, c) {
+            Ok(r) => Some(r),
+            Err(()) => return root_refused(),
+        },
+        _ => None,
+    };
+    let mut id_key = None;
+    if root.is_some() {
+        match chained_call_fits(it, s.sig, c, &who, f, tenant, &req.body) {
+            Ok(k) => id_key = Some(k),
+            Err(r) => return r,
+        }
+    }
     let call_id = c.to_string();
     let key = match &app {
         Some(_) => crate::idempotency::sha256_hex(&[b"quillo tool call\n", c.as_bytes()]),
@@ -2187,15 +2891,25 @@ pub fn answer(it: &mut Interp, f: &str, req: &HttpRequest) -> HttpResponse {
         }
         Some(crate::db::Claim::Mine) | None => {}
     }
-    let r = run_call(it, f, tenant, req, caller);
+    let mut failed = false;
+    let chained = root.is_some();
+    let r = match root {
+        Some(root) => run_chained(it, f, tenant, req, caller, &who, &call_id, to, root, &mut failed),
+        None => run_call(it, f, tenant, req, caller, &mut failed),
+    };
+    // In a chain, an error value is not the call's answer for good: the chain's retry sends the same
+    // id, and is run again, as `idempotent` keeps no error value and as a new id was run before. Kept,
+    // the retry got the error for eleven minutes, the link below back or not (Q-1394). The request
+    // itself, sent again as it was, is a replay, and refused (`chained_call_fits`; P5).
+    let ended = r.status == 200 && !(failed && chained && remember_replay(it, s.sig, id_key.as_deref()));
     if shared.is_some() {
-        crate::db::call_done(it, c, r.status, &String::from_utf8_lossy(&r.body));
+        crate::db::call_done(it, c, if ended { r.status } else { 0 }, &String::from_utf8_lossy(&r.body));
     }
     let mut seen = seen().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // A call that did not finish may be sent again: only an answer of 200
     // ends one, so a 409 before a deploy is not the answer after it
     // (FEEDBACK23.md, Q-184; branch feedback23-fixes).
-    if r.status != 200 {
+    if !ended {
         seen.remove(c);
     } else {
         seen.insert(c.to_string(), (Instant::now(), Some(r.clone())));
@@ -2210,6 +2924,337 @@ pub fn call_key(id: &str, caller: &str, f: &str, tenant: &str, body: &[u8]) -> S
     crate::idempotency::sha256_hex(&[id.as_bytes(), caller.as_bytes(), f.as_bytes(), tenant.as_bytes(), body])
 }
 
+/// Chained calls answered here lately, by caller, function, tenant and id: a hash of the arguments
+/// each came with (FEEDBACK89.md, Q-1394; branch feedback86-89).
+fn chain_ids() -> &'static Mutex<Lately<String>> {
+    static M: OnceLock<Mutex<Lately<String>>> = OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// The signatures of chained calls whose error answer was not kept, lately (`answer`).
+fn replays() -> &'static Mutex<Lately<()>> {
+    static M: OnceLock<Mutex<Lately<()>>> = OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// What was seen lately, by key, at most `SEEN_MAX` of them: the oldest go first, those older than
+/// `SEEN_FOR` as soon as another comes (the review's L2). Kept in the order they came, which is the
+/// order of their times (`Instant` only goes forward), so the oldest is the first.
+struct Lately<V> {
+    map: HashMap<String, (Instant, V)>,
+    order: std::collections::VecDeque<(Instant, String)>,
+}
+
+impl<V> Default for Lately<V> {
+    fn default() -> Self {
+        Lately { map: HashMap::new(), order: std::collections::VecDeque::new() }
+    }
+}
+
+impl<V> Lately<V> {
+    fn get(&self, k: &str) -> Option<&(Instant, V)> {
+        self.map.get(k)
+    }
+
+    fn remove(&mut self, k: &str) {
+        self.map.remove(k);
+    }
+
+    /// The first in the order, gone: from the map too, unless the key came again since.
+    fn pop_oldest(&mut self) {
+        if let Some((at, k)) = self.order.pop_front() {
+            if self.map.get(&k).is_some_and(|(a, _)| *a == at) {
+                self.map.remove(&k);
+            }
+        }
+    }
+
+    /// Room for one more: what is older than `SEEN_FOR` goes; then, full still, the oldest when
+    /// `evict` says so. Whether there is room.
+    fn room(&mut self, now: Instant, evict: bool) -> bool {
+        while self.order.front().is_some_and(|(at, _)| now.duration_since(*at) >= SEEN_FOR) {
+            self.pop_oldest();
+        }
+        // The order also holds keys that came again: at most twice the map's.
+        while self.order.len() >= 2 * SEEN_MAX || (evict && self.map.len() >= SEEN_MAX) {
+            self.pop_oldest();
+        }
+        self.map.len() < SEEN_MAX
+    }
+
+    fn insert(&mut self, k: String, at: Instant, v: V) {
+        self.order.push_back((at, k.clone()));
+        self.map.insert(k, (at, v));
+    }
+}
+
+/// The field of a chained call's answer, and of `_contracts`'s, by which a service says it keeps
+/// chained calls' records, and takes their roots (0.8.12 on): `"chain": 1`, in the body the answer's signature covers
+/// (`svcauth::sign_answer`), so that nothing on the way adds it. A Quillo before reads no such
+/// field (FEEDBACK89.md, Q-1394; branch feedback86-89).
+const CHAIN_MARK: &str = "chain";
+
+/// What an address of a service last said of chained calls' records.
+#[derive(Clone, Copy, PartialEq)]
+enum Heard {
+    /// A signed answer said `CHAIN_MARK`.
+    Yes,
+    /// A signed answer did not, at this time: asked again `ASK_NO_AGAIN` after, so that a callee
+    /// upgraded in place is chained again (the review's R7-D).
+    No(Instant),
+    /// Asked, and no answer came, at this time: asked again `ASK_AGAIN` after.
+    Silent(Instant),
+    /// Being asked since then by the request holding this token: one question at a time for an
+    /// address, taken over only once it is older than a question can be (`QUESTION_TIMEOUT`).
+    Asking(Instant, u64),
+}
+
+/// How long after a question that got no answer the address is asked again (the concurrency
+/// review's probe 11): a callee down at the first chained call is chained again once it is up.
+const ASK_AGAIN: Duration = Duration::from_secs(5);
+
+/// How long after an answer without `CHAIN_MARK` the address is asked again.
+const ASK_NO_AGAIN: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(600) };
+
+/// The question's own timeout, whatever the service's: a request waits at most this long before its
+/// call, at an address that takes the connection and never answers (the reviews' d1 and R7-C).
+const QUESTION_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// What is known of an address: `Some(true)` it keeps chained records, `Some(false)` not, or not
+/// to be asked yet, `None` to be asked now.
+fn heard_now(h: Option<&Heard>) -> Option<bool> {
+    match h? {
+        Heard::Yes => Some(true),
+        Heard::No(at) if at.elapsed() < ASK_NO_AGAIN => Some(false),
+        Heard::Silent(at) if at.elapsed() < ASK_AGAIN => Some(false),
+        Heard::Asking(at, _) if at.elapsed() < QUESTION_TIMEOUT + Duration::from_secs(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// The body of the question asked before a chained call: `_contracts` with one argument, which a
+/// Quillo before 0.8.12 does not read (it answers the list), and 0.8.12 answers with `CHAIN_MARK`.
+const CHAIN_QUESTION: &str = r#"["chain"]"#;
+
+/// What each service's addresses last said (`Heard`).
+fn chain_takers() -> &'static Mutex<HashMap<String, HashMap<String, Heard>>> {
+    static M: OnceLock<Mutex<HashMap<String, HashMap<String, Heard>>>> = OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+/// Whether every address of service `name` said it keeps chained calls' records: `None` while one
+/// is to be asked (never heard from, or silent `ASK_AGAIN` since).
+fn takes_chains(name: &str, urls: &[String]) -> Option<bool> {
+    let m = chain_takers().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let s = m.get(name)?;
+    let mut all = true;
+    let mut ask = false;
+    for u in urls {
+        match heard_now(s.get(u)) {
+            Some(true) => {}
+            Some(false) => all = false,
+            None => ask = true,
+        }
+    }
+    if ask && all {
+        return None;
+    }
+    Some(all && !ask)
+}
+
+/// Whether a chained call to service `name` at `urls` may carry its derived id and root: every
+/// address said it keeps chained records. An address not heard from yet (the first chained call
+/// since this process started) is asked first, once, by a call of `_contracts` signed as any call
+/// (it changes nothing there): a Quillo of 0.8.12 says the mark in its answer, an older one does
+/// not, and one that cannot be reached stays unknown, so the call gets a new id.
+#[cold]
+#[inline(never)]
+fn may_chain(it: &mut Interp, name: &str, urls: &[String]) -> bool {
+    if let Some(known) = takes_chains(name, urls) {
+        return known;
+    }
+    static TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let token = TOKENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    for u in urls {
+        // Taken to be asked here, unless known, being asked, or silent lately.
+        {
+            let mut m = chain_takers().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let s = m.entry(name.to_string()).or_default();
+            if heard_now(s.get(u)).is_some() {
+                continue;
+            }
+            s.insert(u.clone(), Heard::Asking(Instant::now(), token));
+        }
+        // An address left alone (its circuit open) is not asked. The question is no call of a tool's
+        // call that may ask its user, and changes nothing there (the review's LOW): asked with no
+        // asking, which is taken back after.
+        let left_alone = health().lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(u).is_some_and(|h| h.until.is_some_and(|t| Instant::now() < t));
+        if !left_alone {
+            let asking = it.asking.take();
+            let in_tool = std::mem::replace(&mut it.in_tool, false);
+            let _ = remote_hop(it, std::slice::from_ref(u), name, CONTRACTS, vec![Value::str("chain")], None, None, new_id(16), None, None, &mut false, true);
+            it.asking = asking;
+            it.in_tool = in_tool;
+        }
+        question_unanswered(name, u, token);
+    }
+    takes_chains(name, urls) == Some(true)
+}
+
+/// The question to `url` asked by the holder of `token` got no answer: silent, asked again
+/// `ASK_AGAIN` from now, unless another request took the asking over since (only its own is
+/// cleared; the review's LOW) or an answer came.
+fn question_unanswered(name: &str, url: &str, token: u64) {
+    let mut m = chain_takers().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(h) = m.get_mut(name).and_then(|s| s.get_mut(url)).filter(|h| matches!(h, Heard::Asking(_, t) if *t == token)) {
+        *h = Heard::Silent(Instant::now());
+    }
+}
+
+/// What service `name`'s signed answer from `url` said of chains.
+fn said_chains(name: &str, url: &str, yes: bool) {
+    let heard = if yes { Heard::Yes } else { Heard::No(Instant::now()) };
+    let mut m = chain_takers().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match m.get_mut(name) {
+        Some(s) => match s.get_mut(url) {
+            Some(was) => *was = heard,
+            None => {
+                s.insert(url.to_string(), heard);
+            }
+        },
+        None => {
+            m.insert(name.to_string(), HashMap::from([(url.to_string(), heard)]));
+        }
+    }
+}
+
+/// What a chained call's id is refused with when it came before with other arguments.
+pub(crate) const OTHER_ARGUMENTS: &str = "this call's id came before with other arguments: a call sent again is sent as it was";
+
+/// Whether a chained call, signed `sig`, of `f` by `who` for `tenant` with id `call` and these
+/// arguments, may run or be answered from its record: refused when the same signed request came
+/// before and its error answer was not kept (a replay, P5), and when its id came before from the
+/// same caller with other arguments (422, as a key used with another request is), never answered
+/// from a record (P4). Kept by caller, function, tenant and id here, and in `_quillo_calls` for the
+/// copies sharing the database.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn chained_call_fits(it: &mut Interp, sig: &str, call: &str, who: &str, f: &str, tenant: &str, body: &[u8]) -> Result<String, HttpResponse> {
+    let now = Instant::now();
+    let fresh = |at: &Instant| now.duration_since(*at) < SEEN_FOR;
+    {
+        let mut r = replays().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match r.get(sig) {
+            Some((at, ())) if fresh(at) => return Err(refused(409, "this call was sent before, as it is")),
+            Some(_) => {
+                r.remove(sig);
+            }
+            None => {}
+        }
+    }
+    // By `ring`, which the processor's SHA instructions run.
+    let digest = |parts: &[&[u8]]| {
+        let mut c = ring::digest::Context::new(&ring::digest::SHA256);
+        for p in parts {
+            c.update(&(p.len() as u64).to_be_bytes());
+            c.update(p);
+        }
+        crate::crypto::hex(c.finish().as_ref())
+    };
+    let id_key = digest(&[b"quillo chained id", call.as_bytes(), who.as_bytes(), f.as_bytes(), tenant.as_bytes()]);
+    let hash = digest(&[body]);
+    // Where the service has a database, its record in `_quillo_calls`, which its copies share: the
+    // arguments' hash, then the signatures of its sends whose error answer was not kept
+    // (`remember_replay`), so that a captured one is refused by every copy (the review's r1).
+    let now_ms = now_secs() as i64 * 1000;
+    match crate::db::call_claim(it, &id_key, now_ms, now_ms - SEEN_FOR.as_millis() as i64) {
+        Some(crate::db::Claim::Done(_, had)) => {
+            let mut parts = had.split(' ');
+            if parts.next() != Some(hash.as_str()) {
+                return Err(refused(422, OTHER_ARGUMENTS));
+            }
+            let sd = digest(&[b"quillo replay", sig.as_bytes()]);
+            if parts.any(|p| p == sd) {
+                return Err(refused(409, "this call was sent before, as it is"));
+            }
+        }
+        Some(crate::db::Claim::Mine) => crate::db::call_done(it, &id_key, 200, &hash),
+        Some(crate::db::Claim::Running) => {}
+        // No database: what this process remembers.
+        None => {
+            let m = chain_ids().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match m.get(&id_key) {
+                Some((at, had)) if fresh(at) && *had != hash => return Err(refused(422, OTHER_ARGUMENTS)),
+                Some((at, _)) if fresh(at) => return Ok(id_key),
+                _ => {}
+            }
+        }
+    }
+    // Full of ids still fresh, the oldest goes (L2): its arguments are still in `_quillo_calls` where
+    // the service has a database, and without one the id with other arguments is no longer refused
+    // but is not answered from a record either (`seen` and `idempotent` hold the arguments): it
+    // runs as a call of its own.
+    let mut m = chain_ids().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    m.room(now, true);
+    m.insert(id_key.clone(), now, hash);
+    Ok(id_key)
+}
+
+/// `run_call` of a call that came in a chain, in its link (FEEDBACK89.md, Q-1394; branch
+/// feedback86-89): out of line, so that a call in no chain goes through `answer` as before.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn run_chained(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: Value, who: &str, call: &str, to: &str, root: Arc<str>, failed: &mut bool) -> HttpResponse {
+    let program = SERVED_AS.get().map_or(to, String::as_str).to_string();
+    let link = enter_call(it, &program, who, f, tenant, call, root);
+    // Out of its link however it ends, a panic too (carried on after).
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_call(it, f, tenant, req, caller, failed)));
+    leave(it, link);
+    r.unwrap_or_else(|p| std::panic::resume_unwind(p))
+}
+
+/// A chained call's signature, its error answer not kept: the same request again is a replay.
+/// Whether it was kept: full of signatures still fresh, none is evicted, since its request could
+/// then be sent again and run (L2); the error answer is then kept as any other, and the chain's
+/// retry gets it, as in 0.8.11. A signature is fresh while its time may still be taken (`WINDOW`
+/// either way, `SEEN_FOR` with a minute to spare).
+/// Kept too in the call's record in `_quillo_calls` (`id_key`, `chained_call_fits`), for the copies
+/// sharing the database, while the record lasts (`SEEN_FOR`).
+#[cold]
+fn remember_replay(it: &mut Interp, sig: &str, id_key: Option<&str>) -> bool {
+    if sig.is_empty() {
+        return true;
+    }
+    if let Some(k) = id_key {
+        let now_ms = now_secs() as i64 * 1000;
+        if let Some(crate::db::Claim::Done(status, had)) = crate::db::call_claim(it, k, now_ms, now_ms - SEEN_FOR.as_millis() as i64) {
+            let mut c = ring::digest::Context::new(&ring::digest::SHA256);
+            for p in [&b"quillo replay"[..], sig.as_bytes()] {
+                c.update(&(p.len() as u64).to_be_bytes());
+                c.update(p);
+            }
+            crate::db::call_done(it, k, status, &format!("{} {}", had, crate::crypto::hex(c.finish().as_ref())));
+        }
+    }
+    let now = Instant::now();
+    let mut r = replays().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !r.room(now, false) {
+        return false;
+    }
+    r.insert(sig.to_string(), now, ());
+    true
+}
+
+/// What a call whose `ROOT_WORD` is not its own is refused with.
+#[cold]
+#[inline(never)]
+fn root_refused() -> HttpResponse {
+    refused(401, &format!("{} is not signed with this call (or was changed on its way)", ROOT_WORD))
+}
+
+/// What a call is refused with while a try of it runs.
+const STILL_RUNNING: &str = "this call is still running";
+
 /// Calls answered lately, by call id: when, and the answer (none while it runs).
 fn seen() -> &'static Mutex<HashMap<String, (Instant, Option<HttpResponse>)>> {
     static S: OnceLock<Mutex<HashMap<String, (Instant, Option<HttpResponse>)>>> = OnceLock::new();
@@ -2222,13 +3267,20 @@ fn seen() -> &'static Mutex<HashMap<String, (Instant, Option<HttpResponse>)>> {
 const SEEN_FOR: Duration = Duration::from_secs(2 * WINDOW + 60);
 const SEEN_MAX: usize = 100_000;
 
-fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: Value) -> HttpResponse {
+/// `failed`: the function gave an error value (FEEDBACK89.md, Q-1394; branch feedback86-89).
+fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: Value, failed: &mut bool) -> HttpResponse {
     if f == CONTRACTS && !it.server_fns.iter().any(|n| n == f) {
         let who = match &caller {
             Value::Map(m) => m.get("name").map(|n| n.display()).unwrap_or_default(),
             _ => String::new(),
         };
-        return json(200, contract_list(it, &who));
+        // Asked before a chained call (`may_chain`, its body `CHAIN_QUESTION`): said with
+        // `CHAIN_MARK`. Asked for the list alone, as before.
+        let mut list = contract_list(it, &who);
+        if req.body == CHAIN_QUESTION.as_bytes() {
+            list[CHAIN_MARK] = serde_json::json!(1);
+        }
+        return json(200, list);
     }
     // A call that carries a tool's call is an object: a tool of this service's, called at its
     // app's door, or a server fn with the call's asking (FEEDBACK56.md, Part F; branch
@@ -2322,7 +3374,13 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: V
     };
     let refused_with = |status: u16, msg: String| json(status, with_asking(serde_json::json!({ "error": msg })));
     // Sent only when there are some: an answer without any is as before.
+    // A chained call (answered in its link): this Quillo keeps chained calls' records (Q-1394),
+    // said in the body, which the answer's signature covers. A plain call's answer is as before.
+    let chained = it.chain.is_some();
     let with_published = |mut j: serde_json::Value| {
+        if chained {
+            j[CHAIN_MARK] = serde_json::json!(1);
+        }
         if !published.is_empty() {
             j["published"] = serde_json::json!(published);
         }
@@ -2341,9 +3399,19 @@ fn run_call(it: &mut Interp, f: &str, tenant: &str, req: &HttpRequest, caller: V
     match result {
         Ok(v) | Err(Ctrl::Return(v)) => match v {
             Value::Response(_) => refused_with(500, format!("`{}` answered with a page, not a value", f)),
-            v => json(200, with_published(wire_answer(&v))),
+            v => {
+                *failed = matches!(v, Value::Err(..));
+                json(200, with_published(wire_answer(&v)))
+            }
         },
         Err(Ctrl::Reply(_)) => refused_with(500, format!("`{}` replied with a page, not a value", f)),
+        // Its `idempotent` record is held by a try still running, or by one stopped part way that
+        // is not yet a minute old: the caller asks again, as at a 503 (FEEDBACK89.md, Q-1394;
+        // branch feedback86-89). It was an internal error, which the caller does not try again.
+        Err(Ctrl::Error(e)) if e.msg == crate::idempotency::RUNNING => refused_with(503, STILL_RUNNING.to_string()),
+        // Its `idempotent` record holds the call's id with other arguments: refused as a key used
+        // with another request is (FEEDBACK89.md, Q-1394; branch feedback86-89).
+        Err(Ctrl::Error(e)) if e.msg == crate::idempotency::OTHER_REQUEST => refused_with(422, OTHER_ARGUMENTS.to_string()),
         Err(Ctrl::Error(e)) => {
             eprintln!("quillo: error in server fn `{}` (called by a service): {:#}", f, e);
             refused_with(500, format!("internal error in `{}`", f))
@@ -2360,7 +3428,12 @@ fn set_called(it: &mut Interp, tenant: &str, req: &HttpRequest, caller: Value) {
     // Called by another service: `request` is the request it came from, as
     // far as it goes with the call (its id), and the call's own id.
     let header = |name: &str| req.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str());
-    let mut step = match step_request(it.request_id.as_deref(), header("x-quillo-call").unwrap_or("")) {
+    // In a chain (`answer` entered its link), the arguments as they came, for its `idempotent`'s
+    // fingerprint (FEEDBACK89.md, Q-1394; branch feedback86-89). A derived id comes only with its
+    // root (`remote_tries` gives a call no key signs a new one, the security review's n5b), so a
+    // call with no root has an id no other request of its caller's sends.
+    let body = in_link(it, |_| ()).map(|()| Value::str(String::from_utf8_lossy(&req.body)));
+    let mut step = match step_request(it.request_id.as_deref(), header("x-quillo-call").unwrap_or(""), body) {
         Value::Map(m) => (*m).clone(),
         _ => Map::new(),
     };
@@ -3576,4 +4649,58 @@ pub fn split(path: &Path, watch: bool, reload: bool, static_check: bool, checked
     }
     supervise(split.services.clone(), split.stop.clone());
     Ok(split)
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    /// A fork made in a keyed run (a task that outlives it) stops looking at its builtins once the
+    /// run has ended: its first builtin after puts it in no chain (FEEDBACK89.md, Q-1391, the
+    /// concurrency review's LOW; branch feedback86-89). Before, it paid the effect hook for good.
+    #[test]
+    fn a_fork_made_in_a_run_leaves_the_chain_once_the_run_ends() {
+        let d = std::env::temp_dir().join(format!("quillo-f89-fork-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let mut it = Interp::new(&d);
+        let link = enter_run(&mut it, &"a".repeat(64), &"b".repeat(64), 1);
+        let mut task = it.fork();
+        assert!(task.chain.is_some(), "a task of a run marks it");
+        effect(&mut task, "len");
+        assert!(task.chain.is_some(), "the run goes on");
+        leave(&mut it, link);
+        assert!(it.chain.is_none());
+        effect(&mut task, "len");
+        assert!(task.chain.is_none(), "the task still looks at its builtins after the run");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod heard_tests {
+    use super::*;
+
+    /// An address that answered without `CHAIN_MARK` is asked again after a while (in tests 300 ms,
+    /// else ten minutes): a callee upgraded in place is chained again with no restart (the
+    /// concurrency review's R7-D). Before, its "no" lasted the process's life.
+    #[test]
+    fn an_answer_without_the_mark_is_asked_again_later() {
+        let urls = vec!["http://127.0.0.1:1".to_string()];
+        said_chains("r7d-billing", &urls[0], false);
+        assert_eq!(takes_chains("r7d-billing", &urls), Some(false));
+        std::thread::sleep(Duration::from_millis(350));
+        assert_eq!(takes_chains("r7d-billing", &urls), None, "never asked again");
+    }
+
+    /// A request whose question got no answer clears only its own asking: one another request took
+    /// over since stays (the review's LOW).
+    #[test]
+    fn only_its_own_asking_is_cleared() {
+        let url = "http://127.0.0.1:2";
+        chain_takers().lock().unwrap().entry("own-asking".into()).or_default().insert(url.into(), Heard::Asking(Instant::now(), 7));
+        question_unanswered("own-asking", url, 6);
+        assert!(matches!(chain_takers().lock().unwrap()["own-asking"][url], Heard::Asking(_, 7)));
+        question_unanswered("own-asking", url, 7);
+        assert!(matches!(chain_takers().lock().unwrap()["own-asking"][url], Heard::Silent(_)));
+    }
 }

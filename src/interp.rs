@@ -271,6 +271,9 @@ pub struct Interp {
     pub shared: Arc<Shared>,
     /// The services this version of the program loaded (see `shared::Services`).
     pub(crate) services: Arc<crate::shared::Services>,
+    /// The chained retries this interpreter's code runs in (`service::ChainCell`): none until it enters
+    /// one (FEEDBACK89.md, Q-1394; branch feedback86-89).
+    pub(crate) chain: Option<Arc<crate::service::ChainCell>>,
     /// Calls in progress on this thread, to stop runaway recursion cleanly.
     depth: usize,
     /// The quotient of two ints a pipe is passing on, for `floor` to make in ints (`eval_pipe`):
@@ -3044,6 +3047,7 @@ impl Interp {
             via_links: Arc::new(HashSet::new()),
             shared,
             services: Default::default(),
+            chain: None,
             depth: 0,
             pipe_div: None,
             exact_div: None,
@@ -3189,6 +3193,7 @@ impl Interp {
             via_links: self.via_links.clone(),
             shared: self.shared.clone(),
             services: self.services.clone(),
+            chain: crate::service::forked(&self.chain),
             depth: 0,
             pipe_div: None,
             exact_div: None,
@@ -5988,6 +5993,12 @@ impl Interp {
                 }
                 if self.allowed != ALL_EFFECTS {
                     self.check_builtin_effect(name, &args, line)?;
+                }
+                // In a chain (a keyed `idempotent` run), what reaches past the program's own
+                // database marks the run, and its end is kept (FEEDBACK89.md, Q-1391; branch
+                // feedback86-89). In none, this one branch.
+                if self.chain.is_some() {
+                    crate::service::effect(self, name);
                 }
                 if self.writes_noted() && (CHANGES.contains(name) || changes_as_called(name, &args)) {
                     self.no_writes(name, line)?;

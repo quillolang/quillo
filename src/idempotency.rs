@@ -203,8 +203,16 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let mut by_form = false;
     let key = match (header("idempotency-key"), form_key) {
         (Some(k), _) => k,
-        // By its line too: a function may have two.
-        (None, _) if step => format!("{}:{}", call, line),
+        // By its line too: a function may have two. And by who called, so that another caller with
+        // the call's id is another key, not the first one's answer (FEEDBACK89.md, Q-1394, the
+        // security review's P4 and P6; branch feedback86-89); a call in this process names none.
+        (None, _) if step => match req.get("caller") {
+            Some(Value::Map(c)) => match c.get("name").map(|n| n.display()).filter(|n| !n.is_empty()) {
+                Some(who) => format!("{}:{}:{}", call, line, &sha256_hex(&[who.as_bytes()])[..16]),
+                None => format!("{}:{}", call, line),
+            },
+            _ => format!("{}:{}", call, line),
+        },
         (None, Some(k)) => {
             by_form = true;
             k
@@ -246,74 +254,100 @@ fn idempotent(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         Err(e) => return no(503, &db_failed(it, step, line, "could not record the Idempotency-Key", &e)),
     };
     cleanup(it, tenant.as_deref());
+    // The calls `f` makes to services get ids derived from this key's row and their place in the
+    // run, so a run of the key again sends the same ids, and each service answers from its record
+    // (FEEDBACK89.md, Q-1394; branch feedback86-89).
+    let chain = crate::service::enter_run(it, &id, &print, line);
+    // The run, out of its link once it ends, a panic too (caught here, and carried on after): the
+    // interpreter is back in no chain, and a builtin it calls after looks at nothing (FEEDBACK89.md,
+    // Q-1391, the reviews' L1 and LOW; branch feedback86-89).
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> R {
 
-    if !opts.transaction {
-        let r = it.call(&f, Vec::new(), line);
-        let a = match if step { render_step(r) } else { render(rpc.as_deref(), r) } {
-            Ok(a) => a,
-            Err(e) => {
+        if !opts.transaction {
+            let r = it.call(&f, Vec::new(), line);
+            // A run that ends in failure (an early reply, an error value, a `?` passing one on, a
+            // runtime error) after a service call that was never sent (refused before it left, an open
+            // circuit) is not kept: nothing reached the service, and a retry with the key, once it is
+            // back, runs. Kept, the form stayed "busy" until the key expired. After a call that may have
+            // run (no answer in time, a 503, a proxy's 502 or 504) it is kept, as before, since the
+            // service's record of it lasts less than the key; and once the run sent anything outside
+            // (`http.*`, a push, udp), whatever follows (FEEDBACK89.md, Q-1391, and the batch's
+            // decisions on it; branch feedback86-89).
+            let unsent = matches!(r, Err(Ctrl::Reply(_)) | Err(Ctrl::Error(_)) | Ok(Value::Err(..)) | Err(Ctrl::Return(Value::Err(..)))) && crate::service::end_not_kept(it);
+            let a = match if step { render_step(r) } else { render(rpc.as_deref(), r) } {
+                Ok(a) => a,
+                Err(e) => {
+                    release(it, &id, &token);
+                    return Err(e);
+                }
+            };
+            if unsent {
                 release(it, &id, &token);
-                return Err(e);
+                return give(a, false);
             }
-        };
-        let after = says(named, &header, crate::session::current_owner(it));
-        add_owners(&mut owners, after);
-        match store(it, &id, &token, &a, &owners) {
-            Ok(true) => {}
-            Ok(false) => eprintln!("quillo: an idempotent request's claim was gone when its answer was kept"),
-            Err(e) => eprintln!("quillo: could not keep an idempotent request's answer: {}", e),
+            let after = says(named, &header, crate::session::current_owner(it));
+            add_owners(&mut owners, after);
+            match store(it, &id, &token, &a, &owners) {
+                Ok(true) => {}
+                Ok(false) => eprintln!("quillo: an idempotent request's claim was gone when its answer was kept"),
+                Err(e) => eprintln!("quillo: could not keep an idempotent request's answer: {}", e),
+            }
+            return give(a, false);
         }
-        return give(a, false);
-    }
 
-    // The work and its answer, in one transaction.
-    let mut kept: Option<HttpResponse> = None;
-    let mut lost = false;
-    let ok = |r: &R| matches!(r, Ok(v) if !matches!(v, Value::Err(..)));
-    let r = crate::txn::run(it, None, &opts.tx, line, &mut |it| {
-        kept = None;
-        lost = false;
-        let v = match it.call(&f, Vec::new(), line) {
-            Ok(v) if !matches!(v, Value::Err(..)) => v,
-            other => return other,
-        };
-        let a = if step { render_step(Ok(v.clone()))? } else { render(rpc.as_deref(), Ok(v.clone()))? };
-        let mut all = owners.clone();
-        add_owners(&mut all, says(named, &header, crate::session::current_owner(it)));
-        match store(it, &id, &token, &a, &all) {
-            Ok(true) => {
-                kept = Some(a);
-                Ok(v)
+        // The work and its answer, in one transaction.
+        let mut kept: Option<HttpResponse> = None;
+        let mut lost = false;
+        let ok = |r: &R| matches!(r, Ok(v) if !matches!(v, Value::Err(..)));
+        let r = crate::txn::run(it, None, &opts.tx, line, &mut |it| {
+            kept = None;
+            lost = false;
+            // Tried again (a serialization failure): the same calls, the same ids (Q-1394).
+            crate::service::chain_again(it);
+            let v = match it.call(&f, Vec::new(), line) {
+                Ok(v) if !matches!(v, Value::Err(..)) => v,
+                other => return other,
+            };
+            let a = if step { render_step(Ok(v.clone()))? } else { render(rpc.as_deref(), Ok(v.clone()))? };
+            let mut all = owners.clone();
+            add_owners(&mut all, says(named, &header, crate::session::current_owner(it)));
+            match store(it, &id, &token, &a, &all) {
+                Ok(true) => {
+                    kept = Some(a);
+                    Ok(v)
+                }
+                // Taken over by another request: this one must not commit.
+                Ok(false) => {
+                    lost = true;
+                    Ok(Value::err(Value::str("idempotent: the request was taken over")))
+                }
+                Err(e) => Ok(Value::err(Value::str(format!("db: {}", e)))),
             }
-            // Taken over by another request: this one must not commit.
-            Ok(false) => {
-                lost = true;
-                Ok(Value::err(Value::str("idempotent: the request was taken over")))
+        });
+        match kept {
+            Some(a) if ok(&r) => give(a, false),
+            _ => {
+                // Nothing was committed: give the claim up, so the request may
+                // run again.
+                release(it, &id, &token);
+                if lost {
+                    return match claim(it, &attempt) {
+                        Ok(Claim::Answer(a)) => give(a, true),
+                        Ok(Claim::Mine(t, _)) => {
+                            release(it, &id, &t);
+                            no(409, "a request with this Idempotency-Key was running at the same time; try again")
+                        }
+                        Ok(Claim::Busy) => no(409, RUNNING),
+                        Ok(Claim::Refused(status, msg)) => no(status, &msg),
+                        Err(e) => no(503, &db_failed(it, step, line, "could not read the Idempotency-Key", &e)),
+                    };
+                }
+                r
             }
-            Err(e) => Ok(Value::err(Value::str(format!("db: {}", e)))),
         }
-    });
-    match kept {
-        Some(a) if ok(&r) => give(a, false),
-        _ => {
-            // Nothing was committed: give the claim up, so the request may
-            // run again.
-            release(it, &id, &token);
-            if lost {
-                return match claim(it, &attempt) {
-                    Ok(Claim::Answer(a)) => give(a, true),
-                    Ok(Claim::Mine(t, _)) => {
-                        release(it, &id, &t);
-                        no(409, "a request with this Idempotency-Key was running at the same time; try again")
-                    }
-                    Ok(Claim::Busy) => no(409, RUNNING),
-                    Ok(Claim::Refused(status, msg)) => no(status, &msg),
-                    Err(e) => no(503, &db_failed(it, step, line, "could not read the Idempotency-Key", &e)),
-                };
-            }
-            r
-        }
-    }
+    }));
+    crate::service::leave(it, chain);
+    r.unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
 /// What a visitor is told when the table of keys fails: `what` alone, as a builtin's error says
@@ -517,7 +551,9 @@ enum Claim {
     Refused(u16, String),
 }
 
-const RUNNING: &str = "a request with this Idempotency-Key is still running; try again shortly";
+pub(crate) const RUNNING: &str = "a request with this Idempotency-Key is still running; try again shortly";
+/// What a key used with another request is refused with (a service answers it as a 422).
+pub(crate) const OTHER_REQUEST: &str = "this Idempotency-Key was used with another request";
 /// The same for a row done or running: nothing is said of what is there.
 const SOMEONE_ELSES: &str = "this Idempotency-Key is someone else's: nothing was run; use a key of your own, or say whose it is with `{ user }`";
 
@@ -558,7 +594,7 @@ fn judge(row: &Map, a: &Attempt) -> Verdict {
     let ours = owners_of(row).map_or(true, |o| same_visitor(&o, a.owners));
     let someone_elses = || Verdict::Final(Claim::Refused(409, SOMEONE_ELSES.into()));
     let same = row_text(row, "fingerprint") == a.print;
-    let other = || Verdict::Final(Claim::Refused(422, "this Idempotency-Key was used with another request".into()));
+    let other = || Verdict::Final(Claim::Refused(422, OTHER_REQUEST.into()));
     let done = row_int(row, "done") == 1;
     if done || row_int(row, "lease_until") > now {
         return match (ours, same) {
@@ -840,4 +876,37 @@ pub fn holds_form_key(body: &[u8]) -> bool {
 fn marked(mut r: HttpResponse) -> HttpResponse {
     r.headers.push((crate::server::MARKED.into(), "1".into()));
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn boom(_: &mut Interp, _: Vec<Value>, _: u32) -> R {
+        panic!("a builtin's bug, in a keyed run")
+    }
+
+    /// A keyed run that panics leaves its chain: the interpreter's next request starts in none, and
+    /// its builtins look at nothing (FEEDBACK89.md, Q-1391, the concurrency review's LOW; branch
+    /// feedback86-89). Before, `chain` stayed set after the panic.
+    #[test]
+    fn a_keyed_run_that_panics_leaves_its_chain() {
+        let d = std::env::temp_dir().join(format!("quillo-f89-panic-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let mut it = Interp::new(&d);
+        it.load_source("db.open(\"k.db\")\n", "main.qwe").unwrap();
+        let mut headers = Map::new();
+        headers.insert("idempotency-key".into(), Value::str("k1"));
+        let mut req = Map::new();
+        req.insert("method".into(), Value::str("POST"));
+        req.insert("path".into(), Value::str("/k"));
+        req.insert("headers".into(), Value::map(headers));
+        it.current_request = Some(Value::map(req));
+        let mut opts = Map::new();
+        opts.insert("transaction".into(), Value::Bool(false));
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| idempotent(&mut it, vec![Value::map(opts), Value::Builtin("boom", boom)], 1)));
+        assert!(r.is_err(), "the panic was not carried on");
+        assert!(it.chain.is_none(), "the chain outlived the run");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
