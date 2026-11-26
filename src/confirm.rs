@@ -801,7 +801,10 @@ fn taken_note(name: &str, names: &[String], routes: &[(String, u32)], site: &[(&
         also.push(format!("reaches out as the program starts (line {})", at_start.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")));
     }
     let line = routes.first().map(|r| r.1).into_iter().chain(site.iter().map(|s| s.2).min()).chain(at_start.first().copied()).min().unwrap_or(0);
+    // Each once, in one order: the files that take them are read in no order of their own (found
+    // in review; FEEDBACK89.md's review of slice A; branch feedback86-89).
     let mut names = names.to_vec();
+    names.sort();
     names.dedup();
     Some((line, format!("{} is taken for {}, and also {}", name, names.join(", "), also.join(" and "))))
 }

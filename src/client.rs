@@ -2015,6 +2015,40 @@ fn each_expr_in(e: &Expr, f: &mut dyn FnMut(&Expr), fns: bool) {
         Expr::Html(el, _) => each_html_expr(el, f, fns),
     }
 }
+/// Whether a component's body is made again whole when what it read changes, its state kept
+/// (`setup_inner`): it can return early (a `return` or a `?` in it, outside its functions), or it
+/// changes, on a line of its own, a name that is not one of its states (a `let`, a prop). Then each
+/// of its lines runs again, an assignment to a state too, which `quillo check`'s run-once warning
+/// asks here, so the two cannot differ (FEEDBACK90.md, Q-1401; branch feedback86-89).
+pub(crate) fn runs_again_whole(body: &Expr) -> bool {
+    let mut exits = false;
+    let mut changed = HashSet::new();
+    each_expr_in(
+        body,
+        &mut |e| match e {
+            Expr::Try(_) => exits = true,
+            Expr::Block(ss) => {
+                for st in ss {
+                    match st {
+                        Stmt::Return(..) => exits = true,
+                        Stmt::Assign(n, ..) => {
+                            changed.insert(n.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        },
+        false,
+    );
+    let states: HashSet<&String> = match body {
+        Expr::Block(ss) => ss.iter().filter_map(|st| if let Stmt::State(n, ..) = st { Some(n) } else { None }).collect(),
+        _ => HashSet::new(),
+    };
+    exits || changed.iter().any(|n| !states.iter().any(|s| s.as_str() == n.as_str()))
+}
+
 
 /// Whether `body` can leave its function early (`return`, or `?` on an
 /// error), which compiled code does by throwing `W.Ret`; a function whose
@@ -3433,33 +3467,9 @@ impl<'a> Compiler<'a> {
         // A body that can return early, or changes its own variables as it
         // runs, is made again whole when what it read changes (its state
         // stays).
-        let mut exits = false;
-        let mut changed = HashSet::new();
-        each_expr_in(
-            &def.body,
-            &mut |e| match e {
-                Expr::Try(_) => exits = true,
-                Expr::Block(ss) => {
-                    for st in ss {
-                        match st {
-                            Stmt::Return(..) => exits = true,
-                            Stmt::Assign(n, ..) => {
-                                changed.insert(n.clone());
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
-            },
-            false,
-        );
-        let states: HashSet<&String> = match &def.body {
-            Expr::Block(ss) => ss.iter().filter_map(|st| if let Stmt::State(n, ..) = st { Some(n) } else { None }).collect(),
-            _ => HashSet::new(),
-        };
+        let again = runs_again_whole(&def.body);
         expr_assigned(&def.body, &mut self.mutable);
-        if exits || changed.iter().any(|n| !states.iter().any(|s| s.as_str() == n.as_str())) {
+        if again {
             self.ctx().hoisted = true;
             let mut copy = String::new();
             for p in &def.params {

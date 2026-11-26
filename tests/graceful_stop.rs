@@ -564,21 +564,16 @@ fn check_warns_where_idempotent_changes_data_in_another_program() {
             Some((at.rsplit(':').next()?.parse().ok()?, rest.split('`').next()?.to_string()))
         })
         .collect();
-    // Directly; through the program's function; two (the first named, the other counted); a
-    // site's; a function named, not written there; a service's that changes data in another
-    // service; `transaction: true` written out. Not: a function that only reads, one run without
-    // the transaction, and one made later, which waits in the transaction's own database.
-    let want: Vec<(u32, String)> = [(6, "billing.charge"), (7, "billing.charge"), (10, "billing.charge"), (14, "shop.order"), (16, "billing.charge"), (17, "billing.relay"), (18, "billing.charge"), (20, "billing.charge"), (22, "billing.charge"), (25, "billing.charge")]
-        .iter()
-        .map(|(l, c)| (*l, c.to_string()))
-        .collect();
+    // A site's, directly and beside a service's calls. A Quillo service's calls are no longer said,
+    // whichever way they are reached: a call made in an `idempotent` run has an id made of the run's
+    // key and its place in it, so a retry answers from the service's record (the user's decision
+    // 2026-11-24; FEEDBACK89.md, Q-1392; branch feedback86-89). Before it, lines 6, 7, 10, 16, 17,
+    // 18, 20, 22 and 25 named `billing.charge` or `billing.relay`.
+    let want: Vec<(u32, String)> = [(14, "shop.order"), (25, "shop.order")].iter().map(|(l, c)| (*l, c.to_string())).collect();
     assert_eq!(said, want, "{}", err);
-    let line = err.lines().find(|l| l.contains("main.qwe:10: warning:")).unwrap();
-    // A variable that holds a function is read (22); a function a call gives (24) and a
-    // parameter (30) are not: not warned of. Three: the first named, the two others counted.
-    let three = err.lines().find(|l| l.contains("main.qwe:25: warning:")).unwrap();
-    assert!(three.contains("outside its transaction (and 2 more such calls): when"), "{}", three);
-    assert!(line.contains("`idempotent` reaches `billing.charge`, which may change data in another program, outside its transaction (and 1 more such call): when that call's answer is lost, the key is given up and a retry with it runs the call there again, under a new call id. Give `idempotent` `{ transaction: false }`, which keeps every answer, failures too, or send an id the other program's change is keyed by, so that a second run changes nothing"), "{}", line);
+    // The service's two calls beside it are not counted.
+    let line = err.lines().find(|l| l.contains("main.qwe:25: warning:")).unwrap();
+    assert!(line.contains("`idempotent` reaches `shop.order`, which may change data in another program, outside its transaction: when that call's answer is lost, the key is given up and a retry with it runs the call there again, under a new call id. Give `idempotent` `{ transaction: false }`, which keeps every answer, failures too, or send an id the other program's change is keyed by, so that a second run changes nothing"), "{}", line);
     // A warning: the program still starts.
     assert!(o.status.success(), "{}", err);
     // In another file, said once, at its own line: walked again for its type where it is called,

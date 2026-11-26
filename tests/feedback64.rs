@@ -415,7 +415,10 @@ component C() {
 route GET / = <C/>
 "#;
     let said: Vec<String> = diags(src).into_iter().filter(|d| d.contains("warning")).collect();
-    assert_eq!(said, Vec::<String>::new());
+    // `lam`'s first line drops a `map` whose function does nothing else, which is said since the
+    // decision on FEEDBACK86.md's Q-1360 (branch feedback86-89); what this test is for, that the
+    // lambda's own `total` hides nothing of `lam`'s and `lam` changes the program's, is as it was.
+    assert_eq!(said, ["21 warning: `map` gives a new value and changes nothing, and it is dropped here: write `items = items | map(...)`"]);
 }
 
 #[test]

@@ -231,6 +231,14 @@ fn budget_spent(k: usize) -> bool {
 thread_local! {
     /// Service programs being checked: one using another that uses it is not checked twice over.
     static SERVICE_CHECKS: std::cell::RefCell<HashSet<PathBuf>> = std::cell::RefCell::new(HashSet::new());
+    /// Service programs the outermost check on this thread has checked: one that two programs of
+    /// the app declare is checked once, and what it says said once, as `--split` checks the tree
+    /// (FEEDBACK89.md, Q-1393; branch feedback86-89).
+    static SERVICES_CHECKED: std::cell::RefCell<HashSet<PathBuf>> = std::cell::RefCell::new(HashSet::new());
+    /// Each checked service's own types (`type Invoice = { ... }`), by its file, for what its calls
+    /// take and give: the program calling it may have a type of the same name that is another
+    /// (FEEDBACK87.md, Q-1370, found in review; branch feedback86-89).
+    static SERVICE_RECORDS: std::cell::RefCell<HashMap<PathBuf, Arc<HashMap<String, Arc<TypeDef>>>>> = std::cell::RefCell::new(HashMap::new());
     static TABLES: std::cell::RefCell<Tables> = std::cell::RefCell::new(Tables::default());
     /// Checks in progress on this thread (a mounted program is checked
     /// inside its parent's check): the tables are emptied by the outermost.
@@ -355,6 +363,25 @@ pub fn untaken_at_load(main: &Path) -> Result<(), String> {
 enum Next {
     Fn(Arc<FnDef>),
     Type(String),
+}
+
+/// Each function or type `next` names once, where it is named last: read from the end as
+/// `Checker::reach_all` reads it, the same order, with no copy read again (found in review: a
+/// function called 8,000 times was put on the list 8,000 times, at each `idempotent`).
+fn last_of_each(next: &mut Vec<Next>) {
+    let mut seen: HashSet<(usize, &str)> = HashSet::new();
+    let mut keep = vec![false; next.len()];
+    for (i, x) in next.iter().enumerate().rev() {
+        keep[i] = match x {
+            Next::Fn(f) => seen.insert((def_key(f), "")),
+            Next::Type(t) => seen.insert((0, t.as_str())),
+        };
+    }
+    let mut i = 0;
+    next.retain(|_| {
+        i += 1;
+        keep[i - 1]
+    });
 }
 
 fn record(name: &str) -> Option<Arc<TypeDef>> {
@@ -979,6 +1006,344 @@ fn bound_in(e: &Expr, out: &mut HashSet<String>) {
         _ => {}
     });
     out.extend(names);
+}
+
+/// Builtins that give a new value and do nothing else, whose answer dropped is a mistake
+/// (`Checker::answer_dropped_e`; FEEDBACK45.md, Q-505; branch feedback40-43).
+const GIVES_ONLY: &[&str] = &["push", "set", "merge", "remove", "sort", "sort_by", "drop", "take", "reverse", "unique", "insert", "append", "concat", "flatten"];
+
+/// A test as written, for keeping one of each (`Checker::held_index_of`): names, fields, calls, literals
+/// and operators of them, no deeper than 16; None for any other, which is kept each time
+/// (FEEDBACK89.md, Q-1390, found in review; branch feedback86-89).
+fn fact_key(e: &Expr, depth: u32) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    Some(match e {
+        Expr::Ident(n, _) => n.to_string(),
+        Expr::Lit(Lit::Nil) => "null".to_string(),
+        Expr::Lit(Lit::Bool(b)) => b.to_string(),
+        Expr::Lit(Lit::Int(i)) => i.to_string(),
+        Expr::Lit(Lit::Str(t)) => format!("{:?}", t),
+        Expr::Field(o, f, _) => format!("{}.{}", fact_key(o, depth + 1)?, f),
+        Expr::Unary(UnOp::Not, x, _) => format!("!{}", fact_key(x, depth + 1)?),
+        Expr::Call(f, args, _) => {
+            let mut k = format!("{}(", fact_key(f, depth + 1)?);
+            for a in args {
+                k.push_str(&fact_key(a, depth + 1)?);
+                k.push(',');
+            }
+            k.push(')');
+            k
+        }
+        Expr::Binary(op, a, b, _) => format!("({} {:?} {})", fact_key(a, depth + 1)?, op, fact_key(b, depth + 1)?),
+        _ => return None,
+    })
+}
+
+/// The name `is_err` is asked of, `is_err(x)` or `x.is_err()` (`Checker::facts`; FEEDBACK89.md,
+/// Q-1390, found in review; branch feedback86-89).
+fn is_err_of<'e>(f: &'e Expr, args: &'e [Expr]) -> Option<&'e str> {
+    match (f, args) {
+        (Expr::Ident(g, _), [Expr::Ident(n, _)]) if g == "is_err" => Some(n.as_str()),
+        (Expr::Field(o, g, _), []) if g == "is_err" => match &**o {
+            Expr::Ident(n, _) => Some(n.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The name whose error `e` reads, null when it holds none: `x.error`, `x.message`, `error(x)` and
+/// `x.error()` (`Checker::facts`; FEEDBACK89.md, Q-1390, found in review; branch feedback86-89).
+fn error_test_of(e: &Expr) -> Option<&str> {
+    match e {
+        Expr::Field(o, f, _) if f == "error" || f == "message" => match &**o {
+            Expr::Ident(n, _) => Some(n.as_str()),
+            _ => None,
+        },
+        Expr::Call(f, args, _) => match (&**f, args.as_slice()) {
+            (Expr::Ident(g, _), [Expr::Ident(n, _)]) if g == "error" => Some(n.as_str()),
+            (Expr::Field(o, g, _), []) if g == "error" => match &**o {
+                Expr::Ident(n, _) => Some(n.as_str()),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The first name `e` reads that is one of `names`, not one it binds itself (a lambda's
+/// parameter): what a state's initializer follows (`Checker::run_once_states`; FEEDBACK86.md,
+/// Q-1361; branch feedback86-89).
+fn first_read(e: &Expr, names: &HashMap<String, String>) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let mut own = HashSet::new();
+    bound_in(e, &mut own);
+    let mut found = None;
+    walk_expr(e, &mut |x| {
+        if let (None, Expr::Ident(n, _)) = (&found, x) {
+            if !own.contains(n.as_str()) && names.contains_key(n.as_str()) {
+                found = Some(n.to_string());
+            }
+        }
+    });
+    found
+}
+
+/// Which of the states `said` (each with what it was set from) a component's code works out
+/// together with what it was set from: a call, an operator, a pipe, an index or a `??` reading both,
+/// or one of what it was set from assigned from it. Such a state is kept as it started on purpose, a
+/// count or a day to measure from (`len(rows) - start`, `day = add_days(base_day, n)`), not a value
+/// meant to follow (`run_once_states`; FEEDBACK86.md, Q-1361, found on quillolang.org's
+/// components; branch feedback86-89). Markup and a template show each of their parts apart, so
+/// `{len(open)} left · {total}` is none. Read in one walk for all of them: each outermost
+/// operation's names once, as one group, which holds both if any operation inside it does; past the
+/// check's budget it stops (found in review: one walk a state, and each node's own walk again, took
+/// 2.2 s for 3,200 states and escaped a confined check's 2 s).
+fn taken_as_it_started(body: &Expr, said: &[(u32, String, String, HashSet<String>)]) -> Vec<bool> {
+    let wanted: HashSet<&str> = said.iter().flat_map(|(_, n, _, from)| std::iter::once(n.as_str()).chain(from.iter().map(String::as_str))).collect();
+    // A name read or assigned where a lambda's parameter, a `let`, a `for` or an arm of that name
+    // hides the component's is not the component's (found in review: grouped by its text).
+    let mut hidden = Hidden { wanted: &wanted, depth: HashMap::new(), reads: HashSet::new(), sets: HashSet::new() };
+    match body {
+        Expr::Block(stmts) => hidden.block(stmts, false),
+        e => hidden.expr(e),
+    }
+    let Hidden { reads: hidden_reads, sets: hidden_sets, .. } = hidden;
+    let mut inside: HashSet<*const Expr> = HashSet::new();
+    // The names of each group, and of what each assignment of a wanted name is given.
+    let mut groups: Vec<HashSet<&str>> = Vec::new();
+    let mut assigned: Vec<(&str, HashSet<&str>)> = Vec::new();
+    let mut seen = 0usize;
+    let mut over = false;
+    walk_expr(body, &mut |x| {
+        seen += 1;
+        if over || budget_spent(seen) {
+            over = true;
+            return;
+        }
+        if let Expr::Block(stmts) = x {
+            for st in stmts {
+                if let Stmt::Assign(t, _, e, _) = st {
+                    if let (Some(t), false) = (wanted.get(t.as_str()), hidden_sets.contains(&(st as *const Stmt))) {
+                        let mut names = HashSet::new();
+                        walk_expr(e, &mut |y| {
+                            if let Expr::Ident(m, _) = y {
+                                if let (Some(m), false) = (wanted.get(m.as_str()), hidden_reads.contains(&(y as *const Expr))) {
+                                    names.insert(*m);
+                                }
+                            }
+                        });
+                        assigned.push((*t, names));
+                    }
+                }
+            }
+        }
+        if inside.contains(&(x as *const Expr)) || !matches!(x, Expr::Call(..) | Expr::Binary(..) | Expr::Pipe(..) | Expr::Index(..) | Expr::Coalesce(..)) {
+            return;
+        }
+        let mut names = HashSet::new();
+        walk_expr(x, &mut |y| {
+            inside.insert(y as *const Expr);
+            if let Expr::Ident(m, _) = y {
+                if let (Some(m), false) = (wanted.get(m.as_str()), hidden_reads.contains(&(y as *const Expr))) {
+                    names.insert(*m);
+                }
+            }
+        });
+        groups.push(names);
+    });
+    if over {
+        return vec![true; said.len()];
+    }
+    // Each state's place, by its name: a group or an assignment is read once, for the states in it.
+    let at: HashMap<&str, usize> = said.iter().enumerate().map(|(i, (_, n, _, _))| (n.as_str(), i)).collect();
+    let mut taken = vec![false; said.len()];
+    for g in &groups {
+        for m in g {
+            if let Some(&i) = at.get(m) {
+                taken[i] |= said[i].3.iter().any(|f| g.contains(f.as_str()));
+            }
+        }
+    }
+    for (t, names) in &assigned {
+        for m in names {
+            if let Some(&i) = at.get(m) {
+                taken[i] |= said[i].3.contains(*t);
+            }
+        }
+    }
+    taken
+}
+
+/// The reads and assignments of `wanted` names in a component's body that a binding of the name
+/// inside hides (`taken_as_it_started`): one walk, a count of each name's bindings in reach.
+struct Hidden<'w> {
+    wanted: &'w HashSet<&'w str>,
+    depth: HashMap<String, usize>,
+    reads: HashSet<*const Expr>,
+    sets: HashSet<*const Stmt>,
+}
+
+impl Hidden<'_> {
+    fn hides(&self, n: &str) -> bool {
+        self.depth.get(n).is_some_and(|d| *d > 0)
+    }
+
+    /// Binds `names` (those wanted), and gives back what to undo.
+    fn bind(&mut self, names: Vec<String>) -> Vec<String> {
+        let names: Vec<String> = names.into_iter().filter(|n| self.wanted.contains(n.as_str())).collect();
+        for n in &names {
+            *self.depth.entry(n.clone()).or_insert(0) += 1;
+        }
+        names
+    }
+
+    fn unbind(&mut self, names: Vec<String>) {
+        for n in names {
+            if let Some(d) = self.depth.get_mut(&n) {
+                *d -= 1;
+            }
+        }
+    }
+
+    fn func(&mut self, d: &FnDef) {
+        let b = self.bind(d.params.iter().map(|p| p.name.to_string()).collect());
+        d.params.iter().filter_map(|p| p.default.as_ref()).for_each(|x| self.expr(x));
+        self.expr(&d.body);
+        self.unbind(b);
+    }
+
+    fn expr(&mut self, e: &Expr) {
+        match e {
+            Expr::Ident(n, _) => {
+                if self.hides(n.as_str()) {
+                    self.reads.insert(e as *const Expr);
+                }
+            }
+            Expr::Lambda(d) => self.func(d),
+            Expr::For(p, it, body, _) => {
+                self.expr(it);
+                let mut ns = Vec::new();
+                pattern_names(p, &mut ns);
+                let b = self.bind(ns);
+                self.expr(body);
+                self.unbind(b);
+            }
+            Expr::Match(subj, arms, _) => {
+                self.expr(subj);
+                for a in arms {
+                    let mut ns = Vec::new();
+                    pattern_names(&a.pat, &mut ns);
+                    let b = self.bind(ns);
+                    if let Some(g) = &a.guard {
+                        self.expr(g);
+                    }
+                    self.expr(&a.body);
+                    self.unbind(b);
+                }
+            }
+            Expr::Block(stmts) => self.block(stmts, true),
+            _ => self.children(e),
+        }
+    }
+
+    /// A block's statements; its `let`s and `fn`s bind where `binds` (the component's own body's
+    /// are the component's).
+    fn block(&mut self, stmts: &[Stmt], binds: bool) {
+        let mut bound = Vec::new();
+        for st in stmts {
+            match st {
+                Stmt::Let(p, x, _) => {
+                    self.expr(x);
+                    if binds {
+                        let mut ns = Vec::new();
+                        pattern_names(p, &mut ns);
+                        bound.extend(self.bind(ns));
+                    }
+                }
+                Stmt::Assign(n, _, x, _) => {
+                    self.expr(x);
+                    if self.hides(n.as_str()) {
+                        self.sets.insert(st as *const Stmt);
+                    }
+                }
+                Stmt::Fn(d) => {
+                    if binds {
+                        bound.extend(self.bind(vec![d.name.clone()]));
+                    }
+                    self.func(d);
+                }
+                Stmt::State(_, x, _) | Stmt::Expr(x) | Stmt::Return(Some(x), _) => self.expr(x),
+                Stmt::SetField(o, _, _, x, _) => {
+                    self.expr(o);
+                    self.expr(x);
+                }
+                _ => {}
+            }
+        }
+        self.unbind(bound);
+    }
+
+    fn children(&mut self, e: &Expr) {
+        match e {
+            Expr::Lit(_) | Expr::Ident(..) | Expr::Lambda(_) | Expr::For(..) | Expr::Match(..) | Expr::Block(_) => {}
+            Expr::Template(parts) => {
+                for p in parts {
+                    if let TPart::Expr(x) = p {
+                        self.expr(x);
+                    }
+                }
+            }
+            Expr::List(xs) => xs.iter().for_each(|x| self.expr(x)),
+            Expr::Map(es) => es.iter().for_each(|(_, x)| self.expr(x)),
+            Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => self.expr(x),
+            Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) | Expr::Pipe(a, b, _) | Expr::Index(a, b, _) | Expr::While(a, b, _) => {
+                self.expr(a);
+                self.expr(b);
+            }
+            Expr::Call(c, args, _) => {
+                self.expr(c);
+                args.iter().for_each(|x| self.expr(x));
+            }
+            Expr::If(c, a, b) => {
+                self.expr(c);
+                self.expr(a);
+                if let Some(b) = b {
+                    self.expr(b);
+                }
+            }
+            Expr::Reply(a, b, _) => {
+                self.expr(a);
+                if let Some(b) = b {
+                    self.expr(b);
+                }
+            }
+            Expr::Html(el, _) => self.html(el),
+        }
+    }
+
+    fn html(&mut self, el: &HtmlEl) {
+        if let Some(id) = &el.id {
+            self.expr(id);
+        }
+        el.classes.iter().for_each(|c| self.expr(c));
+        for (_, v) in &el.attrs {
+            if let AttrVal::Expr(x) | AttrVal::Spread(x) = v {
+                self.expr(x);
+            }
+        }
+        for c in &el.children {
+            match c {
+                HtmlChild::El(x) => self.html(x),
+                HtmlChild::Expr(x) => self.expr(x),
+            }
+        }
+    }
 }
 
 /// The names a route binds: its path's parameters, its patterns' names, `request`, and what its
@@ -2293,6 +2658,9 @@ pub struct Local {
 #[derive(Default, Debug)]
 pub struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
+    /// A program's own types, as a service's check gives them to the program calling it
+    /// (`SERVICE_RECORDS`; FEEDBACK87.md, Q-1370, found in review; branch feedback86-89).
+    pub(crate) records: HashMap<String, Arc<TypeDef>>,
     /// Where else a warning is about, by its file and line: a GET write said once for the routes
     /// that do it, each route's file, line and name, for an editor's `relatedInformation`
     /// (FEEDBACK70.md, Q-965, second review; branch security).
@@ -2465,6 +2833,7 @@ struct Reached {
     seen: Seen,
     next: Vec<Next>,
 }
+
 
 /// A function's code, in the order it runs (`Checker::ordered_fn`): the first change it makes and
 /// the first question it asks, as `quillo check` says them, and the questions it asks after a
@@ -2699,6 +3068,8 @@ fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: Hash
         HELD.with(|h| h.set(held));
         UNTAKEN.with(|u| u.borrow_mut().clear());
         UNREAD.with(|u| u.borrow_mut().clear());
+        SERVICES_CHECKED.with(|s| s.borrow_mut().clear());
+        SERVICE_RECORDS.with(|s| s.borrow_mut().clear());
     }
     // A mounted program's types are its own.
     let outer_records = RECORDS.with(|r| std::mem::take(&mut *r.borrow_mut()));
@@ -2716,6 +3087,8 @@ fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: Hash
     if outermost {
         DEADLINE.with(|d| d.set(None));
         CONFINED.with(|c| c.set(false));
+        SERVICES_CHECKED.with(|s| s.borrow_mut().clear());
+        SERVICE_RECORDS.with(|s| s.borrow_mut().clear());
         // What a start refuses under a hold, and, where it found nothing, that these files were
         // read: their start does not read them again (`untaken_at_load`).
         a.untaken = UNTAKEN.with(|u| std::mem::take(&mut *u.borrow_mut()));
@@ -2761,6 +3134,9 @@ fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: Hash
         let shown = Path::new(file).parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(|| crate::pwa::FILE.to_string(), |p| p.join(crate::pwa::FILE).display().to_string());
         a.diagnostics.extend(crate::pwa::check(base_dir, &shown));
     }
+    if !outermost {
+        a.records = RECORDS.with(|r| r.borrow().clone());
+    }
     RECORDS.with(|r| *r.borrow_mut() = outer_records);
     DEPTH.with(|d| d.set(d.get() - 1));
     a
@@ -2768,6 +3144,7 @@ fn check_source_budgeted(src: &str, file: &str, base_dir: &Path, overrides: Hash
 
 fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<PathBuf, String>, opts: Options) -> Analysis {
     let mut c = Checker::new(file);
+    c.main_key = std::fs::canonicalize(file).ok();
     c.strict_null = opts.strict_null;
     c.confined = opts.confined;
     c.held = HELD.with(|h| h.get());
@@ -2799,6 +3176,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
             }
             let mut order = Vec::new();
             c.expand(stmts, main, &src_dir, &mut seen, &mut order);
+            c.services_read();
             // A script beside an app is not the app (FEEDBACK72.md, Q-1012; branch feedback72-81).
             let serves = serves_pages(&order);
             let mut focus = Vec::new();
@@ -2839,6 +3217,8 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
                     .collect()
             };
             c.run(order);
+            c.server_fn_redirects();
+            c.loading_reads_said();
             c.unused_said();
             c.value_comments_said(&consts);
             c.state_details();
@@ -2915,6 +3295,30 @@ struct Var {
     used: bool,
     /// For globals: defined by the time top-level code reaches this point.
     ready: bool,
+    /// Where a binding of a block, a function or a lambda was declared (`Resolve`), 0 for the
+    /// program's: what its tables are kept by (`Bid`), never its name alone (FEEDBACK89.md, Q-1390,
+    /// and FEEDBACK88.md, Q-1380, found in review; branch feedback86-89).
+    decl: usize,
+}
+
+/// A binding, for the tables kept of one (`fail_lets`, `loading_states`, `aliases`, `lit_bindings`,
+/// `lambda_bindings`, by the binding alone) with its name: a local one by where it is declared, the program's by its file
+/// and line, as the language reaches it by name across files (FEEDBACK89.md, Q-1390, and
+/// FEEDBACK88.md, Q-1380, found in review; branch feedback86-89).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Bid {
+    Local(usize),
+    Global(Arc<str>, u32),
+}
+
+type BKey = (Bid, String);
+
+fn bid(v: &Var) -> Bid {
+    if v.decl != 0 {
+        Bid::Local(v.decl)
+    } else {
+        Bid::Global(v.file.clone(), v.line)
+    }
 }
 
 /// An unknown name in a function: where, the error said if nothing defines it, and how many
@@ -2964,6 +3368,18 @@ struct FnCtx {
     /// What the function gives back other than at the end of its body:
     /// values of `return`, and the errors `?` passes on.
     exits: T,
+}
+
+/// One test a `let` holds (`Checker::aliases`): as written, the way it holds there (true or
+/// false), and the names it reads, each with where the binding it meant was declared (FEEDBACK89.md,
+/// Q-1390, and FEEDBACK88.md, Q-1380, found in review; branch feedback86-89).
+struct HeldTest {
+    test: Expr,
+    way: bool,
+    names: Vec<(String, Bid)>,
+    /// Whether it tells an error apart (`is_err`, `type_of`, `.error`, `error(...)`), worked out
+    /// once (found in review).
+    errors: bool,
 }
 
 /// One statement of the program, in the order the top level runs them.
@@ -3016,6 +3432,87 @@ struct Checker {
     /// fn declared `! str`), by where each is declared: shown in markup as they are, they may show
     /// an error value (FEEDBACK81.md, Q-1272; branch feedback72-81).
     failing_vars: HashSet<(Arc<str>, u32, String)>,
+    /// The `let`s and `state`s set from a call whose signature says it may give an error (a
+    /// function declared `-> T ! E`, a service's), by where each is declared, with the call as
+    /// written, `invoice(...)`; and the names a `match` being read takes as its value: a field read
+    /// on one before the error is taken out is said (`read_past_error`; FEEDBACK89.md, Q-1390;
+    /// branch feedback86-89).
+    fail_lets: HashMap<BKey, (String, bool)>,
+    /// What the code around tests: each name, and whether for an error too (a `match` on it, a
+    /// function given it whole in a condition) or only for null (a loading state's, FEEDBACK88.md,
+    /// Q-1380).
+    matching: Vec<(String, Bid, bool)>,
+    /// The component states a server fn loads, `state trail = load_trail(id)`, by where each is
+    /// declared, with the server fn: null in the browser until it answers (`loading_read`;
+    /// FEEDBACK88.md, Q-1380; branch feedback86-89).
+    loading_states: HashMap<BKey, String>,
+    /// Each read of one where null fails, to be said if another component makes the one it is in:
+    /// the file, the line, the component, and what to say before and after its maker's name.
+    loading_reads: Vec<(Arc<str>, u32, String, String, String)>,
+    /// The server fns a component calls, each with the first component seen calling it, for
+    /// `redirect` in one (`server_fn_redirects`; FEEDBACK88.md, Q-1381; branch feedback86-89).
+    component_server_calls: HashMap<String, String>,
+    /// The names `bind:` gives in the component being read, for `run_once_states` (FEEDBACK86.md,
+    /// Q-1361; branch feedback86-89).
+    bound_here: HashSet<String>,
+    /// How many `??`s' left sides are being read: a field read there that fails is taken by the
+    /// `??` (`read_past_error`; FEEDBACK89.md, Q-1390, found in review; branch feedback86-89).
+    fallback_left: u32,
+    /// A component's states some code assigns, read as true or false (`unread && <span/>`): said
+    /// once the component is read, with the type its first value and each assignment give it
+    /// (`state_types`), as for one nothing assigns (FEEDBACK90.md, Q-1400; branch feedback86-89).
+    /// With `||`, what its fallback said of the value's kind, as 0.8.11 read it (`fallback_says`).
+    truth_later: Vec<(Arc<str>, u32, Expr, Truth, (Arc<str>, u32, String), T)>,
+    /// The `let`s that hold a test of one of `fail_lets` or `loading_states`, by where each is
+    /// declared, with the test (`alias_of`; FEEDBACK89.md, Q-1390, and FEEDBACK88.md, Q-1380;
+    /// branch feedback86-89). And how deep `facts` reads through them.
+    /// Each is kept as the tests it holds, flattened through `!`, `&&`, `||` and the `let`s it
+    /// names, as indexes into `held_tests`, for where it is true and where false: shared, never
+    /// copied, each test read once where it is written, with the bindings of the names it reads;
+    /// a use reads each against the types there, where those names still mean what they meant
+    /// (found in review: a `let` of four others, each of four more, was read 4^k times; a `let`
+    /// that rebinds a name read itself again; a big test was copied into each `let` that named it).
+    aliases: HashMap<BKey, std::rc::Rc<(Vec<usize>, Vec<usize>)>>,
+    held_tests: Vec<HeldTest>,
+    held_index: HashMap<String, usize>,
+    /// What each declaration of a block, a function or a lambda is assigned, by where it is
+    /// declared and its name (`Resolve`): 0 nothing, 1 `+=` or `-=` alone, 2 `=`; and the names a
+    /// closure assigns that no declaration in reach has, each binding of which is taken as assigned
+    /// (found in review: `ok = true` in another function, or a lambda's own `ok`, turned this one's
+    /// `ok` off; FEEDBACK89.md, Q-1390 and Q-1392; branch feedback86-89).
+    binds: HashMap<usize, u8, crate::value::BuildFx>,
+    loose: HashSet<String>,
+    /// The names assigned where no declaration in reach has them, `=name` too: the program's.
+    top_assigned: HashSet<String>,
+    /// The declaration the next `define` makes, and a number for one `Resolve` does not know.
+    next_decl: usize,
+    fresh_decl: usize,
+    /// The binding of the name `ident` read last, 0 for the program's, and its kind.
+    last_ident: (usize, Kind),
+    /// The calls of a name of a block, a function or a lambda, by where the callee is written: the
+    /// lambda its binding holds, which nothing assigns again, or none (`reach_call`; FEEDBACK89.md,
+    /// Q-1392, found in review: a local `send` was read as the program's `send`).
+    local_calls: HashMap<usize, Option<Arc<FnDef>>, crate::value::BuildFx>,
+    /// The `let`s that hold a lambda nothing assigns again, by where each is declared: what an
+    /// `idempotent` run calls through them (`idempotent_site`; FEEDBACK89.md, Q-1392, found in
+    /// review; branch feedback86-89).
+    lambda_bindings: HashMap<Bid, Arc<FnDef>>,
+    alias_depth: std::cell::Cell<u32>,
+    /// The tests read through them in all: past the check's budget, none (FEEDBACK89.md, Q-1390,
+    /// found in review; branch feedback86-89).
+    alias_work: std::cell::Cell<usize>,
+    /// The `let`s, the top level's too, that hold text, null or a small map written out and that
+    /// nothing assigns again, by where each is declared: what a request is sent with, through the
+    /// binding its name has where it is sent (FEEDBACK89.md, Q-1392, found in review; branch
+    /// feedback86-89).
+    lit_bindings: HashMap<BKey, Expr>,
+    /// Each `http.*` call as the walk read it, by where it is written: the function, when it may
+    /// change another site with no key (`http_verdict`), for `idempotent_reaches_outside`.
+    http_verdicts: HashMap<usize, Option<String>>,
+    /// This program's main file, as `SERVICE_RECORDS` keys a service by it.
+    main_key: Option<PathBuf>,
+    /// The services `expand` met, checked once the program is read (`services_read`).
+    services_pending: Vec<(String, Option<String>, String, bool, Arc<str>, u32, PathBuf, Vec<Arc<FnDef>>)>,
     /// `can_fail` of each function asked, by `def_key`: asked of each call dropped or shown, it
     /// walked the function's body each time (FEEDBACK72.md, Q-1018; branch feedback72-81).
     fails: std::cell::RefCell<HashMap<usize, bool>>,
@@ -3134,6 +3631,9 @@ struct Checker {
     /// What each function's own code and each record's defaults were found to do, read once a
     /// check however many tools reach them, and how many were read (found in review).
     reached_fns: std::cell::RefCell<HashMap<usize, Arc<Reached>>>,
+    /// What each function (by `def_key`) or type (by name) reaches in all, once worked out
+    /// (`reach_all`).
+    reached_all: std::cell::RefCell<HashMap<(usize, String), Seen>>,
     reached_types: std::cell::RefCell<HashMap<String, Arc<Reached>>>,
     /// Of each function a tool that asks reaches, in the order its code runs: what it changes
     /// and asks first, and the questions it asks after a change (FEEDBACK56.md, Part E; branch
@@ -3141,7 +3641,7 @@ struct Checker {
     ordered: std::cell::RefCell<HashMap<usize, Arc<Ordered>>>,
     /// Each `idempotent(f)` that runs `f` in its transaction: where, and `f`, read once every
     /// body is known (`idempotent_reaches_outside`).
-    idempotent_at: Vec<(Arc<str>, u32, Arc<FnDef>)>,
+    idempotent_at: Vec<(Arc<str>, u32, Vec<Arc<FnDef>>)>,
     walked: std::cell::Cell<usize>,
     /// What "did you mean" measured in this check (`suggest`), and the names' lower case it keeps.
     suggested: std::cell::Cell<u64>,
@@ -3302,18 +3802,43 @@ impl Checker {
             let sig = Arc::new(Sig::builtin(name, params, ret));
             globals.insert(
                 name.to_string(),
-                Var { t: T::of(FN), sig: Some(sig), file: builtin_file.clone(), line: 0, kind: Kind::Global, used: true, ready: true },
+                Var { t: T::of(FN), sig: Some(sig), file: builtin_file.clone(), line: 0, kind: Kind::Global, used: true, ready: true, decl: 0 },
             );
         }
         for m in MODULES {
             globals.insert(
                 m.to_string(),
-                Var { t: T::of(MAP), sig: None, file: builtin_file.clone(), line: 0, kind: Kind::Global, used: true, ready: true },
+                Var { t: T::of(MAP), sig: None, file: builtin_file.clone(), line: 0, kind: Kind::Global, used: true, ready: true, decl: 0 },
             );
         }
         Checker {
             page_lets: Vec::new(),
             failing_vars: HashSet::new(),
+            fail_lets: HashMap::new(),
+            matching: Vec::new(),
+            loading_states: HashMap::new(),
+            loading_reads: Vec::new(),
+            component_server_calls: HashMap::new(),
+            bound_here: HashSet::new(),
+            fallback_left: 0,
+            truth_later: Vec::new(),
+            aliases: HashMap::new(),
+            held_tests: Vec::new(),
+            held_index: HashMap::new(),
+            binds: HashMap::default(),
+            loose: HashSet::new(),
+            top_assigned: HashSet::new(),
+            next_decl: 0,
+            fresh_decl: 0,
+            last_ident: (0, Kind::Global),
+            local_calls: HashMap::default(),
+            lambda_bindings: HashMap::new(),
+            alias_depth: std::cell::Cell::new(0),
+            alias_work: std::cell::Cell::new(0),
+            lit_bindings: HashMap::new(),
+            http_verdicts: HashMap::new(),
+            main_key: None,
+            services_pending: Vec::new(),
             fails: Default::default(),
             makes_errors: Default::default(),
             component_assigned: HashMap::new(),
@@ -3364,6 +3889,7 @@ impl Checker {
             service_files: HashMap::new(),
             service_closed: Default::default(),
             reached_fns: Default::default(),
+            reached_all: Default::default(),
             ordered: Default::default(),
             idempotent_at: Vec::new(),
             reached_types: Default::default(),
@@ -3598,57 +4124,10 @@ impl Checker {
                         self.services.entry(name.clone()).or_default();
                     }
                     Err(e) => self.diag_at(file.clone(), *line, Severity::Error, e),
-                    Ok(defs) => {
-                        // Called from here: what it takes and gives, as declared.
-                        let sigs = defs
-                            .iter()
-                            .map(|d| {
-                                let mut sig = Sig::of_def(d);
-                                sig.def = None;
-                                sig.server = false;
-                                sig.effects = Some(crate::ast::effect_bit("http"));
-                                (d.name.clone(), Arc::new(sig))
-                            })
-                            .collect();
-                        self.services.insert(name.clone(), sigs);
-                        // A program of its own: checked alone (once, as services may use each other).
-                        let key = full.canonicalize().unwrap_or_else(|_| full.clone());
-                        let first = SERVICE_CHECKS.with(|c| c.borrow_mut().insert(key.clone()));
-                        // Read again only when a tool calls it (`service_stays_inside`).
-                        self.service_files.insert(name.clone(), full.clone());
-                        if first {
-                            let sub = check_file_opts(&full, HashMap::new(), self.options());
-                            SERVICE_CHECKS.with(|c| c.borrow_mut().remove(&key));
-                            // `service mcp /billing`: billing's own tools are this program's too,
-                            // as `billing.<name>`, a name MCP allows (FEEDBACK56.md, Part F, B.1;
-                            // branch feedback56). Not those of a service billing offers in turn.
-                            if *mcp && !self.out.service_tools.iter().any(|s| s.name == *name) {
-                                if sub.tools.is_empty() {
-                                    self.diag_at(file.clone(), *line, Severity::Warning, format!(
-                                        "`service mcp`: {} has no tools (`fn mcp name(...)`), so none of it is offered to AI clients here; `service {}` serves it as this does",
-                                        path, prefix.as_deref().unwrap_or("")
-                                    ));
-                                }
-                                for t in &sub.tools {
-                                    let joined = format!("{}.{}", name, t.def.name);
-                                    if joined.chars().count() > 128 {
-                                        self.diag_at(file.clone(), *line, Severity::Error, format!(
-                                            "a tool's name is 1 to 128 of A-Z, a-z, 0-9, `_`, `-` and `.`, as MCP allows: {}'s tool `{}` is offered here as `{}`, {} characters",
-                                            name, t.def.name, joined, joined.chars().count()
-                                        ));
-                                    }
-                                }
-                                self.out.service_tools.push(ServiceTools { name: name.clone(), tools: sub.tools.clone(), types: sub.types.clone() });
-                            }
-                            self.out.diagnostics.extend(sub.diagnostics);
-                            if let Some(prefix) = prefix {
-                                self.out.symbols.extend(sub.symbols.into_iter().filter(|s| s.kind == SymbolKind::Route).map(|mut s| {
-                                    s.name = s.name.replacen(' ', &format!(" {}", prefix), 1);
-                                    s
-                                }));
-                            }
-                        }
-                    }
+                    // Checked once the whole program is read, its types and the `use`s after this line
+                    // too (`services_read`; found in review of FEEDBACK89.md's Q-1393; branch
+                    // feedback86-89).
+                    Ok(defs) => self.services_pending.push((name.clone(), prefix.clone(), path.clone(), *mcp, file.clone(), *line, full.clone(), defs)),
                 }
                 order.push(Item { stmt: s.clone(), file: file.clone() });
                 continue;
@@ -3872,6 +4351,88 @@ impl Checker {
     /// For every form: a file taken whole, whose names are not known, and a Rust one, where
     /// only `import x.qwe use name` was, and a near file of any of the program's kinds
     /// (FEEDBACK55.md, Q-819; branch feedback55).
+    /// The services the program declares, checked once all of it is read (`expand` keeps them):
+    /// this program's types, whole, are given first to one that calls back into it while it is still
+    /// being checked, a type a `use` after the `service` line brings among them (found in review;
+    /// FEEDBACK87.md, Q-1370, and FEEDBACK89.md, Q-1393; branch feedback86-89).
+    #[allow(clippy::type_complexity)]
+    fn services_read(&mut self) {
+        let pending = std::mem::take(&mut self.services_pending);
+        if pending.is_empty() {
+            return;
+        }
+        if let Some(me) = self.main_key.clone() {
+            let mine = RECORDS.with(|r| r.borrow().clone());
+            SERVICE_RECORDS.with(|c| c.borrow_mut().insert(me, Arc::new(mine)));
+        }
+        for (name, prefix, path, mcp, file, line, full, defs) in pending {
+            let (name, prefix, path, mcp, line) = (&name, &prefix, &path, &mcp, &line);
+            // A program of its own: checked alone (once, as services may use each other).
+            let key = full.canonicalize().unwrap_or_else(|_| full.clone());
+            // Checked already in this run, from another program of the app: not again,
+            // unless what it offers here is wanted from its check (its tools, its
+            // routes under a prefix), whose diagnostics were said (FEEDBACK89.md,
+            // Q-1393; branch feedback86-89).
+            let again = SERVICES_CHECKED.with(|c| !c.borrow_mut().insert(key.clone()));
+            let first = !(again && !*mcp && prefix.is_none()) && SERVICE_CHECKS.with(|c| c.borrow_mut().insert(key.clone()));
+            // Read again only when a tool calls it (`service_stays_inside`).
+            self.service_files.insert(name.clone(), full.clone());
+            if first {
+                let sub = check_file_opts(&full, HashMap::new(), self.options());
+                SERVICE_CHECKS.with(|c| c.borrow_mut().remove(&key));
+                SERVICE_RECORDS.with(|c| c.borrow_mut().insert(key.clone(), Arc::new(sub.records.clone())));
+                // `service mcp /billing`: billing's own tools are this program's too,
+                // as `billing.<name>`, a name MCP allows (FEEDBACK56.md, Part F, B.1;
+                // branch feedback56). Not those of a service billing offers in turn.
+                if *mcp && !self.out.service_tools.iter().any(|s| s.name == *name) {
+                    if sub.tools.is_empty() {
+                        self.diag_at(file.clone(), *line, Severity::Warning, format!(
+                            "`service mcp`: {} has no tools (`fn mcp name(...)`), so none of it is offered to AI clients here; `service {}` serves it as this does",
+                            path, prefix.as_deref().unwrap_or("")
+                        ));
+                    }
+                    for t in &sub.tools {
+                        let joined = format!("{}.{}", name, t.def.name);
+                        if joined.chars().count() > 128 {
+                            self.diag_at(file.clone(), *line, Severity::Error, format!(
+                                "a tool's name is 1 to 128 of A-Z, a-z, 0-9, `_`, `-` and `.`, as MCP allows: {}'s tool `{}` is offered here as `{}`, {} characters",
+                                name, t.def.name, joined, joined.chars().count()
+                            ));
+                        }
+                    }
+                    self.out.service_tools.push(ServiceTools { name: name.clone(), tools: sub.tools.clone(), types: sub.types.clone() });
+                }
+                if !again {
+                    self.out.diagnostics.extend(sub.diagnostics);
+                }
+                if let Some(prefix) = prefix {
+                    self.out.symbols.extend(sub.symbols.into_iter().filter(|s| s.kind == SymbolKind::Route).map(|mut s| {
+                        s.name = s.name.replacen(' ', &format!(" {}", prefix), 1);
+                        s
+                    }));
+                }
+            }
+            // Called from here: what it takes and gives, as declared, in the service's
+            // own types, not this program's of the same names; one not read yet (it is
+            // being checked up the stack) has none, and what names a type is anything
+            // (FEEDBACK87.md, Q-1370, found in review; branch feedback86-89).
+            let own = SERVICE_RECORDS.with(|c| c.borrow().get(&key).map(|r| (**r).clone())).unwrap_or_default();
+            let here = RECORDS.with(|r| std::mem::replace(&mut *r.borrow_mut(), own));
+            let sigs = defs
+                .iter()
+                .map(|d| {
+                    let mut sig = Sig::of_def(d);
+                    sig.def = None;
+                    sig.server = false;
+                    sig.effects = Some(crate::ast::effect_bit("http"));
+                    (d.name.clone(), Arc::new(sig))
+                })
+                .collect();
+            RECORDS.with(|r| *r.borrow_mut() = here);
+            self.services.insert(name.clone(), sigs);
+        }
+    }
+
     fn missing_file(&mut self, file: &Arc<str>, line: u32, path: &str, full: &Path, names: Option<&[(String, String)]>, e: std::io::Error) {
         let k = self.key_of(file);
         match names {
@@ -3938,20 +4499,31 @@ impl Checker {
     }
 
     fn run(&mut self, order: Vec<Item>) {
+        // What each assignment changes, by its declaration (`Resolve`; FEEDBACK89.md, Q-1390, found
+        // in review; branch feedback86-89), and every name assigned.
+        let mut res = Resolve::new(&order);
         for it in &order {
             // A component's own, kept apart too, for `let_not_state` (FEEDBACK80.md, Q-1268; branch
             // feedback72-81).
             match &it.stmt {
                 Stmt::Fn(d) if d.component => {
-                    let mut own = HashSet::new();
-                    collect_assigned(std::slice::from_ref(&it.stmt), &mut own);
-                    self.assigned.extend(own.iter().cloned());
+                    let all = std::mem::take(&mut res.names);
+                    let all_set = std::mem::take(&mut res.set_names);
+                    res.item(&it.stmt);
+                    let own = std::mem::replace(&mut res.names, all);
+                    res.set_names = all_set;
+                    res.names.extend(own.iter().cloned());
                     self.component_assigned.insert(def_key(d), own);
                 }
-                _ => collect_assigned(std::slice::from_ref(&it.stmt), &mut self.assigned),
+                _ => res.item(&it.stmt),
             }
             global_assigned(std::slice::from_ref(&it.stmt), &mut self.assigned_globals);
         }
+        self.assigned.extend(std::mem::take(&mut res.names));
+        self.binds = std::mem::take(&mut res.binds);
+        self.loose = std::mem::take(&mut res.loose);
+        self.top_assigned = std::mem::take(&mut res.top);
+        drop(res);
         // `let theme = css`...``, and a name or a `+` of such, never changed: what CSS joined from
         // it holds, as far as eight rounds find (FEEDBACK72.md, Q-1017; branch feedback72-81).
         for _ in 0..8 {
@@ -4018,12 +4590,12 @@ impl Checker {
                 detail = format!("{}\n\n{}", detail, e.doc);
             }
             self.out.symbols.push(Symbol { name: e.name.clone(), kind: SymbolKind::Function, file: file.to_string(), line: e.line, detail });
-            self.globals.insert(e.name.clone(), Var { t: T::of(FN), sig: Some(Arc::new(sig)), file, line: e.line, kind: Kind::Global, used: true, ready: true });
+            self.globals.insert(e.name.clone(), Var { t: T::of(FN), sig: Some(Arc::new(sig)), file, line: e.line, kind: Kind::Global, used: true, ready: true, decl: 0 });
         }
         for (name, src, file, line) in std::mem::take(&mut self.js_libs) {
             let detail = format!("{}  (JavaScript, in the browser: {})", name, src);
             self.out.symbols.push(Symbol { name: name.clone(), kind: SymbolKind::Variable, file: file.to_string(), line, detail });
-            self.globals.insert(name, Var { t: T::of(ANY), sig: None, file, line, kind: Kind::Global, used: true, ready: true });
+            self.globals.insert(name, Var { t: T::of(ANY), sig: None, file, line, kind: Kind::Global, used: true, ready: true, decl: 0 });
         }
         // The types that name themselves with nothing between (`type Ab = Ab | int`): a value of
         // one could be anything, so each is an error, found once over the definitions; the
@@ -4062,13 +4634,13 @@ impl Checker {
                     let sig = Arc::new(Sig::of_def(d));
                     self.globals.insert(
                         d.name.clone(),
-                        Var { t: T::of(FN), sig: Some(sig), file: it.file.clone(), line: d.line, kind: Kind::Global, used: false, ready: false },
+                        Var { t: T::of(FN), sig: Some(sig), file: it.file.clone(), line: d.line, kind: Kind::Global, used: false, ready: false, decl: 0 },
                     );
                 }
                 Stmt::Service(name, _, _, _, line, _) => {
                     self.globals.insert(
                         name.clone(),
-                        Var { t: T::of(MAP), sig: None, file: it.file.clone(), line: *line, kind: Kind::Global, used: true, ready: false },
+                        Var { t: T::of(MAP), sig: None, file: it.file.clone(), line: *line, kind: Kind::Global, used: true, ready: false, decl: 0 },
                     );
                 }
                 Stmt::Type(td) => {
@@ -4094,6 +4666,7 @@ impl Checker {
                             kind: Kind::Global,
                             used: true,
                             ready: true,
+                            decl: 0,
                         },
                     );
                 }
@@ -4101,7 +4674,7 @@ impl Checker {
                     self.defines(n, &it.file, *line, false);
                     self.globals.insert(
                         n.clone(),
-                        Var { t: T::ANY, sig: None, file: it.file.clone(), line: *line, kind: Kind::PageState, used: false, ready: false },
+                        Var { t: T::ANY, sig: None, file: it.file.clone(), line: *line, kind: Kind::PageState, used: false, ready: false, decl: 0 },
                     );
                 }
                 Stmt::Let(p, _, line) => {
@@ -4114,7 +4687,7 @@ impl Checker {
                         }
                         self.globals.insert(
                             n,
-                            Var { t: T::ANY, sig: None, file: it.file.clone(), line: *line, kind: Kind::Global, used: false, ready: false },
+                            Var { t: T::ANY, sig: None, file: it.file.clone(), line: *line, kind: Kind::Global, used: false, ready: false, decl: 0 },
                         );
                     }
                 }
@@ -4174,7 +4747,7 @@ impl Checker {
                     let mut binds = Vec::new();
                     self.bind_pattern(p, t, &mut binds);
                     self.keep_component(p, e, &mut binds);
-                    self.keep_lambda(p, e, &mut binds);
+                    self.keep_lambda(p, e, &mut binds, 0);
                     // What text a global holds, for the SQL warning in the
                     // functions that use it; one reassigned anywhere holds
                     // nothing known.
@@ -4192,9 +4765,27 @@ impl Checker {
                             }
                         }
                     }
+                    // Text or a small map written out, for what a request is sent with, and a test kept
+                    // as `let`s inside functions are (`http_verdict`, `note_alias`; FEEDBACK89.md,
+                    // Q-1392 and Q-1390, found in review; branch feedback86-89).
+                    if let Pattern::Bind(n) = p {
+                        if !self.decl_reassigned(0, n.as_str()) && (matches!(e, Expr::Lit(Lit::Str(_) | Lit::Nil)) || matches!(e, Expr::Map(m) if m.len() <= 16)) {
+                            self.lit_bindings.insert((Bid::Global(it.file.clone(), *line), n.to_string()), e.clone());
+                        }
+                        let reassigned = self.decl_reassigned(0, n.as_str());
+                        self.note_alias(n.as_str(), e, t, Bid::Global(it.file.clone(), *line), reassigned);
+                    }
                     for (n, t, sig) in binds {
-                        let reassigned = self.assigned.contains(&n);
-                        self.note_first_t(&it.file, *line, &n, t);
+                        let how = self.decl_assigned(0, &n);
+                        let reassigned = how != 0;
+                        self.note_first_t(&it.file, *line, &n, t, how);
+                        // Set from a call whose signature says it may give an error (FEEDBACK89.md,
+                        // Q-1390; branch feedback86-89).
+                        if !reassigned && matches!(p, Pattern::Bind(_)) && t.bits & ERR != 0 && !t.vague() {
+                            if let Some(c) = self.declared_failing(e) {
+                                self.fail_lets.insert((Bid::Global(it.file.clone(), *line), n.clone()), c);
+                            }
+                        }
                         if let Some(g) = self.globals.get_mut(&n) {
                             g.ready = true;
                             if g.file == it.file && g.line == *line {
@@ -4344,21 +4935,109 @@ impl Checker {
         ToolFacts { def: d.clone(), file: file.to_string(), effects: r.effects, uncertain: r.uncertain, writes: r.writes, open: r.open, db: r.db, asks: r.asks, sure_writes: None }
     }
 
-    /// What `d`'s code does, with every function it names, each read once (`tool_facts`).
+    /// What `d`'s code does, with every function it names, each read once (`tool_facts`). What each
+    /// function reaches in all is kept once worked out, so a function many `idempotent`s or tools
+    /// reach is read through once a check (found in review: each site read all it reaches again,
+    /// sites times calls). One walk, with no recursion, that finds each group of functions that call
+    /// each other (Tarjan's): a group's all is worked out once and kept for each of them, so a
+    /// recursion costs what a chain does (found in review: past 200 calls deep, and in a cycle,
+    /// nothing was kept). A function's own reasons come first, then what it calls in the order it
+    /// is read from the end, as the walk before read them. Past the check's budget it stops.
     fn reach_all(&self, d: &Arc<FnDef>, top_lets: &HashSet<String>) -> Seen {
-        let mut r = Seen::default();
-        let mut todo = vec![Next::Fn(d.clone())];
-        let (mut seen, mut types) = (HashSet::new(), HashSet::new());
-        while let Some(next) = todo.pop() {
-            let local = match next {
-                Next::Fn(f) if seen.insert(def_key(&f)) => self.local_fn(&f, top_lets),
-                Next::Type(n) if types.insert(n.clone()) => self.local_type(&n, top_lets),
-                _ => continue,
-            };
-            r.join(&local.seen);
-            todo.extend(local.next.iter().cloned());
+        let key_of = |x: &Next| match x {
+            Next::Fn(f) => (def_key(f), String::new()),
+            Next::Type(n) => (0, n.clone()),
+        };
+        let root = Next::Fn(d.clone());
+        if let Some(r) = self.reached_all.borrow().get(&key_of(&root)) {
+            return r.clone();
         }
-        r
+        struct Open {
+            key: (usize, String),
+            local: Arc<Reached>,
+            /// How many of `local.next` are read, from the end.
+            read: usize,
+            low: usize,
+            acc: Seen,
+        }
+        let mut index: HashMap<(usize, String), usize> = HashMap::new();
+        // Read and not yet in a group done, and of those, the ones whose own walk is over.
+        let mut in_stack: HashSet<(usize, String)> = HashSet::new();
+        let mut on_stack: HashMap<(usize, String), Seen> = HashMap::new();
+        let mut stack: Vec<(usize, String)> = Vec::new();
+        let mut open: Vec<Open> = Vec::new();
+        let mut steps = 0usize;
+        let mut last = Seen::default();
+        let enter = |x: &Next, index: &mut HashMap<(usize, String), usize>, stack: &mut Vec<(usize, String)>, in_stack: &mut HashSet<(usize, String)>, open: &mut Vec<Open>| {
+            let key = key_of(x);
+            let n = index.len();
+            index.insert(key.clone(), n);
+            stack.push(key.clone());
+            in_stack.insert(key.clone());
+            let local = match x {
+                Next::Fn(f) => self.local_fn(f, top_lets),
+                Next::Type(t) => self.local_type(t, top_lets),
+            };
+            let acc = local.seen.clone();
+            open.push(Open { key, local, read: 0, low: n, acc });
+        };
+        enter(&root, &mut index, &mut stack, &mut in_stack, &mut open);
+        while let Some(top) = open.last_mut() {
+            steps += 1;
+            if budget_spent(steps) {
+                return top.acc.clone();
+            }
+            if top.read < top.local.next.len() {
+                let y = top.local.next[top.local.next.len() - 1 - top.read].clone();
+                top.read += 1;
+                let k = key_of(&y);
+                if let Some(r) = self.reached_all.borrow().get(&k) {
+                    top.acc.join(r);
+                    continue;
+                }
+                match index.get(&k) {
+                    // In the group being read: joined when the group is done.
+                    Some(&i) => {
+                        if in_stack.contains(&k) {
+                            top.low = top.low.min(i);
+                        }
+                    }
+                    None => enter(&y, &mut index, &mut stack, &mut in_stack, &mut open),
+                }
+                continue;
+            }
+            // Done with this one: its group, if it is the group's first, is done too.
+            let done = open.pop().expect("open");
+            let my = index[&done.key];
+            if done.low == my {
+                let mut all = done.acc;
+                let mut members = Vec::new();
+                while let Some(k) = stack.pop() {
+                    in_stack.remove(&k);
+                    if k == done.key {
+                        break;
+                    }
+                    if let Some(s) = on_stack.remove(&k) {
+                        all.join(&s);
+                    }
+                    members.push(k);
+                }
+                members.push(done.key);
+                for k in members {
+                    self.reached_all.borrow_mut().insert(k, all.clone());
+                }
+                if let Some(parent) = open.last_mut() {
+                    parent.acc.join(&all);
+                }
+                last = all;
+            } else {
+                if let Some(parent) = open.last_mut() {
+                    parent.low = parent.low.min(done.low);
+                }
+                on_stack.insert(done.key, done.acc);
+            }
+        }
+        last
     }
 
     /// One function's own code, read once a check.
@@ -4368,6 +5047,7 @@ impl Checker {
         }
         let (mut seen, mut next) = (Seen::default(), Vec::new());
         self.reach_def(f, top_lets, &mut seen, &mut next);
+        last_of_each(&mut next);
         self.walked.set(self.walked.get() + 1);
         let l = Arc::new(Reached { seen, next });
         self.reached_fns.borrow_mut().insert(def_key(f), l.clone());
@@ -4386,6 +5066,7 @@ impl Checker {
             next.extend(names.into_iter().map(Next::Type));
             let defaults: Vec<&Expr> = td.defaults.iter().map(|(_, e)| e).collect();
             self.reach_code(&defaults, top_lets, &mut seen, &mut next);
+            last_of_each(&mut next);
             self.walked.set(self.walked.get() + 1);
         }
         let l = Arc::new(Reached { seen, next });
@@ -4431,12 +5112,18 @@ impl Checker {
                     return;
                 }
                 match x {
-                    Expr::Call(callee, args, _) => self.reach_call(callee, args.first(), &local_fns, &mut called, r, todo),
+                    Expr::Call(callee, args, _) => {
+                        self.http_change(x, callee, None, args, r);
+                        self.reach_call(callee, args.first(), &local_fns, &mut called, r, todo)
+                    }
                     // `a | f(b)` calls `f(a, b)`: `a` is the statement of `"select ..." | db.query()`.
                     Expr::Pipe(lhs, rhs, _) => {
                         called.insert(&**rhs as *const Expr);
                         match &**rhs {
-                            Expr::Call(c, _, _) => self.reach_call(c, Some(lhs), &local_fns, &mut called, r, todo),
+                            Expr::Call(c, args, _) => {
+                                self.http_change(rhs, c, Some(lhs), args, r);
+                                self.reach_call(c, Some(lhs), &local_fns, &mut called, r, todo)
+                            }
                             other => self.reach_call(other, Some(lhs), &local_fns, &mut called, r, todo),
                         }
                     }
@@ -4534,7 +5221,13 @@ impl Checker {
             called.insert(callee as *const Expr);
         }
         match callee {
-            Expr::Ident(n, _) => self.reach_name(n, first, true, local_fns, r, todo),
+            // A name of a block, a function or a lambda where it is written: the lambda it holds, or
+            // what it is is not known; never the program's of that name (found in review).
+            Expr::Ident(n, _) => match self.local_calls.get(&(callee as *const Expr as usize)) {
+                Some(Some(d)) => todo.push(Next::Fn(d.clone())),
+                Some(None) => note(&mut r.uncertain, format!("`{}(...)` calls a parameter or a variable", n)),
+                None => self.reach_name(n, first, true, local_fns, r, todo),
+            },
             Expr::Field(obj, f, _) => match &**obj {
                 Expr::Ident(m, _) if self.module_named(m) => {
                     called.insert(&**obj as *const Expr);
@@ -4547,10 +5240,12 @@ impl Checker {
                     r.effects |= http;
                     self.reach_service(m, f, r);
                     // A change unless it is seen whole to write nothing, as a tool's question
-                    // after it is held to (FEEDBACK56.md, Part F, security review).
+                    // after it is held to (FEEDBACK56.md, Part F, security review). Not one for
+                    // `idempotent` to say: a call made in its run has an id made of the run's key and
+                    // its place in it, so a retry answers from the service's record (the user's
+                    // decision 2026-11-24; FEEDBACK89.md, Q-1392; branch feedback86-89).
                     if !self.service_fn(m, f).is_some_and(|x| x.sure && !x.writes) {
                         note(&mut r.writes, format!("calls `{}.{}`, a call of another program", m, f));
-                        r.elsewhere.push(format!("{}.{}", m, f));
                     }
                 }
                 Expr::Field(inner, later, _) if later == "later" && matches!(&**inner, Expr::Ident(s, _) if self.services.contains_key(s.as_str())) => {
@@ -4579,6 +5274,70 @@ impl Checker {
             Expr::Lambda(_) => {}
             _ => note(&mut r.uncertain, "calls a function an expression gives".to_string()),
         }
+    }
+
+    /// `http.post(...)`, `http.put`, `http.patch`, `http.delete`, and `http.request` with a method
+    /// other than GET, HEAD or OPTIONS (or one not known): a change at another site, which a retry of
+    /// an `idempotent` run sends again (`idempotent_reaches_outside`). As the walk read the call
+    /// (`http_verdict`); one it did not read, by what is written in place.
+    fn http_change(&self, at: &Expr, callee: &Expr, piped: Option<&Expr>, args: &[Expr], r: &mut Seen) {
+        let name = match self.http_verdicts.get(&(at as *const Expr as usize)) {
+            Some(v) => v.clone(),
+            None => self.http_judged(callee, piped, args, &|e: &Expr| (!matches!(e, Expr::Ident(..))).then(|| e.clone())),
+        };
+        if let Some(name) = name {
+            if !r.elsewhere.contains(&name) {
+                r.elsewhere.push(name);
+            }
+        }
+    }
+
+    /// `http_judged` of a call the walk reads (`at`), with what a name holds by its binding here, a
+    /// parameter's not known (FEEDBACK89.md, Q-1392, found in review; branch feedback86-89).
+    fn http_verdict(&mut self, at: &Expr, callee: &Expr, piped: Option<&Expr>, args: &[Expr]) {
+        let lit = |e: &Expr| match e {
+            Expr::Ident(n, _) => {
+                let v = self.binding(n)?;
+                if self.decl_reassigned(v.decl, n) {
+                    return None;
+                }
+                self.lit_bindings.get(&(bid(v), n.to_string())).cloned()
+            }
+            e => Some(e.clone()),
+        };
+        let v = self.http_judged(callee, piped, args, &lit);
+        self.http_verdicts.insert(at as *const Expr as usize, v);
+    }
+
+    /// The function of an `http.*` call that may change another site with no key: a writing method,
+    /// or `http.request` with a method not GET, HEAD or OPTIONS, or not known (`lit`: what an
+    /// argument surely is); not one that sends an `Idempotency-Key` header, in any case, nor one
+    /// whose headers are not known (a call's, a map spread in, a parameter): it may (the user's
+    /// decision 2026-11-24; FEEDBACK89.md, Q-1392; branch feedback86-89).
+    fn http_judged(&self, callee: &Expr, piped: Option<&Expr>, args: &[Expr], lit: &dyn Fn(&Expr) -> Option<Expr>) -> Option<String> {
+        let Expr::Field(obj, f, _) = callee else { return None };
+        if !matches!(&**obj, Expr::Ident(m, _) if m == "http") || !self.module_named("http") {
+            return None;
+        }
+        let given: Vec<&Expr> = piped.into_iter().chain(args.iter()).collect();
+        let headers_at = match f.as_str() {
+            "post" | "put" | "patch" => 2,
+            "delete" => 1,
+            "request" => {
+                let reads = given.first().and_then(|m| lit(m)).is_some_and(|m| matches!(&m, Expr::Lit(Lit::Str(m)) if matches!(m.to_ascii_uppercase().as_str(), "GET" | "HEAD" | "OPTIONS")));
+                if reads {
+                    return None;
+                }
+                3
+            }
+            _ => return None,
+        };
+        match given.get(headers_at).map(|h| lit(h)) {
+            None | Some(Some(Expr::Lit(Lit::Nil))) => {}
+            Some(Some(Expr::Map(entries))) if !entries.iter().any(|(k, _)| k.starts_with("...") || k.eq_ignore_ascii_case("idempotency-key")) => {}
+            _ => return None,
+        }
+        Some(format!("http.{}", f))
     }
 
     /// A call of the service `s`'s `f`: outside the program unless its code was read and stays
@@ -5083,8 +5842,8 @@ impl Checker {
     }
 
     /// A `let` only `+=` and `-=` change keeps its first value's type for them (Q-525).
-    fn note_first_t(&mut self, file: &Arc<str>, line: u32, name: &str, t: T) {
-        if self.assigned.contains(name) && !self.assigned.contains(&format!("={}", name)) && !t.vague() && t.bits & NIL == 0 {
+    fn note_first_t(&mut self, file: &Arc<str>, line: u32, name: &str, t: T, how: u8) {
+        if how == 1 && !t.vague() && t.bits & NIL == 0 {
             self.first_t.insert((file.clone(), line, name.to_string()), t);
         }
     }
@@ -5267,7 +6026,18 @@ impl Checker {
         }
         let url = std::mem::replace(&mut self.next_url, false);
         self.url_vars.push((self.scopes.len(), name.to_string(), url));
-        let v = Var { t, sig, file: self.file.clone(), line: self.line, kind, used: false, ready: true };
+        // A local binding by where it is declared (`Resolve`), or a number of its own where that is
+        // not known; the program's by name (FEEDBACK89.md, Q-1390, found in review; branch
+        // feedback86-89).
+        let decl = match std::mem::take(&mut self.next_decl) {
+            _ if self.scopes.is_empty() => 0,
+            0 => {
+                self.fresh_decl += 1;
+                usize::MAX - self.fresh_decl
+            }
+            d => d,
+        };
+        let v = Var { t, sig, file: self.file.clone(), line: self.line, kind, used: false, ready: true, decl };
         let read_before = kind == Kind::Let && self.read_before(name);
         match self.scopes.last_mut() {
             Some(s) => {
@@ -5473,8 +6243,10 @@ impl Checker {
     }
 
     fn ident(&mut self, name: &str) -> (T, Option<Arc<Sig>>) {
+        self.last_ident = (0, Kind::Global);
         match self.lookup(name) {
             Some(v) => {
+                self.last_ident = (v.decl, v.kind);
                 if v.kind == Kind::Global && !v.ready && self.sequential && self.fns.is_empty() {
                     // Another file's line says which file (FEEDBACK45.md, Q-523).
                     let at = if v.file == self.file {
@@ -5847,11 +6619,21 @@ impl Checker {
             self.define("request", request_t(), None, Kind::Bound);
         }
         self.params(d);
+        // What a view's or another component's markup binds is not this one's (found in review).
+        if d.component {
+            self.bound_here.clear();
+        }
         let t = self.expr(&d.body);
         self.check_return_expr(&d.body, t);
         if d.component {
             self.run_once_assignments(d);
+            self.run_once_states(d);
             self.let_not_state(d);
+            // Its loading states and what it binds are its own: the code read after it does not
+            // look them up (FEEDBACK86.md, Q-1361, and FEEDBACK88.md, Q-1380; branch feedback86-89).
+            self.loading_states.clear();
+            self.bound_here.clear();
+            self.truth_said();
         }
         if tool {
             let answer = t.union(self.fns.last().map_or(T::NEVER, |f| f.exits));
@@ -6120,6 +6902,11 @@ impl Checker {
     /// instead (FEEDBACK55.md, Q-764; branch feedback55).
     fn run_once_assignments(&mut self, d: &FnDef) {
         let Expr::Block(stmts) = &d.body else { return };
+        // A body made again whole when what it read changes (a `return` or `?` in it, or a `let` or
+        // a prop it assigns on a line of its own) runs such an assignment again each time, so it does
+        // follow: asked as the browser's code is made, and only of a body with one to say
+        // (FEEDBACK90.md, Q-1401; branch feedback86-89).
+        let mut again: Option<bool> = None;
         let mut changing: Vec<&str> = d.params.iter().map(|p| p.name.as_str()).collect();
         changing.extend(stmts.iter().filter_map(|st| if let Stmt::State(n, ..) = st { Some(n.as_str()) } else { None }));
         for st in stmts {
@@ -6135,6 +6922,9 @@ impl Checker {
                     }
                 }
             });
+            if read.is_some() && *again.get_or_insert_with(|| crate::client::runs_again_whole(&d.body)) {
+                return;
+            }
             if let Some(r) = read {
                 self.line = *line;
                 self.warn(format!(
@@ -6142,6 +6932,134 @@ impl Checker {
                     name, d.name, r, name
                 ));
             }
+        }
+    }
+
+    /// `state total = open | map(...) | sum()`, `state b = a * 2`: a state's initializer runs once,
+    /// as the component starts, so one set from another state of the component, or from a `let`
+    /// that reads one, keeps its first value when that changes, as `b = a * 2` in the body does
+    /// (`run_once_assignments`). Of what changes: a state the component's code assigns or binds,
+    /// a `live(...)` one, one a server fn loads (null in the browser until it answers), and a `let`
+    /// that reads one. Not a state set from a prop alone, which the guide says is read once, nor one
+    /// whose initializer may load (a call of anything but a builtin that only gives a value: a
+    /// server fn, `live`, the program's own function), nor one the component's code assigns or
+    /// binds itself, which is its own from then on, nor one its code works out with what it was
+    /// set from, which is kept as it started on purpose (`state start = len(rows)` read as
+    /// `len(rows) - start`, `day = add_days(base_day, n)`; `taken_as_it_started`) (FEEDBACK86.md,
+    /// Q-1361; branch feedback86-89).
+    fn run_once_states(&mut self, d: &Arc<FnDef>) {
+        let Expr::Block(stmts) = &d.body else { return };
+        // Two states at least: one that changes and one set from it.
+        if self.quiet > 0 || stmts.iter().filter(|st| matches!(st, Stmt::State(..))).nth(1).is_none() {
+            return;
+        }
+        // And one set from another state or a `let` at all: most are set from a literal or a prop,
+        // and the component is read no further.
+        let mut names: Vec<&str> = Vec::new();
+        let mut spread: Vec<String> = Vec::new();
+        for st in stmts {
+            match st {
+                Stmt::State(n, ..) => names.push(n.as_str()),
+                Stmt::Let(Pattern::Bind(n), ..) => names.push(n.as_str()),
+                Stmt::Let(p, ..) => pattern_names(p, &mut spread),
+                _ => {}
+            }
+        }
+        names.extend(spread.iter().map(String::as_str));
+        let names: HashSet<&str> = names.into_iter().collect();
+        let reads_one = |e: &Expr| {
+            let mut found = false;
+            walk_expr(e, &mut |x| found |= matches!(x, Expr::Ident(n, _) if names.contains(n.as_str())));
+            found
+        };
+        if !stmts.iter().any(|st| matches!(st, Stmt::State(_, e, _) if reads_one(e))) {
+            return;
+        }
+        let empty = HashSet::new();
+        let assigned = self.component_assigned.get(&def_key(d)).unwrap_or(&empty);
+        // What `bind:` changes, as the component's markup was read (`html`).
+        let bound = &self.bound_here;
+        // The state's own declaration assigned (`Resolve`), not a name like it (found in review: a
+        // lambda's parameter `a`, or a helper's `let a`, made `state c = a * 2` said).
+        let set_here = |st: &Stmt, n: &str| match self.binds.get(&(st as *const Stmt as usize)) {
+            Some(h) => *h & (3 | BOUND) != 0,
+            None => assigned.contains(n) || bound.contains(n),
+        };
+        // A builtin that gives a value and does nothing else, called by name, as a module's or as
+        // a method.
+        let pure = |c: &Self, n: &str| !c.is_local(n) && c.globals.get(n).is_some_and(|v| &*v.file == "<builtin>") && !builtin_changes(n) && !matches!(n, "defer" | "live");
+        // The names that change, each with what it follows, and the warnings, said after.
+        let mut changes: HashMap<String, String> = HashMap::new();
+        let mut said: Vec<(u32, String, String, HashSet<String>)> = Vec::new();
+        for st in stmts {
+            match st {
+                Stmt::Let(p, e, _) if !matches!(e, Expr::Lambda(_)) => {
+                    let mut names = Vec::new();
+                    pattern_names(p, &mut names);
+                    let read = first_read(e, &changes);
+                    for n in names {
+                        match &read {
+                            Some(r) => changes.insert(n, r.clone()),
+                            None => changes.remove(&n),
+                        };
+                    }
+                }
+                // A function, `state show = () => a * 2`, reads `a` when it is called (found in
+                // review).
+                Stmt::State(n, e, line) if matches!(e, Expr::Lambda(_)) || self.state_types.get(&(self.file.clone(), *line, n.clone())).is_some_and(|(t, _)| t.bits == FN) => {
+                    changes.remove(n.as_str());
+                }
+                Stmt::State(n, e, line) => {
+                    let mut loads = false;
+                    walk_expr(e, &mut |x| {
+                        loads |= match x {
+                            Expr::Call(c, _, _) => match &**c {
+                                Expr::Ident(f, _) => !pure(self, f),
+                                Expr::Field(o, m, _) => match &**o {
+                                    Expr::Ident(o, _) if MODULES.contains(&o.as_str()) && !self.is_local(o) => !pure(self, &format!("{}.{}", o, m)),
+                                    _ => !pure(self, m),
+                                },
+                                _ => true,
+                            },
+                            Expr::Pipe(_, r, _) => matches!(&**r, Expr::Ident(f, _) if !pure(self, f)),
+                            Expr::Html(..) => true,
+                            _ => false,
+                        };
+                    });
+                    if let (false, false, Some(r)) = (set_here(st, n), loads, first_read(e, &changes).filter(|r| r != n)) {
+                        // What it was set from, and what that follows, to the state that changes.
+                        let mut from: HashSet<String> = HashSet::new();
+                        let mut at = r.clone();
+                        while from.insert(at.clone()) && from.len() < 32 {
+                            match changes.get(&at) {
+                                Some(next) => at = next.clone(),
+                                None => break,
+                            }
+                        }
+                        said.push((*line, n.to_string(), r, from));
+                    }
+                    // What it changes with: assigned or bound here, given by `live`, or loaded.
+                    let live = matches!(e, Expr::Call(c, _, _) if matches!(&**c, Expr::Ident(f, _) if f == "live" || f == "defer"));
+                    let server = matches!(e, Expr::Call(c, _, _) if matches!(&**c, Expr::Ident(f, _) if !self.is_local(f) && self.globals.get(f.as_str()).and_then(|v| v.sig.as_ref()).is_some_and(|s| s.server)));
+                    if set_here(st, n) || live || server {
+                        changes.insert(n.to_string(), n.to_string());
+                    } else {
+                        changes.remove(n.as_str());
+                    }
+                }
+                _ => {}
+            }
+        }
+        let taken = if said.is_empty() { Vec::new() } else { taken_as_it_started(&d.body, &said) };
+        for ((line, n, r, _), taken) in said.into_iter().zip(taken) {
+            if taken {
+                continue;
+            }
+            self.line = line;
+            self.warn(format!(
+                "`state {} = ...` is set once, as <{}> starts: it does not follow `{}` when that changes; for a value that follows it, write `let {} = ...`",
+                n, d.name, r, n
+            ));
         }
     }
 
@@ -6197,6 +7115,7 @@ impl Checker {
                     }
                 }
             }
+            self.next_decl = p as *const Param as usize;
             self.define(&p.name, t, None, Kind::Param);
         }
     }
@@ -6278,6 +7197,8 @@ impl Checker {
         // What a group's middleware is given (FEEDBACK47.md, Q-535; branch feedback40-43).
         self.define("__request", request_t(), None, Kind::Bound);
         let mut seen = HashSet::new();
+        // Each name the route binds, by where (`Resolve::item`).
+        let (at, mut nth) = (&**r as *const RouteDef as usize, 0);
         for seg in &r.path {
             match seg {
                 Seg::Param(n, ty, _) => {
@@ -6285,9 +7206,15 @@ impl Checker {
                         self.error(format!("path parameter `{}` appears twice", n));
                     }
                     let t = ty.as_deref().map_or(STR, name_bits);
+                    self.next_decl = decl_id(at, nth);
+                    nth += 1;
                     self.define(n, T::of(t), None, Kind::Bound);
                 }
-                Seg::Rest(n) => self.define(n, T::of(STR), None, Kind::Bound),
+                Seg::Rest(n) => {
+                    self.next_decl = decl_id(at, nth);
+                    nth += 1;
+                    self.define(n, T::of(STR), None, Kind::Bound)
+                }
                 Seg::Lit(_) => {}
             }
         }
@@ -6302,7 +7229,8 @@ impl Checker {
         if let Some(b) = &r.body_pat {
             self.bind_pattern(b, T::of(MAP), &mut binds);
         }
-        for (n, t, sig) in binds {
+        for (i, (n, t, sig)) in binds.into_iter().enumerate() {
+            self.next_decl = decl_id(at, nth + i);
             self.define(&n, t, sig, Kind::Bound);
         }
         // `:id + 1` gives "51": an untyped parameter is text (FEEDBACK45.md, Q-513).
@@ -6471,14 +7399,22 @@ impl Checker {
                 let mut binds = Vec::new();
                 self.bind_pattern(p, t, &mut binds);
                 self.keep_component(p, e, &mut binds);
-                self.keep_lambda(p, e, &mut binds);
+                let decl = if self.scopes.is_empty() { 0 } else { s as *const Stmt as usize };
+                self.keep_lambda(p, e, &mut binds, decl);
                 let sql = if matches!(p, Pattern::Bind(_)) { self.sql_kind(e) } else { SqlVar::Other };
                 let url = matches!(p, Pattern::Bind(_)) && self.url_fixed(e);
-                for (n, t, sig) in binds {
+                for (i, (n, t, sig)) in binds.into_iter().enumerate() {
                     let kind = if matches!(p, Pattern::Bind(_)) { Kind::Let } else { Kind::Bound };
-                    let t = if self.assigned.contains(&n) {
+                    // `any` where this binding is assigned again, not where a name like it is (`Resolve`;
+                    // FEEDBACK89.md, Q-1390, found in review: `inv = 2` in another function turned this
+                    // one's warning off; branch feedback86-89).
+                    let decl = if self.scopes.is_empty() { 0 } else { decl_id(s as *const Stmt as usize, i) };
+                    let at = if decl == 0 { Bid::Global(self.file.clone(), self.line) } else { Bid::Local(decl) };
+                    let how = self.decl_assigned(decl, &n);
+                    let given = t;
+                    let t = if how != 0 {
                         let (file, line) = (self.file.clone(), self.line);
-                        self.note_first_t(&file, line, &n, t);
+                        self.note_first_t(&file, line, &n, t, how);
                         T::ANY
                     } else {
                         t
@@ -6489,6 +7425,41 @@ impl Checker {
                     if kind == Kind::Let && t.bits & ERR != 0 && !t.vague() && self.shows_failure(e) {
                         self.failing_vars.insert((self.file.clone(), self.line, n.clone()));
                     }
+                    // And from one whose signature says so, for a field read on it (FEEDBACK89.md,
+                    // Q-1390; branch feedback86-89).
+                    if kind == Kind::Let && t.bits & ERR != 0 && !t.vague() {
+                        if let Some(c) = self.declared_failing(e) {
+                            self.fail_lets.insert((at.clone(), n.clone()), c);
+                        }
+                    }
+                    // Text or a small map, for what a request is sent with, by this binding
+                    // (`http_verdict`; FEEDBACK89.md, Q-1392, found in review; branch feedback86-89).
+                    if kind == Kind::Let && (matches!(e, Expr::Lit(Lit::Str(_) | Lit::Nil)) || matches!(e, Expr::Map(m) if m.len() <= 16)) {
+                        self.lit_bindings.insert((at.clone(), n.clone()), e.clone());
+                    }
+                    // A lambda, for what an `idempotent` run calls through it (`idempotent_site`), and
+                    // another name for one, `let g = send` (found in review).
+                    if kind == Kind::Let {
+                        let held = match e {
+                            Expr::Lambda(f) => Some(f.clone()),
+                            Expr::Ident(m, _) if !self.lambda_bindings.is_empty() => self
+                                .binding(m)
+                                .filter(|v| !self.decl_reassigned(v.decl, m))
+                                .and_then(|v| self.lambda_bindings.get(&bid(v)).cloned()),
+                            _ => None,
+                        };
+                        if let Some(f) = held {
+                            self.lambda_bindings.insert(at.clone(), f);
+                        }
+                    }
+                    // A test of one of those, `let ok = !is_err(inv)`, for where `ok` is read as one
+                    // (`alias_of`; FEEDBACK89.md, Q-1390, and FEEDBACK88.md, Q-1380; branch
+                    // feedback86-89).
+                    if kind == Kind::Let {
+                        let bound = decl != 0 && self.binds.get(&decl).is_some_and(|h| *h & BOUND != 0);
+                        self.note_alias(&n, e, given, at, how != 0 || bound);
+                    }
+                    self.next_decl = decl;
                     self.define(&n, t, sig, kind);
                 }
                 self.next_sql = SqlVar::Other;
@@ -6571,8 +7542,25 @@ impl Checker {
                         }
                         if v.kind == Kind::State {
                             let key = (v.file.clone(), v.line, name.to_string());
+                            // `total = total + 1`: worked out from the state's own type, not `any`'s,
+                            // which `+` makes text too (found in review; FEEDBACK90.md, Q-1400;
+                            // branch feedback86-89).
+                            let own = match (op, e) {
+                                (AssignOp::Set, Expr::Binary(bop @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod), l, r, _)) => match (&**l, &**r) {
+                                    // The other's type as written or held, not walked again: a walk again of each
+                                    // nested `total = total + run(...)` doubled at each level (found in review).
+                                    (Expr::Ident(x, _), other) | (other, Expr::Ident(x, _)) if x.as_str() == name.as_str() && self.state_types.contains_key(&key) => match other {
+                                        Expr::Lit(l) => Some((*bop, lit_t(l))),
+                                        Expr::Ident(o, _) => self.scopes.iter().rev().find_map(|s| s.get(o.as_str())).or_else(|| self.globals.get(o.as_str())).map(|v| (*bop, v.t)),
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
                             if let Some(e) = self.state_types.get_mut(&key) {
                                 let now = match op {
+                                    AssignOp::Set if own.is_some() => own.and_then(|(bop, o)| binop_t(bop, e.0, o)).unwrap_or(rhs),
                                     AssignOp::Set => rhs,
                                     AssignOp::Add => binop_t(BinOp::Add, e.0, rhs).unwrap_or(rhs),
                                     _ => binop_t(BinOp::Sub, e.0, rhs).unwrap_or(rhs),
@@ -6617,6 +7605,7 @@ impl Checker {
                     }
                     self.twice(&d.name, Kind::Fn);
                     let sig = Arc::new(Sig::of_def(d));
+                    self.next_decl = s as *const Stmt as usize;
                     self.define(&d.name, T::of(FN), Some(sig), Kind::Fn);
                     self.lambda_body(d);
                 }
@@ -6755,7 +7744,20 @@ impl Checker {
                         }
                     }
                 }
-                let assigned = self.assigned.contains(name);
+                // Assigned again by its own binding, not by a name like it in another component
+                // (`Resolve`; FEEDBACK88.md, Q-1380, found in review; branch feedback86-89).
+                let decl = if self.scopes.is_empty() { 0 } else { s as *const Stmt as usize };
+                let at = if decl == 0 { Bid::Global(self.file.clone(), self.line) } else { Bid::Local(decl) };
+                let assigned = self.decl_reassigned(decl, name);
+                // A component's state a server fn loads is null in the browser until it answers
+                // (after a move to the page, or when the component is first shown there): a read of
+                // it where null fails, with no test for null around it, is said (`loading_read`;
+                // FEEDBACK88.md, Q-1380; branch feedback86-89). Its type stays the server's, which
+                // the initializer runs on.
+                let loading = match self.fns.last() {
+                    Some(f) if f.component.is_some() && !self.scopes.is_empty() && !assigned => self.server_loader(e),
+                    _ => None,
+                };
                 // A page's state that is a function, under a quillo.confirmed: refused as each page
                 // starts, as every file reads a page's state without taking it (interp.rs
                 // `PAGE_STATE_FN`; FEEDBACK83.md, Q-1300, found fixing the review of 2a1d3f7;
@@ -6768,11 +7770,22 @@ impl Checker {
                 if t.bits & ERR != 0 && !assigned && self.shows_failure(e) {
                     self.failing_vars.insert((self.file.clone(), self.line, name.clone()));
                 }
+                // And from one whose signature says so, for a field read on it (FEEDBACK89.md,
+                // Q-1390; branch feedback86-89).
+                if t.bits & ERR != 0 && !assigned && !t.vague() {
+                    if let Some(c) = self.declared_failing(e) {
+                        self.fail_lets.insert((at.clone(), name.clone()), c);
+                    }
+                }
+                if let Some(f) = loading {
+                    self.loading_states.insert((at, name.clone()), f);
+                }
+                self.next_decl = decl;
                 self.define(name, if assigned { T::ANY } else { t }, None, Kind::State);
                 if self.quiet == 0 {
                     self.state_types.insert((self.file.clone(), *line, name.clone()), (t, Vec::new()));
                     // Its declaration hovers too.
-                    let v = Var { t, sig: None, file: self.file.clone(), line: *line, kind: Kind::State, used: false, ready: true };
+                    let v = Var { t, sig: None, file: self.file.clone(), line: *line, kind: Kind::State, used: false, ready: true, decl: 0 };
                     self.record(name, &v);
                 }
                 T::of(NIL)
@@ -7262,41 +8275,68 @@ impl Checker {
             [Expr::Map(opts), f, ..] if !opts.iter().any(|(k, v)| k == "transaction" && !matches!(v, Expr::Lit(Lit::Bool(true)))) => f,
             _ => return,
         };
+        // A name, by the binding it has here: a local one's lambda, which nothing assigns again,
+        // else the program's function (found in review: `idempotent(send)` with a local `send` was
+        // not followed). What it calls, through the bindings each call has where it is written
+        // (`local_calls`).
         let def = match f {
             Expr::Lambda(d) => d.clone(),
-            Expr::Ident(n, _) => match self.globals.get(n.as_str()).and_then(|g| g.sig.as_ref()).and_then(|s| s.def.clone()) {
-                Some(d) => d,
-                None => return,
+            Expr::Ident(n, _) => match self.binding(n) {
+                Some(v) if v.decl != 0 => {
+                    let held = if self.decl_reassigned(v.decl, n) {
+                        None
+                    } else {
+                        self.lambda_bindings.get(&bid(v)).cloned().or_else(|| v.sig.as_ref().and_then(|s| s.def.clone()))
+                    };
+                    match held {
+                        Some(d) => d,
+                        None => return,
+                    }
+                }
+                _ => match self.globals.get(n.as_str()).and_then(|g| g.sig.as_ref()).and_then(|s| s.def.clone()) {
+                    Some(d) => d,
+                    None => return,
+                },
             },
             _ => return,
         };
-        self.idempotent_at.push((self.file.clone(), self.line, def));
+        let defs = vec![def];
+        self.idempotent_at.push((self.file.clone(), self.line, defs));
     }
 
-    /// An `idempotent` whose function changes data in another program (a service's function that
-    /// writes or may, a site's): that change is outside its transaction, so when the call's answer
+    /// An `idempotent` whose function changes data in another program (a site's, or another site's
+    /// by `http.post` and the like; not a Quillo service's since FEEDBACK89.md's Q-1392): that change
+    /// is outside its transaction, so when the call's answer
     /// is lost the claim is given up, and a retry with the key runs it there again, under a new
     /// call id. Warned of, with the way out the guide gives: lost answers are what a program of
     /// services lives with, so the program says where they matter (the user's decision,
     /// 2026-11-09; branch feedback56).
     fn idempotent_reaches_outside(&mut self, top_lets: &HashSet<String>) {
-        for (file, line, def) in std::mem::take(&mut self.idempotent_at) {
-            let r = self.reach_all(&def, top_lets);
+        for (file, line, defs) in std::mem::take(&mut self.idempotent_at) {
+            let mut r = Seen::default();
+            for def in &defs {
+                r.join(&self.reach_all(def, top_lets));
+            }
             let Some(first) = r.elsewhere.first() else { continue };
             let more = match r.elsewhere.len() - 1 {
                 0 => String::new(),
                 1 => " (and 1 more such call)".to_string(),
                 n => format!(" (and {} more such calls)", n),
             };
-            self.diag_at(
-                file,
-                line,
-                Severity::Warning,
+            // A request to another site, in the words slice D gave (the user's decision 2026-11-24;
+            // FEEDBACK89.md, Q-1392; branch feedback86-89); a site's call as before.
+            let msg = if first.starts_with("http.") {
+                format!(
+                    "`idempotent` reaches `{}`, which may change data at another site, outside its transaction{}: when its answer is lost, the key is given up and a retry with it sends the request again. Send the site a key of its own that is the same on each try (its `Idempotency-Key` header, made from this request's key); where it takes none, look up whether the first request's change is there before sending it again. Or give `idempotent` `{{ transaction: false }}`, which keeps every answer, failures too: a kept failure replays until the key expires, so its page should offer a fresh form",
+                    first, more
+                )
+            } else {
                 format!(
                     "`idempotent` reaches `{}`, which may change data in another program, outside its transaction{}: when that call's answer is lost, the key is given up and a retry with it runs the call there again, under a new call id. Give `idempotent` `{{ transaction: false }}`, which keeps every answer, failures too, or send an id the other program's change is keyed by, so that a second run changes nothing",
                     first, more
-                ),
-            );
+                )
+            };
+            self.diag_at(file, line, Severity::Warning, msg);
         }
     }
 
@@ -7740,10 +8780,12 @@ impl Checker {
 
     /// `let f = (a, b) => a + b`: `f(1)` is checked as a `fn`'s call is, with the name `f`
     /// (FEEDBACK45.md, Q-515; branch feedback40-43).
-    fn keep_lambda(&mut self, p: &Pattern, e: &Expr, binds: &mut [(String, T, Option<Arc<Sig>>)]) {
+    fn keep_lambda(&mut self, p: &Pattern, e: &Expr, binds: &mut [(String, T, Option<Arc<Sig>>)], decl: usize) {
         let (Pattern::Bind(n), Expr::Lambda(d), [(_, _, sig)]) = (p, e, binds) else { return };
-        // `h = (a, b) => ...` later: no longer the first lambda (found in review).
-        if sig.is_none() && !self.assigned.contains(&**n) {
+        // `h = (a, b) => ...` later: no longer the first lambda (found in review). This binding, not
+        // one of its name elsewhere (`Resolve`; FEEDBACK89.md, Q-1392, found in review; branch
+        // feedback86-89).
+        if sig.is_none() && !self.decl_reassigned(decl, n) {
             let mut s = Sig::of_def(d);
             s.name = n.to_string();
             *sig = Some(Arc::new(s));
@@ -7966,11 +9008,19 @@ impl Checker {
                     _ => {}
                 }
                 let maybe = matches!(op, BinOp::And | BinOp::Or);
+                let tested = self.matching.len();
+                if maybe && !(self.fail_lets.is_empty() && self.loading_states.is_empty()) {
+                    self.given_whole(a, matches!(op, BinOp::And));
+                }
                 let y = if maybe { self.on_path(Step::Maybe, |s| s.under(facts, |c| c.expr(b))) } else { self.under(facts, |c| c.expr(b)) };
+                self.matching.truncate(tested);
                 self.line = *line;
                 self.js_comparisons(op, a, b, x, y);
                 self.line = *line;
                 match op {
+                    // An assigned state's own type, once its assignments are read, not a guess from
+                    // the fallback (FEEDBACK90.md, Q-1400; branch feedback86-89).
+                    BinOp::Or if x.is_any() && self.defer_truth(a, Truth::Or, fallback_says(x, b)) => {}
                     BinOp::Or => self.js_truthiness(fallback_says(x, b), a, Truth::Or),
                     BinOp::And => self.js_truthiness(x, a, Truth::And),
                     _ => {}
@@ -8012,7 +9062,9 @@ impl Checker {
                 }
             }
             Expr::Coalesce(a, b) => {
+                self.fallback_left += 1;
                 let x = self.expr(a);
+                self.fallback_left -= 1;
                 let y = self.on_path(Step::Maybe, |s| s.expr(b));
                 x.without(NIL | ERR).union(y)
             }
@@ -8056,10 +9108,14 @@ impl Checker {
                     }
                     Expr::Call(callee, args, l) => {
                         self.line = *l;
+                        if matches!(callee.as_ref(), Expr::Field(o, _, _) if matches!(&**o, Expr::Ident(m, _) if m == "http")) {
+                            self.http_verdict(rhs, callee, Some(lhs), args);
+                        }
                         self.call(callee, args, Some(v))
                     }
                     other => {
                         let (ft, sig) = self.callee(other);
+                        self.note_local_call(other);
                         self.apply(ft, sig, vec![v], &[], &callee_name(other))
                     }
                 }
@@ -8134,6 +9190,11 @@ impl Checker {
                 if job.is_some() {
                     self.job_arg = job;
                 }
+                // What an `http.*` call is sent with, by the bindings its names have here
+                // (`http_verdict`; FEEDBACK89.md, Q-1392, found in review; branch feedback86-89).
+                if matches!(callee.as_ref(), Expr::Field(o, _, _) if matches!(&**o, Expr::Ident(m, _) if m == "http")) {
+                    self.http_verdict(e, callee, None, args);
+                }
                 let t = self.call(callee, args, None);
                 if job.is_some() {
                     self.job_arg = None;
@@ -8151,6 +9212,10 @@ impl Checker {
                     self.warn(format!("`x?.{name}` is not optional chaining: `?` leaves on an error, and a component that can leave is remade on each change, which loses the focus of an input. A field of null is null, so write `x.{name}`"));
                 }
                 self.module_member(obj, name);
+                // Read past an error the call may give (FEEDBACK89.md, Q-1390; branch feedback86-89).
+                if t.bits & ERR != 0 && !t.vague() {
+                    self.read_past_error(obj, t, name, false);
+                }
                 self.field(t, obj, name)
             }
             Expr::Index(obj, idx, line) => {
@@ -8201,21 +9266,40 @@ impl Checker {
                 let (mut yes, mut no) = (Vec::new(), Vec::new());
                 self.facts(c, true, &mut yes);
                 self.facts(c, false, &mut no);
+                // What the test tells apart, each in the branch where it holds (`given_whole`).
+                let tested = self.matching.len();
+                let testing = !(self.fail_lets.is_empty() && self.loading_states.is_empty());
+                if testing {
+                    self.given_whole(c, true);
+                }
                 self.block_kind = matches!(&**a, Expr::Block(_)).then_some("if");
                 let at = self.branch_point();
                 let x = self.on_path(Step::Arm(at, 0), |s| s.under(yes, |s| s.expr(a)));
+                self.matching.truncate(tested);
                 let y = match b {
                     Some(b) => {
+                        if testing {
+                            self.given_whole(c, false);
+                        }
                         self.block_kind = matches!(&**b, Expr::Block(_)).then_some("if");
                         self.on_path(Step::Arm(at, 1), |s| s.under(no, |s| s.expr(b)))
                     }
                     None => T::of(NIL),
                 };
+                self.matching.truncate(tested);
                 x.union(y)
             }
             Expr::Match(subj, arms, line) => {
                 let mut st = self.expr(subj);
                 self.line = *line;
+                // Its arms take the value as it is, an error too (`read_past_error`; FEEDBACK89.md,
+                // Q-1390; branch feedback86-89).
+                let matched = match &**subj {
+                    Expr::Ident(n, _) if !self.fail_lets.is_empty() || !self.loading_states.is_empty() => {
+                        self.match_push(n, true)
+                    }
+                    _ => false,
+                };
                 // `match x { }` matches nothing (FEEDBACK45.md, Q-516; branch feedback40-43).
                 if arms.is_empty() {
                     self.error("this `match` has no arms, so nothing matches: add one, `_ => ...` for any value");
@@ -8245,13 +9329,21 @@ impl Checker {
                         self.warn("this arm never matches: the value it is given is another");
                     }
                     self.push();
+                    // `match ok { true => ... }`: the subject's test holds in the arm, as in an `if`
+                    // (found in review; FEEDBACK89.md, Q-1390; branch feedback86-89).
+                    if let (Pattern::Lit(Lit::Bool(v)), None) = (&arm.pat, &arm.guard) {
+                        let mut held = Vec::new();
+                        self.facts(subj, *v, &mut held);
+                        self.assume(held);
+                    }
                     let mut binds = Vec::new();
                     self.bind_pattern(&arm.pat, st, &mut binds);
                     // `null => ...` first: the arms after it never see null.
                     if matches!(arm.pat, Pattern::Lit(Lit::Nil)) && arm.guard.is_none() {
                         st = st.without(NIL);
                     }
-                    for (n, bt, sig) in binds {
+                    for (i, (n, bt, sig)) in binds.into_iter().enumerate() {
+                        self.next_decl = decl_id(arm as *const Arm as usize, i);
                         self.define(&n, bt, sig, Kind::Bound);
                     }
                     if let Some(g) = &arm.guard {
@@ -8272,6 +9364,9 @@ impl Checker {
                     }
                     self.pop();
                 }
+                if matched {
+                    self.matching.pop();
+                }
                 t
             }
             Expr::For(pat, iter, body, line) => {
@@ -8288,7 +9383,8 @@ impl Checker {
                 };
                 let mut binds = Vec::new();
                 self.bind_pattern(pat, item, &mut binds);
-                for (n, bt, sig) in binds {
+                for (i, (n, bt, sig)) in binds.into_iter().enumerate() {
+                    self.next_decl = decl_id(e as *const Expr as usize, i);
                     self.define(&n, bt, sig, Kind::Bound);
                 }
                 self.block_kind = matches!(&**body, Expr::Block(_)).then_some("for");
@@ -8347,6 +9443,7 @@ impl Checker {
                 // FEEDBACK80.md, Q-1267; branch feedback72-81).
                 let dropped = if self.quiet == 0 && !self.drop_marks.is_empty() { self.drop_marks.remove(&(e as *const Expr)) } else { None };
                 self.push();
+                let tested = self.matching.len();
                 let mut t = T::of(NIL);
                 let mut never = false;
                 for (i, s) in stmts.iter().enumerate() {
@@ -8383,12 +9480,26 @@ impl Checker {
                             let mut no = Vec::new();
                             self.facts(c, false, &mut no);
                             self.assume(no);
+                            // And what its test tells apart, `if !show(r) { return }`
+                            // (`given_whole`; FEEDBACK89.md, Q-1390; branch feedback86-89).
+                            self.given_whole(c, false);
+                        }
+                    }
+                    // `while is_err(inv) { return ... }` leaves as such an `if` does, for what it
+                    // tells apart (found in review; FEEDBACK89.md, Q-1390; branch feedback86-89).
+                    if let Stmt::Expr(Expr::While(c, body, _)) = s {
+                        if exits(body) && !(self.fail_lets.is_empty() && self.loading_states.is_empty()) {
+                            let mut no = Vec::new();
+                            self.facts(c, false, &mut no);
+                            self.assume(no);
+                            self.given_whole(c, false);
                         }
                     }
                     if i + 1 == stmts.len() {
                         t = st;
                     }
                 }
+                self.matching.truncate(tested);
                 if let (Some(kind), 0) = (kind, self.quiet) {
                     let lets: Vec<(String, u32)> = self.scopes.last().map_or(Vec::new(), |s| {
                         s.iter().filter(|(_, v)| v.kind == Kind::Let).map(|(n, v)| (n.clone(), v.line)).collect()
@@ -8826,11 +9937,15 @@ impl Checker {
             return;
         }
         // What it was given, by name if it was a name: `xs` of `xs.push(2)`, `push(xs, 2)` and
-        // `xs | push(2)`, for the message.
-        let (name, on, given, line) = match e {
+        // `xs | push(2)`, for the message; and the function a `map` or `filter` is given. Piped,
+        // what it is given may be a field of a name, or calls of the same kind on one, `m.items |
+        // map(f)`, `xs | map(f) | filter(g)` (found in review; FEEDBACK86.md, Q-1360; branch
+        // feedback86-89): what to write then (`fix`).
+        let mut fix: Option<String> = None;
+        let (name, on, given, func, line) = match e {
             Expr::Call(f, args, line) => match &**f {
                 Expr::Field(o, name, _) => match &**o {
-                    Expr::Ident(o, _) => (name.as_str(), Some(o.as_str()), Some(o.to_string()), *line),
+                    Expr::Ident(o, _) => (name.as_str(), Some(o.as_str()), Some(o.to_string()), args.first(), *line),
                     _ => return,
                 },
                 Expr::Ident(name, _) if !args.is_empty() => {
@@ -8838,13 +9953,27 @@ impl Checker {
                         Expr::Ident(n, _) => Some(n.to_string()),
                         _ => None,
                     };
-                    (name.as_str(), None, first, *line)
+                    (name.as_str(), None, first, args.get(1), *line)
                 }
                 _ => return,
             },
             Expr::Pipe(l, r, line) => match (&**l, &**r) {
-                (Expr::Ident(n, _), Expr::Call(f, ..)) => match &**f {
-                    Expr::Ident(name, _) => (name.as_str(), None, Some(n.to_string()), *line),
+                (Expr::Ident(n, _), Expr::Call(f, args, _)) => match &**f {
+                    Expr::Ident(name, _) => (name.as_str(), None, Some(n.to_string()), args.first(), *line),
+                    _ => return,
+                },
+                (_, Expr::Call(f, args, _)) => match &**f {
+                    Expr::Ident(name, _) => {
+                        let Some((root, fields, chain)) = self.dropped_root(l) else { return };
+                        let piped: String = chain.iter().chain(std::iter::once(&name.to_string())).map(|g| format!(" | {}(...)", g)).collect();
+                        let at = std::iter::once(root.clone()).chain(fields.iter().cloned()).collect::<Vec<_>>().join(".");
+                        fix = Some(match fields.as_slice() {
+                            [] => format!(": write `{0} = {0}{1}`", root, piped),
+                            [f] => format!(": write `{0} = {{ ...{0}, {1}: {2}{3} }}`", root, f, at, piped),
+                            _ => format!(": use what `{}{}` gives, or leave it out", at, piped),
+                        });
+                        (name.as_str(), None, Some(root), args.first(), *line)
+                    }
                     _ => return,
                 },
                 _ => return,
@@ -8852,9 +9981,12 @@ impl Checker {
             _ => return,
         };
         self.line = line;
-        // Builtins that give a new value and do nothing else; not `map` or `filter`, whose
-        // function may be the work (FEEDBACK45.md, Q-505; branch feedback40-43).
-        if !matches!(name, "push" | "set" | "merge" | "remove" | "sort" | "sort_by" | "drop" | "take" | "reverse" | "unique" | "insert" | "append" | "concat" | "flatten")
+        // Builtins that give a new value and do nothing else; `map` and `filter` too where the
+        // function they are given does nothing else, `xs | map((x) => x * 2)`, not
+        // `xs.map((v) => print(v))`, which is run for its function (FEEDBACK45.md, Q-505; branch
+        // feedback40-43; FEEDBACK86.md, Q-1360; branch feedback86-89).
+        let pure_fn = matches!(name, "map" | "filter");
+        if !(pure_fn || GIVES_ONLY.contains(&name))
             || self.is_local(name)
         {
             return;
@@ -8873,8 +10005,70 @@ impl Checker {
                 return;
             }
         }
+        if pure_fn && !func.is_some_and(|f| self.does_nothing_else(f)) {
+            return;
+        }
+        self.line = line;
         let x = given.unwrap_or_else(|| "x".to_string());
-        self.warn(format!("`{}` gives a new value and changes nothing, and it is dropped here: write `{} = {} | {}(...)`", name, x, x, name));
+        let fix = fix.unwrap_or_else(|| format!(": write `{} = {} | {}(...)`", x, x, name));
+        self.warn(format!("`{}` gives a new value and changes nothing, and it is dropped here{}", name, fix));
+    }
+
+    /// What a dropped pipe's left side is, when it is a name, a field of one or a chain of fields,
+    /// each piped through calls that give a new value and do nothing else (`xs | map(f) |
+    /// filter(g)`, `m.items | map(f)`): the name, the fields, and the calls in their order. A
+    /// chain is read with a loop, as long as it is (FEEDBACK86.md, Q-1360, found in review; branch
+    /// feedback86-89).
+    fn dropped_root(&mut self, l: &Expr) -> Option<(String, Vec<String>, Vec<String>)> {
+        let mut chain: Vec<String> = Vec::new();
+        let mut x = l;
+        while let Expr::Pipe(inner, r, _) = x {
+            let Expr::Call(f, args, _) = &**r else { return None };
+            let Expr::Ident(g, _) = &**f else { return None };
+            let pure_fn = matches!(g.as_str(), "map" | "filter");
+            if !(pure_fn || GIVES_ONLY.contains(&g.as_str())) || self.is_local(g) || !self.globals.get(g.as_str()).is_some_and(|v| &*v.file == "<builtin>") {
+                return None;
+            }
+            if pure_fn && !args.first().is_some_and(|f| self.does_nothing_else(f)) {
+                return None;
+            }
+            chain.push(g.to_string());
+            x = inner;
+        }
+        chain.reverse();
+        let mut fields: Vec<String> = Vec::new();
+        while let Expr::Field(o, f, _) = x {
+            fields.push(f.to_string());
+            x = o;
+        }
+        fields.reverse();
+        match x {
+            Expr::Ident(n, _) if !chain.is_empty() || !fields.is_empty() => Some((n.to_string(), fields, chain)),
+            _ => None,
+        }
+    }
+
+    /// Whether the function given to a `map` or `filter` does nothing but give a value: a lambda
+    /// that assigns nothing and calls only what changes nothing (`changes_anything`, as a dropped
+    /// call of the program's own function is judged), or a function of the program's or a builtin
+    /// of that kind, by name. Not one that names a variable of the code around it that hides one
+    /// of the program's (`changes_anything` reads the program's names), nor a function held in a
+    /// variable here, which may be any (FEEDBACK86.md, Q-1360; branch feedback86-89).
+    fn does_nothing_else(&mut self, f: &Expr) -> bool {
+        match f {
+            Expr::Lambda(l) => {
+                let mut own: Vec<String> = l.params.iter().map(|p| p.name.to_string()).collect();
+                let mut hides = false;
+                walk_fn(l, &mut |x| match x {
+                    Expr::Lambda(inner) => own.extend(inner.params.iter().map(|p| p.name.to_string())),
+                    Expr::Ident(n, _) => hides |= !own.iter().any(|o| o == &**n) && self.is_local(n) && self.globals.contains_key(n.as_str()),
+                    _ => {}
+                });
+                !hides && !self.changes_anything(l)
+            }
+            Expr::Ident(n, _) => !self.is_local(n) && !self.name_changes(n, true),
+            _ => false,
+        }
     }
 
     /// `down(val)` alone, `down` the program's own function, one that changes nothing: what it
@@ -9571,6 +10765,574 @@ impl Checker {
         }
     }
 
+    /// The names a condition tests where it is `yes` (true, or false), taken as tested there: given
+    /// whole to the program's own function whose parameter takes an error, `if show(r) { ... }`
+    /// (app/forum's), where its answer is true; and `type_of(r) == "map"`, or `!= "error"`, where
+    /// that holds. Through `!`, `&&` and `||` as `facts` reads them, and a `let` that holds a test
+    /// (`let ok = show(r)`). Not a builtin that cannot tell an error apart (`len(r) > 0`,
+    /// `str(r) == ""`), nor in the branch where the test fails (found in review; `read_past_error`;
+    /// FEEDBACK89.md, Q-1390; branch feedback86-89).
+    fn given_whole(&mut self, c: &Expr, yes: bool) {
+        if self.fail_lets.is_empty() && self.loading_states.is_empty() {
+            return;
+        }
+        let mut names = Vec::new();
+        self.tested_in(c, yes, &mut names, 0);
+        for n in names {
+            self.match_push(&n, true);
+        }
+    }
+
+    fn tested_in(&self, c: &Expr, yes: bool, out: &mut Vec<String>, depth: u32) {
+        if depth > 16 {
+            return;
+        }
+        match c {
+            Expr::Unary(UnOp::Not, x, _) => self.tested_in(x, !yes, out, depth + 1),
+            Expr::Binary(BinOp::And, a, b, _) if yes => {
+                self.tested_in(a, true, out, depth + 1);
+                self.tested_in(b, true, out, depth + 1);
+            }
+            Expr::Binary(BinOp::Or, a, b, _) if !yes => {
+                self.tested_in(a, false, out, depth + 1);
+                self.tested_in(b, false, out, depth + 1);
+            }
+            Expr::Binary(op @ (BinOp::Eq | BinOp::Ne), a, b, _) => {
+                let (call, kind) = match (&**a, &**b) {
+                    (Expr::Call(f, args, _), Expr::Lit(Lit::Str(k))) | (Expr::Lit(Lit::Str(k)), Expr::Call(f, args, _)) => ((f, args), k),
+                    _ => return,
+                };
+                let (f, args) = call;
+                // `type_of(r)`, or `r.type_of()`, which calls it (found in review).
+                let asked = match (&**f, args.as_slice()) {
+                    (Expr::Ident(t, _), [Expr::Ident(r, _)]) if t == "type_of" => Some(r),
+                    (Expr::Field(o, t, _), []) if t == "type_of" => match &**o {
+                        Expr::Ident(r, _) => Some(r),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(r) = asked {
+                    let holds = matches!(op, BinOp::Eq) == yes;
+                    if self.builtin_in_scope("type_of") && holds != (&**kind == "error") {
+                        out.push(r.to_string());
+                    }
+                }
+            }
+            Expr::Call(f, args, _) if yes => {
+                let Expr::Ident(n, _) = &**f else { return };
+                let v = self.scopes.iter().rev().find_map(|s| s.get(n.as_str())).or_else(|| self.globals.get(n.as_str()));
+                let Some(sig) = v.and_then(|v| v.sig.as_ref()).filter(|s| !s.builtin && s.def.is_some() && s.native.is_none()) else { return };
+                for (p, a) in sig.params.iter().zip(args) {
+                    if let (Expr::Ident(r, _), true) = (a, !p.annotated || p.ty & ERR != 0) {
+                        out.push(r.to_string());
+                    }
+                }
+            }
+            Expr::Ident(n, _) if self.alias_depth.get() == 0 => {
+                // The tests it holds, each where its names mean what they meant, read once, and none
+                // past the check's budget (found in review). A test it holds is never one of these.
+                if let Some(held) = self.alias_of(n) {
+                    self.alias_depth.set(self.alias_depth.get() + 1);
+                    for &i in if yes { &held.0 } else { &held.1 } {
+                        let work = self.alias_work.get() + 1;
+                        self.alias_work.set(work);
+                        if budget_spent(work) {
+                            break;
+                        }
+                        let h = &self.held_tests[i];
+                        if self.held_here(h) {
+                            self.tested_in(&h.test, h.way, out, depth + 1);
+                        }
+                    }
+                    self.alias_depth.set(self.alias_depth.get() - 1);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether `e` names one of `fail_lets` or `loading_states`, as a test of it may, or a `let`
+    /// that holds such a test.
+    fn tests_one(&self, e: &Expr) -> bool {
+        let mut found = false;
+        walk_expr(e, &mut |x| {
+            if let (false, Expr::Ident(n, _)) = (found, x) {
+                if let Some(v) = self.binding(n) {
+                    let key = (bid(v), n.to_string());
+                    found = self.fail_lets.contains_key(&key) || self.loading_states.contains_key(&key) || self.aliases.contains_key(&key);
+                }
+            }
+        });
+        found
+    }
+
+    /// The tests a `let` holds, `let ok = !is_err(inv)`, `let ready = trail != null`, for a name read
+    /// as a condition: what it tests is tested there too (`facts`, `given_whole`; FEEDBACK89.md,
+    /// Q-1390, and FEEDBACK88.md, Q-1380, found in review; branch feedback86-89). By the binding the
+    /// name has here, never by the name alone.
+    fn alias_of(&self, n: &str) -> Option<std::rc::Rc<(Vec<usize>, Vec<usize>)>> {
+        if self.aliases.is_empty() {
+            return None;
+        }
+        let v = self.binding(n)?;
+        if self.decl_reassigned(v.decl, n) {
+            return None;
+        }
+        self.aliases.get(&(bid(v), n.to_string())).cloned()
+    }
+
+    /// What the binding declared at `decl` named `n` is assigned anywhere (`Resolve`): 0 nothing, 1
+    /// `+=` or `-=` alone, 2 `=`. The program's own (0) by the assignments no declaration in reach
+    /// takes (`top_assigned`), by name as the language reaches it across files; one `Resolve` does
+    /// not know by every assignment of the name (FEEDBACK89.md, Q-1390, found in review; branch
+    /// feedback86-89).
+    fn decl_assigned(&self, decl: usize, n: &str) -> u8 {
+        let names = if decl != 0 {
+            if !self.loose.is_empty() && self.loose.contains(n) {
+                return 2;
+            }
+            if let Some(how) = self.binds.get(&decl) {
+                return *how & 3;
+            }
+            &self.assigned
+        } else {
+            &self.top_assigned
+        };
+        if !names.contains(n) {
+            0
+        } else if names.contains(&format!("={}", n)) {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// A call of `callee`, a name of a block, a function or a lambda, kept with the lambda or the
+    /// local `fn` its binding holds (`ident`
+    /// read it last), for `reach_call` (FEEDBACK89.md, Q-1392, found in review; branch
+    /// feedback86-89).
+    fn note_local_call(&mut self, callee: &Expr) {
+        let Expr::Ident(n, _) = callee else { return };
+        let (decl, kind) = self.last_ident;
+        if decl == 0 {
+            return;
+        }
+        // A local `fn`, its own code (found in review: the program's `send` was read for a local
+        // `fn send`, and a local `fn go` not at all).
+        let held = if kind == Kind::Fn {
+            self.binding(n).and_then(|v| v.sig.as_ref()).and_then(|s| s.def.clone())
+        } else if self.lambda_bindings.is_empty() || self.decl_reassigned(decl, n) {
+            None
+        } else {
+            self.lambda_bindings.get(&Bid::Local(decl)).cloned()
+        };
+        // With no lambda and no function of the program's of that name, `reach_name` says the same.
+        if held.is_some() || self.globals.contains_key(n.as_str()) {
+            self.local_calls.insert(callee as *const Expr as usize, held);
+        }
+    }
+
+    /// Whether it is assigned at all (`decl_assigned`), with no text made.
+    fn decl_reassigned(&self, decl: usize, n: &str) -> bool {
+        if decl != 0 {
+            if !self.loose.is_empty() && self.loose.contains(n) {
+                return true;
+            }
+            if let Some(how) = self.binds.get(&decl) {
+                return *how & 3 != 0;
+            }
+            return self.assigned.contains(n);
+        }
+        self.top_assigned.contains(n)
+    }
+
+    /// `n` taken as tested by the code around (`matching`), by the binding it has there: a
+    /// `let` of the name inside is another (found in review; FEEDBACK89.md, Q-1390, and
+    /// FEEDBACK88.md, Q-1380; branch feedback86-89).
+    fn match_push(&mut self, n: &str, err: bool) -> bool {
+        let Some(b) = self.binding(n).map(bid) else { return false };
+        self.matching.push((n.to_string(), b, err));
+        true
+    }
+
+    /// Whether the code around tests `n`, bound to `v` here; for an error too, if `err`.
+    fn matched(&self, n: &str, v: &Var, err: bool) -> bool {
+        self.matching.iter().any(|(m, b, e)| (*e || !err) && m == n && *b == bid(v))
+    }
+
+    /// The binding `n` has here.
+    fn binding(&self, n: &str) -> Option<&Var> {
+        self.scopes.iter().rev().find_map(|s| s.get(n)).or_else(|| self.globals.get(n))
+    }
+
+    /// Whether the names a held test reads still mean, here, what they meant where it was written.
+    fn held_here(&self, h: &HeldTest) -> bool {
+        h.names.iter().all(|(n, b)| self.binding(n).is_some_and(|v| bid(v) == *b))
+    }
+
+    /// `let n = e` at `file`:`line`, kept as the tests it holds where it tests one of `fail_lets` or
+    /// `loading_states`, or names a `let` that does: a boolean nothing assigns again.
+    fn note_alias(&mut self, n: &str, e: &Expr, t: T, at: Bid, reassigned: bool) {
+        if t.bits != BOOL || (self.fail_lets.is_empty() && self.loading_states.is_empty()) || reassigned || !self.tests_one(e) {
+            return;
+        }
+        let held = (self.held_list(e, true), self.held_list(e, false));
+        self.aliases.insert((at, n.to_string()), std::rc::Rc::new(held));
+    }
+
+    /// The tests `e` makes where it is `yes`, as `facts` reads them: through `!`, `&&` where true,
+    /// `||` where false, and a `let` that holds tests (its list joined, not read again), as indexes
+    /// into `held_tests`, each test there once with its bindings. Those that tell an error apart
+    /// first, at most 32 of them and 32 others, so a cap never drops one (found in review). With a
+    /// list, not by recursion.
+    fn held_list(&mut self, e: &Expr, yes: bool) -> Vec<usize> {
+        let (mut errs, mut others): (Vec<usize>, Vec<usize>) = (Vec::new(), Vec::new());
+        let mut todo: Vec<(&Expr, bool)> = vec![(e, yes)];
+        let mut steps = 0usize;
+        while let Some((x, way)) = todo.pop() {
+            steps += 1;
+            if steps > 4096 {
+                break;
+            }
+            match x {
+                Expr::Unary(UnOp::Not, y, _) => todo.push((&**y, !way)),
+                Expr::Binary(BinOp::And, a, b, _) if way => {
+                    todo.push((&**b, true));
+                    todo.push((&**a, true));
+                }
+                Expr::Binary(BinOp::Or, a, b, _) if !way => {
+                    todo.push((&**b, false));
+                    todo.push((&**a, false));
+                }
+                Expr::Ident(n, _) if self.alias_of(n).is_some() => {
+                    if let Some(held) = self.alias_of(n) {
+                        for &i in if way { &held.0 } else { &held.1 } {
+                            let list = if self.held_errors(i) { &mut errs } else { &mut others };
+                            if list.len() < 32 && !list.contains(&i) {
+                                list.push(i);
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    let Some(i) = self.held_index_of(x, way) else { continue };
+                    let list = if self.held_errors(i) { &mut errs } else { &mut others };
+                    if list.len() < 32 && !list.contains(&i) {
+                        list.push(i);
+                    }
+                }
+            }
+        }
+        errs.extend(others);
+        errs
+    }
+
+    /// Whether the held test `i` tells an error apart, as worked out when it was first held.
+    fn held_errors(&self, i: usize) -> bool {
+        self.held_tests[i].errors
+    }
+
+    /// The test `x` where it is `way`, in `held_tests` once, with the bindings of the names it reads:
+    /// those of the values it tests (`fail_lets`, `loading_states`, a `let` that holds a test) always,
+    /// any other up to 32 in all; a test is never left out for the names it reads (found in review:
+    /// `fine(inv, a, ..., h)`, nine names, was). None for none kept.
+    fn held_index_of(&mut self, x: &Expr, way: bool) -> Option<usize> {
+        let mut names: Vec<(String, Bid)> = Vec::new();
+        walk_expr(x, &mut |y| {
+            if let Expr::Ident(n, _) = y {
+                if names.iter().any(|(m, _)| m == &**n) {
+                    return;
+                }
+                if let Some(v) = self.binding(n) {
+                    let key = (bid(v), n.to_string());
+                    let tested = self.fail_lets.contains_key(&key) || self.loading_states.contains_key(&key) || self.aliases.contains_key(&key);
+                    if tested || names.len() < 32 {
+                        names.push((key.1, key.0));
+                    }
+                }
+            }
+        });
+        let key = fact_key(x, 0).map(|k| format!("{}|{}|{:?}", k, way, names));
+        if let Some(&i) = key.as_ref().and_then(|k| self.held_index.get(k)) {
+            return Some(i);
+        }
+        let mut errors = false;
+        walk_expr(x, &mut |y| {
+            errors |= matches!(y, Expr::Ident(n, _) if matches!(n.as_str(), "is_err" | "type_of" | "error")) || matches!(y, Expr::Field(_, f, _) if f == "error" || f == "message" || f == "is_err" || f == "type_of");
+        });
+        self.held_tests.push(HeldTest { test: x.clone(), way, names, errors });
+        let i = self.held_tests.len() - 1;
+        if let Some(k) = key {
+            self.held_index.insert(k, i);
+        }
+        Some(i)
+    }
+
+    /// The call `e` is, as written (`invoice(...)`, `billing.invoice(...)`), when its signature says
+    /// what it gives may be an error: a function declared `-> T ! E`, or a service's, whose call can
+    /// always fail, and whether it is a service's (`read_past_error`; FEEDBACK89.md, Q-1390; branch
+    /// feedback86-89).
+    fn declared_failing(&self, e: &Expr) -> Option<(String, bool)> {
+        let callee = match e {
+            Expr::Call(c, _, _) => &**c,
+            Expr::Pipe(_, r, _) => match &**r {
+                Expr::Call(c, _, _) => &**c,
+                other => other,
+            },
+            _ => return None,
+        };
+        match callee {
+            Expr::Ident(f, _) => {
+                let v = self.scopes.iter().rev().find_map(|s| s.get(f.as_str())).or_else(|| self.globals.get(f.as_str()))?;
+                v.sig.as_ref().filter(|s| !s.builtin && s.native.is_none() && s.err.is_some()).map(|_| (format!("{}(...)", f), false))
+            }
+            Expr::Field(o, f, _) => match &**o {
+                Expr::Ident(s, _) if self.services.contains_key(s.as_str()) && !self.is_local(s) => Some((format!("{}.{}(...)", s, f), true)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `inv.id`, or `inv.total()`, where `inv` may be the error a call gave (`declared_failing`),
+    /// held or as it comes, before `?`, `??`, `is_err` or a `match` took the error out: when it is
+    /// one, the read fails ("error has no field `id`") and the error's own message is lost. A
+    /// warning with the way out, as programs that run today read them so (decided; FEEDBACK89.md,
+    /// Q-1390; branch feedback86-89). Not `.error` or `.message`, which read the error, nor a read
+    /// on the left of a `??`.
+    #[inline(never)]
+    fn read_past_error(&mut self, obj: &Expr, t: T, name: &str, method: bool) {
+        // On the left of a `??`, which takes a read that fails, `inv.id ?? -1` as the guide's
+        // `v.foo ?? "none"` (found in review).
+        if t.bits & ERR == 0 || t.vague() || matches!(name, "error" | "message") || self.fallback_left > 0 {
+            return;
+        }
+        // `inv.is_err()`, `inv.str()`: `f(inv)`, a function that takes the value whole, an error too,
+        // reads nothing of it (found in review).
+        if method && self.scopes.iter().rev().find_map(|s| s.get(name)).or_else(|| self.globals.get(name)).and_then(|v| v.sig.as_ref()).and_then(|s| s.params.first()).is_some_and(|p| p.ty & ERR != 0) {
+            return;
+        }
+        let (call, held, service) = match obj {
+            Expr::Ident(n, _) => {
+                if self.fail_lets.is_empty() {
+                    return;
+                }
+                let Some(v) = self.scopes.iter().rev().find_map(|s| s.get(n.as_str())).or_else(|| self.globals.get(n.as_str())) else { return };
+                if self.matched(n, v, true) {
+                    return;
+                }
+                let Some((call, service)) = self.fail_lets.get(&(bid(v), n.to_string())).cloned() else { return };
+                (call, Some(n.to_string()), service)
+            }
+            e => match self.declared_failing(e) {
+                Some((call, service)) => (call, None, service),
+                None => return,
+            },
+        };
+        let read = if method { format!("`.{}()` is called on it", name) } else { format!("`.{}` is read from it", name) };
+        let why = if service { " (a call to another service can always fail)" } else { "" };
+        self.warn(match held {
+            Some(n) => format!(
+                "`{n}` may hold the error `{call}` gives{why}, and {read} as if it could not: when it is one, this fails and the error's own message is lost. Write `let {n} = {call}?` to pass it on, or `?? ...` after the call to give a value in its place, or test `is_err({n})` first"
+            ),
+            None => format!(
+                "`{call}` may give an error{why}, and {read} as if it could not: when it is one, this fails and the error's own message is lost. Add `?` after the call to pass it on, or `?? ...` to give a value in its place"
+            ),
+        });
+    }
+
+    /// `redirect(...)` in a `server fn` a component calls: the call's answer goes to the page's
+    /// code, not to the browser, so it moves nothing; the call gives an error and the page stays
+    /// where it is. Said where the `redirect` is, once for each, with the component (FEEDBACK88.md,
+    /// Q-1381; branch feedback86-89).
+    fn server_fn_redirects(&mut self) {
+        if self.component_server_calls.is_empty() {
+            return;
+        }
+        let mut calls: Vec<(String, String)> = std::mem::take(&mut self.component_server_calls).into_iter().collect();
+        calls.sort();
+        for (n, c) in calls {
+            let Some((file, d)) = self.globals.get(n.as_str()).and_then(|v| Some((v.file.clone(), v.sig.as_ref()?.def.clone()?))) else { continue };
+            // Its own `redirect`, a parameter or a function of its of that name, is no answer.
+            if !self.builtin_in_scope("redirect") || fn_bound(&d).contains("redirect") {
+                continue;
+            }
+            let mut at: Vec<u32> = Vec::new();
+            walk_fn(&d, &mut |x| {
+                if let Expr::Call(f, _, line) = x {
+                    if matches!(&**f, Expr::Ident(r, _) if r == "redirect") {
+                        at.push(*line);
+                    }
+                }
+            });
+            for line in at {
+                self.diag_at(file.clone(), line, Severity::Warning, format!(
+                    "a server fn cannot redirect: <{c}> calls `{n}`, and its answer goes to the page's code, not to the browser, so the page stays where it is and the call gives an error. Return a value (the new address, an id) and `navigate(...)` to it in <{c}>"
+                ));
+            }
+        }
+    }
+
+    /// `trail != null`, `trail` alone, where `trail` is a state a server fn loads whose type does
+    /// not say null (it is the server's): a fact that changes nothing of its type, by which
+    /// `assume` takes it as tested where the test holds (FEEDBACK88.md, Q-1380; branch
+    /// feedback86-89).
+    fn loading_fact(&self, n: &str, out: &mut Vec<(String, T)>) {
+        if self.loading_states.is_empty() {
+            return;
+        }
+        let Some(v) = self.scopes.iter().rev().find_map(|s| s.get(n)) else { return };
+        if !self.decl_reassigned(v.decl, n) && self.loading_states.contains_key(&(bid(v), n.to_string())) {
+            out.push((n.to_string(), v.t));
+        }
+    }
+
+    /// The server fn a component's state is loaded by, `state trail = load_trail(id)`, or
+    /// `defer(load_trail(id))` (FEEDBACK88.md, Q-1380; branch feedback86-89).
+    fn server_loader(&self, e: &Expr) -> Option<String> {
+        let mut e = e;
+        if let Expr::Call(c, args, _) = e {
+            if let ([a], Expr::Ident(f, _)) = (args.as_slice(), &**c) {
+                if f == "defer" && self.builtin_in_scope(f) {
+                    e = a;
+                }
+            }
+        }
+        let Expr::Call(c, _, _) = e else { return None };
+        let Expr::Ident(f, _) = &**c else { return None };
+        if self.is_local(f) {
+            return None;
+        }
+        self.globals.get(f.as_str()).and_then(|v| v.sig.as_ref()).filter(|s| s.server && !s.builtin).map(|_| f.to_string())
+    }
+
+    /// `<Level level={trail.level}/>` in a component whose `trail` a server fn loads, with no
+    /// null test around it (`trail == null ? ... : ...`, `trail && ...`, an `if` that leaves, a
+    /// `match`): the browser makes the component with `trail` null, the view's typed parameter
+    /// refuses null, and the draw fails. Read in the component's own code, not in a function of it,
+    /// which may be called where the test was made. Said once the walk is done, and only of a
+    /// component another component makes (`loading_reads_said`): one only a route's page holds is
+    /// made by the server, which loads its states first (found on the Single-Page Apps course's
+    /// lessons 1 and 2) (FEEDBACK88.md, Q-1380; branch feedback86-89).
+    #[inline(never)]
+    fn loading_read(&mut self, el: &HtmlEl, param: &str, ty: u16) {
+        if !self.fns.last().is_some_and(|f| f.component.is_some() && !f.nested) {
+            return;
+        }
+        let Some((_, AttrVal::Expr(x))) = el.attrs.iter().find(|(a, _)| a == param) else { return };
+        let mut root = x;
+        while let Expr::Field(o, _, _) = root {
+            root = o;
+        }
+        let Expr::Ident(r, _) = root else { return };
+        let Some(v) = self.scopes.iter().rev().find_map(|s| s.get(r.as_str())) else { return };
+        if self.matched(r, v, false) {
+            return;
+        }
+        let Some(f) = self.loading_states.get(&(bid(v), r.to_string())).cloned() else { return };
+        if self.quiet > 0 {
+            return;
+        }
+        let c = self.in_component().unwrap_or_default();
+        let before = format!("`{}` is null until `{}` answers when the browser makes <{}>", dotted(x).unwrap_or_else(|| written(x)), f, c);
+        let after = format!(
+            ", and `{}` of <{}> must be {}: the draw fails then. Show something else until it comes, `{} == null ? <p>Loading…</p> : ...`",
+            param, el.tag, bits_text(ty), r
+        );
+        self.loading_reads.push((self.file.clone(), el.line, c, before, after));
+    }
+
+    /// `loading_read`'s, for each component another component's code makes, with that one's name:
+    /// in its markup, or in a view's or a function's that a component's code uses, as far as they
+    /// go (`view Shell(on) = <div>{on ? <TrailPage/> : ...}</div>` in <App>; found in review), each
+    /// read once.
+    fn loading_reads_said(&mut self) {
+        if self.loading_reads.is_empty() {
+            return;
+        }
+        let wanted: HashSet<String> = self.loading_reads.iter().map(|(_, _, c, _, _)| c.clone()).collect();
+        let mut makers: Vec<(String, String)> = Vec::new();
+        // The program's own: components first, then the views and functions their code reaches.
+        let own = |c: &Self, n: &str| c.globals.get(n).filter(|v| &*v.file != "<builtin>").and_then(|v| v.sig.as_ref()).filter(|s| !s.builtin && !s.server && s.native.is_none()).and_then(|s| s.def.clone());
+        let mut todo: Vec<Arc<FnDef>> = self.globals.values().filter_map(|v| v.sig.as_ref().filter(|s| s.component && !s.builtin)?.def.clone()).collect();
+        todo.sort_by(|a, b| (b.file.as_deref(), b.line, &b.name).cmp(&(a.file.as_deref(), a.line, &a.name)));
+        let mut read: HashSet<String> = todo.iter().map(|d| d.name.clone()).collect();
+        while let Some(d) = todo.pop() {
+            let mut next: Vec<String> = Vec::new();
+            walk_fn(&d, &mut |x| match x {
+                Expr::Html(el, _) => walk_html_els(el, &mut |h| {
+                    if wanted.contains(&h.tag) && h.tag != d.name && !makers.iter().any(|(c, _)| *c == h.tag) {
+                        makers.push((h.tag.clone(), d.name.clone()));
+                    }
+                    if h.tag.starts_with(|c: char| c.is_uppercase()) {
+                        next.push(h.tag.clone());
+                    }
+                }),
+                Expr::Call(f, _, _) => {
+                    if let Expr::Ident(n, _) = &**f {
+                        next.push(n.to_string());
+                    }
+                }
+                _ => {}
+            });
+            for n in next {
+                if !read.contains(&n) {
+                    if let Some(v) = own(self, &n).filter(|v| !v.component) {
+                        read.insert(n);
+                        todo.push(v);
+                    }
+                }
+            }
+        }
+        for (file, line, c, before, after) in std::mem::take(&mut self.loading_reads) {
+            if let Some((_, by)) = makers.iter().find(|(m, _)| *m == c) {
+                self.diag_at(file, line, Severity::Warning, format!("{} (<{}> shows it){}", before, by, after));
+            }
+        }
+    }
+
+    /// A component's state, read as true or false where its type is `any` as something assigns it:
+    /// kept for `truth_said`. Whether it was.
+    fn defer_truth(&mut self, e: &Expr, how: Truth, fallback: T) -> bool {
+        let Expr::Ident(n, _) = e else { return false };
+        if self.quiet > 0 {
+            return false;
+        }
+        let Some(v) = self.scopes.iter().rev().find_map(|s| s.get(n.as_str())).filter(|v| v.kind == Kind::State) else { return false };
+        let key = (v.file.clone(), v.line, n.to_string());
+        if !self.state_types.contains_key(&key) {
+            return false;
+        }
+        self.truth_later.push((self.file.clone(), self.line, e.clone(), how, key, fallback));
+        true
+    }
+
+    /// `js_truthiness` of each state a component's code assigns, read as true or false, now that
+    /// every assignment of it was read: its type is its first value's and each assignment's, all
+    /// ints for `state unread = 0` and `unread += 1` (FEEDBACK90.md, Q-1400; branch feedback86-89).
+    /// One that may hold a number, the `0` a badge shows: not one that holds only text or null,
+    /// `state problem = null` set to an error's message, read `{problem && <p>{problem}</p>}`
+    /// in the starter app and seven others, whose text is never empty.
+    fn truth_said(&mut self) {
+        if self.truth_later.is_empty() {
+            return;
+        }
+        let (file, line) = (self.file.clone(), self.line);
+        for (f, l, e, how, key, fallback) in std::mem::take(&mut self.truth_later) {
+            // One that may hold a number, by its own type; any other with `||` as 0.8.11 said it,
+            // from what its fallback says (`{name || "anonymous"}`, FEEDBACK19.md's Q-151; found in
+            // review).
+            let own = self.state_types.get(&key).map(|(t, _)| *t).filter(|t| !t.is_any() && t.bits & (NUM | DEC) != 0);
+            let Some(t) = own.or_else(|| (!fallback.is_any()).then_some(fallback)) else { continue };
+            self.file = f;
+            self.line = l;
+            self.js_truthiness(t, &e, how);
+        }
+        self.file = file;
+        self.line = line;
+    }
+
     /// `type_of(x) == "decimal"` is never true, and nothing says so (FEEDBACK28.md, Q-347;
     /// branch feedback29-fixes).
     fn type_name_compared(&mut self, a: &Expr, b: &Expr) {
@@ -9726,6 +11488,10 @@ impl Checker {
             }
             let recv = self.expr(obj);
             self.line = line;
+            // Called on an error the call may give (FEEDBACK89.md, Q-1390; branch feedback86-89).
+            if recv.bits & ERR != 0 && !recv.vague() {
+                self.read_past_error(obj, recv, name, true);
+            }
             self.connection_effects(obj, name, recv);
             // `let json = ...` in a function, then `json.stringify(...)`: the
             // variable, not the module, whose method this is not (Q-069).
@@ -9782,6 +11548,16 @@ impl Checker {
             self.warn_shadowed_builtin(n);
         }
         let (ft, sig) = self.callee(callee);
+        self.note_local_call(callee);
+        // A server fn a component calls, for a `redirect` in it (`server_fn_redirects`;
+        // FEEDBACK88.md, Q-1381; branch feedback86-89).
+        if let (Some(s), Expr::Ident(n, _)) = (sig.as_deref(), callee) {
+            if s.server && !s.builtin && self.quiet == 0 && !self.component_server_calls.contains_key(n.as_str()) {
+                if let Some(c) = self.fns.iter().rev().find_map(|f| f.component.clone()) {
+                    self.component_server_calls.insert(n.to_string(), c);
+                }
+            }
+        }
         self.line = line;
         let mut argts: Vec<T> = pre.into_iter().collect();
         for a in args {
@@ -9801,11 +11577,31 @@ impl Checker {
     /// is known and never reassigned.
     fn facts(&self, c: &Expr, yes: bool, out: &mut Vec<(String, T)>) {
         let known = |n: &str| {
-            let v = self.scopes.iter().rev().find_map(|s| s.get(n)).or_else(|| self.globals.get(n))?;
-            (!v.t.vague() && v.t.bits & NIL != 0 && !self.assigned.contains(n)).then_some(v.t)
+            let v = self.binding(n)?;
+            (!v.t.vague() && v.t.bits & NIL != 0 && !self.decl_reassigned(v.decl, n)).then_some(v.t)
         };
         match c {
             Expr::Binary(op @ (BinOp::Eq | BinOp::Ne), a, b, _) => {
+                // `is_err(inv) == false`, `ok != true`: the test itself, the other way where it says
+                // false (found in review; FEEDBACK89.md, Q-1390; branch feedback86-89).
+                if let (x, Expr::Lit(Lit::Bool(v))) | (Expr::Lit(Lit::Bool(v)), x) = (&**a, &**b) {
+                    if !matches!(x, Expr::Lit(_)) {
+                        self.facts(x, yes == (matches!(op, BinOp::Eq) == *v), out);
+                    }
+                    return;
+                }
+                // `inv.error != null`, `error(inv) == null`: whether `inv` is an error, as `is_err`
+                // tells (found in review; FEEDBACK89.md, Q-1390; branch feedback86-89).
+                let tested = match (&**a, &**b) {
+                    (x, Expr::Lit(Lit::Nil)) | (Expr::Lit(Lit::Nil), x) => error_test_of(x),
+                    _ => None,
+                };
+                if let Some(n) = tested {
+                    if matches!(op, BinOp::Eq) == yes {
+                        self.not_an_error(n, out);
+                    }
+                    return;
+                }
                 let name = match (&**a, &**b) {
                     (Expr::Ident(n, _), Expr::Lit(Lit::Nil)) | (Expr::Lit(Lit::Nil), Expr::Ident(n, _)) => n,
                     _ => return,
@@ -9813,20 +11609,51 @@ impl Checker {
                 if let Some(t) = known(name) {
                     let null = matches!(op, BinOp::Eq) == yes;
                     out.push((name.clone().to_string(), if null { T::of(NIL) } else { t.without(NIL) }));
+                } else if matches!(op, BinOp::Eq) != yes {
+                    self.loading_fact(name, out);
+                }
+            }
+            // A `let` that holds a test, `if ok`, `if !ready`: what it tests (`alias_of`; FEEDBACK89.md,
+            // Q-1390, and FEEDBACK88.md, Q-1380, found in review; branch feedback86-89).
+            Expr::Ident(n, _) if self.alias_depth.get() == 0 && self.alias_of(n).is_some() => {
+                // The tests it holds, each read against the types here where its names mean what
+                // they meant, and none past the check's budget; a test it holds is not read through
+                // a `let` again (found in review).
+                if let Some(held) = self.alias_of(n) {
+                    self.alias_depth.set(1);
+                    for &i in if yes { &held.0 } else { &held.1 } {
+                        let work = self.alias_work.get() + 1;
+                        self.alias_work.set(work);
+                        if budget_spent(work) {
+                            break;
+                        }
+                        let h = &self.held_tests[i];
+                        if self.held_here(h) {
+                            self.facts(&h.test, h.way, out);
+                        }
+                    }
+                    self.alias_depth.set(0);
                 }
             }
             Expr::Ident(n, _) if yes => {
                 if let Some(t) = known(n) {
                     out.push((n.to_string(), t.without(NIL | ERR)));
+                } else {
+                    self.loading_fact(n, out);
                 }
             }
             // `is_err(x)` false: `x` holds no error, after `if is_err(x) { return ... }` too
-            // (FEEDBACK81.md, Q-1272; branch feedback72-81).
-            Expr::Call(f, args, _) if !yes && args.len() == 1 && matches!(&**f, Expr::Ident(n, _) if n == "is_err") && !self.is_local("is_err") => {
-                let Expr::Ident(n, _) = &args[0] else { return };
-                let Some(v) = self.scopes.iter().rev().find_map(|s| s.get(n.as_str())).or_else(|| self.globals.get(n.as_str())) else { return };
-                if !v.t.vague() && v.t.bits & ERR != 0 && v.t.bits & !ERR != 0 && !self.assigned.contains(n.as_str()) {
-                    out.push((n.to_string(), v.t.without(ERR)));
+            // (FEEDBACK81.md, Q-1272; branch feedback72-81). And `x.is_err()`, which calls it
+            // (found in review; FEEDBACK89.md, Q-1390; branch feedback86-89).
+            Expr::Call(f, args, _) if !yes && !self.is_local("is_err") && is_err_of(f, args).is_some() => {
+                if let Some(n) = is_err_of(f, args) {
+                    self.not_an_error(n, out);
+                }
+            }
+            // `if inv.error { ... }`, `if error(inv) { ... }` false: no error (found in review).
+            e if !yes && error_test_of(e).is_some() => {
+                if let Some(n) = error_test_of(e) {
+                    self.not_an_error(n, out);
                 }
             }
             Expr::Unary(UnOp::Not, x, _) => self.facts(x, !yes, out),
@@ -9842,12 +11669,27 @@ impl Checker {
         }
     }
 
+    /// The fact that `n` holds no error, where its type says it may and nothing assigns it.
+    fn not_an_error(&self, n: &str, out: &mut Vec<(String, T)>) {
+        let Some(v) = self.binding(n) else { return };
+        if !v.t.vague() && v.t.bits & ERR != 0 && v.t.bits & !ERR != 0 && !self.decl_reassigned(v.decl, n) {
+            out.push((n.to_string(), v.t.without(ERR)));
+        }
+    }
+
     /// Takes facts as true in the innermost scope: a variable there changes
     /// type, one further out is copied in (the same definition, for the
     /// language server).
     fn assume(&mut self, facts: Vec<(String, T)>) {
         for (n, t) in facts {
             let found = self.scopes.iter().rev().find_map(|s| s.get(&n).cloned()).or_else(|| self.globals.get(&n).cloned());
+            // A state a server fn loads, not null here (`loading_fact`; FEEDBACK88.md, Q-1380;
+            // branch feedback86-89).
+            if let (Some(v), false) = (&found, self.loading_states.is_empty()) {
+                if (t.bits & NIL == 0 || t == v.t) && self.loading_states.contains_key(&(bid(v), n.clone())) {
+                    self.matching.push((n.clone(), bid(v), false));
+                }
+            }
             let (Some(v), Some(scope)) = (found, self.scopes.last_mut()) else { continue };
             match scope.get_mut(&n) {
                 Some(x) => x.t = t,
@@ -9984,6 +11826,13 @@ impl Checker {
     }
 
     fn js_truthiness(&mut self, t: T, e: &Expr, how: Truth) {
+        // A component's state something assigns is typed `any` here, as its assignments are not
+        // all read yet: said when they are (`truth_said`; FEEDBACK90.md, Q-1400; branch
+        // feedback86-89).
+        if t.is_any() {
+            self.defer_truth(e, how, T::ANY);
+            return;
+        }
         // `if ready {` with `ready` a function: always true, the call forgotten (Q-513).
         if t.bits == FN {
             if let Expr::Ident(n, _) = e {
@@ -11494,9 +13343,18 @@ impl Checker {
         // field's type (an error has no fields, so reading one stops there anyway).
         // `money.of(...).amount + 0.5` passed as anything (FEEDBACK50.md, Q-633; branch
         // feedback50-fixes).
+        // One it does not have is a mistake as on a map alone: `Lamp({...})` is a Lamp or an error,
+        // and an error's fields are `error` and `message` (FEEDBACK87.md, Q-1370; branch
+        // feedback86-89).
         if t.bits & MAP != 0 && t.bits & !(MAP | ERR | NIL) == 0 {
-            if let Some((_, ft)) = shape_of(t.shape).and_then(|fs| fs.iter().find(|(k, _)| &**k == name).cloned()) {
-                return ft.union(T::of(t.bits & NIL));
+            if let Some(fs) = shape_of(t.shape) {
+                if let Some((_, ft)) = fs.iter().find(|(k, _)| &**k == name) {
+                    return ft.union(T::of(t.bits & NIL));
+                }
+                if !matches!(name, "len" | "keys" | "values" | "error" | "message") {
+                    self.error(format!("this map has no field `{}`{}", name, field_hint(name, &fs)));
+                    return T::of(NIL);
+                }
             }
         }
         if t.bits & (MAP | NIL) != 0 || t.is_any() {
@@ -11728,6 +13586,11 @@ impl Checker {
                 }
                 match v {
                     AttrVal::Expr(Expr::Ident(n, _)) => {
+                        // What it changes, for `run_once_states` (FEEDBACK86.md, Q-1361; branch
+                        // feedback86-89).
+                        if self.quiet == 0 && self.fns.last().is_some_and(|f| f.component.is_some()) && !self.bound_here.contains(n.as_str()) {
+                            self.bound_here.insert(n.to_string());
+                        }
                         let found = self.scopes.iter().rev().find_map(|s| s.get(n.as_str()).cloned());
                         if found.is_none() && self.in_component().is_some() && self.globals.contains_key(n.as_str()) {
                             self.error(format!("`bind:{}` needs component state or a local variable, like ~{}", prop, n));
@@ -11884,6 +13747,8 @@ impl Checker {
                 Some(p) => {
                     if p.annotated && t.bits != 0 && t.bits & p.ty == 0 {
                         self.error(format!("`{}` of <{}> must be {}, got {}", n, el.tag, bits_text(p.ty), bits_text(t.bits)));
+                    } else if p.annotated && !p.optional && p.ty & NIL == 0 && !self.loading_states.is_empty() {
+                        self.loading_read(el, n, p.ty);
                     }
                 }
             }
@@ -15541,27 +17406,406 @@ pub(crate) fn global_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
     }
 }
 
-fn collect_assigned(stmts: &[Stmt], out: &mut HashSet<String>) {
-    for s in stmts {
-        match s {
-            Stmt::Assign(n, op, e, _) => {
-                out.insert(n.to_string());
-                // `=` too, apart: `+=` and `-=` alone keep a kind (Checker::note_first_t).
-                if matches!(op, AssignOp::Set) {
-                    out.insert(format!("={}", n));
+/// Which declaration each assignment changes, through the scopes where it is written, as the
+/// program runs it: a block's `let`s, `state`s and `fn`s, a function's or a lambda's parameters, a
+/// `for`'s and a `match` arm's names, a route's (FEEDBACK89.md, Q-1390, and FEEDBACK88.md, Q-1380,
+/// found in review: a name assigned in another function, or a lambda's parameter of that name,
+/// turned a binding's tests off; branch feedback86-89). A declaration is known by where it is
+/// written (`Var::decl`) and its name. A name no scope in reach declares is the program's, by name,
+/// as the language reaches it across files; one a closure assigns may be a `let` written after the
+/// closure around it, which is marked too (`late`); one neither finds is `loose`, every binding of
+/// it taken as assigned. Two `let`s of a name in one block are one variable (`define`). Each
+/// declaration and assignment is looked up once: linear in the code.
+struct Resolve<'a> {
+    /// The program's own names, at its top level.
+    tops: HashSet<&'a str, crate::value::BuildFx>,
+    /// The declarations in reach, by name: the frame of each and where it is written.
+    reach: HashMap<&'a str, Vec<(usize, usize)>, crate::value::BuildFx>,
+    frames: Vec<Frame<'a>>,
+    /// The names each frame declares, one after another (`Frame::start`), and room to read one's.
+    declared: Vec<&'a str>,
+    here: Vec<usize>,
+    /// The frames a function or a lambda starts, by depth.
+    funcs: Vec<usize>,
+    binds: HashMap<usize, u8, crate::value::BuildFx>,
+    loose: HashSet<String>,
+    /// Every name assigned anywhere, and `=name` for one assigned with `=` (`Checker::assigned`);
+    /// and those no declaration in reach has, the program's (`Checker::top_assigned`).
+    names: HashSet<String>,
+    top: HashSet<String>,
+    /// The names already put in `names` and `top` as `=name`, so it is made once.
+    set_names: HashSet<&'a str, crate::value::BuildFx>,
+    top_set: HashSet<&'a str, crate::value::BuildFx>,
+}
+
+struct Frame<'a> {
+    start: usize,
+    /// Names a closure inside assigns, each once: the depth of the declaration it found (0 none),
+    /// how, and whether a frame between declared one.
+    late: HashMap<&'a str, (usize, u8, bool), crate::value::BuildFx>,
+}
+
+impl<'a> Resolve<'a> {
+    fn new(order: &'a [Item]) -> Self {
+        let mut tops = HashSet::default();
+        for it in order {
+            match &it.stmt {
+                Stmt::Let(p, _, _) => {
+                    let mut ns = Vec::new();
+                    pattern_strs(p, &mut ns);
+                    tops.extend(ns);
                 }
-                assigned_in(e, out)
+                Stmt::State(n, _, _) => {
+                    tops.insert(n.as_str());
+                }
+                Stmt::Fn(d) => {
+                    tops.insert(d.name.as_str());
+                }
+                _ => {}
             }
-            Stmt::Let(_, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) => assigned_in(e, out),
+        }
+        Resolve { tops, reach: HashMap::default(), frames: Vec::new(), declared: Vec::new(), here: Vec::new(), funcs: Vec::new(), binds: HashMap::default(), loose: HashSet::new(), names: HashSet::new(), top: HashSet::new(), set_names: HashSet::default(), top_set: HashSet::default() }
+    }
+
+    fn push(&mut self, func: bool) {
+        self.frames.push(Frame { start: self.declared.len(), late: HashMap::default() });
+        if func {
+            self.funcs.push(self.frames.len());
+        }
+    }
+
+    fn pop(&mut self) {
+        let depth = self.frames.len();
+        if self.funcs.last() == Some(&depth) {
+            self.funcs.pop();
+        }
+        let f = self.frames.pop().expect("a frame");
+        // A closure's assignment of a name this frame declares after it: the first of its
+        // declarations here, which the ones after it share below. Each name once (found in review:
+        // a mark of each declaration for each closure was quadratic).
+        for (n, (r, how, mut found)) in f.late {
+            if let Some(ds) = self.reach.get(n) {
+                let first = ds.iter().rev().take_while(|(d, _)| *d == depth).last().map(|(_, at)| *at);
+                if let Some(at) = first {
+                    mark(&mut self.binds, at, how | BY_CLOSURE);
+                    found = true;
+                }
+            }
+            match self.frames.last_mut() {
+                Some(parent) if depth - 1 > r => late_join(&mut parent.late, n, (r, how, found)),
+                _ if r == 0 && !found && !self.tops.contains(n) => {
+                    self.loose.insert(n.to_string());
+                }
+                _ => {}
+            }
+        }
+        // Two `let`s of a name here are one variable (`define`): what a closure assigns of the
+        // earlier is the later's too, as the closure may run after it; what code before the later
+        // one assigns is not (found in review: `ok = true` before `let ok = !is_err(inv)` turned
+        // the second's test off).
+        for k in f.start..self.declared.len() {
+            let n = self.declared[k];
+            let Some(ds) = self.reach.get_mut(n) else { continue };
+            self.here.clear();
+            while ds.last().is_some_and(|(d, _)| *d == depth) {
+                self.here.push(ds.pop().expect("one").1);
+            }
+            let mut carry = 0u8;
+            for at in self.here.iter().rev() {
+                if carry != 0 {
+                    mark(&mut self.binds, *at, carry);
+                }
+                let h = self.binds.get(at).copied().unwrap_or(0);
+                if h & BY_CLOSURE != 0 {
+                    carry = h;
+                }
+            }
+        }
+        self.declared.truncate(f.start);
+    }
+
+    fn declare(&mut self, n: &'a str, at: usize) {
+        if self.frames.is_empty() {
+            return;
+        }
+        self.declared.push(n);
+        self.reach.entry(n).or_default().push((self.frames.len(), at));
+        self.binds.insert(at, 0);
+    }
+
+    fn assign(&mut self, n: &'a str, how: u8) {
+        if !self.names.contains(n) {
+            self.names.insert(n.to_string());
+        }
+        if how == 2 && !self.set_names.contains(n) {
+            self.set_names.insert(n);
+            self.names.insert(format!("={}", n));
+        }
+        let found = self.reach.get(n).and_then(|ds| ds.last()).copied();
+        let r = found.map_or(0, |(d, _)| d);
+        let inner = self.funcs.last().copied().unwrap_or(0);
+        match found {
+            Some((_, at)) => mark(&mut self.binds, at, if r < inner { how | BY_CLOSURE } else { how }),
+            // The program's, by name (`top`; found in review: a function's own `inv = 2` counted
+            // against the top level's `inv`).
+            None => {
+                if !self.top.contains(n) {
+                    self.top.insert(n.to_string());
+                }
+                if how == 2 && !self.top_set.contains(n) {
+                    self.top_set.insert(n);
+                    self.top.insert(format!("={}", n));
+                }
+            }
+        }
+        match self.funcs.last() {
+            // In a closure: a declaration around it written after it may be the one it changes.
+            Some(&inner) if inner > r + 1 => late_join(&mut self.frames[inner - 2].late, n, (r, how, false)),
+            _ if r == 0 && !self.tops.contains(n) => {
+                self.loose.insert(n.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    fn item(&mut self, s: &'a Stmt) {
+        match s {
+            Stmt::Route(r) => {
+                let (at, mut nth) = (&**r as *const RouteDef as usize, 0);
+                self.push(true);
+                for seg in &r.path {
+                    if let Seg::Param(n, _, _) | Seg::Rest(n) = seg {
+                        self.declare(n, decl_id(at, nth));
+                        nth += 1;
+                    }
+                }
+                for p in r.query.iter().chain(r.guards.iter()).chain(r.body_pat.iter()) {
+                    nth += self.pattern_from(p, at, nth);
+                }
+                self.expr(&r.body);
+                self.pop();
+            }
+            s => self.stmt(s),
+        }
+    }
+
+    fn stmt(&mut self, s: &'a Stmt) {
+        let at = s as *const Stmt as usize;
+        match s {
+            Stmt::Let(p, e, _) => {
+                self.expr(e);
+                self.pattern(p, at);
+            }
+            Stmt::State(n, e, _) => {
+                self.expr(e);
+                self.declare(n, at);
+            }
+            Stmt::Assign(n, op, e, _) => {
+                self.expr(e);
+                self.assign(n.as_str(), if matches!(op, AssignOp::Set) { 2 } else { 1 });
+            }
             Stmt::SetField(o, _, _, e, _) => {
-                assigned_in(o, out);
-                assigned_in(e, out)
+                self.expr(o);
+                self.expr(e);
             }
-            Stmt::Return(Some(e), _) => assigned_in(e, out),
-            Stmt::Fn(d) => assigned_in(&d.body, out),
-            Stmt::Route(r) => assigned_in(&r.body, out),
+            Stmt::Expr(e) | Stmt::Return(Some(e), _) => self.expr(e),
+            Stmt::Fn(d) => {
+                self.declare(&d.name, at);
+                self.func(d);
+            }
+            Stmt::Route(_) => self.item(s),
             Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Type(_) | Stmt::Return(None, _) => {}
         }
+    }
+
+    /// A pattern's names, declared at `at`, each by its place (`decl_id`), its fields' defaults
+    /// read first.
+    fn pattern(&mut self, p: &'a Pattern, at: usize) {
+        self.pattern_from(p, at, 0);
+    }
+
+    /// The same, its places from `nth`; how many names it declares.
+    fn pattern_from(&mut self, p: &'a Pattern, at: usize, nth: usize) -> usize {
+        pattern_defaults(p, &mut |e| self.expr(e));
+        if let Pattern::Bind(n) = p {
+            self.declare(n.as_str(), decl_id(at, nth));
+            return 1;
+        }
+        let mut ns = Vec::new();
+        pattern_strs(p, &mut ns);
+        for (i, n) in ns.iter().enumerate() {
+            self.declare(n, decl_id(at, nth + i));
+        }
+        ns.len()
+    }
+
+    fn func(&mut self, d: &'a FnDef) {
+        self.push(true);
+        for p in &d.params {
+            if let Some(x) = &p.default {
+                self.expr(x);
+            }
+            self.declare(p.name.as_str(), p as *const Param as usize);
+        }
+        self.expr(&d.body);
+        self.pop();
+    }
+
+    fn expr(&mut self, e: &'a Expr) {
+        match e {
+            Expr::Lit(_) | Expr::Ident(..) => {}
+            Expr::Template(parts) => {
+                for p in parts {
+                    if let TPart::Expr(x) = p {
+                        self.expr(x);
+                    }
+                }
+            }
+            Expr::List(xs) => xs.iter().for_each(|x| self.expr(x)),
+            Expr::Map(es) => es.iter().for_each(|(_, x)| self.expr(x)),
+            Expr::Unary(_, x, _) | Expr::Try(x) | Expr::Field(x, _, _) => self.expr(x),
+            Expr::Binary(_, a, b, _) | Expr::Coalesce(a, b) | Expr::Pipe(a, b, _) | Expr::Index(a, b, _) | Expr::While(a, b, _) => {
+                self.expr(a);
+                self.expr(b);
+            }
+            Expr::Call(c, args, _) => {
+                self.expr(c);
+                args.iter().for_each(|x| self.expr(x));
+            }
+            Expr::If(c, a, b) => {
+                self.expr(c);
+                self.expr(a);
+                if let Some(b) = b {
+                    self.expr(b);
+                }
+            }
+            Expr::Match(subj, arms, _) => {
+                self.expr(subj);
+                for a in arms {
+                    self.push(false);
+                    self.pattern(&a.pat, a as *const Arm as usize);
+                    if let Some(g) = &a.guard {
+                        self.expr(g);
+                    }
+                    self.expr(&a.body);
+                    self.pop();
+                }
+            }
+            Expr::For(p, it, body, _) => {
+                self.expr(it);
+                self.push(false);
+                self.pattern(p, e as *const Expr as usize);
+                self.expr(body);
+                self.pop();
+            }
+            Expr::Block(stmts) => {
+                self.push(false);
+                stmts.iter().for_each(|s| self.stmt(s));
+                self.pop();
+            }
+            Expr::Lambda(d) => self.func(d),
+            Expr::Reply(a, b, _) => {
+                self.expr(a);
+                if let Some(b) = b {
+                    self.expr(b);
+                }
+            }
+            Expr::Html(el, _) => self.html(el),
+        }
+    }
+
+    fn html(&mut self, el: &'a HtmlEl) {
+        if let Some(id) = &el.id {
+            self.expr(id);
+        }
+        el.classes.iter().for_each(|c| self.expr(c));
+        for (name, v) in &el.attrs {
+            if let AttrVal::Expr(e) | AttrVal::Spread(e) = v {
+                self.expr(e);
+            }
+            // `bind:value={a}`: what a person types changes the `a` it reaches (`BOUND`; found in
+            // review: the name alone was taken, a lambda's `a` for a state's).
+            if let (true, AttrVal::Expr(Expr::Ident(n, _))) = (name.starts_with("bind:"), v) {
+                if let Some(&(_, at)) = self.reach.get(n.as_str()).and_then(|ds| ds.last()) {
+                    mark(&mut self.binds, at, BOUND);
+                }
+            }
+        }
+        for c in &el.children {
+            match c {
+                HtmlChild::El(x) => self.html(x),
+                HtmlChild::Expr(x) => self.expr(x),
+            }
+        }
+    }
+}
+
+/// In `Resolve::binds`, beside 1 (`+=` or `-=`) and 2 (`=`): assigned by a closure; and changed
+/// by a `bind:`, which leaves its type as it is but not the tests it holds.
+const BY_CLOSURE: u8 = 4;
+const BOUND: u8 = 8;
+
+fn mark(binds: &mut HashMap<usize, u8, crate::value::BuildFx>, at: usize, how: u8) {
+    if let Some(e) = binds.get_mut(&at) {
+        *e = (*e & 3).max(how & 3) | ((*e | how) & (BY_CLOSURE | BOUND));
+    }
+}
+
+fn late_join<'a>(late: &mut HashMap<&'a str, (usize, u8, bool), crate::value::BuildFx>, n: &'a str, (r, how, found): (usize, u8, bool)) {
+    let e = late.entry(n).or_insert((r, 0, false));
+    e.0 = e.0.min(r);
+    e.1 = (e.1 & 3).max(how & 3) | ((e.1 | how) & BY_CLOSURE);
+    e.2 |= found;
+}
+
+/// The id of the `nth` name a declaration at `at` binds: its place in the code, the name's place in
+/// it above any address (`Var::decl`).
+fn decl_id(at: usize, nth: usize) -> usize {
+    at ^ (nth << 48)
+}
+
+/// `pattern_names`, borrowed.
+fn pattern_strs<'a>(p: &'a Pattern, out: &mut Vec<&'a str>) {
+    match p {
+        Pattern::Bind(n) => out.push(n.as_str()),
+        Pattern::Alt(ps) => ps.iter().for_each(|q| pattern_strs(q, out)),
+        Pattern::As(q, n) => {
+            pattern_strs(q, out);
+            out.push(n)
+        }
+        Pattern::List(ps, rest) => {
+            ps.iter().for_each(|q| pattern_strs(q, out));
+            if let Some(Some(n)) = rest {
+                out.push(n)
+            }
+        }
+        Pattern::Record(fs) => {
+            for f in fs {
+                let before = out.len();
+                pattern_strs(&f.pat, out);
+                if out.len() == before && f.pat.is_type_test() {
+                    out.push(f.path.last().unwrap())
+                }
+            }
+        }
+        Pattern::Wild | Pattern::Lit(_) | Pattern::Type(_) => {}
+    }
+}
+
+/// A pattern's fields' defaults, each given to `f` with the AST's lifetime.
+fn pattern_defaults<'a>(p: &'a Pattern, f: &mut dyn FnMut(&'a Expr)) {
+    match p {
+        Pattern::Record(fields) => {
+            for field in fields {
+                if let Some(d) = &field.default {
+                    f(d)
+                }
+                pattern_defaults(&field.pat, f)
+            }
+        }
+        Pattern::List(items, _) | Pattern::Alt(items) => items.iter().for_each(|q| pattern_defaults(q, f)),
+        Pattern::As(q, _) => pattern_defaults(q, f),
+        Pattern::Wild | Pattern::Bind(_) | Pattern::Lit(_) | Pattern::Type(_) => {}
     }
 }
 

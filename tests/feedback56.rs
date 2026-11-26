@@ -1929,7 +1929,10 @@ fn q858_review_a_records_defaults_run_as_one_is_made() {
 fn q858_what_the_checker_cannot_see() {
     let unseen = [
         ("f()", "calls a parameter or a variable"),
-        ("{\n    let g = () => 1\n    g()\n}", "calls a parameter or a variable"),
+        // A `let`'s lambda assigned again: which one runs is not known. One nothing assigns again is
+        // read where it is written (below), as `idempotent` follows it since FEEDBACK89.md's review
+        // of Q-1392 (branch feedback86-89).
+        ("{\n    let g = () => 1\n    g = () => 2\n    g()\n}", "calls a parameter or a variable"),
         ("apply(() => 1)", "calls a parameter or a variable"),
         ("js(\"Chart\")", "`js` runs code"),
         ("run_script(\"1 + 1\")", "`run_script` runs code"),
@@ -1956,6 +1959,7 @@ fn q858_what_the_checker_cannot_see() {
     // written as data, a record made, a method that is a builtin's.
     let seen = [
         "{\n    fn inner(x) = x + 1\n    inner(1)\n}",
+        "{\n    let g = () => 1\n    g()\n}",
         "[1, 2] | map((x) => x * LIMIT)",
         "[1, 2] | map(twice)",
         "Note({ id: 1 })",
