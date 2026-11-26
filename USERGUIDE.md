@@ -1103,7 +1103,7 @@ html fn response any` (`num` is `int | float`, not `dec`). Unions are written `i
 list<str>, note: str? }` a map's fields; `quillo check` holds the program to them (a
 call with a map missing `title`, a list of strings for `list<int>`), and at run time
 they are `list` and `map`. A capitalised name in an annotation is a record's (below); one
-that no `type` declares is not reported by `quillo check`, and fails at the first call.
+that no `type` declares is reported by `quillo check`.
 A function with a capital first letter (`fn Card()`) is taken for a view. A list's item
 type goes in `<>` in a map's or a record's fields too: `quillo check` says so for
 `tags: list[str]?`, with the fix `` `tags: list<str>?` `` (FEEDBACK56.md, Q-861).
@@ -9708,7 +9708,7 @@ work, division by a written zero, return and error types, effects, view and comp
 component code that cannot run in a browser, route mistakes, and calls like `last(xs)`
 where a variable of yours named `last`, known not to be a function, hides the builtin.
 Also: a parameter, a record's field, or a local `fn` or `state` named twice; a pattern's
-type the program has not (`Usr`); a type that names itself with nothing between (`type Ab
+or annotation's type the program has not (`Usr`); a type that names itself with nothing between (`type Ab
 = Ab | int`, see [Records](#records)) *(since 0.8.9)*; a `let` or a `match` that cannot match what it is given
 (`let [a, b] = [1]`, `match x { }`); a lambda called with the wrong number of arguments,
 by its `let` name or given to `map`, `filter`, `reduce`, `sort_by` and the like; a list
@@ -9857,8 +9857,7 @@ effect the policy does not allow (`` `udp.listen` needs the net effect, which ho
 does not allow ``), a plugin it does not list, a Rust file with no `//! effects:` line
 under a policy that narrows effects. See [The policy](#the-policy).
 
-What it does not find, so a reader is not surprised: an unknown type name in an
-annotation (`u: Usr`, when no `type Usr` exists; it fails at the first call), division
+What it does not find, so a reader is not surprised: division
 by a variable that is zero, `==` between values that can never be equal, a `match`
 that misses a case (it fails when the value comes), and component code that reaches the
 database through a helper between them (`quillo run` refuses that before it serves).

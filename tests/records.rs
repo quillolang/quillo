@@ -161,6 +161,173 @@ fn quillo_check_holds_code_to_the_fields() {
     assert!(e.iter().any(|m| m.contains("unknown type `strng`")), "{:?}", e);
 }
 
+#[test]
+fn unknown_type_names_in_annotations_are_reported() {
+    let e = check(
+        r#"
+type Todo = { id: int, text: str }
+type OrderLine = { id: int }
+type Usér = { id: int }
+type BadRecord = { owner: Usr }
+type BadAlias = list<Tdoo>
+fn param_typo(u: Usr) = u
+fn dup_line(a: Dup, b: Dup) -> Dup = a
+server fn ret_and_err() -> Tdoo ! ErrTyp = err("x")
+fn nested(xs: list<Usr>, m: { owner: Usr }, u: Usr?, both: int | Usr) = [xs, m, u, both]
+component C(u: Usr) = <p>{u}</p>
+view Card() = <div/>
+fn bad_view_ty(c: Card) = c
+fn case_typo(o: Orderline) = o
+fn nonascii_case(u: UsÉr) = u
+fn fwd_ok(x: Later) -> Later = x
+type Later = { y: int }
+fn outer() {
+    fn inner(u: Usr) = u
+    let a = (u: Usr) => u
+    let b = (x): Usr => x
+    [inner, a, b]
+}
+fn local_type() {
+    type Local = { next: Local? }
+}
+fn q_caller() = q_target(1)
+fn q_target(x: Qmissing) = x
+fn far_name(x: Zzzzzz) = x
+fn upper_ret() -> Int = 1
+type BadStr = list<Str>
+fn upper_more(a: Bool, b: Any, c: Float, d: List, e: Map, f: Dec, g: Num, h: Date, i: Money, j: Html, k: Fn, l: Response) = [a, b, c, d, e, f, g, h, i, j, k, l]
+fn foreign_more(a: Integer, b: Long, c: String, d: Boolean, e: Object, f: Double, g: Array, h: Vec, i: Dict, j: Decimal, k: Number) = [a, b, c, d, e, f, g, h, i, j, k]
+"#,
+    );
+    let count = |s: &str| e.iter().filter(|m| m.contains(s)).count();
+    assert!(e.iter().any(|m| m.contains("there is no type `Usr` (did you mean `User`?)")), "{:?}", e);
+    assert!(e.iter().any(|m| m.contains("there is no type `Tdoo` (did you mean `Todo`?)")), "{:?}", e);
+    assert!(e.iter().any(|m| m.contains("there is no type `Orderline` (did you mean `OrderLine`?)")), "{:?}", e);
+    assert!(e.iter().any(|m| m.contains("there is no type `UsÉr` (did you mean `Usér`?)")), "{:?}", e);
+    assert!(!e.iter().any(|m| m.contains("Later")), "{:?}", e);
+    assert!(e.iter().any(|m| m.contains("there is no type `Card`") && !m.contains("did you mean")), "{:?}", e);
+    assert!(e.iter().any(|m| m.contains("there is no type `ErrTyp`") && !m.contains("did you mean")), "{:?}", e);
+    assert!(e.iter().any(|m| m.contains("there is no type `Zzzzzz`") && !m.contains("did you mean")), "{:?}", e);
+    assert!(e.iter().any(|m| m.contains("`type` must be at the top level")), "{:?}", e);
+    assert!(!e.iter().any(|m| m.contains("there is no type `Local`")), "{:?}", e);
+    for (bad, good) in [
+        ("Int", "int"),
+        ("Float", "float"),
+        ("Dec", "dec"),
+        ("Num", "num"),
+        ("Str", "str"),
+        ("Date", "date"),
+        ("Money", "money"),
+        ("Bool", "bool"),
+        ("List", "list"),
+        ("Map", "map"),
+        ("Html", "html"),
+        ("Fn", "fn"),
+        ("Any", "any"),
+        ("Response", "response"),
+        ("Integer", "int"),
+        ("Long", "int"),
+        ("String", "str"),
+        ("Boolean", "bool"),
+        ("Object", "any"),
+        ("Double", "float"),
+        ("Array", "list"),
+        ("Vec", "list"),
+        ("Dict", "map"),
+        ("Decimal", "dec"),
+        ("Number", "num"),
+    ] {
+        let want = format!("there is no type `{}`: the builtin types are written in small letters, `{}`", bad, good);
+        assert!(e.iter().any(|m| m.contains(&want)), "missing `{}` in {:?}", want, e);
+    }
+    // All 7 distinct lines with Usr, both Tdoo lines, same-line dedup on Dup, and quiet-prechecked Qmissing.
+    assert_eq!(count("there is no type `Usr`"), 7, "{:?}", e);
+    assert_eq!(count("there is no type `Tdoo`"), 2, "{:?}", e);
+    assert_eq!(count("there is no type `Dup`"), 1, "{:?}", e);
+    assert_eq!(count("there is no type `Qmissing`"), 1, "{:?}", e);
+
+    // Imported type alias works, while failed or unparsed imports suppress cascading errors.
+    let dir = support::temp_dir("check-unknown-type-imports");
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::write(dir.join("lib/geo.qwe"), "type Point = { x: int, y: int }\n").unwrap();
+    std::fs::write(dir.join("main.qwe"), "import lib/geo.qwe use Point as Pt\ntype Wrapper = { p: Pt }\nfn id(p: Pt) -> Pt = p\n").unwrap();
+    let ok = quillo::check::check_file(&dir.join("main.qwe"));
+    assert!(ok.diagnostics.is_empty(), "{:#?}", ok.diagnostics);
+
+    std::fs::write(
+        dir.join("bad_whole.qwe"),
+        "use \"lib/missing.qwe\"\nfn f(u: Missing) = u\n",
+    )
+    .unwrap();
+    let errs: Vec<String> = quillo::check::check_file(&dir.join("bad_whole.qwe")).errors().map(|d| d.message.clone()).collect();
+    assert!(errs.iter().any(|m| m.contains("missing.qwe")), "{:?}", errs);
+    assert!(!errs.iter().any(|m| m.contains("there is no type `Missing`")), "{:?}", errs);
+
+    std::fs::write(
+        dir.join("bad_named.qwe"),
+        "import lib/geo.qwe use Missing\nfn f(u: Missing) = u\n",
+    )
+    .unwrap();
+    let errs: Vec<String> = quillo::check::check_file(&dir.join("bad_named.qwe")).errors().map(|d| d.message.clone()).collect();
+    assert!(errs.iter().any(|m| m.contains("has no public name `Missing`")), "{:?}", errs);
+    assert!(!errs.iter().any(|m| m.contains("there is no type `Missing`")), "{:?}", errs);
+
+    std::fs::write(
+        dir.join("lib/broken.qwe"),
+        "type BrokenUser = { id: int }\nfn bad( =\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("bad_parse.qwe"),
+        "use \"lib/broken.qwe\"\nfn f(u: BrokenUser) = u\n",
+    )
+    .unwrap();
+    let errs: Vec<String> = quillo::check::check_file(&dir.join("bad_parse.qwe")).errors().map(|d| d.message.clone()).collect();
+    assert!(errs.iter().any(|m| m.contains("expected a parameter name")), "{:?}", errs);
+    assert!(!errs.iter().any(|m| m.contains("there is no type `BrokenUser`")), "{:?}", errs);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Confined checks bound suggestion work across many unknown type annotations.
+    let mut big = String::new();
+    for i in 0..500 {
+        big.push_str(&format!("type Rec{:04} = {{ v: int }}\n", i));
+    }
+    for i in 0..250 {
+        big.push_str(&format!("fn f{}(x: Xec{:04}) = x\n", i, i));
+    }
+    let started = std::time::Instant::now();
+    let confined_errs: Vec<String> = quillo::check::check_source_opts(
+        &big,
+        "confined.qwe",
+        Path::new("."),
+        quillo::check::Options { confined: true, ..Default::default() },
+    )
+    .errors()
+    .map(|d| d.message.clone())
+    .collect();
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+    assert!(confined_errs.iter().any(|m| m.contains("there is no type `Xec0000` (did you mean `Rec0000`?)")), "{:?}", &confined_errs[..5.min(confined_errs.len())]);
+    assert!(confined_errs.iter().any(|m| m == "there is no type `Xec0249`"), "{:?}", confined_errs.last());
+
+    // User-defined type shadowing a builtin name is accepted without error.
+    let shadowed = quillo::check::check_source("type Date = { y: int }\nfn ok_date(d: Date) -> Date = d\n", "shadow.qwe", Path::new("."));
+    assert!(shadowed.diagnostics.is_empty(), "{:#?}", shadowed.diagnostics);
+
+    // Confined checks skip case-only scans and suggestions for names past 64 characters.
+    let long_def = format!("Long{}A", "x".repeat(60));
+    let long_use = format!("Long{}a", "x".repeat(60));
+    let long_errs: Vec<String> = quillo::check::check_source_opts(
+        &format!("type {} = {{ v: int }}\nfn f(x: {}) = x\n", long_def, long_use),
+        "long_confined.qwe",
+        Path::new("."),
+        quillo::check::Options { confined: true, ..Default::default() },
+    )
+    .errors()
+    .map(|d| d.message.clone())
+    .collect();
+    assert_eq!(long_errs, vec![format!("there is no type `{}`", long_use)]);
+}
+
 // ---- the browser ------------------------------------------------------------------------------
 
 fn node_available() -> bool {

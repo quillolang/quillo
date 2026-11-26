@@ -208,7 +208,7 @@ html fn response any` (`num` is `int | float`, not `dec`). Unions are written `i
 list<str>, note: str? }` a map's fields; `quillo check` holds the program to them (a
 call with a map missing `title`, a list of strings for `list<int>`), and at run time
 they are `list` and `map`. A capitalised name in an annotation is a record's (below); one
-that no `type` declares is not reported by `quillo check`, and fails at the first call.
+that no `type` declares is reported by `quillo check`.
 A function with a capital first letter (`fn Card()`) is taken for a view. A list's item
 type goes in `<>` in a map's or a record's fields too: `quillo check` says so for
 `tags: list[str]?`, with the fix `` `tags: list<str>?` `` (FEEDBACK56.md, Q-861).

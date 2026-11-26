@@ -11,7 +11,7 @@ work, division by a written zero, return and error types, effects, view and comp
 component code that cannot run in a browser, route mistakes, and calls like `last(xs)`
 where a variable of yours named `last`, known not to be a function, hides the builtin.
 Also: a parameter, a record's field, or a local `fn` or `state` named twice; a pattern's
-type the program has not (`Usr`); a type that names itself with nothing between (`type Ab
+or annotation's type the program has not (`Usr`); a type that names itself with nothing between (`type Ab
 = Ab | int`, see [Records](#records)) *(since 0.8.9)*; a `let` or a `match` that cannot match what it is given
 (`let [a, b] = [1]`, `match x { }`); a lambda called with the wrong number of arguments,
 by its `let` name or given to `map`, `filter`, `reduce`, `sort_by` and the like; a list
@@ -160,8 +160,7 @@ effect the policy does not allow (`` `udp.listen` needs the net effect, which ho
 does not allow ``), a plugin it does not list, a Rust file with no `//! effects:` line
 under a policy that narrows effects. See [The policy](#the-policy).
 
-What it does not find, so a reader is not surprised: an unknown type name in an
-annotation (`u: Usr`, when no `type Usr` exists; it fails at the first call), division
+What it does not find, so a reader is not surprised: division
 by a variable that is zero, `==` between values that can never be equal, a `match`
 that misses a case (it fails when the value comes), and component code that reaches the
 database through a helper between them (`quillo run` refuses that before it serves).

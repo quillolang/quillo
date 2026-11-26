@@ -6145,6 +6145,92 @@ impl Checker {
         }
     }
 
+    fn check_fn_tys(&mut self, d: &FnDef) {
+        if self.quiet > 0 {
+            return;
+        }
+        for p in &d.params {
+            if let Some(ty) = &p.ty {
+                self.check_ty(ty);
+            }
+        }
+        if let Some(ty) = &d.ret {
+            self.check_ty(ty);
+        }
+        if let Some(ty) = &d.err {
+            self.check_ty(ty);
+        }
+    }
+
+    fn check_ty(&mut self, ty: &Ty) {
+        for n in &ty.names {
+            if crate::ast::is_type_name(n)
+                && !RECORDS.with(|r| r.borrow().contains_key(n))
+                && !self.unparsed_names.contains(n)
+                && !self.failed_import(n)
+            {
+                // `a: Int`, `a: String`: Kotlin's and Java's names, taken for a record of the
+                // program's own that is not there, and every call failed (FEEDBACK45.md, Q-519;
+                // branch feedback40-43).
+                let builtin = crate::parser::TYPE_NAMES
+                    .iter()
+                    .copied()
+                    .find(|t| t.eq_ignore_ascii_case(n))
+                    .or_else(|| match n.as_str() {
+                        "Integer" | "Long" => Some("int"),
+                        "String" => Some("str"),
+                        "Boolean" => Some("bool"),
+                        "Object" => Some("any"),
+                        "Double" => Some("float"),
+                        "Array" | "Vec" => Some("list"),
+                        "Dict" => Some("map"),
+                        "Decimal" => Some("dec"),
+                        "Number" => Some("num"),
+                        _ => None,
+                    });
+                if let Some(b) = builtin {
+                    self.error(format!("there is no type `{}`: the builtin types are written in small letters, `{}`", n, b));
+                } else {
+                    let near = self.suggest_type(n);
+                    self.error(format!("there is no type `{}`{}", n, near.map_or(String::new(), |m| format!(" (did you mean `{}`?)", m))));
+                }
+            }
+        }
+        if let Some(e) = &ty.elem {
+            self.check_ty(e);
+        }
+        for (_, f) in ty.fields.iter().flatten() {
+            self.check_ty(f);
+        }
+    }
+
+    fn suggest_type(&self, name: &str) -> Option<String> {
+        let (most, most_len) = if self.confined { (MOST_SUGGEST_COMPARED, 64) } else { (MOST_SUGGEST_COST, 1024) };
+        let mut cost = self.suggested.get();
+        if cost > most || name.chars().count() > most_len {
+            return None;
+        }
+        RECORDS.with(|r| {
+            let records = r.borrow();
+            // `closest_within` skips case-only matches, so check for a casing typo like
+            // `Orderline` for `OrderLine` first, counting the scan against the same budget.
+            cost += records.len() as u64 * (name.len() as u64 / 4 + 1);
+            let lower = (!name.is_ascii()).then(|| name.to_lowercase());
+            let case_match = |k: &str| match &lower {
+                None => k.eq_ignore_ascii_case(name),
+                Some(l) => k.len() <= l.len() * 4 && k.to_lowercase() == *l,
+            };
+            if let Some(m) = records.keys().filter(|k| case_match(k)).min() {
+                self.suggested.set(cost);
+                return Some(m.clone());
+            }
+            let cands = records.keys().map(|s| s.as_str()).chain(crate::parser::TYPE_NAMES.iter().copied());
+            let near = closest_within(name, cands, &mut cost, most_len, &mut self.lowered.borrow_mut());
+            self.suggested.set(cost);
+            near
+        })
+    }
+
     fn params(&mut self, d: &FnDef) {
         self.params_hinted(d, None)
     }
@@ -6157,27 +6243,8 @@ impl Checker {
                 self.warn(format!("`{}` is named twice in this `with`", e));
             }
         }
+        self.check_fn_tys(d);
         for (i, p) in d.params.iter().enumerate() {
-            // `a: Int`, `a: String`: Kotlin's and Java's names, taken for a record of the
-            // program's own that is not there, and every call failed (FEEDBACK45.md, Q-519;
-            // branch feedback40-43).
-            if let Some(ty) = &p.ty {
-                for n in &ty.names {
-                    let builtin = match n.as_str() {
-                        "Int" | "Integer" | "Long" => Some("int"),
-                        "String" | "Str" => Some("str"),
-                        "Bool" | "Boolean" => Some("bool"),
-                        "Any" | "Object" => Some("any"),
-                        "Float" | "Double" => Some("float"),
-                        "List" | "Array" => Some("list"),
-                        "Map" | "Dict" => Some("map"),
-                        _ => None,
-                    };
-                    if let Some(b) = builtin.filter(|_| !RECORDS.with(|r| r.borrow().contains_key(n)) && !self.globals.contains_key(n.as_str())) {
-                        self.error(format!("there is no type `{}`: the builtin types are written in small letters, `{}`", n, b));
-                    }
-                }
-            }
             // `fn f(a, a)`: the last argument was `a` (FEEDBACK45.md, Q-508; branch
             // feedback40-43).
             if d.params[..i].iter().any(|q| q.name == p.name) && p.name != "_" {
@@ -6693,6 +6760,8 @@ impl Checker {
                 self.line = td.line;
                 if !self.scopes.is_empty() {
                     self.error("`type` must be at the top level");
+                } else {
+                    self.check_ty(&td.ty);
                 }
                 // A default must be of its field's type. It is made with each record, not as
                 // top-level code runs, so it may read what is defined later (found in review).
