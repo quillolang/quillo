@@ -7,8 +7,10 @@ use std::sync::Arc;
 #[derive(Debug, Clone, PartialEq)]
 pub enum StrPart {
     Lit(String),
-    /// Source of an interpolated `{expr}` and the line it starts on.
-    Expr(String, u32),
+    /// Source of an interpolated `{expr}`, the line it starts on, and where it starts in this
+    /// lexer's text: what a message's column on the part's first line counts from
+    /// (FEEDBACK87.md, Q-1371, round 9, found in review; branch feedback86-89).
+    Expr(String, u32, usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +161,17 @@ pub struct Lexer {
     pub line: u32,
     /// Open brackets. Newlines are ignored inside `(` and `[`.
     pub stack: Vec<char>,
+    /// How many `{` have been read, as tokens and by the parser at a markup value's `{`: whether
+    /// a handler's block holds a block or a map of its own (FEEDBACK87.md, Q-1371; branch
+    /// feedback86-89).
+    pub braces: u32,
+    /// The file's line ending, as its first line has it: what a fix puts at the end of a line it
+    /// adds (FEEDBACK87.md, Q-1371, round 7, found in review; branch feedback86-89).
+    pub eol: &'static str,
+    /// The line breaks whose ending is not `eol`, by where their `\n` is in `chars`, in a file
+    /// with mixed endings only: what a fix puts at the end of a line it adds there
+    /// (FEEDBACK87.md, Q-1371, round 8, found in review; branch feedback86-89).
+    odd_eols: Option<Arc<Vec<(usize, &'static str)>>>,
     /// The last token produced, used to decide whether a newline ends a statement.
     pub last: Option<Tok>,
     /// A `/* ... */` comment just skipped held a line break (on this line):
@@ -191,25 +204,94 @@ impl Lexer {
     /// feedback27-35-fixes). A `\r` written as `\r` stays.
     pub fn new(src: &str, line: u32) -> Self {
         let src = if line == 1 { src.strip_prefix('\u{FEFF}').unwrap_or(src) } else { src };
+        let eol = match src.find(['\n', '\r']) {
+            Some(i) if src[i..].starts_with("\r\n") => "\r\n",
+            Some(i) if src.as_bytes()[i] == b'\r' => "\r",
+            _ => "\n",
+        };
         let mut chars: Vec<char> = Vec::with_capacity(src.len());
         let mut it = src.chars().peekable();
         if line == 1 && src.starts_with("#!") {
-            for c in it.by_ref() {
-                if c == '\n' {
+            // Its line ends at a lone `\r` too, as the file's others do (FEEDBACK87.md, Q-1371,
+            // round 9, found in review; branch feedback86-89).
+            while let Some(c) = it.next() {
+                if c == '\n' || c == '\r' {
+                    if c == '\r' && it.peek() == Some(&'\n') {
+                        it.next();
+                    }
                     chars.push('\n');
                     break;
                 }
             }
         }
-        while let Some(c) = it.next() {
-            if c == '\r' && it.peek() == Some(&'\n') {
-                continue;
+        let mut odd = Vec::new();
+        // A lone CR, as old Mac files end lines, is a line break too (FEEDBACK45.md, Q-529; branch
+        // feedback40-43). A break unlike the first is noted; a `\n` is one only where the first
+        // is not, which a file of `\n` (the loop most files take) never asks (rounds 9 and 12).
+        fn cr(it: &mut std::iter::Peekable<std::str::Chars<'_>>) -> &'static str {
+            if it.peek() == Some(&'\n') {
+                it.next();
+                "\r\n"
+            } else {
+                "\r"
             }
-            // A lone CR, as old Mac files end lines, is a line break too (FEEDBACK45.md,
-            // Q-529; branch feedback40-43).
-            chars.push(if c == '\r' { '\n' } else { c });
         }
-        Lexer { chars: Arc::new(chars), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None, unclosed: None, plain_dollars: Default::default(), comments: Default::default(), triple: None }
+        if eol == "\n" {
+            while let Some(c) = it.next() {
+                if c == '\r' {
+                    odd.push((chars.len(), cr(&mut it)));
+                    chars.push('\n');
+                } else {
+                    chars.push(c);
+                }
+            }
+        } else if eol == "\r\n" {
+            // Each ending its own loop, so no break compares its ending with the file's
+            // (FEEDBACK87.md, Q-1371, round 12, found in review; branch feedback86-89).
+            while let Some(c) = it.next() {
+                if c == '\r' {
+                    if it.peek() == Some(&'\n') {
+                        it.next();
+                    } else {
+                        odd.push((chars.len(), "\r"));
+                    }
+                    chars.push('\n');
+                } else {
+                    if c == '\n' {
+                        odd.push((chars.len(), "\n"));
+                    }
+                    chars.push(c);
+                }
+            }
+        } else {
+            while let Some(c) = it.next() {
+                if c == '\r' {
+                    if it.peek() == Some(&'\n') {
+                        it.next();
+                        odd.push((chars.len(), "\r\n"));
+                    }
+                    chars.push('\n');
+                } else {
+                    if c == '\n' {
+                        odd.push((chars.len(), "\n"));
+                    }
+                    chars.push(c);
+                }
+            }
+        }
+        let odd_eols = if odd.is_empty() { None } else { Some(Arc::new(odd)) };
+        Lexer { chars: Arc::new(chars), pos: 0, line, stack: Vec::new(), last: None, comment_newline: None, unclosed: None, plain_dollars: Default::default(), comments: Default::default(), triple: None, braces: 0, eol, odd_eols }
+    }
+
+    /// The ending of the line a fix adds text to at `at`: the line break after it, or, on a last
+    /// line with none, the one before; `eol` in a file with one ending (FEEDBACK87.md, Q-1371,
+    /// round 8, found in review; branch feedback86-89).
+    #[cold]
+    pub fn eol_near(&self, at: usize) -> &'static str {
+        let Some(odd) = &self.odd_eols else { return self.eol };
+        let at = at.min(self.chars.len());
+        let brk = self.chars[at..].iter().position(|c| *c == '\n').map(|i| at + i).or_else(|| self.chars[..at].iter().rposition(|c| *c == '\n'));
+        brk.and_then(|b| odd.iter().find(|(i, _)| *i == b)).map_or(self.eol, |(_, e)| *e)
     }
 
     /// A `//` comment just read, from `start` to here on `line`: noted when it starts its line
@@ -503,6 +585,7 @@ impl Lexer {
                 }
                 '{' => {
                     self.stack.push('{');
+                    self.braces = self.braces.wrapping_add(1);
                     Tok::LBrace
                 }
                 '}' => {
@@ -825,6 +908,7 @@ impl Lexer {
                         parts.push(StrPart::Lit(std::mem::take(&mut buf)));
                     }
                     let line = self.line;
+                    let at = self.pos;
                     let open = || QuilloError::new("unexpected end of input: `${` in a template is never closed", line);
                     let mut depth = 1;
                     let mut src = String::new();
@@ -861,7 +945,7 @@ impl Lexer {
                     if src.trim().is_empty() {
                         return Err(QuilloError::new("empty `${}` in template", line));
                     }
-                    parts.push(StrPart::Expr(src, line));
+                    parts.push(StrPart::Expr(src, line, at));
                 }
                 _ => buf.push(c),
             }

@@ -3,7 +3,7 @@
 //! unary `-`, then postfix calls, fields, indexing and `?`.
 
 use crate::ast::*;
-use crate::error::{Fix, QuilloError};
+use crate::error::{Fix, Place, QuilloError};
 use crate::lexer::{Lexer, StrPart, Tok, Token};
 use std::sync::Arc;
 
@@ -298,6 +298,17 @@ pub(crate) const IMPORT_WORDS: &[&str] = &["import", "client", "preload", "preco
 /// source is refused here, so that nothing that walks it later (the
 /// checker, the interpreter, freeing it) runs out of stack.
 pub const MAX_NESTING: u32 = 256;
+
+/// `Parser::arrow_at` when no arrow function's body is about to be read, and when one is whose
+/// start is not kept (`e => { ... }`; FEEDBACK87.md, Q-1371; branch feedback86-89).
+const NO_ARROW: usize = usize::MAX;
+const ARROW_UNKNOWN: usize = usize::MAX - 1;
+
+/// A `>`, `>=` or `/` read as an operator right after an arrow function's block (`Parser::
+/// after_arrow`): where, its line, where the arrow starts, whether a fix there is held (the block
+/// holds a block or a map of its own, or ends in an operation), and where the operator ends
+/// (FEEDBACK87.md, Q-1371; branch feedback86-89).
+type Note = (usize, u32, usize, bool, usize);
 const TOO_DEEP: &str = "the code nests too deeply";
 
 pub struct Parser {
@@ -350,6 +361,25 @@ pub struct Parser {
     /// What the block about to be parsed is the body of (an `if`, a `for`), for a `state` in it
     /// (FEEDBACK81.md, Q-1271; branch feedback72-81).
     block_of: &'static str,
+    /// An attribute's `{` left open after a handler's block, `onclick={() => { n += 1 }>`, told by
+    /// what the parser read, not by the text after it (FEEDBACK87.md, Q-1371, the coordinator's
+    /// decision of round 3; branch feedback86-89): where the arrow function whose body is about to
+    /// be read starts (its `(`; `ARROW_UNKNOWN` when not known, `NO_ARROW` for none); while its
+    /// body in braces is read, the depth that body's own operators are read at and that start; a
+    /// `>` or `/` read as an operator right after such a block (`Note`), kept while that operator's
+    /// right side is read; and the `{` of a `{ ... }` value whose `}` was wanted where the value
+    /// ended. `arrow_block` also holds how many `{` the lexer had read when the block's own `{`
+    /// was read, which tells whether the block holds a block or a map of its own (round 4).
+    arrow_at: usize,
+    arrow_block: Option<(u32, usize, u32)>,
+    after_arrow: Option<Box<Note>>,
+    brace_wanted: Option<usize>,
+    /// A parse that asks whether a fix is taken (`takes_with_brace`), which asks no more.
+    trial: bool,
+    /// How many notes (`after_arrow`) have been made, for a look ahead to drop one it made.
+    notes: u32,
+    /// The fix of the last error made with one, to be judged if that error leaves `parse_program`.
+    pending: std::cell::RefCell<Option<Box<Pending>>>,
 }
 
 /// An element whose end tag has not been read yet.
@@ -375,6 +405,8 @@ pub struct OpenTag {
 /// editor-end-tags).
 pub fn open_tags_at_end(src: &str) -> Option<Vec<OpenTag>> {
     let mut p = Parser::new(src);
+    // Its error is not shown: no fix of it is tried (`takes_edit`).
+    p.trial = true;
     match p.parse_program() {
         Ok(_) => None,
         Err(_) => p.unclosed_at_end.filter(|o| !o.is_empty()),
@@ -667,7 +699,8 @@ impl Parser {
 
     pub fn with_line(src: &str, line: u32) -> Self {
         Parser { lx: Lexer::new(src, line), peeked: None, in_typedef: false, no_bare_arrow: 0, depth: 0, deepest: 0, ternaries: Default::default(), file: None, styling: None, file_style: None, file_styles: 0, components: 0, callers_ok: false, callers: None, view_next: false, open: Vec::new(), unclosed_at_end: None, top: false, more: Vec::new(),
-                 privates: Default::default(), privacy_tag: crate::privacy::tag(None, src), implied_ext: false, block_of: "" }
+                 privates: Default::default(), privacy_tag: crate::privacy::tag(None, src), implied_ext: false, block_of: "",
+                 arrow_at: NO_ARROW, arrow_block: None, after_arrow: None, brace_wanted: None, trial: false, notes: 0, pending: Default::default() }
     }
 
     /// Records `file` on the functions and routes parsed (see `FnDef::file`).
@@ -809,14 +842,20 @@ impl Parser {
         Ok(())
     }
 
-    fn save(&self) -> (Lexer, Option<Token>, u32) {
-        (self.lx.clone(), self.peeked.clone(), self.depth)
+    /// What is read again after a look ahead, with how many notes of a `>` after a handler's block
+    /// had been made: one made in the look ahead is dropped (Q-1371, found in review; branch
+    /// feedback86-89).
+    fn save(&self) -> (Lexer, Option<Token>, u32, u32) {
+        (self.lx.clone(), self.peeked.clone(), self.depth, self.notes)
     }
 
-    fn restore(&mut self, s: (Lexer, Option<Token>, u32)) {
+    fn restore(&mut self, s: (Lexer, Option<Token>, u32, u32)) {
         self.lx = s.0;
         self.peeked = s.1;
         self.depth = s.2;
+        if self.notes != s.3 {
+            self.after_arrow = None;
+        }
     }
 
     /// One level deeper, unless that is too deep. A chain such as
@@ -1111,6 +1150,16 @@ impl Parser {
     }
 
     pub fn parse_program(&mut self) -> PResult<Vec<Stmt>> {
+        match self.program() {
+            Err(mut e) if !self.trial && self.pending.borrow().is_some() => {
+                self.judge_fix(&mut e);
+                Err(e)
+            }
+            r => r,
+        }
+    }
+
+    fn program(&mut self) -> PResult<Vec<Stmt>> {
         let mut out = Vec::new();
         loop {
             self.skip_seps()?;
@@ -2964,6 +3013,8 @@ impl Parser {
         })();
         match head {
             Ok(Some((params, ret))) => {
+                // Where it starts: its `(`, just read (Q-1371; branch feedback86-89).
+                self.arrow_at = saved.0.pos.wrapping_sub(1);
                 let body = self.no_bare_arrow_off(|p| p.measured(Self::parse_arrow_body))?;
                 Ok(Some(arrow(params, ret, body, line, self.file.clone())))
             }
@@ -2987,6 +3038,9 @@ impl Parser {
     /// function's, or a `match` arm's, which was told as a function's (FEEDBACK81.md, Q-1271, found
     /// by the coverage tests of feedback72-81; branch feedback72-81).
     fn arrow_body_of(&mut self, what: &'static str) -> PResult<Expr> {
+        // An arrow function's, whose operators after its block are noted (`note_after_arrow`;
+        // Q-1371; branch feedback86-89).
+        let arrow = std::mem::replace(&mut self.arrow_at, NO_ARROW);
         if self.at(&Tok::LBrace)? {
             let s = self.save();
             self.next()?;
@@ -3003,10 +3057,17 @@ impl Parser {
         // and the arrow gives null (FEEDBACK45.md, Q-518; branch feedback40-43).
         let line = self.line()?;
         // A body in braces is a function's, or an arm's, for a `state` in it (Q-1271).
+        let mut outer = None;
         if self.at(&Tok::LBrace)? {
             self.block_of = what;
+            if arrow != NO_ARROW {
+                outer = Some(self.arrow_block.replace((self.depth + 1, arrow, self.lx.braces)));
+            }
         }
         let e = self.parse_expr();
+        if let Some(o) = outer {
+            self.arrow_block = o;
+        }
         self.block_of = "";
         let e = e?;
         if matches!(self.peek()?, Tok::Assign | Tok::PlusAssign | Tok::MinusAssign) {
@@ -3203,6 +3264,10 @@ impl Parser {
             Tok::Ge => BinOp::Ge,
             _ => return Ok(lhs),
         };
+        // `}>` or `}>=` (its text beginning with `=`) in a handler's block, read apart (Q-1371).
+        if matches!(op, BinOp::Gt | BinOp::Ge) && self.arrow_block.is_some_and(|b| b.0 == self.depth) {
+            return self.after_arrow_block(lhs, op, line);
+        }
         self.next()?;
         let rhs = self.parse_range()?;
         Ok(Expr::Binary(op, Box::new(lhs), Box::new(rhs), line))
@@ -3252,6 +3317,11 @@ impl Parser {
                     return Ok(lhs);
                 }
             };
+            // `}/>` in a handler's block, read apart (Q-1371).
+            if op == BinOp::Div && self.arrow_block.is_some_and(|b| b.0 == self.depth) {
+                lhs = self.after_arrow_block(lhs, op, line)?;
+                continue;
+            }
             self.next()?;
             self.deeper()?;
             if op == BinOp::Mul && self.at(&Tok::Star)? {
@@ -3530,6 +3600,8 @@ impl Parser {
                     // `x => body`: an arrow function with one parameter.
                     if self.no_bare_arrow == 0 && self.at(&Tok::FatArrow)? {
                         self.next()?;
+                        // Its start is not kept (Q-1371; branch feedback86-89).
+                        self.arrow_at = ARROW_UNKNOWN;
                         let body = self.measured(Self::parse_arrow_body)?;
                         let params = vec![Param { name: k.clone().into(), ty: None, default: None }];
                         return Ok(arrow(params, None, body, line, self.file.clone()));
@@ -3677,10 +3749,32 @@ impl Parser {
         for p in parts {
             match p {
                 StrPart::Lit(s) => out.push(TPart::Lit(s)),
-                StrPart::Expr(src, line) => {
+                StrPart::Expr(src, line, at) => {
                     let mut sub = Parser::with_line(&src, line);
+                    // A part on line 1 is no file: a U+FEFF or `#!` at its start is its own text,
+                    // not a byte-order mark or a shebang line to take away (`Lexer::new` takes them
+                    // only on line 1), so its columns stay the file's (FEEDBACK87.md, Q-1371,
+                    // round 11, found in review; branch feedback86-89).
+                    if line == 1 && (src.starts_with('\u{FEFF}') || src.starts_with("#!")) {
+                        sub.lx = Lexer::new(&src, 0);
+                        sub.lx.line = 1;
+                    }
                     (sub.depth, sub.deepest) = (self.depth, self.depth);
-                    let e = sub.parse_expr()?;
+                    // No fix from inside `${…}`: its parser has the part's text alone, so a fix's
+                    // column is the part's, and no whole-file parse judges it (FEEDBACK87.md,
+                    // Q-1371, round 8, found in review; branch feedback86-89).
+                    sub.trial = true;
+                    let e = match sub.parse_expr() {
+                        Ok(e) => e,
+                        Err(mut e) => {
+                            e.fix = None;
+                            // A place its message names on the part's first line: its column from
+                            // the line's start, which a template around this one moves in turn
+                            // (rounds 9 and 10, found in review).
+                            e.shift_named(line, col_at(self.lx.text(), at.min(self.lx.text().len())));
+                            return Err(e);
+                        }
+                    };
                     self.deepest = self.deepest.max(sub.deepest);
                     sub.skip_seps()?;
                     if !sub.at(&Tok::Eof)? {
@@ -4035,6 +4129,171 @@ impl Parser {
         false
     }
 
+    /// A `>`, `>=` or `/` (operator `op`, at `line`, about to be read after `lhs`) at the top of an
+    /// arrow function's body in braces: the operator and its right side, with the
+    /// operator noted while that side is read when `lhs` is that block, the body's first operand,
+    /// and it is a `>`, `>=` or the `/` of `/>` (`() => { n += 1 }>`), the tag's end read as code
+    /// (FEEDBACK87.md, Q-1371, the coordinator's decision of round 3; branch feedback86-89). The
+    /// note goes once that side is read: a block compared or divided, `(v) => { v * 2 } > 5`, is a
+    /// program's own (round 4, found in review), and an error past that side's first token is no
+    /// tag's end (`attr_left_open`). Read apart so that the operators of any other code are read as
+    /// they were, a comparison or a division paying one test of the depth (round 5, found in
+    /// review: `*` and `%` never come here).
+    #[cold]
+    #[inline(never)]
+    fn after_arrow_block(&mut self, lhs: Expr, op: BinOp, line: u32) -> PResult<Expr> {
+        self.next()?;
+        let noted = matches!(lhs, Expr::Block(_)) && self.note_after_arrow(&lhs, op, line);
+        // As `parse_mul` reads a `/` and `parse_cmp` a comparison.
+        let r = if op == BinOp::Div {
+            self.deeper()?;
+            self.parse_unary()?
+        } else {
+            self.parse_range()?
+        };
+        if noted {
+            self.after_arrow = None;
+        }
+        Ok(Expr::Binary(op, Box::new(lhs), Box::new(r), line))
+    }
+
+    fn note_after_arrow(&mut self, lhs: &Expr, op: BinOp, line: u32) -> bool {
+        let len = match op {
+            BinOp::Gt => 1,
+            BinOp::Ge => 2,
+            BinOp::Div if self.lx.peek_char() == Some('>') => 1,
+            _ => return false,
+        };
+        match (lhs, self.arrow_block) {
+            // A block whose value is the point, `{ v * 2 }` or `{ p.n }`, is compared by a program
+            // as written (`keep={(p) => { p.n } > $5}`, its right side broken while it is typed):
+            // not noted (round 5, found in review).
+            (Expr::Block(stmts), _) if ends_in_value(stmts) => false,
+            // Its block holds one of its own when the lexer has read a `{` since the block's; and
+            // one ending in an operation, `{ x * 2 > 5 }`, may be `{ x * 2 } > 5` with its own `}`
+            // left out (round 4, found in review).
+            (Expr::Block(stmts), Some((_, at, braces))) => {
+                let held = self.lx.braces != braces || ends_in_operation(stmts);
+                self.after_arrow = Some(Box::new((self.lx.pos - len, line, at, held, self.lx.pos)));
+                self.notes = self.notes.wrapping_add(1);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `e`, the error of attribute `name`'s `{ ... }` value, whose `{` is at `open` on line `line`,
+    /// or what it is when that `{` was left open, by what the parser read (FEEDBACK87.md, Q-1371,
+    /// the coordinator's decision of round 3; branch feedback86-89; reading the text after the
+    /// error kept finding forms it took wrongly, in review):
+    /// - a handler's block, then a `>` or `/` read as an operator (`note_after_arrow`): the `}`
+    ///   goes before that `>` or `/>`, and the fix puts it there when the arrow is the whole value;
+    /// - the parser wanting this value's `}` where the value ended: said of this `{`, with no fix;
+    /// - anything else, and an error at the end of the input (the REPL reads on after one), as it
+    ///   was. The error keeps its line, from which the errors after it are looked for.
+    #[cold]
+    fn attr_left_open(&mut self, name: &str, open: usize, line: u32, tag: &str, mut e: QuilloError) -> QuilloError {
+        let wanted = self.brace_wanted.take() == Some(open);
+        let after = self.after_arrow.take().map(|n| *n);
+        if e.msg.contains("end of input") && !wanted {
+            return e;
+        }
+        let text = self.lx.text();
+        let col = col_at(text, open) + 1;
+        // The handler is the whole value: nothing but spaces between the `{` and its arrow; one
+        // in a call or a list is as it was (round 5).
+        let whole = |start: usize| start < ARROW_UNKNOWN && text.get(open + 1..start).is_some_and(|t| t.iter().all(|c| c.is_whitespace()));
+        // The parser stopped at the operator's right side's first token (`}>♥`): one that reads
+        // as code there (`}> 5/>`, a block compared then divided) is the value's own (round 4,
+        // found in review); and that token is no `}`, `)` or `]` and not the end, which no text
+        // of an element starts with, as `keep={(p) => { p.n } > }` has while it is typed (round 5).
+        let at_first = |end: usize| {
+            let mut lx = self.lx.clone();
+            lx.pos = end;
+            let first = lx.next_token();
+            lx.pos == self.lx.pos && !matches!(first.map(|t| t.tok), Ok(Tok::RBrace | Tok::RParen | Tok::RBracket | Tok::Eof))
+        };
+        if let Some((at, at_line, _, held, _)) = after.filter(|a| a.0 > open && !e.msg.contains("end of input") && whole(a.2) && at_first(a.4)) {
+            // Its line, unless both the `{` and the error are on it (found in review).
+            let on = if at_line != line || at_line != e.line { format!(" on line {}", at_line) } else { String::new() };
+            // Its place on the error, which a template's part around it moves (round 10).
+            let after = if text[at] == '/' {
+                format!(" is never closed: add `}}` before the tag's `/>`{}; without it, that `/` is read as division and the `>` as greater than", on)
+            } else {
+                format!(" is never closed: add `}}` before the tag's `>`{}; without it, that `>` is read as greater than and the text of <{}> as code", on, tag)
+            };
+            e = e.with_named(Place { line, col, before: format!("`{}={{` on line {}, column ", name, line), after });
+            e.fix = None;
+            // No fix is held for its block (`Note`): with no block or map of its own and no
+            // operation at its end, its `}` and this `{`'s go at the same place, where one left out
+            // of an `if` in it, `{ if n > 0 { n -= 1 n += 2 }>`, would be fixed into another program
+            // (round 4, found in review). A template's `${` is no block: one left open there is the
+            // lexer's error, before any `>` (round 4). And the parser takes the file with the `}`
+            // put there, from the tag's line on (round 5: the parser is the judge of the fix).
+            if !held {
+                // Judged once the error leaves `parse_program` (`judge_fix`; round 7).
+                if !self.trial {
+                    *self.pending.borrow_mut() = Some(Box::new(Pending { line: at_line, col: col_at(text, at), at, len: 0, put: "}".into(), text_from: at, text_to: at, tag: String::new(), doubled: false }));
+                }
+                return e.with_fix(Fix { title: "Add }".into(), line: at_line, col: col_at(text, at), len: 0, text: "}".into() });
+            }
+            return e;
+        }
+        // Said of this `{`, and of what the parser wanted for it, which is no word on whether a
+        // `}` comes later (`title={a b}`).
+        if let Some(found) = e.msg.strip_prefix("expected `}`, ").filter(|_| wanted) {
+            let after = format!(": expected `}}` to close it, {}", found);
+            e = e.with_named(Place { line, col, before: format!("`{}={{` on line {}, column ", name, line), after });
+            e.fix = None;
+        }
+        e
+    }
+
+    /// The fix of `e`, the error leaving `parse_program`, kept only where the parser takes the file
+    /// with it (`takes_edit`), and an end tag's where its element's text does not hold its own end
+    /// tag or `/>` with the `<` left out (`end_in_text`) and it is no `<b>hi<b>`. Judged here, once,
+    /// and not where the error was made, as a look ahead throws errors away: judging each made a
+    /// valid file's parse quadratic (FEEDBACK87.md, Q-1371, rounds 5 and 7, found in review; branch
+    /// feedback86-89).
+    #[cold]
+    fn judge_fix(&mut self, e: &mut QuilloError) {
+        let Some(p) = self.pending.borrow_mut().take() else { return };
+        // The error's own fix, which its words may have had more said after (`judge_fix` tells it
+        // by the fix, not the words).
+        if e.fix.as_ref().map_or(true, |f| (f.line, f.col, f.text.as_str()) != (p.line, p.col, p.put.as_str())) {
+            return;
+        }
+        let chars = self.lx.text();
+        let region = &chars[p.text_from.min(p.text_to).min(chars.len())..p.text_to.min(chars.len())];
+        let held = !p.tag.is_empty() && (end_in_text(region, &p.tag) || (p.doubled && region.iter().all(|c| c.is_whitespace())));
+        // The input ending is no word against it only where it ended in the file as written too (a
+        // view's own `}` still to come).
+        let ended = e.msg.contains("end of input") || e.msg.contains("end of the file");
+        if held || !self.takes_edit(p.at, p.len, &p.put, ended) {
+            e.fix = None;
+        }
+    }
+
+    /// Whether this parser's text, with the `len` characters at `at` replaced by `put`, parses with
+    /// no error, or, where `ended`, none but its input ending: the parser's word on a fix, asked
+    /// only once a parse has failed (FEEDBACK87.md, Q-1371, rounds 5 and 7; branch feedback86-89).
+    #[cold]
+    fn takes_edit(&self, at: usize, len: usize, put: &str, ended: bool) -> bool {
+        TRIALS.with(|t| t.set(t.get() + 1));
+        let text = self.lx.text();
+        let first = self.lx.line - text[..self.lx.pos.min(text.len())].iter().filter(|c| **c == '\n').count() as u32;
+        let (at, end) = (at.min(text.len()), (at + len).min(text.len()));
+        let mut fixed: String = text[..at].iter().collect();
+        fixed.push_str(put);
+        fixed.extend(&text[end..]);
+        let mut p = Parser::with_line(&fixed, first);
+        p.trial = true;
+        match p.parse_program() {
+            Ok(_) => true,
+            Err(e) => ended && e.msg.contains("end of input"),
+        }
+    }
+
     /// How many characters `!DOCTYPE html>` takes after a `<` just read (any case), or 0.
     fn doctype_len(&self) -> usize {
         let ahead: String = (0..15).map_while(|i| self.lx.peek_char_at(i)).collect();
@@ -4165,7 +4424,15 @@ impl Parser {
                             // Plain text with HTML's entities, as in JSX: `&amp;` in a link is `&`
                             // (FEEDBACK48.md, Q-562 and Q-563; branch main).
                             Some('"') => Expr::Lit(Lit::Str(decode_entities(&self.lx.lex_attr_string()?).into())),
-                            Some('{') => self.parse_braced_expr()?,
+                            // One whose `{` is left open is said so, not what came after it
+                            // (FEEDBACK87.md, Q-1371; branch feedback86-89).
+                            Some('{') => {
+                                let (open, open_line) = (self.lx.pos, self.lx.line);
+                                match self.parse_braced_expr() {
+                                    Ok(e) => e,
+                                    Err(e) => return Err(self.attr_left_open(&name, open, open_line, &tag, e)),
+                                }
+                            }
                             // HTML's other two ways: 'single quotes' and an unquoted value, taken as
                             // the text they are, with no `{...}` in them (FEEDBACK36.md, Q-449;
                             // branch feedback36-39).
@@ -4492,6 +4759,12 @@ impl Parser {
                         let col = col_at(self.lx.text(), at);
                         self.lx.skip_inline_ws();
                         let len = if self.lx.peek_char() == Some('>') { self.lx.pos + 1 - at } else { self.lx.pos - at };
+                        // Judged once the error leaves `parse_program` like the others, so a removal
+                        // that leaves the element open (`<b>hi</br>`) is not offered
+                        // (FEEDBACK87.md, Q-1371, round 8, found in review; branch feedback86-89).
+                        if !self.trial {
+                            *self.pending.borrow_mut() = Some(Box::new(Pending { line: at_line, col, at, len, put: String::new(), text_from: at, text_to: at, tag: String::new(), doubled: false }));
+                        }
                         return Err(QuilloError::new(format!("`<{}>` has no end tag: remove `</{}>`", close, close), at_line)
                             .with_fix(Fix { title: format!("Remove </{}>", close), line: at_line, col, len: len as u32, text: String::new() }));
                     }
@@ -4501,11 +4774,24 @@ impl Parser {
                             return Err(self.never_closed(format!("before `</{}>` on line {}", close, at_line), at, at_line));
                         }
                         let col = col_at(self.lx.text(), at) + 2;
-                        return Err(QuilloError::new(
-                            format!("`</{}>` does not close `<{}>` from line {}: expected `</{}>`", close, tag, line, tag),
-                            at_line,
-                        )
-                        .with_fix(Fix { title: format!("Change to </{}>", tag), line: at_line, col, len: close.chars().count() as u32, text: tag.to_string() }));
+                        let e = QuilloError::new(format!("`</{}>` does not close `<{}>` from line {}: expected `</{}>`", close, tag, line, tag), at_line);
+                        // The end tag renamed to the start tag's name only where that is the
+                        // likelier mistake: the start tag's name an element's and the end tag's no
+                        // element's (`<button>..</buton>`). Otherwise either may be the one
+                        // mistyped (`<pan>..</span>`, `<my-crad>..</my-card>`, `<u` for `<ul`); and
+                        // one that is the start tag's name with more after it is its end tag run
+                        // into the text by a `>` left out (`</ula > b`): no rename (rounds 7 and 8,
+                        // found in review).
+                        let known = |t: &str| ELEMENTS.contains(&t);
+                        if !(known(tag) && !known(&close) && !close.starts_with(tag)) {
+                            return Err(e);
+                        }
+                        // Judged once the error leaves `parse_program` (`judge_fix`; round 7).
+                        if !self.trial {
+                            let o = self.open.last().map_or(at, |o| o.end);
+                            *self.pending.borrow_mut() = Some(Box::new(Pending { line: at_line, col, at: at + 2, len: close.chars().count(), put: tag.to_string(), text_from: o, text_to: at, tag: tag.to_string(), doubled: false }));
+                        }
+                        return Err(e.with_fix(Fix { title: format!("Change to </{}>", tag), line: at_line, col, len: close.chars().count() as u32, text: tag.to_string() }));
                     }
                     self.lx.skip_inline_ws();
                     if self.lx.peek_char() != Some('>') {
@@ -4558,10 +4844,16 @@ impl Parser {
                     // write (FEEDBACK35.md, Q-428; branch feedback27-35-fixes).
                     let e = match self.parse_braced_expr() {
                         Err(e) if tag == "script" => {
-                            return Err(QuilloError::new(
-                                format!("{} (a `{{` in a <script> starts a Quillo value: write the code as a string, <script>{{raw(CODE)}}</script>, or put it in a file of its own)", e.msg),
-                                e.line,
-                            ))
+                            const NOTE: &str = " (a `{` in a <script> starts a Quillo value: write the code as a string, <script>{raw(CODE)}</script>, or put it in a file of its own)";
+                            let mut e2 = QuilloError::new(format!("{}{}", e.msg, NOTE), e.line);
+                            // The place its message names kept, with the note after it, for a
+                            // template's part around it to move (FEEDBACK87.md, Q-1371, round 11,
+                            // found in review; branch feedback86-89).
+                            if let Some(mut n) = e.named {
+                                n.after.push_str(NOTE);
+                                e2 = e2.with_named(*n);
+                            }
+                            return Err(e2);
                         }
                         r => r?,
                     };
@@ -4644,14 +4936,27 @@ impl Parser {
     fn never_closed(&self, place: String, at: usize, at_line: u32) -> QuilloError {
         let o = self.open.last().expect("an element is open");
         let chars = self.lx.text();
-        let fix = if starts_line(chars, at) {
-            Fix { title: format!("Add </{}>", o.tag), line: at_line, col: 0, len: 0, text: format!("{}</{}>\n", o.indent, o.tag) }
+        // In the file's own line ending, `\r\n` or `\r` too (round 7, found in review), as the
+        // line it goes in has it where a file mixes them (round 8).
+        let eol = self.lx.eol_near(at);
+        let (fix, from) = if starts_line(chars, at) {
+            (Fix { title: format!("Add </{}>", o.tag), line: at_line, col: 0, len: 0, text: format!("{}</{}>{}", o.indent, o.tag, eol) }, at - col_at(chars, at) as usize)
         } else if at == chars.len() {
-            Fix { title: format!("Add </{}>", o.tag), line: at_line, col: col_at(chars, at), len: 0, text: format!("\n{}</{}>", o.indent, o.tag) }
+            (Fix { title: format!("Add </{}>", o.tag), line: at_line, col: col_at(chars, at), len: 0, text: format!("{}{}</{}>", eol, o.indent, o.tag) }, at)
         } else {
-            Fix { title: format!("Add </{}>", o.tag), line: at_line, col: col_at(chars, at), len: 0, text: format!("</{}>", o.tag) }
+            (Fix { title: format!("Add </{}>", o.tag), line: at_line, col: col_at(chars, at), len: 0, text: format!("</{}>", o.tag) }, at)
         };
-        QuilloError::new(format!("`<{}>` is never closed: add `</{}>` {}", o.tag, o.tag, place), o.line).with_fix(fix)
+        let e = QuilloError::new(format!("`<{}>` is never closed: add `</{}>` {}", o.tag, o.tag, place), o.line);
+        // Judged once the error leaves `parse_program` (`judge_fix`), not where a look ahead may
+        // throw it away (round 7, found in review). Inside one of its own name and holding nothing,
+        // `<b>hi<b>`, is an end tag with its `/` left out, which a second would not mend.
+        let n = self.open.len();
+        let doubled = n >= 2 && self.open[n - 2].tag == o.tag;
+        let pending = Pending { line: fix.line, col: fix.col, at: from, len: 0, put: fix.text.clone(), text_from: o.end, text_to: at, tag: o.tag.clone(), doubled };
+        if !self.trial {
+            *self.pending.borrow_mut() = Some(Box::new(pending));
+        }
+        e.with_fix(fix)
     }
 
     /// How many characters `{/* ... */}` takes, starting at its `{`, or 0
@@ -4737,7 +5042,10 @@ impl Parser {
     /// Parses `{expr}` starting at the `{` character, inside an HTML literal.
     fn parse_braced_expr(&mut self) -> PResult<Expr> {
         debug_assert!(self.peeked.is_none());
+        let open = self.lx.pos;
         self.lx.bump();
+        // A `{` read, as the lexer counts its own (`Lexer::braces`; Q-1371).
+        self.lx.braces = self.lx.braces.wrapping_add(1);
         self.lx.stack.push('(');
         self.lx.last = Some(Tok::LParen);
         let e = self.parse_expr()?;
@@ -4756,9 +5064,123 @@ impl Parser {
             // The handler as the guide writes it (FEEDBACK72.md, Q-1030; branch feedback72-81).
             return self.err_at(format!("an assignment is not a value: a handler is a function, `onclick={{() => {{ {} {} ... }}}}`", name, op));
         }
-        self.expect(&Tok::RBrace, "`}`")?;
+        // Its `}` wanted where the value ends: noted for the attribute it may be (Q-1371).
+        if let Err(e) = self.expect(&Tok::RBrace, "`}`") {
+            self.brace_wanted = Some(open);
+            return Err(e);
+        }
         Ok(e)
     }
+}
+
+/// Whether an element's text, `inside`, holds `/b>` (`tag` b) with no `<` before it: its end tag
+/// with the `<` left out, `<b>hi/b>`; or a `/>` outside any tag in it, its own start tag's end, the
+/// tag ended early by a `>` before it (`data-y={(p) => p.n } > 5 title={...}/>`). An end tag put
+/// after, or one changed, would leave that text as it is: no fix is offered (FEEDBACK87.md, Q-1371,
+/// found by the fourth review's fuzzer; branch feedback86-89).
+fn end_in_text(inside: &[char], tag: &str) -> bool {
+    let end: Vec<char> = format!("/{}>", tag).chars().collect();
+    if inside.windows(end.len()).enumerate().any(|(i, w)| w == end.as_slice() && (i == 0 || inside[i - 1] != '<')) {
+        return true;
+    }
+    let mut in_tag = false;
+    for (i, c) in inside.iter().enumerate() {
+        match c {
+            '<' if inside.get(i + 1).is_some_and(|d| d.is_alphabetic() || *d == '/') => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            '/' if !in_tag && inside.get(i + 1) == Some(&'>') => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+thread_local! {
+    /// How many trial parses a fix has been judged by on this thread (`takes_edit`), for the tests
+    /// that a file that parses asks none.
+    static TRIALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many trial parses have judged a fix on this thread (FEEDBACK87.md, Q-1371, round 7).
+#[doc(hidden)]
+pub fn trial_parses() -> usize {
+    TRIALS.with(|t| t.get())
+}
+
+/// A fix made with an error, judged once the error leaves `parse_program` (`Parser::judge_fix`):
+/// the fix's line and column, the edit (`len` characters at `at` replaced by `put`), and for an end
+/// tag, its element's text (`text_from..text_to`), name and whether it sits in one of its own name.
+struct Pending {
+    line: u32,
+    col: u32,
+    at: usize,
+    len: usize,
+    put: String,
+    text_from: usize,
+    text_to: usize,
+    tag: String,
+    doubled: bool,
+}
+
+/// The names of HTML's, SVG's and MathML's elements, old ones too, for which way an end tag that
+/// does not match its start tag is mended (`Change to`; FEEDBACK87.md, Q-1371, rounds 7 and 8;
+/// branch feedback86-89).
+const ELEMENTS: &[&str] = &[
+    // HTML's.
+    "a", "abbr", "address", "area", "article", "aside", "audio", "b", "base", "bdi", "bdo", "blockquote", "body", "br", "button",
+    "canvas", "caption", "cite", "code", "col", "colgroup", "data", "datalist", "dd", "del", "details", "dfn", "dialog", "div", "dl",
+    "dt", "em", "embed", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header",
+    "hgroup", "hr", "html", "i", "iframe", "img", "input", "ins", "kbd", "label", "legend", "li", "link", "main", "map", "mark", "menu",
+    "meta", "meter", "nav", "noscript", "object", "ol", "optgroup", "option", "output", "p", "param", "picture", "pre", "progress", "q",
+    "rp", "rt", "ruby", "s", "samp", "script", "search", "section", "select", "slot", "small", "source", "span", "strong", "style", "sub",
+    "summary", "sup", "table", "tbody", "td", "template", "textarea", "tfoot", "th", "thead", "time", "title", "tr", "track", "u",
+    "ul", "var", "video", "wbr",
+    // HTML's older ones, which browsers still know.
+    "acronym", "applet", "basefont", "bgsound", "big", "blink", "center", "content", "dir", "font", "frame", "frameset", "image",
+    "isindex", "keygen", "listing", "marquee", "menuitem", "multicol", "nextid", "nobr", "noembed", "noframes", "plaintext", "rb",
+    "rtc", "shadow", "spacer", "strike", "tt", "xmp",
+    // SVG's.
+    "svg", "a", "animate", "animateMotion", "animateTransform", "circle", "clipPath", "defs", "desc", "discard", "ellipse",
+    "feBlend", "feColorMatrix", "feComponentTransfer", "feComposite", "feConvolveMatrix", "feDiffuseLighting", "feDisplacementMap",
+    "feDistantLight", "feDropShadow", "feFlood", "feFuncA", "feFuncB", "feFuncG", "feFuncR", "feGaussianBlur", "feImage", "feMerge",
+    "feMergeNode", "feMorphology", "feOffset", "fePointLight", "feSpecularLighting", "feSpotLight", "feTile", "feTurbulence",
+    "filter", "foreignObject", "g", "image", "line", "linearGradient", "marker", "mask", "metadata", "mpath", "path", "pattern",
+    "polygon", "polyline", "radialGradient", "rect", "set", "stop", "switch", "symbol", "text", "textPath", "tspan", "use", "view",
+    // SVG 1.1's older ones.
+    "altGlyph", "altGlyphDef", "altGlyphItem", "animateColor", "cursor", "font-face", "font-face-format", "font-face-name",
+    "font-face-src", "font-face-uri", "glyph", "glyphRef", "hkern", "missing-glyph", "tref", "vkern",
+    // MathML's.
+    "math", "annotation", "annotation-xml", "maction", "menclose", "merror", "mfenced", "mfrac", "mglyph", "mi", "mlabeledtr",
+    "mlongdiv", "mmultiscripts", "mn", "mo", "mover", "mpadded", "mphantom", "mprescripts", "mroot", "mrow", "ms", "mscarries",
+    "mscarry", "msgroup", "msline", "mspace", "msqrt", "msrow", "mstack", "mstyle", "msub", "msubsup", "msup", "mtable", "mtd", "mtext",
+    "mtr", "munder", "munderover", "none", "semantics",
+];
+
+/// Whether a block's last statement is an expression whose value is the point (`v * 2`, `p.n`,
+/// `t`), not an assignment, a call or a statement: such a block is one a program compares
+/// (FEEDBACK87.md, Q-1371, round 5, found in review; branch feedback86-89).
+fn ends_in_value(stmts: &[Stmt]) -> bool {
+    match stmts.last() {
+        Some(Stmt::Expr(e)) => match e {
+            Expr::Lit(_) | Expr::Template(_) | Expr::Ident(..) | Expr::List(_) | Expr::Map(_) | Expr::Unary(..) | Expr::Binary(..) | Expr::Coalesce(..) | Expr::Pipe(..) | Expr::Field(..) | Expr::Index(..) => true,
+            // A ternary, not an `if` statement with blocks.
+            Expr::If(_, a, Some(b)) => !matches!(**a, Expr::Block(_)) && !matches!(**b, Expr::Block(_)),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether a block's last statement's value is an operation at its top (`x * 2 > 5`, `n = n * 2`):
+/// then a block's `}` left out of `{ x * 2 } > 5` reads as this block, and a `}` put at the tag's
+/// `>` would make another program (FEEDBACK87.md, Q-1371, round 4, found in review; branch
+/// feedback86-89).
+fn ends_in_operation(stmts: &[Stmt]) -> bool {
+    let value = match stmts.last() {
+        Some(Stmt::Expr(e) | Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::SetField(_, _, _, e, _) | Stmt::Return(Some(e), _)) => e,
+        _ => return false,
+    };
+    matches!(value, Expr::Binary(..) | Expr::Coalesce(..) | Expr::Pipe(..) | Expr::If(_, _, Some(_)))
 }
 
 fn arrow(params: Vec<Param>, ret: Option<Ty>, (body, nesting): (Expr, u32), line: u32, file: Option<Arc<str>>) -> Expr {
@@ -4822,7 +5244,10 @@ pub fn more_errors(src: &str, after: u32) -> Vec<QuilloError> {
     while out.len() < 9 {
         let Some(i) = (from..lines.len()).find(|&i| !inside[i] && STARTS.iter().any(|s| lines[i].starts_with(s))) else { break };
         let rest = lines[i..].join("\n");
-        match Parser::with_line(&rest, (i + 1) as u32).parse_program() {
+        // Its errors' fixes are thrown away: none is judged (round 7, found in review).
+        let mut p = Parser::with_line(&rest, (i + 1) as u32);
+        p.trial = true;
+        match p.parse_program() {
             Ok(_) => break,
             Err(e) if e.line <= last => from = i + 1,
             Err(e) => {

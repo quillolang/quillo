@@ -18,6 +18,21 @@ pub struct QuilloError {
     /// program, a map's key or another server's header can hold too (FEEDBACK71.md, Q-977,
     /// found in review; branch security).
     pub memory_stop: bool,
+    /// The place in the source its message names, by line and column, which a template's
+    /// `${…}` part, parsed on its own text, moves to where the part starts (FEEDBACK87.md,
+    /// Q-1371, round 10, found in review; branch feedback86-89).
+    pub named: Option<Box<Place>>,
+}
+
+/// A message naming a place by line and column: the words before and after the column, so that
+/// the column can change without its words being searched (FEEDBACK87.md, Q-1371, round 10;
+/// branch feedback86-89).
+#[derive(Debug, Clone)]
+pub struct Place {
+    pub line: u32,
+    pub col: u32,
+    pub before: String,
+    pub after: String,
 }
 
 /// The calls an error came out of, innermost first, kept as it passes up them
@@ -52,7 +67,24 @@ pub struct Fix {
 impl QuilloError {
     pub fn new(msg: impl Into<String>, line: u32) -> Self {
         // A private name as it was written (src/privacy.rs; branch public-private).
-        QuilloError { msg: crate::privacy::demangle(&msg.into()), line, file: None, fix: None, calls: None, memory_stop: false }
+        QuilloError { msg: crate::privacy::demangle(&msg.into()), line, file: None, fix: None, calls: None, memory_stop: false, named: None }
+    }
+
+    /// This error's message as `named` says it: the words before its column, the column, and
+    /// those after (FEEDBACK87.md, Q-1371, round 10; branch feedback86-89).
+    pub fn with_named(mut self, n: Place) -> Self {
+        self.msg = format!("{}{}{}", n.before, n.col, n.after);
+        self.named = Some(Box::new(n));
+        self
+    }
+
+    /// The place its message names moved `by` columns where it is on `line`: the first line of a
+    /// template's part, which starts `by` columns into its line (round 10).
+    pub fn shift_named(&mut self, line: u32, by: u32) {
+        if let Some(n) = self.named.as_mut().filter(|n| n.line == line) {
+            n.col += by;
+            self.msg = format!("{}{}{}", n.before, n.col, n.after);
+        }
     }
 
     /// The stop of a request whose value would take the server's memory past `--max-memory`.
@@ -204,6 +236,11 @@ pub fn may_be_newer_syntax(msg: &str) -> bool {
     if msg.starts_with("unexpected character U+") {
         return false;
     }
+    // Nor is one outside ASCII, which no Quillo takes in code (letters are names'): `♥`, as in
+    // a tag's text read as code (FEEDBACK87.md, Q-1371 and Q-008; branch feedback86-89).
+    if msg.strip_prefix("unexpected character `").and_then(|r| r.chars().next()).is_some_and(|c| !c.is_ascii()) {
+        return false;
+    }
     // One that says what to write instead (`@`, a curly quote, `===`) names a rule, not newer
     // syntax (FEEDBACK45.md, Q-008, Q-520; branch feedback40-43).
     if msg.starts_with("unexpected character") {
@@ -212,6 +249,11 @@ pub fn may_be_newer_syntax(msg: &str) -> bool {
     // A regular expression's escape is told what to write (FEEDBACK53.md, Q-008).
     if msg.contains("a regular expression's") {
         return false;
+    }
+    // An attribute's `{` named before what the parser wanted for it: as that alone would be
+    // (FEEDBACK87.md, Q-1371, found in review; branch feedback86-89).
+    if let Some((_, found)) = msg.split_once(": expected `}` to close it, ") {
+        return may_be_newer_syntax(&format!("expected `}}`, {}", found));
     }
     if msg.starts_with("unexpected keyword") || msg.starts_with("unknown escape") || msg.starts_with("bad escape") {
         return true;

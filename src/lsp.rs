@@ -145,7 +145,7 @@ fn uses_transitively(main: &Path, base: &Path, target: &Path) -> bool {
         // A line at a time, with the one before and after it that a `use` over two lines needs:
         // a list of every line took 1.4 GB for 64 MiB of line breaks (FEEDBACK71.md, Q-982, found
         // in review; branch security).
-        let mut rest = src.lines().peekable();
+        let mut rest = lines_of(&src).peekable();
         let mut before: Option<&str> = None;
         while let Some(this) = rest.next() {
             let after = rest.peek().copied();
@@ -394,21 +394,43 @@ fn utf16_col(line: &str, chars: usize) -> usize {
 
 /// Where a position (line, UTF-16 column) is in `text`, as a byte index.
 fn byte_offset(text: &str, line: usize, col16: usize) -> usize {
+    // Lines as the parser and the editor count them, a lone `\r` ending one too (`lines_of`).
     let mut at = 0;
-    for (i, l) in text.split_inclusive('\n').enumerate() {
-        if i == line {
-            let mut n = 0;
-            for (b, c) in l.char_indices() {
-                if n >= col16 || c == '\n' {
-                    return at + b;
-                }
-                n += c.len_utf16();
-            }
-            return at + l.len();
+    for _ in 0..line {
+        match text[at..].find(['\n', '\r']) {
+            Some(k) => at += k + if text[at + k..].starts_with("\r\n") { 2 } else { 1 },
+            None => return text.len(),
         }
-        at += l.len();
+    }
+    let mut n = 0;
+    for (b, c) in text[at..].char_indices() {
+        if n >= col16 || c == '\n' || c == '\r' {
+            return at + b;
+        }
+        n += c.len_utf16();
     }
     text.len()
+}
+
+/// The lines of `text` as the parser counts them and an editor does: one ends at `\n`, `\r\n` or
+/// a lone `\r` (an old Mac file), where `str::lines` took a lone `\r` for none, and put every
+/// quick fix of such a file at its first column (FEEDBACK87.md, Q-1371, found by the fourth review;
+/// branch feedback86-89).
+fn lines_of(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = Some(text);
+    std::iter::from_fn(move || {
+        let r = rest?;
+        match r.find(['\n', '\r']) {
+            Some(i) => {
+                rest = Some(&r[i + if r[i..].starts_with("\r\n") { 2 } else { 1 }..]);
+                Some(&r[..i])
+            }
+            None => {
+                rest = None;
+                (!r.is_empty()).then_some(r)
+            }
+        }
+    })
 }
 
 /// Character index for a UTF-16 column.
@@ -461,7 +483,7 @@ fn find_name(line: &str, name: &str) -> Option<(usize, usize)> {
 /// appears on the line, else the line's text.
 fn diag_range(text: &str, line: u32, msg: &str) -> J {
     let l = line.saturating_sub(1) as usize;
-    let src = text.lines().nth(l).unwrap_or("");
+    let src = lines_of(&text).nth(l).unwrap_or("");
     let mut span = None;
     for part in msg.split('`').skip(1).step_by(2) {
         let word = part.trim_start_matches('~').trim_start_matches('<').trim_start_matches('.').trim_end_matches('>');
@@ -481,7 +503,7 @@ fn diag_range(text: &str, line: u32, msg: &str) -> J {
 }
 
 fn word_at(text: &str, line: usize, col16: usize) -> Option<(String, usize)> {
-    let src = text.lines().nth(line)?;
+    let src = lines_of(&text).nth(line)?;
     let chars: Vec<char> = src.chars().collect();
     let col = char_col(src, col16).min(chars.len());
     let mut a = col;
@@ -875,7 +897,7 @@ impl Server {
                     .iter()
                     .map(|n| {
                         let col = |line: u32, c: u32| {
-                            let src = text.lines().nth(line.saturating_sub(1) as usize).unwrap_or("");
+                            let src = lines_of(&text).nth(line.saturating_sub(1) as usize).unwrap_or("");
                             utf16_col(src, c as usize)
                         };
                         let range = if n.end_line == n.line && n.end_col == n.col {
@@ -978,7 +1000,7 @@ impl Server {
     /// (FEEDBACK56.md, Q-853; branch feedback56).
     fn on_mcp_tag(&self, params: &J) -> bool {
         let (uri, line, col) = Self::position(params);
-        let Some(src) = self.docs.get(&uri).and_then(|d| d.text.lines().nth(line)) else { return false };
+        let Some(src) = self.docs.get(&uri).and_then(|d| lines_of(&d.text).nth(line)) else { return false };
         let Some((w, a)) = word_at(src, 0, col) else { return false };
         let chars: Vec<char> = src.chars().collect();
         w == "mcp" && crate::highlight::mcp_tag(&chars, a, a + 3)
@@ -989,7 +1011,7 @@ impl Server {
     /// security), and not a name `offline` or `writes`.
     fn on_route_tag(&self, params: &J) -> Option<&'static str> {
         let (uri, line, col) = Self::position(params);
-        let src = self.docs.get(&uri).and_then(|d| d.text.lines().nth(line))?;
+        let src = self.docs.get(&uri).and_then(|d| lines_of(&d.text).nth(line))?;
         let (w, a) = word_at(src, 0, col)?;
         let tag = ["offline", "writes"].into_iter().find(|t| w == *t)?;
         let chars: Vec<char> = src.chars().collect();
@@ -1004,7 +1026,7 @@ impl Server {
             return None;
         }
         let doc = self.docs.get(&uri)?;
-        let lines: Vec<&str> = doc.text.lines().collect();
+        let lines: Vec<&str> = lines_of(&doc.text).collect();
         let (src, at) = use_text(&lines, line, char_col(lines.get(line)?, col))?;
         let u = use_line(&src)?;
         let base = use_base(&uri_to_path(&uri));
@@ -1080,7 +1102,7 @@ impl Server {
         };
         let l = line.saturating_sub(1) as usize;
         let text = self.text_of(&file);
-        let (a, b) = find_word(text.lines().nth(l).unwrap_or(""), &name).unwrap_or((0, 0));
+        let (a, b) = find_word(lines_of(&text).nth(l).unwrap_or(""), &name).unwrap_or((0, 0));
         Some(self.location(&file, l, a, b))
     }
 
@@ -1150,7 +1172,7 @@ impl Server {
     /// file gives, which is why it comes first (FEEDBACK19.md, Q-156; branch
     /// feedback19-fixes). Nothing to say when the line is something else.
     fn import_completion(&self, doc: &Doc, uri: &str, line: usize, col16: usize) -> Option<J> {
-        let lines: Vec<&str> = doc.text.lines().collect();
+        let lines: Vec<&str> = lines_of(&doc.text).collect();
         let src = *lines.get(line)?;
         let chars: Vec<char> = src.chars().collect();
         let col = char_col(src, col16).min(chars.len());
@@ -1209,7 +1231,7 @@ impl Server {
         if let Some(items) = self.import_completion(doc, uri, line, col16) {
             return Some(items);
         }
-        let src = doc.text.lines().nth(line)?;
+        let src = lines_of(&doc.text).nth(line)?;
         let chars: Vec<char> = src.chars().collect();
         let col = char_col(src, col16).min(chars.len());
         let before: String = chars[..col].iter().collect();
@@ -1339,7 +1361,7 @@ impl Server {
             crate::error::read_text(&file).unwrap_or_default()
         };
         let l = line.saturating_sub(1) as usize;
-        let src = text.lines().nth(l).unwrap_or("");
+        let src = lines_of(&text).nth(l).unwrap_or("");
         // A `.qwer` function taken under another name (`use brightness as bright`)
         // is found by its own (branch use-editor).
         let own = || {
@@ -1364,7 +1386,7 @@ impl Server {
             return None;
         }
         let doc = self.docs.get(&uri)?;
-        let (class, _) = class_at(doc.text.lines().nth(line)?, col)?;
+        let (class, _) = class_at(lines_of(&doc.text).nth(line)?, col)?;
         let found: Vec<J> = self.rule_spans(&doc.analysis, &class).into_iter().map(|(f, l, a, b)| self.location(&f, l, a, b)).collect();
         (!found.is_empty()).then(|| json!(found))
     }
@@ -1380,7 +1402,7 @@ impl Server {
     /// A location from character columns on a line (from 0).
     fn location(&self, file: &str, line: usize, a: usize, b: usize) -> J {
         let text = self.text_of(file);
-        let src = text.lines().nth(line).unwrap_or("");
+        let src = lines_of(&text).nth(line).unwrap_or("");
         json!({ "uri": path_to_uri(file), "range": {
             "start": { "line": line, "character": utf16_col(src, a) },
             "end": { "line": line, "character": utf16_col(src, b) }
@@ -1392,7 +1414,7 @@ impl Server {
     fn class_here(&self, params: &J) -> Option<(String, usize, usize)> {
         let (uri, line, col) = Self::position(params);
         let doc = self.docs.get(&uri)?;
-        let src = doc.text.lines().nth(line)?;
+        let src = lines_of(&doc.text).nth(line)?;
         let chars: Vec<char> = src.chars().collect();
         let col = char_col(src, col).min(chars.len());
         let (mut a, mut b) = (col, col);
@@ -1466,7 +1488,7 @@ impl Server {
         let mut texts: HashMap<String, String> = HashMap::new();
         for (file, l) in lines {
             let text = texts.entry(file.clone()).or_insert_with(|| self.text_of(&file));
-            let src = text.lines().nth(l).unwrap_or("");
+            let src = lines_of(&text).nth(l).unwrap_or("");
             let mut from = 0;
             let chars: Vec<char> = src.chars().collect();
             while let Some((x, y)) = find_class(&chars[from..].iter().collect::<String>(), class) {
@@ -1483,7 +1505,7 @@ impl Server {
     fn use_spans(&self, a: &Analysis, class: &str) -> Vec<(String, usize, usize, usize)> {
         let mut out = Vec::new();
         for file in &a.files {
-            for (l, src) in self.text_of(file).lines().enumerate() {
+            for (l, src) in lines_of(&self.text_of(file)).enumerate() {
                 let chars: Vec<char> = src.chars().collect();
                 let mut i = 0;
                 while i < chars.len() {
@@ -1522,7 +1544,7 @@ impl Server {
             // The rule, to the `}` that ends it.
             let mut rule = Vec::new();
             let mut depth = 0i32;
-            for src in text.lines().skip(*l).take(12) {
+            for src in lines_of(&text).skip(*l).take(12) {
                 rule.push(src);
                 depth += src.matches('{').count() as i32 - src.matches('}').count() as i32;
                 if depth <= 0 && src.contains('}') {
@@ -1535,7 +1557,7 @@ impl Server {
         if shown.len() > 5 {
             value.push_str(&format!("\n\n… and {} more", shown.len() - 5));
         }
-        let src = self.docs.get(&uri)?.text.lines().nth(line).unwrap_or("").to_string();
+        let src = lines_of(&self.docs.get(&uri)?.text).nth(line).unwrap_or("").to_string();
         Some(json!({
             "contents": { "kind": "markdown", "value": value },
             "range": { "start": { "line": line, "character": utf16_col(&src, a) }, "end": { "line": line, "character": utf16_col(&src, b) } }
@@ -1559,7 +1581,7 @@ impl Server {
     fn prepare_rename(&self, params: &J) -> J {
         let (uri, line, _) = Self::position(params);
         let Some((class, a, b)) = self.class_here(params) else { return J::Null };
-        let src = self.docs.get(&uri).and_then(|d| d.text.lines().nth(line)).unwrap_or("").to_string();
+        let src = self.docs.get(&uri).and_then(|d| lines_of(&d.text).nth(line)).unwrap_or("").to_string();
         json!({
             "range": { "start": { "line": line, "character": utf16_col(&src, a) }, "end": { "line": line, "character": utf16_col(&src, b) } },
             "placeholder": class
@@ -1608,7 +1630,7 @@ impl Server {
         if let Some(items) = Self::markup_completion(doc, params, line, col) {
             return items;
         }
-        let src = doc.text.lines().nth(line).unwrap_or("");
+        let src = lines_of(&doc.text).nth(line).unwrap_or("");
         let before: String = src.chars().take(char_col(src, col)).collect();
         let mut items = Vec::new();
         // After `db.`, `udp.` or any module's name: its functions.
@@ -1708,7 +1730,7 @@ impl Server {
     /// After `<span.` or in `class="...`: the classes the program's style
     /// sheets have rules for (branch class-links).
     fn class_completion(doc: &Doc, line: usize, col: usize) -> Option<J> {
-        let src = doc.text.lines().nth(line)?;
+        let src = lines_of(&doc.text).nth(line)?;
         let chars: Vec<char> = src.chars().collect();
         let col = char_col(src, col).min(chars.len());
         let mut a = col;
@@ -1832,7 +1854,7 @@ impl Server {
             return json!([]);
         }
         let fl = fix.line.saturating_sub(1) as usize;
-        let src = doc.text.lines().nth(fl).unwrap_or("");
+        let src = lines_of(&doc.text).nth(fl).unwrap_or("");
         let range = json!({
             "start": { "line": fl, "character": utf16_col(src, fix.col as usize) },
             "end": { "line": fl, "character": utf16_col(src, (fix.col + fix.len) as usize) }
@@ -1850,7 +1872,7 @@ impl Server {
         let uri = params["textDocument"]["uri"].as_str().unwrap_or("");
         let Some(doc) = self.docs.get(uri) else { return json!([]) };
         let file = uri_to_path(uri).display().to_string();
-        let lines: Vec<&str> = doc.text.lines().collect();
+        let lines: Vec<&str> = lines_of(&doc.text).collect();
         let out: Vec<J> = doc
             .analysis
             .symbols
@@ -2063,7 +2085,7 @@ fn split_signature(sig: &str) -> Option<(&str, Vec<String>, &str)> {
 
 /// The `//` comment right above the definition on `line` (from 1), as one line.
 fn comment_above(text: &str, line: u32) -> String {
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<&str> = lines_of(&text).collect();
     let mut above = Vec::new();
     for l in lines[..(line as usize).saturating_sub(1).min(lines.len())].iter().rev() {
         match l.trim().strip_prefix("//") {
