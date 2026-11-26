@@ -1,0 +1,12 @@
+// Q-1400 `n && <markup>` on an int state gets check's "0 counts as true" warning only while nothing assigns the state; once a handler sets it (`n += 1`, `n = 0`), the warning is gone and the page shows the badge for 0
+// mode: check
+// fixed-when: /:9: warning/
+// From FEEDBACK90.md §Q-1400 (found on 61997ab).
+component Inbox() {
+    state unread = 0
+    <div>
+        <button onclick={() => { unread += 1 }}>+1 unread</button>
+        <p>Inbox{unread && <span>{unread} new</span>}</p>
+    </div>
+}
+route GET / = <html><body><Inbox/></body></html>
