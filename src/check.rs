@@ -3821,9 +3821,12 @@ struct Checker {
     /// value, and what components do with their parameters is not gathered (found in review of
     /// FEEDBACK86-89 round 10: a program with none should pay nothing for it).
     page_possible: bool,
+    /// The callees of the calls of the builtin `js` and `js_new`, each resolved as the check read it,
+    /// with what the code around it binds in scope (a lambda's parameter, a match arm, a block's
+    /// `let`): for `note_page_let`, which runs after those scopes are gone.
+    js_calls: HashSet<*const Expr, BuildPtr>,
     /// Whether a local or parameter is named `js` or `js_new` (set as one is declared, and kept),
-    /// and whether the program's `js` and `js_new` are the builtins (found once the bodies are
-    /// read, when the program's names are all in): for `note_page_let`.
+    /// and whether the program's `js` and `js_new` are the builtins (looked up once): for `js_calls`.
     js_locals: bool,
     js_global: std::cell::Cell<[Option<bool>; 2]>,
     /// Whether any local or parameter has a capitalised name, which an element's tag may then be
@@ -4237,6 +4240,7 @@ impl Checker {
             showing_at: 0,
             upper_locals: false,
             page_possible: false,
+            js_calls: HashSet::default(),
             js_locals: false,
             js_global: std::cell::Cell::new([None, None]),
             showing_conds: Vec::new(),
@@ -8511,23 +8515,9 @@ impl Checker {
             return;
         }
         // A `js(...)` in it, then one not in what runs later (looked for only where there is one).
-        // The builtin, as the program's `js` calls are checked: not a local or the program's own
-        // `fn js`, nor a module's taken under another name (found in review of FEEDBACK86-89 round
-        // 10b; from 0.8.11).
-        let builtin = |c: &Self, n: &str| {
-            let i = (n == "js_new") as usize;
-            let global = match c.js_global.get()[i] {
-                Some(b) => b,
-                None => {
-                    let b = c.globals.get(n).is_some_and(|v| &*v.file == "<builtin>");
-                    let mut known = c.js_global.get();
-                    known[i] = Some(b);
-                    c.js_global.set(known);
-                    b
-                }
-            };
-            global && !(c.js_locals && c.is_local(n))
-        };
+        // The builtin, as the check resolved each call where it read it (`js_calls`): not a local,
+        // also one the value binds itself, nor the program's own `fn js`, nor a module's taken
+        // under another name (found in review of FEEDBACK86-89 rounds 10b and 11; from 0.8.11).
         let named = |x: &Expr| matches!(x, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "js" || n == "js_new"));
         let mut any = false;
         walk_expr(e, &mut |x| any |= named(x));
@@ -8537,7 +8527,7 @@ impl Checker {
         let mut from_page = false;
         let later = runs_later(e);
         walk_expr(e, &mut |x| {
-            from_page = from_page || (named(x) && !later.contains(&(x as *const Expr)) && matches!(x, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if builtin(self, n))));
+            from_page = from_page || (named(x) && !later.contains(&(x as *const Expr)) && matches!(x, Expr::Call(f, _, _) if self.js_calls.contains(&(&**f as *const Expr))));
         });
         let Some(c) = self.fns.last().and_then(|f| f.component.clone()) else { return };
         if from_page {
@@ -12669,6 +12659,30 @@ impl Checker {
         }
         // `js(name, ...)`: the name is written in the code, as loading the
         // program requires (FEEDBACK18.md, Q-100; branch feedback18-fixes).
+        // The builtin `js`, piped into or not, resolved here where what the code around it binds is
+        // in scope, for `note_page_let` (found in review of FEEDBACK86-89 round 11).
+        // Cheaply: the global looked up once, and the scopes only once a local of the name is seen.
+        if let (true, Expr::Ident(n, _)) = (self.page_possible, callee) {
+            if n == "js" || n == "js_new" {
+                let i = (n == "js_new") as usize;
+                // Kept from inside a body only, which is read once the program's names are all in.
+                let mut known = self.js_global.get();
+                let global = match known[i] {
+                    Some(b) => b,
+                    None => {
+                        let b = self.globals.get(n.as_str()).is_some_and(|v| &*v.file == "<builtin>");
+                        if !self.fns.is_empty() {
+                            known[i] = Some(b);
+                            self.js_global.set(known);
+                        }
+                        b
+                    }
+                };
+                if global && !(self.js_locals && self.is_local(n)) {
+                    self.js_calls.insert(callee as *const Expr);
+                }
+            }
+        }
         if let (Expr::Ident(n, _), None) = (callee, &pre) {
             if (n == "js" || n == "js_new") && !self.is_local(n) && self.globals.get(n.as_str()).map_or(false, |v| &*v.file == "<builtin>") {
                 match args.first() {

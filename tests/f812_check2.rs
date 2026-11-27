@@ -1200,3 +1200,16 @@ fn q431_review_round10b_a_js_of_the_programs_own_is_no_page_value() {
         assert!(!said.iter().any(|d| d.contains(PAGE_VALUE)), "{name}: {:?}", said);
     }
 }
+
+#[test]
+fn q431_review_round11_a_js_bound_inside_the_value_is_no_page_value() {
+    // Found in review of round 11: a `js` bound inside the `let`'s own value (a match arm, a
+    // lambda's parameter, a block's `let`, a `map` callback) was taken for the builtin, as the
+    // check asked after that scope was gone; each call is now resolved as it is read.
+    for src in ["component C() {\n    let f = (s) => s\n    let w = match f {\n        js => js(\"document.title\")\n    }\n    <div><p>{w}</p></div>\n}\nroute GET / = <html><body><C/></body></html>\n", "component C() {\n    let w = ((js) => js(\"document.title\"))((s) => s)\n    <div><p>{w}</p></div>\n}\nroute GET / = <html><body><C/></body></html>\n", "component C() {\n    let w = {\n        let js = (s) => s\n        js(\"document.title\")\n    }\n    <div><p>{w}</p></div>\n}\nroute GET / = <html><body><C/></body></html>\n", "component C() {\n    let w = [(s) => s].map((js) => js(\"document.title\"))\n    <div><p>{w}</p></div>\n}\nroute GET / = <html><body><C/></body></html>\n"] {
+        assert_eq!(lines(src, PAGE_VALUE), Vec::<u32>::new(), "{}", src);
+    }
+    // The builtin still is one, piped into too.
+    assert_eq!(lines("component C() {\n    let w = js(\"document.title\")\n    <div><p>{w}</p></div>\n}\nroute GET / = <html><body><C/></body></html>\n", PAGE_VALUE).len(), 1);
+    assert_eq!(lines("component C() {\n    let w = \"document.title\" | js()\n    <div><p>{w}</p></div>\n}\nroute GET / = <html><body><C/></body></html>\n", PAGE_VALUE).len(), 1);
+}
