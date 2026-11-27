@@ -3985,6 +3985,13 @@ impl Interp {
         self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).runtime.as_ref().map(|r| (r.hash.clone(), r.js.clone()))
     }
 
+    /// The runtime file's code only a failure runs, by its hash (FEEDBACK88.md, Q-1380; branch
+    /// feedback86-89).
+    pub fn recovery_file(&self, hash: &str) -> Option<Arc<String>> {
+        let b = self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        b.runtime.as_ref().and_then(|r| r.rec.as_ref()).filter(|(h, _)| h == hash).map(|(_, js)| js.clone())
+    }
+
     pub fn load_file(&mut self, path: &Path) -> Result<Value, QuilloError> {
         let src = crate::error::read_source(path)
             .map_err(|e| QuilloError::new(format!("cannot read {}: {}", path.display(), e), 0))?;
@@ -4222,7 +4229,14 @@ impl Interp {
                         self.island_defers.push(name.clone());
                         Value::Nil
                     }
-                    None => self.eval(e, env)?,
+                    None => match self.eval(e, env)? {
+                        // A server fn's redirect: the error value the page's call is given
+                        // (FEEDBACK88.md, Q-1381; branch feedback86-89).
+                        Value::Response(r) if crate::server::redirects(&r) => {
+                            crate::server::redirect_in_state(&crate::server::said_of(&self.base_dir, &self.base), name, self.rendering.as_ref().map_or("?", |d| &*d.name), &r)
+                        }
+                        v => v,
+                    },
                 };
                 let live = self.last_live.take();
                 if let Some((state, subs)) = self.islands.last_mut() {
@@ -8863,7 +8877,12 @@ impl Interp {
         let outer_ns = self.ns;
         self.ns = if outer_ns == crate::foreign::At::default() { outer_ns } else { crate::foreign::LOST };
         let marked = self.marked;
+        // Its component, as a component placed in the page has it (`render_component_into`): a
+        // deferred state given a server fn's redirect was said as of `<?>`, and the second
+        // component's not at all (FEEDBACK88.md, Q-1381, the review of slice C; branch feedback86-89).
+        let named = std::mem::replace(&mut self.rendering, Some(d.c.def.clone()));
         let r = crate::value::js_numbers(true, || self.render_call_into(&d.c, d.args.clone(), d.line, &mut body));
+        self.rendering = named;
         self.in_component = was;
         let (state, mut live) = self.islands.pop().unwrap_or_default();
         let _ = self.states_now(&state);

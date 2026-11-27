@@ -44,8 +44,11 @@ fn run_page_with_path(chrome: &Path, app: &Path, port: u16, path: &str, script: 
 /// `quillo run app` with `args`, once it listens, and its port: on `port` 0 the one the system
 /// picked, read from what it says; a port given, waited for and checked to be this server's.
 fn serving(app: &Path, port: u16, args: &[&str]) -> (support::Guard, u16) {
+    // QUILLO_TEST_BIN: another build's quillo, to tell a change's failure from one of the machine
+    // (as tests/feedback61.rs; the sixteenth review of slice C, FEEDBACK88.md, Q-1380; branch
+    // feedback86-89).
     let mut server = support::Guard::new(
-        Command::new(env!("CARGO_BIN_EXE_quillo"))
+        Command::new(std::env::var_os("QUILLO_TEST_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_quillo").into()))
             .arg("run")
             .arg(app)
             .args(["--port", &port.to_string()])
@@ -849,8 +852,9 @@ fn a_2xx_its_server_did_not_send_is_an_error_not_null() {
     for k in ["made", "early", "record", "blank"] {
         assert_eq!(r[k], "value: null", "{}: {}", k, r);
     }
-    let moved = r["moved"].as_str().unwrap();
-    assert!(moved.starts_with("err: server fn `moved` answered something that is not its answer"), "{}", r);
+    // A server fn's redirect is an error value that says so, not followed (FEEDBACK88.md, Q-1381;
+    // branch feedback86-89: it was followed, and its page was not the call's answer).
+    assert_eq!(r["moved"], "err: a server fn cannot redirect: return a value and navigate", "{}", r);
     // Cut short, it may have run: the same key goes again, and a new one after it is answered.
     assert_eq!(r["paid"], "value: me", "{}", r);
     assert_eq!(r["keys"][0], r["keys"][1], "{}", r);

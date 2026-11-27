@@ -578,11 +578,26 @@ fn script(body: &str) -> String {
 
 /// `src` served, and `body` run at `path` in Chrome: what it gave back. None without Chrome.
 fn in_page(name: &str, src: &str, path: &str, body: &str) -> Option<serde_json::Value> {
+    in_page_via(name, src, path, body, None)
+}
+
+/// `in_page`, the page loaded through `front`: a Node script, given the server's port as `QP`,
+/// that serves in front of it and prints its own port (FEEDBACK88.md, Q-1381; branch
+/// feedback86-89).
+fn in_page_via(name: &str, src: &str, path: &str, body: &str, front: Option<&str>) -> Option<serde_json::Value> {
     let Some(chrome) = chrome() else {
         eprintln!("skipping: needs Chrome and Node 22 or later");
         return None;
     };
     let s = served(name, src, &[], &[]);
+    let mut port = s.port;
+    let _front = front.map(|js| {
+        let mut c = Command::new("node").args(["-e", js]).env("QP", s.port.to_string()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut first = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(c.stdout.take().unwrap()), &mut first).unwrap();
+        port = first.trim().parse().unwrap_or_else(|_| panic!("no port: {:?}", first));
+        support::Guard::new(c)
+    });
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let t = s.dir.0.join("t.js");
@@ -593,7 +608,7 @@ fn in_page(name: &str, src: &str, path: &str, body: &str) -> Option<serde_json::
         .env_remove("QUILLO_PAGE_CDP")
         .arg(&run)
         .arg(&chrome)
-        .arg(format!("http://127.0.0.1:{}{}", s.port, path))
+        .arg(format!("http://127.0.0.1:{}{}", port, path))
         .arg(s.dir.0.join("profile"))
         .arg("60000")
         .arg(&t)
@@ -1231,55 +1246,63 @@ route GET / = <html><body><C/></body></html>
 /// A server fn's call that a redirect takes to another origin: whatever that answer says, its mark
 /// is not the page's server's, and its trusted CSS mark is data, after a 302 and a 307 alike
 /// (FEEDBACK79.md, Q-1250, found in the second review of the trusted CSS; branch feedback72-81).
+/// The redirect is a proxy's in front of the server: the server fn's own `respond(302, ...)` is an
+/// error value now, which nothing follows (FEEDBACK88.md, Q-1381; branch feedback86-89).
 #[test]
 fn a_redirected_answer_carries_no_trust() {
     if chrome().is_none() {
         return;
     }
-    // Another origin that answers as the server's own answer would, and lets the page read it.
-    let js = r#"const http = require("http");
+    // Another origin that answers as the server's own answer would, and lets the page read it;
+    // and in front of the server, a proxy that sends the calls of `go` there, with the status
+    // they ask for.
+    let front = r#"const http = require("http");
 const h = { "access-control-allow-origin": "*", "access-control-allow-headers": "*", "access-control-allow-methods": "*", "access-control-expose-headers": "x-quillo-marked, x-quillo-answer" };
-const s = http.createServer((req, res) => {
+const other = http.createServer((req, res) => {
   if (req.method === "OPTIONS") { res.writeHead(204, h); return res.end(); }
   res.writeHead(200, { ...h, "content-type": "application/json", "x-quillo-marked": "1", "x-quillo-answer": "1" });
   res.end(JSON.stringify({ ok: { color: { $css: "red; background: blue" } } }));
 });
-s.listen(0, "127.0.0.1", () => console.log(s.address().port));
+other.listen(0, "127.0.0.1", () => {
+  const to = "http://127.0.0.1:" + other.address().port + "/x";
+  const front = http.createServer((req, res) => {
+    const parts = [];
+    req.on("data", (d) => parts.push(d));
+    req.on("end", () => {
+      const body = Buffer.concat(parts);
+      if (req.method === "POST" && req.url === "/_quillo/rpc/go") { res.writeHead(JSON.parse(String(body))[0], { location: to }); return res.end(); }
+      const p = http.request({ host: "127.0.0.1", port: +process.env.QP, path: req.url, method: req.method, headers: req.headers }, (r) => { res.writeHead(r.statusCode, r.headers); r.pipe(res); });
+      p.on("error", () => { res.writeHead(502); res.end(); });
+      p.end(body);
+    });
+  });
+  front.listen(0, "127.0.0.1", () => console.log(front.address().port));
+});
 setTimeout(() => process.exit(0), 120000);
 "#;
-    let mut other = Command::new("node").args(["-e", js]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
-    let mut first = String::new();
-    {
-        use std::io::BufRead;
-        let mut r = std::io::BufReader::new(other.stdout.take().unwrap());
-        r.read_line(&mut first).unwrap();
-    }
-    let _other = support::Guard::new(other);
-    let port: u16 = first.trim().parse().unwrap_or_else(|_| panic!("no port: {:?}", first));
-    let src = format!(
-        r#"server fn go(code: int) {{
-    return respond(code, "", {{ location: "http://127.0.0.1:{port}/x" }})
-}}
-component C() {{
+    let src = r#"server fn go(code: int) -> map {
+    return { code: code }
+}
+component C() {
     state a = null
     state b = null
     <div>
-        <button id="go" onclick={{() => {{ a = go(302); b = go(307) }}}}>go</button>
-        {{a != null ? <p id="a" style={{`padding: 1px; color: ${{is_err(a) ? "error" : a.color}}`}}>{{is_err(a) ? "error" : type_of(a.color)}}</p> : null}}
-        {{b != null ? <p id="b" style={{`padding: 1px; color: ${{is_err(b) ? "error" : b.color}}`}}>{{is_err(b) ? "error" : type_of(b.color)}}</p> : null}}
+        <button id="go" onclick={() => { a = go(302); b = go(307) }}>go</button>
+        {a != null ? <p id="a" style={`padding: 1px; color: ${is_err(a) ? "error" : a.color}`}>{is_err(a) ? "error" : type_of(a.color)}</p> : null}
+        {b != null ? <p id="b" style={`padding: 1px; color: ${is_err(b) ? "error" : b.color}`}>{is_err(b) ? "error" : type_of(b.color)}</p> : null}
     </div>
-}}
+}
 route GET / = <html><body><C/></body></html>
-"#
-    );
-    let Some(v) = in_page(
+"#;
+    let Some(v) = in_page_via(
         "redirect",
-        &src,
+        src,
         "/",
         r#"$("go").click();
   for (let i = 0; i < 100 && !($("a") && $("b")); i++) await tick(30);
   const st = (id) => [$(id).getAttribute("style"), $(id).textContent, getComputedStyle($(id)).backgroundColor];
   return { a: st("a"), b: st("b") };"#,
+        Some(front),
     ) else {
         return;
     };

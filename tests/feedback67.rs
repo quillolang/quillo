@@ -1419,7 +1419,8 @@ const SW_KIT: &str = r#"
       // Opened only if it is still there: opening one the worker just dropped makes it again,
       // empty, and it was seen on every look after (found in the third review's runs).
       if (n.endsWith(":gone") || !(await caches.has(n))) continue;
-      const k = (await (await caches.open(n)).keys()).map((r) => decodeURI(new URL(r.url).pathname).replace(/\/[0-9a-f]{16}\./, "/H.")).filter((p) => !p.endsWith("/_quillo/sw-state")).sort();
+      // (Q-1380's failure file, `f` and sixteen digits, as F: FEEDBACK89.md; branch feedback86-89.)
+      const k = (await (await caches.open(n)).keys()).map((r) => decodeURI(new URL(r.url).pathname).replace(/\/f[0-9a-f]{16}\./, "/F.").replace(/\/[0-9a-f]{16}\./, "/H.")).filter((p) => !p.endsWith("/_quillo/sw-state")).sort();
       if (k.length) out[n.replace(/:[0-9a-f]{16}/, ":V").replace(/:V:.+$/, ":V:S")] = k;
     }
     return out;
@@ -1544,7 +1545,9 @@ fn b2_offline_pages_are_kept_and_shown_with_the_server_stopped() {
     let r = page.join().unwrap();
     let name = "Corner <Shop> ✓";
     let offline_page = serde_json::json!({ "h1": name, "kept": null, "offline": true, "title": name });
-    let files = serde_json::json!(["/", "/_quillo/b/H.js", "/_quillo/b/H.js", "/_quillo/r/H.js", "/menu", "/never"]);
+    // With Q-1380's failure file (`/_quillo/r/F.js`), which the worker keeps with the runtime file, a
+    // decision of 2026-11-26 (FEEDBACK89.md; branch feedback86-89).
+    let files = serde_json::json!(["/", "/_quillo/b/H.js", "/_quillo/b/H.js", "/_quillo/r/F.js", "/_quillo/r/H.js", "/menu", "/never"]);
     assert_eq!(
         r,
         serde_json::json!({
@@ -1651,7 +1654,9 @@ fn b2_a_visitors_page_is_dropped_when_the_session_ends_or_changes() {
     let log = std::fs::read_to_string(&s.1).unwrap_or_default();
     drop(s);
     let r = page.join().unwrap();
-    let public = serde_json::json!(["/", "/_quillo/b/H.js", "/_quillo/r/H.js"]);
+    // With Q-1380's failure file (`/_quillo/r/F.js`), which the worker keeps with the runtime file, a
+    // decision of 2026-11-26 (FEEDBACK89.md; branch feedback86-89).
+    let public = serde_json::json!(["/", "/_quillo/b/H.js", "/_quillo/r/F.js", "/_quillo/r/H.js"]);
     let with = |user_page: bool| if user_page { serde_json::json!({ "quillo::V": public, "quillo::V:S": ["/mine"] }) } else { serde_json::json!({ "quillo::V": public }) };
     assert_eq!(
         r,
@@ -1907,7 +1912,9 @@ fn b2_under_base_the_worker_and_its_pages_carry_the_prefix() {
         r,
         serde_json::json!({
             "controlled": true, "worker": "/shop/_quillo/sw.js", "scope": "/shop/",
-            "kept": { "quillo:/shop:V": ["/shop/", "/shop/_quillo/b/H.js", "/shop/_quillo/r/H.js", "/shop/menu"] },
+            // With Q-1380's failure file, which the worker keeps with the runtime file, a decision of
+            // 2026-11-26 (FEEDBACK89.md; branch feedback86-89).
+            "kept": { "quillo:/shop:V": ["/shop/", "/shop/_quillo/b/H.js", "/shop/_quillo/r/F.js", "/shop/_quillo/r/H.js", "/shop/menu"] },
             "down": true,
             "menu": { "h1": "Menu", "kept": "iso", "offline": false, "title": "" }, "component": "clicked 1",
             "home": { "h1": "Home", "kept": "iso", "offline": false, "title": "" },

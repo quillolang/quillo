@@ -2315,6 +2315,21 @@ impl Interp {
         // (a page from before a reload) gets this one, which does no harm:
         // its bundle is not kept either, so it is sent the whole bundle.
         if let Some(hash) = rest.strip_prefix("r/").and_then(|r| r.strip_suffix(".js")) {
+            // Or its code only a failure runs, fetched the first time a draw fails (FEEDBACK88.md,
+            // Q-1380, the user's decision in the thirteenth review of slice C; branch feedback86-89).
+            // One this program does not have (seventeen digits: a page from before it changed) is
+            // not found, never this program's code against that page's runtime: the page loads
+            // again (see `recStale` in runtime.js; the fourteenth review of slice C).
+            if hash.len() == 17 {
+                return match self.recovery_file(hash) {
+                    Some(js) => HttpResponse {
+                        status: 200,
+                        headers: vec![("content-type".into(), "text/javascript; charset=utf-8".into()), ("cache-control".into(), "public, max-age=31536000, immutable".into())],
+                        body: js.as_bytes().to_vec(),
+                    },
+                    None => HttpResponse { status: 404, headers: vec![("cache-control".into(), "no-cache".into())], body: Vec::new() },
+                };
+            }
             let (js, cache) = match self.runtime_file() {
                 Some((h, js)) if h == hash => (js, "public, max-age=31536000, immutable"),
                 Some((_, js)) => (js, "no-cache"),
@@ -2715,12 +2730,12 @@ impl Interp {
             self.current_request = None;
             return match res {
                 Ok(v) | Err(Ctrl::Return(v)) => match for_visitor(v) {
-                    Value::Response(r) => render_response(&r),
+                    Value::Response(r) => rpc_response(&self.base_dir, &self.base, name, &r),
                     // Held as a route's answer is (FEEDBACK71.md, Q-977; branch security).
                     Value::Err(e, _, _) => answer_held("err", &e),
                     v => answer_held("ok", &v),
                 },
-                Err(Ctrl::Reply(r)) => render_response(&r),
+                Err(Ctrl::Reply(r)) => rpc_response(&self.base_dir, &self.base, name, &r),
                 Err(Ctrl::Error(e)) => {
                     eprintln!("quillo: error in server fn `{}`: {:#}", name, e);
                     rpc_failed(name, &e)
@@ -2765,7 +2780,7 @@ impl Interp {
                 self.current_request = None;
                 let answer = Arc::new(match res {
                     Ok(v) | Err(Ctrl::Return(v)) => match for_visitor(v) {
-                        Value::Response(r) => return render_response(&r),
+                        Value::Response(r) => return rpc_response(&self.base_dir, &self.base, name, &r),
                         // Held to `--max-memory` where it is set (FEEDBACK71.md, Q-977; branch security).
                         Value::Err(e, _, _) => match crate::livecache::Answer::of(&e, true) {
                             Some(a) => a,
@@ -2776,7 +2791,7 @@ impl Interp {
                             None => return over_memory_answer(),
                         },
                     },
-                    Err(Ctrl::Reply(r)) => return render_response(&r),
+                    Err(Ctrl::Reply(r)) => return rpc_response(&self.base_dir, &self.base, name, &r),
                     Err(Ctrl::Error(e)) => {
                         eprintln!("quillo: error in server fn `{}`: {:#}", name, e);
                         return rpc_failed(name, &e);
@@ -3652,6 +3667,61 @@ fn over_memory_answer() -> HttpResponse {
     crate::httpd::error_line(&crate::httpd::over_memory());
     rpc_error(500, &crate::httpd::over_memory_said_to_pages())
 }
+
+/// A server fn's answer that is a response of its own (`respond`, `reply`), as it is written; but
+/// not a redirect, which the page's call followed to a page that is no answer: the call gave
+/// `err("internal error")` and the page stayed where it was, with not a word in the log. The call's
+/// error value says why, and the log says so once for each function; nothing is followed
+/// (FEEDBACK88.md, Q-1381; branch feedback86-89).
+fn rpc_response(dir: &Path, base: &str, name: &str, r: &Response) -> HttpResponse {
+    if !redirects(r) {
+        return render_response(r);
+    }
+    if said_once(format!("{}fn {}", said_of(dir, base), name)) {
+        eprintln!("quillo: server fn `{}` redirects{}, which a page's call does not follow: the call is given an error value; return a value, and `navigate` in the page", name, redirect_to(r));
+    }
+    answer_held("err", &Value::str(NO_REDIRECT))
+}
+
+/// Whether `r` is a redirect, which a page's call is not given (see `rpc_response`).
+pub(crate) fn redirects(r: &Response) -> bool {
+    matches!(r.status, 301 | 302 | 303 | 307 | 308)
+}
+
+/// A server fn's redirect given to a component's `state` as the server renders it: the error value
+/// the page's call is given, said once for each state in the log, where the page failed with
+/// "state `x` of <C> is a response, which cannot be sent to the browser" (FEEDBACK88.md, Q-1381;
+/// branch feedback86-89).
+#[cold]
+#[inline(never)]
+pub(crate) fn redirect_in_state(program: &str, state: &str, component: &str, r: &Response) -> Value {
+    if said_once(format!("{}state {} {}", program, component, state)) {
+        eprintln!("quillo: state `{}` of <{}> is given a redirect{} by the server fn it calls, which a page's call does not follow: the state is given an error value; return a value, and `navigate` in the page", state, component, redirect_to(r));
+    }
+    Value::own_err(Value::str(NO_REDIRECT))
+}
+
+/// What `said_once` has said, each key after its program's (`said_of`): one process serves several
+/// mounted programs (the fourth review of slice C).
+static SAID: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+/// The start of the keys `said_once` notes for the program in `dir` mounted at `base`.
+pub(crate) fn said_of(dir: &Path, base: &str) -> String {
+    format!("{}\u{0}{}\u{0}", dir.display(), base)
+}
+
+/// Whether `key` is said for the first time (see `rpc_response`).
+fn said_once(key: String) -> bool {
+    SAID.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(Default::default).insert(key)
+}
+
+/// " to <its location>", the first 200 characters, or nothing.
+fn redirect_to(r: &Response) -> String {
+    r.headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("location")).map_or(String::new(), |(_, v)| format!(" to {}", v.chars().take(200).collect::<String>()))
+}
+
+/// The error value of a server fn's call that redirected (see `rpc_response`).
+const NO_REDIRECT: &str = "a server fn cannot redirect: return a value and navigate";
 
 fn rpc_error(status: u16, msg: &str) -> HttpResponse {
     json_response(status, serde_json::json!({ "error": msg }))
@@ -4532,6 +4602,13 @@ impl App {
                 let n = it.routes.iter().filter(|r| r.method != crate::ast::GUARD_METHOD).count();
                 if say {
                     eprintln!("quillo: reloaded {} ({} route{}){}", self.main_file.display(), n, if n == 1 { "" } else { "s" }, carried);
+                }
+                // A redirect said once is said again by the program saved anew, its own and not
+                // another mounted program's (FEEDBACK88.md, Q-1381, the reviews of slice C; branch
+                // feedback86-89).
+                let mine = said_of(&self.base_dir, &self.base);
+                if let Some(said) = SAID.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
+                    said.retain(|k| !k.starts_with(&mine));
                 }
                 // A version that is the first to use services or `db.atomic`
                 // needs what delivers and recovers in the background.

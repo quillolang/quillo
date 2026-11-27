@@ -308,6 +308,17 @@ async function settle() {
 // write, or set a cookie. A page that did not come (no network, a proxy's 502, 503 or 504) is
 // asked for again on the next try; one refused, redirected (here or off the site), or answered
 // otherwise is done with for this version.
+// A file a page names, kept; a script's own files with it (`deep`): the runtime file names the code
+// only a failure runs, fetched the first time a draw fails, which a failure offline needs
+// (FEEDBACK88.md, Q-1380, the fourteenth review of slice C; branch feedback86-89).
+async function keepFile(c, f, deep) {
+  if (await c.match(f)) return;
+  const file = await fetch(f);
+  if (!lasting(file)) return;
+  if (deep && f.endsWith(".js")) await Promise.all([...new Set((await file.clone().text()).match(ALL) || [])].filter((g) => g !== f).map((g) => keepFile(c, g, false)));
+  await c.put(f, file);
+}
+
 async function ahead() {
   const s = await state(), c = await caches.open(NAME);
   if (s.ready) return true;
@@ -334,11 +345,7 @@ async function ahead() {
       if (res.status !== 200 || !mark) return true;
       const html = await res.clone().text();
       await seen(res, new URL(p, location.href).href, res.headers.get("x-quillo-session"), mark);
-      await Promise.all([...new Set(html.match(ALL) || [])].map(async (f) => {
-        if (await c.match(f)) return;
-        const file = await fetch(f);
-        if (lasting(file)) await c.put(f, file);
-      }));
+      await Promise.all([...new Set(html.match(ALL) || [])].map((f) => keepFile(c, f, true)));
       return true;
     } catch (_) {
       return false;

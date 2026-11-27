@@ -96,6 +96,7 @@ fn compiled<'a>(it: &'a Interp, roots: Option<&[String]>) -> Result<(Compiler<'a
     for (name, _) in &names {
         c.global(name, 0)?;
     }
+    debug_assert!(fact_refs_ok(&c.defs, &c.fact_refs), "a component's facts refer to one not written before it");
     // Moves in place start from the bundle, on a page with no component too (FEEDBACK84.md,
     // Q-1323; branch feedback82-85).
     Ok((c, !names.is_empty() || it.site.in_place))
@@ -441,6 +442,9 @@ pub struct PageRef {
 pub struct RuntimeFile {
     pub hash: String,
     pub js: Arc<String>,
+    /// The code only a failure runs, a file of its own fetched the first time a draw fails: its
+    /// hash and its code (see `recovery_file`).
+    pub rec: Option<(String, Arc<String>)>,
     keep: Vec<bool>,
     exported: HashSet<String>,
 }
@@ -455,28 +459,130 @@ pub fn runtime_file(it: &Interp) -> Result<Option<RuntimeFile>, QuilloError> {
 fn runtime_from(it: &Interp, c: &Compiler, boots: bool) -> RuntimeFile {
     let program = program_text(it, c, boots, false);
     let rt = runtime_units();
-    // `QW`, which the file hands the bundles the runtime by.
-    let keep = shake(rt, &format!("{}\nQW", program));
+    // `QW`, which the file hands the bundles the runtime by. What the file holds (`main`): all but
+    // the code only a failure runs (FEEDBACK88.md, Q-1380, the user's decision in the thirteenth
+    // review of slice C; branch feedback86-89). Under Quillo's worker (`offline` routes), the page
+    // has that code's file kept (`recKeep`).
+    let offline = it.routes.iter().any(|r| r.offline);
+    let (keep, main) = shake_split(rt, &format!("{}\nQW", program), if offline { "recKeep" } else { "" });
     let wanted: HashSet<String> = names_in(&program).into_iter().collect();
     let mut exported: Vec<String> = rt
         .by_name
         .iter()
-        .filter(|(n, &i)| keep[i] && !n.contains('.') && wanted.contains(**n))
+        .filter(|(n, &i)| main[i] && !n.contains('.') && wanted.contains(**n))
         .map(|(n, _)| n.to_string())
         .collect();
     exported.sort();
     let mut js = String::from("(function () {\n");
-    runtime_into(rt, &keep, &mut js);
+    runtime_into(rt, &main, &mut js);
     if !it.base.is_empty() {
         let _ = writeln!(js, "BASE = {};", js_str(&it.base));
     }
-    if rt.by_name.get("VERSION").is_some_and(|&i| keep[i]) {
+    if rt.by_name.get("VERSION").is_some_and(|&i| main[i]) {
         js.push_str(&version_line());
+    }
+    let rec = recovery_file(rt, &keep, &main);
+    if let Some((hash, _, with)) = &rec {
+        let _ = writeln!(js, "RecAt = {}; RecWith = () => ({{ {} }});{}", js_str(&format!("{}/_quillo/r/{}.js", it.base, hash)), with, if offline { " recKeep();" } else { "" });
     }
     let _ = writeln!(js, "QW.rt = {{ {} }};", exported.join(", "));
     js.push_str("})();\n");
     let hash = hash_text(&js);
-    RuntimeFile { hash, js: Arc::new(js), keep, exported: exported.into_iter().collect() }
+    RuntimeFile { hash, js: Arc::new(js), rec: rec.map(|(h, js, _)| (h, Arc::new(js))), keep, exported: exported.into_iter().collect() }
+}
+
+/// `shake`'s two sets for a runtime file in one walk, each unit's names read once: `main`, all but
+/// what only `LAZY` reaches (the code only a failure runs), and `keep`, that too; `extra`, a name the
+/// file's own line uses when there is such code. Two shakes made a program's first page 39% dearer
+/// (the fourteenth review of slice C).
+fn shake_split(rt: &Runtime, program: &str, extra: &str) -> (Vec<bool>, Vec<bool>) {
+    let mut main = vec![false; rt.units.len()];
+    let lazy = rt.by_name.get("LAZY").copied();
+    let mut todo: Vec<String> = names_in(program);
+    let (mut reached, mut added) = (false, false);
+    loop {
+        while let Some(n) = todo.pop() {
+            if let Some(&i) = rt.by_name.get(n.as_str()) {
+                if Some(i) == lazy {
+                    reached = true;
+                } else if !main[i] {
+                    main[i] = true;
+                    todo.extend(names_in(&rt.units[i].1));
+                }
+            }
+        }
+        if reached && !added && !extra.is_empty() {
+            added = true;
+            todo.push(extra.to_string());
+            continue;
+        }
+        break;
+    }
+    let mut keep = main.clone();
+    if let (true, Some(l)) = (reached, lazy) {
+        keep[l] = true;
+        let mut todo = names_in(&rt.units[l].1);
+        while let Some(n) = todo.pop() {
+            if let Some(&i) = rt.by_name.get(n.as_str()) {
+                if !keep[i] {
+                    keep[i] = true;
+                    todo.extend(names_in(&rt.units[i].1));
+                }
+            }
+        }
+    }
+    (keep, main)
+}
+
+/// The code only a failure runs, what the program needs (`keep`) but the runtime file (`main`) does
+/// not: a file of its own, fetched the first time a draw fails (see `recover` in runtime.js). Its
+/// code runs in the runtime file's names, which it reaches through what `RecWith` makes: each it
+/// reads, and a getter and a setter for each `let` (FEEDBACK88.md, Q-1380, the user's decision in
+/// the thirteenth review of slice C; branch feedback86-89). Its hash, its code, and that object's
+/// text; none when the program has no such code.
+fn recovery_file(rt: &Runtime, keep: &[bool], main: &[bool]) -> Option<(String, String, String)> {
+    let lazy: Vec<usize> = (0..rt.units.len()).filter(|&i| keep[i] && !main[i]).collect();
+    if lazy.is_empty() {
+        return None;
+    }
+    // Not strict: its code reads the runtime's names through `with`.
+    let mut js = String::from("(function () {\nwindow[Symbol.for(\"quillo\")].recover(function (R) {\nwith (R) return (function () {\n");
+    let cover = covering();
+    let mut used: Vec<String> = Vec::new();
+    for &i in &lazy {
+        let text = &rt.units[i].1;
+        if cover {
+            let _ = write!(js, "//@rt {}\n{}", rt.starts[i], text);
+        } else {
+            minify_into(text, &mut js);
+        }
+        used.extend(names_in(text));
+    }
+    if cover {
+        js.push_str("//@rt end\n");
+    }
+    js.push_str("return LAZY;\n})();\n});\n})();\n");
+    used.sort();
+    used.dedup();
+    let mut with = Vec::new();
+    for n in used.iter().filter(|n| !n.contains('.')) {
+        let Some(&i) = rt.by_name.get(n.as_str()) else { continue };
+        if !main[i] {
+            continue;
+        }
+        if rt.units[i].1.starts_with("let ") {
+            // A setter only for one its code assigns.
+            if lazy.iter().any(|&k| assigns(&rt.units[k].1, n)) {
+                with.push(format!("get {n}() {{ return {n}; }}, set {n}(v) {{ {n} = v; }}"));
+            } else {
+                with.push(format!("get {n}() {{ return {n}; }}"));
+            }
+        } else {
+            with.push(n.clone());
+        }
+    }
+    // Seventeen digits, where a runtime file's have sixteen: one from before a reload is told apart.
+    Some((format!("f{}", hash_text(&js)), js, with.join(", ")))
 }
 
 impl RuntimeFile {
@@ -1418,44 +1524,69 @@ fn units_of(src: &'static str) -> Runtime {
 /// (and also giving `B` or `W`). Strings are scanned too: that can only
 /// keep more of the runtime than needed, never less.
 fn names_in(js: &str) -> Vec<String> {
-    let chars: Vec<char> = js.chars().collect();
+    // Its bytes, a character decoded only past ASCII, and a comment line skipped to its end at
+    // once: copied into characters first, the runtime's comments cost a program's first page more
+    // than the code (the fourteenth review of slice C; FEEDBACK88.md, Q-1380; branch feedback86-89).
+    let b = js.as_bytes();
+    let at = |i: usize| -> (bool, usize) {
+        let c = b[i];
+        if c < 0x80 {
+            (c.is_ascii_alphanumeric() || c == b'_' || c == b'$', 1)
+        } else {
+            let ch = js[i..].chars().next().unwrap_or(' ');
+            (ch.is_alphanumeric(), ch.len_utf8())
+        }
+    };
     let mut out = Vec::new();
     let mut i = 0;
-    let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
     let mut line_start = true;
-    while i < chars.len() {
-        let c = chars[i];
+    // Whether the character before `i` is an identifier's, and how many `.` come just before it.
+    let (mut prev_ident, mut dots) = (false, 0usize);
+    while i < b.len() {
+        let c = b[i];
         // A whole-line comment names nothing the code needs.
-        if line_start && c == '/' && chars.get(i + 1) == Some(&'/') {
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
+        if line_start && c == b'/' && b.get(i + 1) == Some(&b'/') {
+            i += b[i..].iter().position(|&x| x == b'\n').unwrap_or(b.len() - i);
+            prev_ident = false;
+            dots = 0;
             continue;
         }
-        if c == '\n' {
+        // (Whitespace as `char::is_whitespace` has it, a vertical tab and U+00A0, U+2028... too.)
+        if c == b'\n' {
             line_start = true;
-        } else if !c.is_whitespace() {
+        } else if if c < 0x80 { !(c as char).is_whitespace() } else { !js[i..].chars().next().is_some_and(char::is_whitespace) } {
             line_start = false;
         }
+        let (id, len) = at(i);
         // (After `.` a property, except after `...`, a spread.)
-        let spread = i >= 3 && chars[i - 3..i] == ['.', '.', '.'];
-        if ident(c) && (i == 0 || !ident(chars[i - 1]) && (chars[i - 1] != '.' || spread)) {
+        if id && !prev_ident && (dots == 0 || dots >= 3) {
             let start = i;
-            while i < chars.len() && ident(chars[i]) {
-                i += 1;
-            }
-            let word: String = chars[start..i].iter().collect();
-            if (word == "B" || word == "W") && chars.get(i) == Some(&'.') {
-                let s2 = i + 1;
-                let mut j = s2;
-                while j < chars.len() && ident(chars[j]) {
-                    j += 1;
+            while i < b.len() {
+                let (id, len) = at(i);
+                if !id {
+                    break;
                 }
-                out.push(format!("{}.{}", word, chars[s2..j].iter().collect::<String>()));
+                i += len;
             }
-            out.push(word);
+            let word = &js[start..i];
+            if (word == "B" || word == "W") && b.get(i) == Some(&b'.') {
+                let mut j = i + 1;
+                while j < b.len() {
+                    let (id, len) = at(j);
+                    if !id {
+                        break;
+                    }
+                    j += len;
+                }
+                out.push(format!("{}.{}", word, &js[i + 1..j]));
+            }
+            out.push(word.to_string());
+            prev_ident = true;
+            dots = 0;
         } else {
-            i += 1;
+            prev_ident = id;
+            dots = if c == b'.' { dots + 1 } else { 0 };
+            i += len;
         }
     }
     out
@@ -1732,6 +1863,14 @@ enum Resolved {
 
 struct Compiler<'a> {
     it: &'a Interp,
+    /// What each function's draw reads and does, worked out once for the program (see `draw_facts`).
+    facts: Facts,
+    /// A long list of page states a component reads, by the first component given it (its name and
+    /// JavaScript name): one that reads the same refers to that one's (see `draw_facts`).
+    fact_lists: HashMap<usize, (usize, String)>,
+    /// Each reference written to another's list: where the def that refers is and where the one it
+    /// names (see `fact_refs_ok`).
+    fact_refs: Vec<(usize, usize, String)>,
     /// The translation keys the code can ask `t` for: each written out, or the start of one
     /// made from parts (`sec.*`); `None` when one is worked out some other way. A page then
     /// carries only those (FEEDBACK30.md, Q-372; branch feedback27-35-fixes).
@@ -1944,6 +2083,40 @@ fn named_in_own_fns(name: &str, e: &Expr) -> bool {
     reads(true) && !reads(false)
 }
 
+/// Whether a component's body is made again whole when what it read changes, its state kept
+/// (`setup_inner`): it can return early (a `return` or a `?` in it, outside its functions), or it
+/// changes, on a line of its own, a name that is not one of its states (a `let`, a prop). Then each
+/// of its lines runs again, an assignment to a state too, which `quillo check`'s run-once warning
+/// asks here, so the two cannot differ (FEEDBACK90.md, Q-1401; branch feedback86-89).
+pub(crate) fn runs_again_whole(body: &Expr) -> bool {
+    let mut exits = false;
+    let mut changed = HashSet::new();
+    each_expr_in(
+        body,
+        &mut |e| match e {
+            Expr::Try(_) => exits = true,
+            Expr::Block(ss) => {
+                for st in ss {
+                    match st {
+                        Stmt::Return(..) => exits = true,
+                        Stmt::Assign(n, ..) => {
+                            changed.insert(n.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        },
+        false,
+    );
+    let states: HashSet<&String> = match body {
+        Expr::Block(ss) => ss.iter().filter_map(|st| if let Stmt::State(n, ..) = st { Some(n) } else { None }).collect(),
+        _ => HashSet::new(),
+    };
+    exits || changed.iter().any(|n| !states.iter().any(|s| s.as_str() == n.as_str()))
+}
+
 /// Calls `f` on `e` and every expression inside it.
 pub(crate) fn each_expr(e: &Expr, f: &mut dyn FnMut(&Expr)) {
     each_expr_in(e, f, true)
@@ -2015,40 +2188,6 @@ fn each_expr_in(e: &Expr, f: &mut dyn FnMut(&Expr), fns: bool) {
         Expr::Html(el, _) => each_html_expr(el, f, fns),
     }
 }
-/// Whether a component's body is made again whole when what it read changes, its state kept
-/// (`setup_inner`): it can return early (a `return` or a `?` in it, outside its functions), or it
-/// changes, on a line of its own, a name that is not one of its states (a `let`, a prop). Then each
-/// of its lines runs again, an assignment to a state too, which `quillo check`'s run-once warning
-/// asks here, so the two cannot differ (FEEDBACK90.md, Q-1401; branch feedback86-89).
-pub(crate) fn runs_again_whole(body: &Expr) -> bool {
-    let mut exits = false;
-    let mut changed = HashSet::new();
-    each_expr_in(
-        body,
-        &mut |e| match e {
-            Expr::Try(_) => exits = true,
-            Expr::Block(ss) => {
-                for st in ss {
-                    match st {
-                        Stmt::Return(..) => exits = true,
-                        Stmt::Assign(n, ..) => {
-                            changed.insert(n.clone());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        },
-        false,
-    );
-    let states: HashSet<&String> = match body {
-        Expr::Block(ss) => ss.iter().filter_map(|st| if let Stmt::State(n, ..) = st { Some(n) } else { None }).collect(),
-        _ => HashSet::new(),
-    };
-    exits || changed.iter().any(|n| !states.iter().any(|s| s.as_str() == n.as_str()))
-}
-
 
 /// Whether `body` can leave its function early (`return`, or `?` on an
 /// error), which compiled code does by throwing `W.Ret`; a function whose
@@ -2344,6 +2483,384 @@ fn free_html<'a>(el: &'a HtmlEl, fns: bool, bound: &mut Bound, f: &mut dyn FnMut
             HtmlChild::El(e) => free_html(e, fns, bound, f),
             HtmlChild::Expr(x) => each_free(x, fns, bound, f),
         }
+    }
+}
+
+/// What a component's draw reads and does, as the browser's runtime wants it when a draw fails
+/// (`probeStopped`, `skippedRead`): the page states its code reads as it draws, and whether it
+/// writes a state then, through the functions and views it calls and the markup it hands others to
+/// draw (children, render props), its own inner `fn`s and the lambdas it makes, which may run as it
+/// draws (`[1].map((i) => ...)`, `let g = () => pg`): their reads count, their writes only where
+/// they run as it draws (render props). Its handlers' and the callbacks it gives (`every`, `js`...),
+/// which run later, count for neither; a component it shows draws by itself. From the program as
+/// written, once, for a scan of the compiled code took a page state a helper read for none, a
+/// handler's write for the draw's, and a string's `W.put(` for a write (FEEDBACK88.md, Q-1380, the
+/// thirteenth and fourteenth reviews of slice C; branch feedback86-89). `memo` holds each function's,
+/// for the whole program: worked out again for each component, a chain of helpers took time
+/// quadratic in its length.
+fn draw_facts(globals: &Env, def: &FnDef, memo: &mut Facts) -> Arc<(Vec<String>, bool)> {
+    let (reads, writes, calls) = local_facts(globals, def);
+    let mut from: Vec<(usize, bool)> = Vec::new();
+    let mut parts = Vec::new();
+    for (n, draws) in calls {
+        if let Some(f) = fn_facts(globals, &n, memo) {
+            from.push((Arc::as_ptr(&f) as usize, draws));
+            parts.push((f, draws));
+        }
+    }
+    from.sort_unstable();
+    from.dedup();
+    // Components that read the same of their own and call into the same groups have one result:
+    // forty calling into a cycle of a thousand functions each merged its thousand names (the
+    // sixteenth review of slice C; FEEDBACK88.md, Q-1380; branch feedback86-89). (The groups'
+    // results live as long as `memo`, so their addresses name them.)
+    let key = (reads.into_iter().collect::<Vec<String>>(), writes, from);
+    if let Some(f) = memo.merged.get(&key) {
+        return f.clone();
+    }
+    let mut all: std::collections::BTreeSet<&str> = key.0.iter().map(|n| n.as_str()).collect();
+    let mut w = key.1;
+    for (f, draws) in &parts {
+        all.extend(f.0.iter().map(|n| n.as_str()));
+        w |= *draws && f.1;
+    }
+    // And those of the same result, however reached, one (its list then written once: see
+    // `fact_lists`).
+    let one: (Vec<String>, bool) = (all.into_iter().map(str::to_string).collect(), w);
+    let one = match memo.same.get(&one) {
+        Some(f) => f.clone(),
+        None => {
+            let f = Arc::new(one.clone());
+            memo.same.insert(one, f.clone());
+            f
+        }
+    };
+    memo.merged.insert(key, one.clone());
+    one
+}
+
+/// What each function's draw reads and does, for the whole program (see `draw_facts`): its own
+/// (`local`), and with what it calls, worked out by groups of functions that call each other
+/// (Tarjan's): one result for each group, kept once the group is closed, never part of one, which
+/// a function read again inside a cycle was given (the fifteenth review of slice C).
+#[derive(Default)]
+struct Facts {
+    done: HashMap<String, Arc<(std::collections::BTreeSet<String>, bool)>>,
+    local: HashMap<String, OwnFacts>,
+    /// A component's result by its own reads and writes and the groups it calls into (see
+    /// `draw_facts`).
+    merged: HashMap<(Vec<String>, bool, Vec<(usize, bool)>), Arc<(Vec<String>, bool)>>,
+    /// Each result once, whichever key reached it.
+    same: HashMap<(Vec<String>, bool), Arc<(Vec<String>, bool)>>,
+}
+
+/// A function's own reads, whether it writes as it draws, and what it calls (`true`: as it draws).
+type OwnFacts = (std::collections::BTreeSet<String>, bool, Vec<(String, bool)>);
+
+fn local_facts(globals: &Env, def: &FnDef) -> OwnFacts {
+    let mut reads = std::collections::BTreeSet::new();
+    let mut writes = false;
+    let mut calls: Vec<(String, bool)> = Vec::new();
+    // A component's own states, which its draw writes as it writes a page state.
+    let own: Vec<String> = match &def.body {
+        Expr::Block(ss) => ss.iter().filter_map(|st| if let Stmt::State(n, ..) = st { Some(n.to_string()) } else { None }).collect(),
+        _ => Vec::new(),
+    };
+    let params: Vec<String> = def.params.iter().map(|p| p.name.to_string()).collect();
+    draw_scan(&def.body, &params, globals, &own, true, &mut reads, &mut writes, &mut calls);
+    (reads, writes, calls)
+}
+
+/// The program's function `n` (not a server fn or a component, which draws by itself).
+fn plain_fn(globals: &Env, n: &str) -> Option<Arc<FnDef>> {
+    match lookup(globals, n) {
+        Some(Value::Func(f)) if !f.def.server && !f.def.component => Some(f.def.clone()),
+        _ => None,
+    }
+}
+
+/// `n`'s facts, with what it calls (see `Facts`); none when it is not the program's function.
+fn fn_facts(globals: &Env, n: &str, memo: &mut Facts) -> Option<Arc<(std::collections::BTreeSet<String>, bool)>> {
+    plain_fn(globals, n)?;
+    if !memo.done.contains_key(n) {
+        let mut t = Tarjan::default();
+        tarjan(globals, n, memo, &mut t);
+    }
+    memo.done.get(n).cloned()
+}
+
+#[derive(Default)]
+struct Tarjan {
+    next: usize,
+    index: HashMap<String, (usize, usize)>,
+    stack: Vec<String>,
+}
+
+fn tarjan(globals: &Env, v: &str, memo: &mut Facts, t: &mut Tarjan) {
+    let i = t.next;
+    t.next += 1;
+    t.index.insert(v.to_string(), (i, i));
+    t.stack.push(v.to_string());
+    if !memo.local.contains_key(v) {
+        let l = plain_fn(globals, v).map(|d| local_facts(globals, &d)).unwrap_or_default();
+        memo.local.insert(v.to_string(), l);
+    }
+    let calls: Vec<String> = memo.local[v].2.iter().map(|(n, _)| n.clone()).filter(|n| plain_fn(globals, n).is_some()).collect();
+    for u in calls {
+        if memo.done.contains_key(&u) {
+            continue;
+        }
+        match t.index.get(&u).copied() {
+            None => {
+                crate::stack::maybe_grow(256 << 10, 4 << 20, || tarjan(globals, &u, memo, t));
+                let lu = t.index[&u].1;
+                let e = t.index.get_mut(v).unwrap();
+                e.1 = e.1.min(lu);
+            }
+            // On the stack still (one not done is): the group's.
+            Some((iu, _)) => {
+                let e = t.index.get_mut(v).unwrap();
+                e.1 = e.1.min(iu);
+            }
+        }
+    }
+    let (iv, lv) = t.index[v];
+    if iv != lv {
+        return;
+    }
+    // A group closed: what its functions read and do, with what they call outside it.
+    let at = t.stack.iter().rposition(|n| n == v).unwrap_or(0);
+    let group: Vec<String> = t.stack.split_off(at);
+    let mut reads = std::collections::BTreeSet::new();
+    let mut writes = false;
+    let inside: HashSet<&str> = group.iter().map(|m| m.as_str()).collect();
+    for m in &group {
+        let (r, w, calls) = &memo.local[m];
+        reads.extend(r.iter().cloned());
+        writes |= *w;
+        for (n, draws) in calls {
+            if inside.contains(n.as_str()) {
+                continue;
+            }
+            if let Some(f) = memo.done.get(n) {
+                reads.extend(f.0.iter().cloned());
+                writes |= *draws && f.1;
+            }
+        }
+    }
+    // One result for the group, shared: each member's copy of a large group's reads took time and
+    // memory in its size squared (the sixteenth review of slice C).
+    let one = Arc::new((reads, writes));
+    for m in group {
+        memo.done.insert(m, one.clone());
+    }
+}
+
+/// Builtins whose lambdas are callbacks, which run later: their reads and writes are not the
+/// draw's (see `draw_facts`); only where the name is the builtin, not a function, a local or a
+/// parameter of the program's of that name.
+const CALLBACKS: &[&str] = &["js", "js_new", "every", "run_after", "listen", "ask", "receive"];
+
+/// Whether each reference to another component's list of facts (`fact_refs`: the def that refers,
+/// the def it names, that one's JavaScript name) names a component's def written before it (see
+/// `fact_lists`). From what was written, not from the text, where a program's string may say
+/// anything (the seventeenth and eighteenth reviews of slice C; FEEDBACK88.md, Q-1380; branch
+/// feedback86-89).
+fn fact_refs_ok(defs: &[String], refs: &[(usize, usize, String)]) -> bool {
+    refs.iter().all(|(at, to, js)| to < at && *at < defs.len() && defs[*to].starts_with(&format!("{} = W.component(", js)))
+}
+
+/// Builtins that give what waits (a Promise), whose `.then` callback runs later.
+const WAITS: &[&str] = &["js", "js_new", "fetch", "ask", "receive", "sleep"];
+
+/// Whether `name` is the builtin module of that name (`channel`), not a program's binding.
+fn builtin_module(globals: &Env, name: &str) -> bool {
+    match lookup(globals, name) {
+        Some(Value::Map(m)) => m.values().any(|x| matches!(x, Value::Builtin(b, _) if b.strip_prefix(name).is_some_and(|r| r.starts_with('.')))),
+        _ => false,
+    }
+}
+
+/// Whether component or view `tag` calls its prop `prop` as it is drawn: a lambda given to one it
+/// only passes to what runs later (a handler, a callback) is not the draw's. One that is not the
+/// program's (none found): taken as called.
+fn called_at_draw(globals: &Env, tag: &str, prop: &str) -> bool {
+    let Some(Value::Func(f)) = lookup(globals, tag) else { return true };
+    let body = &f.def.body;
+    let params: Vec<&str> = f.def.params.iter().map(|p| p.name.as_str()).collect();
+    // What runs later: an HTML element's handlers, a builtin's callbacks, and a `let` lambda used
+    // only as one of those (`let done = () => {...}`, `@click={done}`: the sixteenth review). A
+    // builtin by what its name is bound to where it is called, not by the name: a local or a
+    // parameter named `every` or `js` is that (the seventeenth review of slice C; FEEDBACK88.md,
+    // Q-1380; branch feedback86-89).
+    let mut later: HashSet<*const Expr> = HashSet::new();
+    let mut handed: HashSet<*const Expr> = HashSet::new();
+    let mark = |l: &Expr, later: &mut HashSet<*const Expr>| each_expr(l, &mut |x| {
+        later.insert(x as *const Expr);
+    });
+    fn handlers(el: &HtmlEl, f: &mut dyn FnMut(&Expr), names: &mut HashSet<*const Expr>) {
+        if el.tag.starts_with(|c: char| c.is_ascii_lowercase()) {
+            for (name, v) in &el.attrs {
+                if name.starts_with("on") || name.starts_with('@') {
+                    match v {
+                        AttrVal::Expr(l @ Expr::Lambda(_)) => f(l),
+                        AttrVal::Expr(i @ Expr::Ident(..)) => {
+                            names.insert(i as *const Expr);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        for c in &el.children {
+            if let HtmlChild::El(e) = c {
+                handlers(e, f, names);
+            }
+        }
+    }
+    let mut used: Vec<*const Expr> = Vec::new();
+    each_free(body, true, &mut Bound::new(), &mut |m, b| match m {
+        Met::Expr(Expr::Html(el, _)) => handlers(el, &mut |l| mark(l, &mut later), &mut handed),
+        Met::Expr(Expr::Call(c, args, _)) if matches!(&**c, Expr::Ident(n, _) if CALLBACKS.contains(&n.as_str()) && !b.has(n.as_str()) && !params.contains(&n.as_str()) && matches!(lookup(globals, n.as_str()), Some(Value::Builtin(..)))) => {
+            for a in args {
+                match a {
+                    Expr::Lambda(_) => mark(a, &mut later),
+                    Expr::Ident(..) => {
+                        handed.insert(a as *const Expr);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // The prop, where its name is not bound to something else.
+        Met::Expr(e @ Expr::Ident(n, _)) if n.as_str() == prop => used.push(e as *const Expr),
+        _ => {}
+    });
+    // A `let` lambda handed only to those: each mention of its name is a handler's or a callback's
+    // (a name bound again inside, mentioned elsewhere, takes it for the draw's: the safe side).
+    if let Expr::Block(ss) = body {
+        for st in ss {
+            if let Stmt::Let(Pattern::Bind(n), l @ Expr::Lambda(_), _) = st {
+                let mut all = true;
+                let mut any = false;
+                each_expr(body, &mut |e| {
+                    if matches!(e, Expr::Ident(m, _) if m.as_str() == n.as_str()) {
+                        any = true;
+                        all &= handed.contains(&(e as *const Expr));
+                    }
+                });
+                if any && all {
+                    mark(l, &mut later);
+                }
+            }
+        }
+    }
+    // Any mention outside them: called, handed on, kept or mapped, it may run as the draw does (the
+    // safe side; the sixteenth review of slice C).
+    used.iter().any(|e| !later.contains(e))
+}
+
+/// `facts_of`'s walk of one body, `params` bound: what it reads, writes (where `draws`: the body
+/// runs as the draw does) and calls as it runs, and the same of what is in it that may run then:
+/// render props (lambdas given to an element's attribute, but an event's), whose writes count, and
+/// other lambdas and inner `fn`s, whose reads do; not handlers and callbacks.
+#[allow(clippy::too_many_arguments)]
+fn draw_scan(body: &Expr, params: &[String], globals: &Env, own: &[String], draws: bool, reads: &mut std::collections::BTreeSet<String>, writes: &mut bool, calls: &mut Vec<(String, bool)>) {
+    // The lambdas that run later (handlers, callbacks), and the render props. A handler is an HTML
+    // element's event attribute; a lambda given to a component or a view is a render prop where it
+    // calls it as it is drawn, whatever its name (`only`, `onShow`), and runs later where it does
+    // not (see `called_at_draw`).
+    let (mut later, mut props): (Vec<*const FnDef>, Vec<*const FnDef>) = (Vec::new(), Vec::new());
+    fn attrs_in(globals: &Env, el: &HtmlEl, later: &mut Vec<*const FnDef>, props: &mut Vec<*const FnDef>) {
+        let html = el.tag.starts_with(|c: char| c.is_ascii_lowercase());
+        for (name, v) in &el.attrs {
+            if let AttrVal::Expr(Expr::Lambda(d)) = v {
+                let runs_later = if html { name.starts_with("on") || name.starts_with('@') } else { !called_at_draw(globals, &el.tag, name) };
+                if runs_later {
+                    later.push(&**d as *const FnDef);
+                } else {
+                    props.push(&**d as *const FnDef);
+                }
+            }
+        }
+        for c in &el.children {
+            if let HtmlChild::El(e) = c {
+                attrs_in(globals, e, later, props);
+            }
+        }
+    }
+    each_expr_in(
+        body,
+        &mut |e| {
+            if let Expr::Html(el, _) = e {
+                attrs_in(globals, el, &mut later, &mut props)
+            }
+        },
+        false,
+    );
+    let mut bound = Bound::default();
+    for p in params {
+        bound.push(p.clone());
+    }
+    let mut inner: Vec<(&FnDef, bool)> = Vec::new();
+    each_free(body, false, &mut bound, &mut |m, b| match m {
+        // A callback given to a builtin that runs it later (met before its lambdas): only the builtin,
+        // not a function, a local or a parameter of that name.
+        Met::Expr(Expr::Call(c, args, _)) => {
+            let builtin = |n: &str| !b.has(n) && matches!(lookup(globals, n), Some(Value::Builtin(..)));
+            // `.then` and the like of what a builtin that waits gives (`js`, `fetch`, `ask`...), not
+            // of a program's object; `channel` the builtin module, not a program's binding of that
+            // name (the sixteenth review of slice C). Unsure, its lambda's reads count.
+            let cb = match &**c {
+                Expr::Ident(n, _) => CALLBACKS.contains(&n.as_str()) && builtin(n.as_str()),
+                Expr::Field(o, n, _) => {
+                    (["then", "catch", "finally"].contains(&n.as_str()) && matches!(&**o, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(g, _) if WAITS.contains(&g.as_str()) && builtin(g.as_str()))))
+                        || (["open", "on"].contains(&n.as_str()) && matches!(&**o, Expr::Ident(ch, _) if ch.as_str() == "channel" && !b.has("channel") && builtin_module(globals, "channel")))
+                }
+                _ => false,
+            };
+            if cb {
+                for a in args {
+                    if let Expr::Lambda(d) = a {
+                        later.push(&**d as *const FnDef);
+                    }
+                }
+            }
+        }
+        Met::Expr(Expr::Ident(n, _)) => {
+            if crate::value::page_state_named(globals, n.as_str()) {
+                reads.insert(n.to_string());
+            } else {
+                calls.push((n.to_string(), draws));
+            }
+        }
+        Met::Expr(Expr::Block(ss)) => {
+            for st in ss.iter() {
+                match st {
+                    Stmt::Assign(n, ..) if draws && own.iter().any(|o| o.as_str() == n.as_str()) => *writes = true,
+                    // An inner `fn`: its reads count, as where it is called.
+                    Stmt::Fn(d) => inner.push((&**d, false)),
+                    _ => {}
+                }
+            }
+        }
+        Met::Expr(Expr::Lambda(d)) => {
+            let p = &**d as *const FnDef;
+            if !later.contains(&p) {
+                inner.push((&**d, draws && props.contains(&p)));
+            }
+        }
+        Met::Assigned(n) => {
+            if draws && crate::value::page_state_named(globals, n) {
+                *writes = true;
+            }
+        }
+        Met::Tag(t) => calls.push((t.to_string(), draws)),
+        _ => {}
+    });
+    for (d, d_draws) in inner {
+        let ps: Vec<String> = params.iter().cloned().chain(d.params.iter().map(|p| p.name.to_string())).collect();
+        crate::stack::maybe_grow(256 << 10, 4 << 20, || draw_scan(&d.body, &ps, globals, own, d_draws, reads, writes, calls));
     }
 }
 
@@ -2723,6 +3240,9 @@ impl<'a> Compiler<'a> {
         Compiler {
             t_keys: Some(Vec::new()),
             states: Vec::new(),
+            facts: Facts::default(),
+            fact_lists: HashMap::new(),
+            fact_refs: Vec::new(),
             it,
             assigned,
             private: collect_private(&it.program, &native_names(it)),
@@ -3157,6 +3677,10 @@ impl<'a> Compiler<'a> {
                     if is_async && !assume_async {
                         self.defs.truncate(defs_before);
                         self.globals.retain(|k, _| known.contains(k));
+                        // With the defs they name (the seventeenth review of slice C; FEEDBACK88.md,
+                        // Q-1380; branch feedback86-89).
+                        self.fact_lists.retain(|_, (i, _)| *i < defs_before);
+                        self.fact_refs.retain(|(i, _, _)| *i < defs_before);
                         self.views = views_before.clone();
                         self.view_defs.truncate(view_defs_before);
                         assume_async = true;
@@ -3165,7 +3689,37 @@ impl<'a> Compiler<'a> {
                     break (code, is_async);
                 };
                 let code = if def.component {
-                    format!("{} = W.component({}, {});", js, js_str(&def.name), code)
+                    // What its draw reads and does, for a failed draw's probe, when it reads page
+                    // states or writes (see `draw_facts`).
+                    let facts = draw_facts(&self.it.globals, &def, &mut self.facts);
+                    let (reads, writes) = (&facts.0, facts.1);
+                    if reads.is_empty() && !writes {
+                        format!("{} = W.component({}, {});", js, js_str(&def.name), code)
+                    } else {
+                        // A long list another component was given already is that one's: forty
+                        // components calling into a cycle of a thousand functions wrote its
+                        // thousand names forty times, 316 KB more to send and to compress at
+                        // start (the sixteenth review of slice C; FEEDBACK88.md, Q-1380; branch
+                        // feedback86-89). Only one whose def is written already, which runs before
+                        // this one as the defs run in order: not this one's own, which an async
+                        // retry wrote and dropped (the seventeenth review).
+                        let at = Arc::as_ptr(&facts) as usize;
+                        let same = (reads.len() >= 8).then(|| self.fact_lists.get(&at)).flatten().filter(|(i, j)| self.defs.get(*i).is_some_and(|d| d.starts_with(&format!("{} = W.component(", j)))).cloned();
+                        let r = match &same {
+                            Some((i, j)) => {
+                                self.fact_refs.push((self.defs.len(), *i, j.clone()));
+                                format!("{}.$f.r", j)
+                            }
+                            None => {
+                                let r: Vec<String> = reads.iter().map(|n| js_str(n)).collect();
+                                format!("[{}]", r.join(", "))
+                            }
+                        };
+                        if same.is_none() && reads.len() >= 8 {
+                            self.fact_lists.insert(at, (self.defs.len(), js.clone()));
+                        }
+                        format!("{} = W.component({}, {}, {{ r: {}, w: {} }});", js, js_str(&def.name), code, r, u8::from(writes))
+                    }
                 } else {
                     format!("{} = {};", js, code)
                 };
@@ -3479,7 +4033,10 @@ impl<'a> Compiler<'a> {
             let body = self.body(&def.body)?;
             let _ = writeln!(
                 out,
-                "return W.frag([() => {{\n{}try {{\n{}}} catch ($e) {{ if ($e instanceof W.Ret) return $e.v; throw $e; }}\n}}]);",
+                // (`1`: a body made again whole, which a failed draw's probe tells from a place that
+                // shows what it reads: FEEDBACK88.md, Q-1380, the thirteenth review of slice C;
+                // branch feedback86-89.)
+                "return W.frag([() => {{\n{}try {{\n{}}} catch ($e) {{ if ($e instanceof W.Ret) return $e.v; throw $e; }}\n}}], 1);",
                 copy, body
             );
             return Ok(out);
@@ -6197,5 +6754,104 @@ mod minify_tests {
         // Strings, regular expressions and comments with quotes, backticks
         // and slashes in them; a line ending in a comment keeps its newline.
         assert_eq!(min("const q = \"`\";\nconst r = /[`/]x/g;\nreturn /`;/.test(s);\nx = a / b;\nf(); // a,\ng();\n"), "const q = \"`\";const r = /[`/]x/g;return /`;/.test(s);x = a / b;f(); // a,\ng();");
+    }
+}
+
+/// `names_in` as it was, by characters, which the byte scan must equal (the fourteenth and fifteenth
+/// reviews of slice C): random text of identifiers, dots, comments and Unicode spaces and letters.
+#[cfg(test)]
+mod names_tests {
+    fn names_chars(js: &str) -> Vec<String> {
+        let chars: Vec<char> = js.chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        let ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+        let mut line_start = true;
+        while i < chars.len() {
+            let c = chars[i];
+            // A whole-line comment names nothing the code needs.
+            if line_start && c == '/' && chars.get(i + 1) == Some(&'/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '\n' {
+                line_start = true;
+            } else if !c.is_whitespace() {
+                line_start = false;
+            }
+            // (After `.` a property, except after `...`, a spread.)
+            let spread = i >= 3 && chars[i - 3..i] == ['.', '.', '.'];
+            if ident(c) && (i == 0 || !ident(chars[i - 1]) && (chars[i - 1] != '.' || spread)) {
+                let start = i;
+                while i < chars.len() && ident(chars[i]) {
+                    i += 1;
+                }
+                let word: String = chars[start..i].iter().collect();
+                if (word == "B" || word == "W") && chars.get(i) == Some(&'.') {
+                    let s2 = i + 1;
+                    let mut j = s2;
+                    while j < chars.len() && ident(chars[j]) {
+                        j += 1;
+                    }
+                    out.push(format!("{}.{}", word, chars[s2..j].iter().collect::<String>()));
+                }
+                out.push(word);
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_byte_scan_names_what_the_char_scan_did() {
+        let alpha = ["a", "B", "W", ".", "...", "/", "//", "\n", " ", "\t", "$", "_", "1", "é", "日", "\u{a0}", "\u{b}", "\u{2028}", "\u{85}", "\u{3000}", "`", "${", "}", "'", "\"", "/*", "*/", "x", "(", "\r", "\u{1d49c}", "ß", "\u{200b}", "٣", "\u{feff}", "\u{c}"];
+        let mut r: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            r ^= r << 13;
+            r ^= r >> 7;
+            r ^= r << 17;
+            r
+        };
+        for _ in 0..200_000 {
+            let len = (next() % 24) as usize;
+            let mut s = String::new();
+            for _ in 0..len {
+                s.push_str(alpha[(next() % alpha.len() as u64) as usize]);
+            }
+            assert_eq!(super::names_in(&s), names_chars(&s), "{:?}", s);
+        }
+        for s in ["\u{a0}// x\ny", "\u{b}// y\nz", "\u{2028}// z\nw", "\u{3000}//q\nr", "\u{85}//p\nq"] {
+            assert_eq!(super::names_in(s), names_chars(s), "{:?}", s);
+        }
+    }
+}
+
+#[cfg(test)]
+mod facts_tests {
+    /// A cycle's members share one result, not a copy each: a thousand-function cycle held a
+    /// thousand copies of its read set (+52 MB at start; the sixteenth review of slice C;
+    /// FEEDBACK88.md, Q-1380; branch feedback86-89). Before the fix each member had its own.
+    #[test]
+    fn a_cycle_shares_one_result() {
+        let mut src = String::new();
+        let n = 50;
+        for i in 0..n {
+            src.push_str(&format!("state s{} = 0\n", i));
+        }
+        for i in 0..n {
+            src.push_str(&format!("fn q{}(d: int) -> int {{\n    if d > 0 {{ return q{}(d - 1) + s{} }}\n    return s{}\n}}\n", i, (i + 1) % n, i, i));
+        }
+        let mut it = crate::interp::Interp::new(".");
+        it.load_source(&src, "<input>").unwrap();
+        let mut memo = super::Facts::default();
+        let f0 = super::fn_facts(&it.globals, "q0", &mut memo).unwrap();
+        assert_eq!(f0.0.len(), n, "{:?}", f0.0);
+        for i in 1..n {
+            let fi = memo.done.get(&format!("q{}", i)).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&f0, fi), "q{} has its own copy", i);
+        }
     }
 }

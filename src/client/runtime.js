@@ -373,6 +373,11 @@ function foreignName(name) {
 }
 // Calls a method of the page's object `o`, unless it would run text as code.
 function foreignCall(o, name, args) {
+  // Not by a probe, which only reads: it ends there, as at a call's claim, and the draw is made for
+  // real. Skipped with null for an answer, a failure the real draw has not (a view given that null)
+  // was said and waited on for good (see `probe`; FEEDBACK88.md, Q-1380, the eleventh and twelfth
+  // reviews of slice C; branch feedback86-89).
+  if (Probe !== null) probeStop();
   foreignName(name);
   const f = o[name];
   return fromPage(Reflect.apply(f, o, guardCall(`\`${name}\``, f, args, name)));
@@ -610,6 +615,8 @@ function setField(o, name, v, op) {
   if (/^on/i.test(name) || name === "innerHTML" || name === "outerHTML" || name === "srcdoc")
     fail(`\`${name}\` is not set from Quillo code: it runs text as code or HTML`);
   if (isEvent(o) && !(name in o) && o.target) o = o.target;
+  // (Not by a probe: see `foreignCall`.)
+  if (Probe !== null) return;
   if (op) v = (op === "+" ? add : sub)(field(o, name, null), v);
   guardArgs(`setting \`${name}\``, [v], 0);
   o[name] = forPage(v, 0);
@@ -1863,6 +1870,9 @@ B.receive = meta(async (url, f, opts) => {
 // leaving the page, stops it). Dropped connections are opened again
 // (after a second, then longer); a stream that ends is not.
 B.listen = meta((url, f, inst) => {
+  // Not by a probe, which only reads: it waits for the real draw (see `probe`; FEEDBACK88.md, Q-1380,
+  // the tenth review of slice C; branch feedback86-89).
+  if (Probe !== null) return null;
   // In a component's code, or a handler or `@mount` of one, before or after a wait, where it lasts
   // as long as the component, as `every` does: it checked `Owner` alone, which a handler never has
   // (FEEDBACK61.md, Q-901; branch feedback61). Whose it is: see `ownerOf`.
@@ -1955,7 +1965,9 @@ B.run_after = meta((ms, f, inst) => {
 // What `run_after` started for each owner and has not fired (see `run_after`).
 const AfterTimers = new WeakMap();
 // `page_updated()`: waits until the page shows what was just set.
-B.page_updated = meta(() => new Promise((done) => { if (flushing && effectQueue.length) flush(); queueMicrotask(() => done(null)); }), "page_updated", null);
+// The updates are not a probe's, also when its markup asks for them (see `probe`; FEEDBACK88.md,
+// Q-1380, the sixth review of slice C; branch feedback86-89).
+B.page_updated = meta(() => new Promise((done) => { if (flushing && effectQueue.length) { const pr = Probe; Probe = null; try { flush(); } finally { Probe = pr; } } queueMicrotask(() => done(null)); }), "page_updated", null);
 // `js_has("a.b")`: whether the page has it, without calling it (FEEDBACK28.md, Q-341; branch
 // feedback29-fixes).
 B.js_has = meta((name) => {
@@ -2028,7 +2040,7 @@ B.parallel = meta(async (...fs) => {
   }
   return Promise.all(calls);
 }, "parallel", null);
-B.print = meta((...a) => { console.log(a.map(display).join(" ")); return null; }, "print", null);
+B.print = meta((...a) => { if (Probe === null) console.log(a.map(display).join(" ")); return null; }, "print", null);
 // HTML made from text (by raw or markdown) is that text, as on the server.
 B.error = meta((v) => (v instanceof Err ? v.error : null), "error", null);
 B.str = meta((v) => display(v), "str", null);
@@ -2311,7 +2323,7 @@ const askWords = () => {
   const own = (k, i) => d && hasOwn(d.t, k) && typeof d.t[k] === "string" ? d.t[k] : w[i];
   return [own("quillo.ok", 0), own("quillo.cancel", 1)];
 };
-B.ask = meta((message, options) => new Promise((resolve) => {
+B.ask = meta((message, options) => Probe !== null ? probeStop() : new Promise((resolve) => {
   const o = options == null ? {} : M(options, "ask", 2);
   const host = noticeHost(), before = document.activeElement;
   const back = noticeEl("div", "q-backdrop");
@@ -2350,6 +2362,7 @@ B.ask = meta((message, options) => new Promise((resolve) => {
   (o.tone === "danger" ? no : yes).focus();
 }), "ask", ["message", "options"]);
 B.notify = meta((message, options) => {
+  if (Probe !== null) return null;
   const o = options == null ? {} : M(options, "notify", 2);
   const host = noticeHost();
   let list = host.querySelector(".q-toasts");
@@ -2889,6 +2902,8 @@ function jsNear(v, p) {
 // A class, which only `new` makes one of: `Chart.new(...)`, `js_new(...)`.
 const isClass = (v) => { try { return /^class[\s{]/.test(Function.prototype.toString.call(v)); } catch (_) { return false; } };
 B.js = meta((path, ...args) => {
+  // Not by a probe, which only reads: it ends there (see `foreignCall`).
+  if (Probe !== null) probeStop();
   const [owner, v, missing] = jsPath(path, "js");
   if (missing) return missing;
   if (typeof v !== "function") {
@@ -2906,6 +2921,7 @@ B.js_value = (path) => {
   return fromPage(v);
 };
 B.js_new = meta((path, ...args) => {
+  if (Probe !== null) probeStop();
   const [, v, missing] = jsPath(path, "js_new");
   if (missing) return missing;
   if (typeof v !== "function") fail(`\`js_new\`: ${path} is not a class`);
@@ -3244,6 +3260,7 @@ const HEAD_KEYS = ["title", "description", "image", "canonical"];
 const HEAD_TAGS = { title: [["title"], ["meta", "property", "og:title"]], description: [["meta", "name", "description"], ["meta", "property", "og:description"]], image: [["meta", "property", "og:image"]], canonical: [["link", "rel", "canonical"], ["meta", "property", "og:url"]] };
 const Head = { said: [], seq: 0, base: null, by: new WeakMap() };
 B.page_head = meta((m) => {
+  if (Probe !== null) return null;
   if (!isMap(m)) fail("`page_head` takes a map: page_head({ title: \"Home\", description: \"...\" })");
   const v = {};
   for (const k of Object.keys(m)) {
@@ -3325,6 +3342,7 @@ function wholeAddress(p, f) {
 // code that does not wait is a run that begins as it moves (FEEDBACK61.md, Q-902; branch
 // feedback61).
 B.navigate = meta((to, opts) => {
+  if (Probe !== null) return null;
   to = S(to, "navigate");
   let r = Run;
   if (r !== null) while (r.up) r = r.up;
@@ -5560,6 +5578,9 @@ B.channel = {
 // Sent once the server has let the page in; until then (and while the
 // connection is down) kept, up to a point.
 function chanSend(name, v, o) {
+  // Not by a probe, which only reads (see `probe`; FEEDBACK88.md, Q-1380, the twelfth review of
+  // slice C; branch feedback86-89).
+  if (Probe !== null) return null;
   const text = jsonText(["m", name, v]);
   if (TOOLS) toolsSay("channel", { dir: "out", channel: name, value: toolsWire(v) });
   const reliable = isMap(o) && truthy(o.reliable);
@@ -6682,8 +6703,34 @@ function retryAfter(v) {
 // effects with it when it leaves the page.
 
 const CLEAN = 0, CHECK = 1, DIRTY = 2;
+// A memo whose last run threw: run again when read once what it read has changed (`retry`), as a
+// clean one is, its failure given meanwhile to each that reads it (see `get v`), and it tells its
+// readers each time what it read changes, which a DIRTY one does not (they had waited on it for
+// good: FEEDBACK88.md, Q-1380, the fourth review of slice C and those after; branch feedback86-89).
+const FAILED = 3;
+// A failed memo's value, which no value is (see `runCalc`).
+const NO_VALUE = {};
 let Listener = null;
 let Owner = null;
+// A document no node of which loads anything, for a probe's (see `Tmpl`).
+let inert = null;
+const inertDoc = () => inert || (inert = document.implementation.createHTMLDocument(""));
+// What hears the reads code makes where nothing does (`untrack`, `within`): null, but while a
+// failed draw is run once more to learn what it waits on (see `probe`; FEEDBACK88.md, Q-1380, the
+// third review of slice C; branch feedback86-89).
+let Probe = null;
+// How far the last probe that failed got (what it had made), as `sameFailure` tells failures apart.
+let ProbeAt = 0;
+// What a probe throws at a write, which it never makes (see `probe`).
+const PROBE_WRITES = {};
+// Whether the probe running now came to a write, which it does not make, and the `let`s it worked
+// out that came to one (see `probe`).
+let ProbeWrote = false;
+let ProbeLost = null;
+// The states whose writes the probe running now skipped; and whether the last probe failed after
+// it skipped one, without reading one of them (see `probe`).
+let ProbeSkipped = null;
+let ProbeSkippedFailed = false;
 // The component (or row) a handler or `@mount` running now belongs to, for what it
 // starts to end with it: `run_after` and `every`.
 let Acting = null;
@@ -6860,10 +6907,12 @@ class Calc extends Scope {
     this.name = null;
     this.old = undefined;
   }
-  // A memo's value, brought up to date.
+  // A memo's value, brought up to date; one that failed throws its failure, to each that reads it,
+  // not worked out again for each (see `FAILED`, `runCalc`). A clean one is not
+  // brought up to date (FEEDBACK88.md, Q-1380, the reviews of slice C; branch feedback86-89).
   get v() {
     if (Listener) link(Listener, this);
-    fresh(this);
+    if (this.state !== CLEAN) { fresh(this); if (this.state === FAILED) throw this.err; }
     return this._v;
   }
 }
@@ -6911,8 +6960,20 @@ function unlinkFrom(c, from) {
   }
 }
 
+// A failed memo told what it read has changed: run again when next read, and its readers asked;
+// apart, as `stale` runs at each write (the eighteenth review of slice C; FEEDBACK88.md, Q-1380;
+// branch feedback86-89).
+function staleFailed(c) {
+  if (c.dead || c.retry) return;
+  c.retry = true;
+  const o = c.obs;
+  if (o) for (let i = 0; i < o.length; i += 2) stale(o[i], CHECK);
+}
 function stale(c, level) {
-  if (c.state >= level || c.dead) return;
+  if (c.state >= level || c.dead) {
+    if (c.state === FAILED) staleFailed(c);
+    return;
+  }
   const was = c.state;
   c.state = level;
   if (was !== CLEAN) return;
@@ -6939,7 +7000,8 @@ function fresh(c) {
     }
     if (c.state === CHECK) c.state = CLEAN;
   }
-  if (c.state === DIRTY) runCalc(c);
+  // A memo whose last run threw (`FAILED`) runs again too, once what it read has changed.
+  if (c.state >= DIRTY && (c.state === DIRTY || c.retry)) runCalc(c);
 }
 
 function runCalc(c) {
@@ -6949,40 +7011,120 @@ function runCalc(c) {
   const l = Listener, o = Owner;
   Listener = c;
   Owner = c;
-  let v;
+  let v, n = 0, m = 0;
   try {
     v = c.fn();
     if (c.apply !== null) {
       Listener = null;
+      // What its value's code made so far (a body made again whole), apart from its markup's.
+      // Read here, as only here is the cut between the two known; most values' code makes nothing,
+      // which one branch tells.
+      if (c.owned !== null || c.clean !== null) { if (c.owned !== null) n = c.owned.length; if (c.clean !== null) m = c.clean.length; }
       c.apply(v);
     }
   } catch (e) {
-    Listener = l;
-    Owner = o;
-    if (c.src && c.at < c.src.length) unlinkFrom(c, c.at);
-    c.state = c.effect ? CLEAN : DIRTY;
-    // Taking up the page's HTML found it not what the code makes (a text a script changed):
-    // for the component to be made again (see `island`, `resume`), not an error to report,
-    // after which it stayed empty (branch feedback40-43).
-    if (c.effect && !(e instanceof Mismatch)) {
-      report(e);
-      // A place whose value failed is emptied: the last good value beside a field that no
-      // longer says it reads as the page's answer (FEEDBACK30.md, Q-370; branch
-      // feedback27-35-fixes).
-      if (c.apply !== null) { const l2 = Listener; Listener = null; try { c.apply(null); } catch (_) {} finally { Listener = l2; } }
-      return;
-    }
-    throw e;
+    calcFailed(c, e, l, o, v, n, m);
+    return;
   }
   Listener = l;
   Owner = o;
   if (c.src && c.at < c.src.length) unlinkFrom(c, c.at);
   c.state = CLEAN;
   if (!c.effect && v !== c._v) {
+    if (c._v === NO_VALUE) c.err = null;
     c._v = v;
     const ob = c.obs;
     if (ob) for (let i = 0; i < ob.length; i += 2) if (ob[i].state === CHECK) ob[i].state = DIRTY;
   }
+}
+
+// A run of `c` that threw (see `runCalc`), apart, so that `runCalc` stays small enough to inline
+// (the eighteenth review of slice C; FEEDBACK88.md, Q-1380; branch feedback86-89).
+function calcFailed(c, e, l, o, v, n, m) {
+  // Thrown by the markup a place makes (`apply`, untracked), not by its value.
+  const inMarkup = Listener === null && (c.apply === dynApply || c.apply === dynAllApply);
+  Listener = l;
+  Owner = o;
+  if (c.src && c.at < c.src.length) unlinkFrom(c, c.at);
+  c.state = c.effect ? CLEAN : FAILED;
+  if (!c.effect) {
+    // Stopped by a write in a probe (see `probe`): run again when next read.
+    if (e === PROBE_WRITES) { c.retry = true; throw e; }
+    // A memo that threw has no value: the one it comes back to, its last good one too, is news to
+    // its readers, which had stayed empty (the fifth review of slice C). Its failure is its state,
+    // which each that reads it is given until what it read changes (see `get v`, `stale`); its
+    // readers run, as for a change: one that guards its read goes on (the sixth and seventh
+    // reviews of slice C).
+    c._v = NO_VALUE;
+    c.err = e;
+    c.retry = false;
+    const ob = c.obs;
+    if (ob) for (let i = 0; i < ob.length; i += 2) if (ob[i].state === CHECK) ob[i].state = DIRTY;
+    // Nor thrown: an effect brought up to date reads it, and fails by itself (see `get v`); thrown,
+    // it went out of `flush`, which never ran again, and every component on the page stopped
+    // following its state, with nothing said (FEEDBACK49.md, Q-590; branch feedback86-89).
+    if (!(e instanceof Mismatch)) return;
+  }
+  // Taking up the page's HTML found it not what the code makes (a text a script changed):
+  // for the component to be made again (see `island`, `resume`), not an error to report,
+  // after which it stayed empty (branch feedback40-43).
+  // (A write that stops a probe stops it, not a place in it: see `probe`.)
+  if (c.effect && e !== PROBE_WRITES && !(e instanceof Mismatch)) {
+    effectFailed(c, e, v, inMarkup, n, m);
+    return;
+  }
+  throw e;
+}
+
+// An effect that failed. A place whose value failed is emptied: the last good value beside a field
+// that no longer says it reads as the page's answer (FEEDBACK30.md, Q-370; branch
+// feedback27-35-fixes). One whose markup failed (`inMarkup`; a view given null while a server fn's
+// state loads) is said once while it fails so, what the failed run made goes at once (a component
+// made there stayed, and was drawn where nothing showed it), and it is made again when what that
+// markup read next changes (a `children` or a render prop's state, a page state), or a state or a
+// prop of the component whose markup it is, as a component's own draw is (see `drawFailed`), not
+// only when what its value read does (FEEDBACK88.md, Q-1380, the reviews of slice C; branch
+// feedback86-89).
+function effectFailed(c, e, v, inMarkup, n, m) {
+  const made = (c.owned ? c.owned.length : 0) - n;
+  // Said at once, a markup's once while it fails so (also of a part that goes before the failure
+  // code's file comes).
+  if (!inMarkup || !sameFailure(c, e, c.runs, made)) report(e);
+  // What its markup made goes; what its value's code made and started (a body made again whole:
+  // its `every`) stays until that runs again. Its markup's is waited on by the code only a failure
+  // runs (see `recover`).
+  if (inMarkup) disposeFrom(c, n, m);
+  if (c.apply === null) return;
+  const l = Listener;
+  Listener = null;
+  try { c.apply(null); } catch (_) {} finally { Listener = l; }
+  if (inMarkup) recover(0, [c, v]);
+}
+// It waits by an effect of its own, which runs its markup again as a probe first, and only once
+// that passes makes it again (see `probe`): woken by a state of its component's ticking, it made
+// the components ahead of the failure again each time, and each loaded its state.
+function effectWaits(c, v) {
+  const o = Owner;
+  let w = null;
+  Owner = c;
+  w = effect(() => {
+    // (Its look once its file came: see `ProbeStopped`.)
+    const late = w !== null && w.late === true;
+    if (late) w.late = false;
+    if (c.comp) drawWaits(c.comp);
+    // (`Listener`: this effect, which `w` is not yet as it first runs.) A probe that fails otherwise
+    // than the place last did says so.
+    const e2 = probe(Listener, () => put(v, { claim: false, svg: false, p: null }, []), c.comp);
+    // One that failed after a write it skipped, otherwise than the place last did: drawn for real,
+    // which says it if it fails so (see `probe`).
+    if (e2 && failsAgain(c, e2, c.runs, ProbeAt, ProbeSkippedFailed)) return;
+    if (w === null || late && ProbeStopped) return;
+    dispose(w);
+    stale(c, DIRTY);
+  });
+  w.waits = true;
+  Owner = o;
+  return w;
 }
 
 function flush() {
@@ -7023,6 +7165,7 @@ function flush() {
   flushing = false;
 }
 
+
 // Runs `f` now, and again (in a batch) whenever what it read changes.
 function effect(f) {
   const c = new Calc(f, true);
@@ -7046,19 +7189,34 @@ function bound(get, apply, el, name, old) {
 function memo(f) {
   const c = new Calc(f, false);
   runCalc(c);
+  // One that fails as it is made fails the code that makes it, as before its failure became its
+  // state (see `runCalc`): a component's `let`, its code's failure (see `drawFailed`).
+  if (c.state === FAILED) throw c.err;
   return c;
 }
 
 function untrack(f) {
+  // In a probe, what it reads is heard (see `probe`), apart: setting `Listener` from `Probe` here
+  // made every update 3% dearer (the sixteenth review of slice C; FEEDBACK88.md, Q-1380; branch
+  // feedback86-89).
+  if (Probe !== null) return probeWithin(Owner, f);
   const l = Listener;
   Listener = null;
   try { return f(); } finally { Listener = l; }
 }
 
 function within(scope, f) {
+  // (In a probe: see `untrack`.)
+  if (Probe !== null) return probeWithin(scope, f);
   const o = Owner, l = Listener;
   Owner = scope;
   Listener = null;
+  try { return f(); } finally { Owner = o; Listener = l; }
+}
+function probeWithin(scope, f) {
+  const o = Owner, l = Listener;
+  Owner = scope;
+  Listener = Probe;
   try { return f(); } finally { Owner = o; Listener = l; }
 }
 
@@ -7326,7 +7484,7 @@ let removing = 0;
 // empty text node) that later nodes go in front of. A text that becomes
 // another text is changed in place.
 function dyn(get, c, out, anew) {
-  bound(get, dynApply, { nodes: [], end: null, c, out, made: 0, size: 0, anew: !!anew }, null, undefined);
+  return bound(get, dynApply, { nodes: [], end: null, c, out, made: 0, size: 0, anew: !!anew }, null, undefined);
 }
 
 function dynApply(x) {
@@ -7510,16 +7668,21 @@ function plan(tp) {
 }
 
 function blockTemplate(def, svg) {
-  const make = (t, inSvg) => {
+  const make = (t, inSvg, doc) => {
     const here = inSvg || t[0] === "svg";
-    const el = here ? document.createElementNS(SVG, t[0]) : document.createElement(t[0]);
+    const el = here ? doc.createElementNS(SVG, t[0]) : doc.createElement(t[0]);
     for (const [k, v] of t[1]) codeAttr(k) ? el.setAttribute(k, v === true ? "" : display(v)) : setProp(el, k, v, undefined);
     // A <template>'s children go in its content (see `wire`).
     const box = t[0] === "template" && el.content || el;
-    for (const k of t[2]) box.appendChild(typeof k === "string" ? document.createTextNode(k) : typeof k === "number" ? document.createTextNode("") : make(k, here && t[0] !== "foreignObject"));
+    for (const k of t[2]) box.appendChild(typeof k === "string" ? doc.createTextNode(k) : typeof k === "number" ? doc.createTextNode("") : make(k, here && t[0] !== "foreignObject", doc));
     return el;
   };
-  return svg ? (def.svg || (def.svg = make(def.tpl, true))) : (def.html || (def.html = make(def.tpl, false)));
+  if (svg ? def.svg : def.html) return svg ? def.svg : def.html;
+  // A probe's, made in a document where nothing loads, is not kept: kept, it was without the
+  // addresses a probe leaves out, and every page then made it so (the sixth review of slice C);
+  // made whole for it, its images loaded (see `probe`; the seventh review of slice C).
+  if (Probe !== null) return make(def.tpl, svg, inertDoc());
+  return svg ? (def.svg = make(def.tpl, true, document)) : (def.html = make(def.tpl, false, document));
 }
 
 // W.t(def, values): a use of a template.
@@ -7547,7 +7710,10 @@ class Tmpl extends Html {
         out.push(el);
         return;
       }
-      const el = blockTemplate(def, svg).cloneNode(true);
+      // A probe's nodes in a document of their own, where an image the template names loads
+      // nothing (see `probe`; FEEDBACK88.md, Q-1380, the fifth review of slice C; branch
+      // feedback86-89).
+      const el = Probe === null ? blockTemplate(def, svg).cloneNode(true) : inertDoc().importNode(blockTemplate(def, svg), true);
       if (marking) markTpl(def.tpl, el);
       wire(def.tpl, el, this.vals, svg);
       if (def.af) focusSoon(el.hasAttribute("autofocus") ? el : el.querySelector("[autofocus]"));
@@ -7866,10 +8032,10 @@ function clsWords(x, out) {
 const spreadClasses = (maps) => maps.filter(isMap).flatMap((m) => mkeys(m).filter((k) => { const l = k.toLowerCase(); return l === "class" || l === "classname"; }).map((k) => m[k]));
 
 // Several values side by side, each fixed or following what it reads.
-function frag(items) {
+function frag(items, whole) {
   return new Html((c, out) => {
     for (const x of items) {
-      if (typeof x === "function") dyn(x, c, out);
+      if (typeof x === "function") { const d = dyn(x, c, out); if (whole) d.whole = 1; }
       else put(x, c, out);
     }
   });
@@ -7922,7 +8088,8 @@ function rawHtml(html) {
     }
     const el = document.createElement("quillo-raw");
     el.style.display = "contents";
-    el.innerHTML = html;
+    // Not for a probe's node, thrown away (see `probe`).
+    if (Probe === null) el.innerHTML = html;
     out.push(el);
   });
 }
@@ -8702,6 +8869,10 @@ function setProp(el, k, v, old) {
   // Only text written in the program goes there (set with the template),
   // and a page for a sandboxed frame that is kept away from the site.
   if (codeAttr(k) && !(attrKey(k) === "srcdoc" && sandboxed(el))) return;
+  // Nothing fetched for a probe's node, thrown away: no attribute that names an address, `srcset`
+  // and SVG's `href` among them (see `probe`; FEEDBACK88.md, Q-1380, the reviews of slice C; branch
+  // feedback86-89).
+  if (Probe !== null && (URL_ATTRS.includes(k.toLowerCase()) || /srcset$/i.test(k))) return;
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
   let s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? jsonText(visible(v)) : noNul(display(v));
   // The text the attribute will say, whatever the value's type (html too).
@@ -8916,11 +9087,30 @@ function each(list, key, row, follows) {
     // kept, one row element a script held kept every row's record through its list's marker
     // (found in review of 0851ec8; FEEDBACK61.md, Q-889; branch feedback61).
     onCleanup(() => { for (const r of st.rows) dispose(r.scope); rowsGone(st); });
+    // Its first make, of `items` with keys `ks`.
+    const make = (items, ks) => {
+      first = false;
+      const at = out.length, inTable = c.claim && (c.p.localName === "table" || c.p.__qb);
+      st.rows = items.map((x, i) => newRow(x, ks ? ks[i] : key ? keyOf(st, key, x) : i, row, c, out));
+      st.end = document.createTextNode("");
+      st.end.__part = st;
+      partsMade++;
+      st.made = partsMade;
+      st.size = out.length - at;
+      if (c.claim) c.p.insertBefore(st.end, c.n);
+      out.push(st.end);
+      if (inTable) inOneBody(out, at);
+    };
     effect(() => {
       // Whether the run before had a key that failed (see `keyOf`).
       st.failed = st.failing;
       st.failing = false;
-      const items = iter(list());
+      let items;
+      // A list that fails as it is first made stands empty, its marker where its rows go, and its
+      // next run fills it: it put them where its first make had put its nodes, long taken, and
+      // nothing showed (FEEDBACK88.md, Q-1380, the fourteenth review of slice C; branch
+      // feedback86-89).
+      try { items = iter(list()); } catch (e) { if (first) untrack(() => make([], null)); throw e; }
       // A key that reads other state (`${ver}:${x}`) is read as the list is, and makes its rows
       // again when that changes, as a `key` outside a list does. Read where nothing is heard, it
       // waited for the list's next change (FEEDBACK61.md, Q-895; branch feedback61). Others are
@@ -8928,17 +9118,7 @@ function each(list, key, row, follows) {
       const ks = follows ? keysOf(st, items, key) : null;
       untrack(() => {
         if (!first) { reconcile(st, items, key, ks, row, svg); return; }
-        first = false;
-        const at = out.length, inTable = c.claim && (c.p.localName === "table" || c.p.__qb);
-        st.rows = items.map((x, i) => newRow(x, ks ? ks[i] : key ? keyOf(st, key, x) : i, row, c, out));
-        st.end = document.createTextNode("");
-        st.end.__part = st;
-        partsMade++;
-        st.made = partsMade;
-        st.size = out.length - at;
-        if (c.claim) c.p.insertBefore(st.end, c.n);
-        out.push(st.end);
-        if (inTable) inOneBody(out, at);
+        make(items, ks);
       });
     });
   });
@@ -9055,7 +9235,7 @@ function rowDirect(row, fn, apply, el, name, old, kid) {
   const l = Listener;
   Listener = null;
   let x;
-  try { x = fn(); } catch (e) { report(e); } finally { Listener = l; }
+  try { x = fn(); } catch (e) { if (e === PROBE_WRITES) throw e; report(e); } finally { Listener = l; }
   if (kid && !plainVal(x)) { bound(fn, apply, el, name, old); return; }
   const d = new Direct(fn, apply, el, name, old, kid);
   Listener = null;
@@ -9074,10 +9254,212 @@ function newRow(x, k, row, c, out) {
   const r = { key: k, item: new Item(x, sc), scope: sc, nodes: null };
   Owner = r.scope;
   const got = [], made = partsMade;
-  try { put(part(row(r.item)), c, got); } finally { Owner = o; Listener = l; }
+  try { put(part(row(r.item)), c, got); } catch (e) {
+    // Taking up the page, its component is made again, which says it once (see `resume`).
+    if (DEV && c.claim && !(e instanceof Mismatch)) wanted = [c.n, "a row whose markup failed (said as the component is made again)"]; // dev
+    if (c.claim) throw e instanceof Mismatch ? e : new Mismatch("row");
+    if (e instanceof Mismatch || e === PROBE_WRITES) throw e;
+    rowFailed(r, row, c.svg, e);
+    got.length = 0;
+    got.push(r.at);
+  } finally { Owner = o; Listener = l; }
   for (const n of got) out.push(n);
   r.nodes = own(got, made);
   return r;
+}
+
+// A row whose markup failed (a typed view given a field of a state still loading) is a failed place
+// of its own: said once while it fails so, it shows nothing, before a mark its list moves and takes
+// away with it (see `nodesOf`), and is made again when its item, or a state or a prop of its list's
+// component, next changes. The list was left with no marker for good, its other rows not shown, and
+// a later change of it failed (FEEDBACK88.md, Q-1380, the second review of slice C; branch
+// feedback86-89).
+function rowFailed(r, row, svg, e) {
+  const sc = r.scope;
+  if (!sameFailure(r, e, (r.failedAt | 0) + 1, sc.owned ? sc.owned.length : 0)) report(e);
+  disposeKids(sc);
+  // Nor its item's records of what the failed make built: they piled up at each try.
+  r.item.direct = null;
+  const at = r.at || (r.at = document.createTextNode(""));
+  if (!at.__part) at.__part = { nodes: [] };
+  recover(2, [r, row, svg]);
+}
+// The rest of `rowFailed`, which only a failure runs (see `recover`).
+function rowWaits(r, row, svg) {
+  const sc = r.scope, o = Owner, at = r.at;
+  let w = null;
+  Owner = sc;
+  w = effect(() => {
+    // (Its look once its file came: see `ProbeStopped`.)
+    const late = w !== null && w.late === true;
+    if (late) w.late = false;
+    r.item.v;
+    if (sc.comp) drawWaits(sc.comp);
+    const e2 = probe(Listener, () => put(part(row(r.item)), { claim: false, svg, p: null }, []), sc.comp);
+    r.item.direct = null;
+    if (e2 && failsAgain(r, e2, (r.failedAt | 0) + 1, ProbeAt, ProbeSkippedFailed)) return;
+    if (w === null || late && ProbeStopped) return;
+    dispose(w);
+    if (!at.isConnected) return;
+    const p = at.parentNode, got = [], made = partsMade, l = Listener;
+    Owner = sc;
+    Listener = null;
+    try { put(part(row(r.item)), { claim: false, svg, p }, got); } catch (e2) { rowFailed(r, row, svg, e2); return; } finally { Owner = w; Listener = l; }
+    for (const n of got) p.insertBefore(n, at);
+    at.__part.nodes = own(got, made);
+    selFollow(p);
+  });
+  w.waits = true;
+  Owner = o;
+  return w;
+}
+
+// What failing markup `f` reads, heard by `w` (what waits for it to change): `f` run once more,
+// what it reads where nothing hears heard too (a view's arguments, a `children` or a render
+// prop's state, a page state), what it makes thrown away and what it says not said again;
+// components in it not made, as each fails by itself. The failed run's own reads were not heard,
+// and the waiting stopped at the component that places the markup (FEEDBACK88.md, Q-1380, the
+// third review of slice C; branch feedback86-89).
+// It only reads: a write its markup comes to (`W.put`) is not made, and it goes on, to learn all
+// the markup reads (a page state after the write: the tenth review of slice C), and then passes
+// as below, the draw then made for real, once in that wake (a waiter's first run draws
+// nothing), which writes for real. A `let` it works out that comes to a write gives the probe what
+// it worked out without it, and is worked out again when next read for real, its readers told
+// (`ProbeLost`): stopped there, the probe learnt nothing the markup read after it, a page state that
+// the failure waits on (the tenth review of slice C). A call's claim, a call of the page's (`js`, a
+// method of a page object) or `ask` stops it (`PROBE_WRITES`, see `probeStop`), and it passes: the
+// call would have gone out, and its answer is not known. Other things that act outside the page
+// (`navigate`, `notify`, `listen`, `page_head`, a channel's send) are skipped: their answer is
+// null either way. Passing, it is one that failed after a write only when the write has readers
+// (see `skippedRead`). Dropped, a draw whose markup sets a state and reads it back
+// failed each probe and waited for good; written for the probe alone and put back, what it worked
+// out from them stayed, and a server fn's answer was lost (the seventh and eighth reviews of slice
+// C). Markup that writes a state each draw draws once per wake, as the program has it (decided for
+// the eighth review).
+// What it works out (a `let`) is as a real read works it out, and kept. It runs as no run (`Run`),
+// as an effect does, which a write tells by (see `W.put`).
+// States nothing writes, which a probe's waiter reads first (see `probe`).
+const PADS = [new Sig(0), new Sig(0), new Sig(0), new Sig(0), new Sig(0), new Sig(0), new Sig(0), new Sig(0), new Sig(0)];
+function probe(w, f, owner) {
+  const pr = Probe, o = Owner, l = Listener, wr = Writer, run = Run, pw = ProbeWrote, pl = ProbeLost;
+  Owner = null;
+  const t = new Scope();
+  Owner = t;
+  Listener = Probe = w;
+  Writer = null;
+  Run = null;
+  ProbeWrote = false;
+  ProbeLost = null;
+  ProbeStopped = false;
+  // Its reads all kept in order, also a state read again (`link` keeps one of the first few once),
+  // so that what it reads after a write it skips is seen whatever it read before (see
+  // `skippedRead`; the thirteenth review of slice C).
+  if (w !== null && w.at <= 16) for (const p of PADS) link(w, p);
+  const ps = ProbeSkipped;
+  ProbeSkipped = null;
+  ProbeSkippedFailed = false;
+  try { f(); return null; } catch (e) {
+    if (e === PROBE_WRITES) { ProbeStopped = true; probeStopped(w, owner); return null; }
+    ProbeAt = t.owned ? t.owned.length : 0;
+    // One that failed after a write it skipped passes when the write may be what the failure waits
+    // on: its markup read the state after the write (itself, or by a `let`), or something other than
+    // a place that shows it reads it (a statement, a `live` call's arguments, an effect, a `let` one
+    // of those reads). Else it fails as the draw did, and the waiter draws only when the failure is
+    // not the last (see `failsAgain`): passing each time, it made the components ahead of the
+    // failure again at each wake, and each loaded its state again; passing on its own read before
+    // the write (`seen += 1`), or a place that shows the state, did the same (the eleventh to
+    // thirteenth reviews of slice C).
+    if (ProbeWrote) { if (skippedRead(w, ProbeSkipped, owner)) return null; ProbeSkippedFailed = true; }
+    return e || true;
+  } finally {
+    Probe = pr; Owner = o; Listener = l; Writer = wr; Run = run; ProbeWrote = pw; ProbeSkipped = ps;
+    const lost = ProbeLost;
+    ProbeLost = pl;
+    if (lost !== null) for (const c of lost) probeLost(c);
+    dispose(t);
+  }
+}
+// Whether the probe that ran last stopped (see `probeStop`): a waiter's look once its file came
+// (`late`, see `recLoad`) ends there, as a probe that stopped at a call passes, which would draw for
+// real for no change.
+let ProbeStopped = false;
+// A write a probe comes to (see `probe`): not made, and said; in a `let` (a memo running), that
+// `let` is not kept.
+function probeWrite(s, v) {
+  // The value it has: no write (the thirteenth review of slice C).
+  if (v === s._v) return null;
+  if (Listener !== null && Listener !== Probe && !Listener.effect) (ProbeLost || (ProbeLost = [])).push(Listener);
+  ProbeWrote = true;
+  // With how far the probe's own reads had come at its last write of it: a read between two writes
+  // reads it to write it again (a view's argument is read at each use: `hits = hits + 1` twice), not
+  // back (the thirteenth review of slice C).
+  const ss = ProbeSkipped || (ProbeSkipped = []), k = ss.indexOf(s);
+  if (k < 0) ss.push(s, Probe.at);
+  else ss[k + 1] = Probe.at;
+  return null;
+}
+// Whether a write probe `w` skipped (`ss`: each state with how far `w`'s reads had come) may be what
+// its failure waits on: `w` read the state after the write, itself or by a `let` worked out from it,
+// or something other than `w`, a place that shows it, or a failed draw's waiter reads it (a
+// component's body made again whole, its statements, where the compiler says it writes as it
+// draws, `$f.w`, but the failed draw's own component's, which drawing again is what the probe
+// decides; a `live` call's arguments; an effect; a `let` one of those reads).
+function skippedRead(w, ss, owner) {
+  const src = w.src, seen = new Set();
+  for (let k = 0; k < ss.length; k += 2) {
+    const s = ss[k];
+    if (src) for (let i = ss[k + 1]; i < w.at; i += 2) if (src[i] === s || src[i] instanceof Calc && fromState(src[i], s, new Set())) return true;
+    if (readBy(s, w, seen, owner)) return true;
+  }
+  return false;
+}
+// Whether `let` `c` was worked out from state `s`.
+function fromState(c, s, seen) {
+  const src = c.src;
+  if (!src || seen.has(c)) return false;
+  seen.add(c);
+  for (let i = 0; i < c.at; i += 2) if (src[i] === s || src[i] instanceof Calc && !src[i].effect && fromState(src[i], s, seen)) return true;
+  return false;
+}
+function readBy(s, w, seen, owner) {
+  const o = s.obs;
+  if (o) for (let i = 0; i < o.length; i += 2) {
+    const c = o[i];
+    if (c === w || c.dead || seen.has(c)) continue;
+    seen.add(c);
+    if (c.effect ? !c.waits && (c.apply === null || c.whole === 1 && c.comp !== owner && c.comp && c.comp.def.$f && c.comp.def.$f.w === 1) : readBy(c, w, seen, owner)) return true;
+  }
+  return false;
+}
+// A probe stopped (see `probeStop`) learnt nothing its markup reads after: its waiter also waits on
+// the page states its component's code reads as it draws, as the compiler gives them (`$f.r`,
+// through the functions and views it calls and the markup it hands others), as the real draw it
+// passes to may read them and fail on them (a call's markup, failing on a page state after it,
+// waited for good: the twelfth review of slice C); on all of them, a page state the draw does not
+// read woke it, a frame's callback that writes one went round at each frame, and a ticking one made
+// it at each tick (the thirteenth). Its component's states and props it waits on already (see
+// `drawWaits`).
+function probeStopped(w, owner) {
+  const f = w !== null && owner && owner.def && owner.def.$f;
+  if (!f) return;
+  const l = Listener;
+  Listener = w;
+  // (One the page has not made yet the draw has not read.)
+  try { for (const n of f.r) { const s = PageStates.get(n); if (s) s.v; } } finally { Listener = l; }
+}
+// What a probe throws at what acts outside the page (a call of the page's, `ask`): it ends there
+// (see `probe`).
+function probeStop() {
+  throw PROBE_WRITES;
+}
+// A `let` a probe worked out without a write it came to, its value or its failure: worked out again
+// when next read, and what was worked out from it checked again.
+function probeLost(c) {
+  if (c.dead || c.state < DIRTY && c.state !== CLEAN) return;
+  c.state = FAILED;
+  c.retry = true;
+  const o = c.obs;
+  if (o) for (let i = 0; i < o.length; i += 2) stale(o[i], CHECK);
 }
 
 // The first node of a part's nodes (see `nodesOf`), without listing them.
@@ -9323,7 +9705,9 @@ function comp(def, props, kids, spreads) {
   if (spreads) p = withSpreads(props, ps, def, spreads);
   if (ps.includes("children") && !hasOwn(p, "children")) p.children = kids;
   return new Html((c, out) => {
-    if (def.$comp) { island(def, p, takeHydration(def.$name), c, out); return; }
+    // Not made by a probe (see `probe`): one fails by itself, and made, its states would load. It
+    // counts as made, as the draw tells how far it got (see `sameFailure`).
+    if (def.$comp) { if (Probe === null) island(def, p, takeHydration(def.$name), c, out); else new Scope(); return; }
     if (def.$view) {
       const s = new Scope();
       within(s, () => put(part(def.$view(p)), c, out));
@@ -9404,7 +9788,7 @@ class Inst extends Scope {
     // user's rule of 2026-11-04); else it starts again, and the console says so.
     if (this.swapped && hasOwn(this.s0, name) && !page) {
       let fresh;
-      try { fresh = init(); } catch (_) { fresh = null; }
+      try { fresh = within(this, init); } catch (_) { fresh = null; }
       const was = this.s0[name];
       if (fresh !== null && !(fresh instanceof Promise) && keptKind(fresh) !== keptKind(was)) {
         console.info(`quillo: <${this.def.$name}>'s state ${name} starts again: it was ${keptKind(was)}, the new code makes it ${keptKind(fresh)}`); // dev
@@ -9423,7 +9807,10 @@ class Inst extends Scope {
       if (page) { const n = W.claim(s); Promise.resolve().then(init).then((x) => W.latest(s, n, x), report); }
       return s;
     }
-    const v = init();
+    // What the initializer starts, at once or after it waits, is the component's, not its draw's,
+    // which a failed draw takes with it (see `runOwn`; FEEDBACK88.md, Q-1380, the reviews of slice
+    // C; branch feedback86-89).
+    const v = within(this, init);
     if (v instanceof Promise) {
       const s = new Sig(null), n = W.claim(s);
       v.then((x) => W.latest(s, n, x), report);
@@ -9656,13 +10043,26 @@ function run(inst, el, claim, svg, p) {
 }
 
 function runOwn(inst, el, claim, svg, p) {
-  return within(inst, () => {
+  // Its draw in a scope of its own, the component's: what the draw makes goes with it, and a draw
+  // that fails takes nothing else with it, not what the component's states started (a live state's
+  // subscription, a timer), nor did it leave what it made (FEEDBACK88.md, Q-1380, the reviews of
+  // slice C; branch feedback86-89).
+  const o = Owner;
+  Owner = inst;
+  const d = new Scope();
+  Owner = o;
+  // Swapped under --watch: the states of the components inside it, for a draw again after one that
+  // failed, which had used them up (see `takeHydration`).
+  let hq = null;
+  if (DEV && !claim && hydrating) hq = heldStates(hydrating); // dev
+  return within(d, () => {
     let view;
     try {
       view = part(inst.def(inst, inst.props));
     } catch (e) {
       if (e instanceof Ret) view = e.v;
-      else { report(e); return; }
+      else if (claim) { report(e); return; }
+      else return drawFailed(inst, d, el, svg, p, e, null, 0, 0, hq);
     }
     if (claim && el.nodeType === 8) {
       // Between the comments the server marked it with (see `islandMarked`).
@@ -9689,13 +10089,218 @@ function runOwn(inst, el, claim, svg, p) {
       const c = { p: el, n: el.firstChild, claim: true, svg: false };
       put(view, c, []);
       rest(el, c.n);
-    } else {
-      const got = [];
-      put(view, { claim: false, svg: !!svg, p: p || el }, got);
-      if (!el) return got;
-      el.append(...got);
-    }
+    } else return drawView(inst, d, view, el, svg, p, hq);
   });
+}
+
+// The view put on the page, in draw `d`: one that fails takes with it only what it built, not what
+// the component's code made and started (its `let`s, an `every`, a `listen`), which the draw again
+// puts the same view by (see `drawFailed`). A body made again whole (`W.frag`) is a place of the
+// component's, whose run is that body: what its statements start goes when it runs again
+// (FEEDBACK88.md, Q-1380, the third review of slice C; branch feedback86-89).
+function drawView(inst, d, view, el, svg, p, hq) {
+  // Its code succeeded: a live state follows the arguments it gave (see `drawFailed`).
+  const rp = inst.repoint;
+  if (rp) { inst.repoint = null; for (const f of rp) f(); }
+  const got = [], n = d.owned ? d.owned.length : 0, m = d.clean ? d.clean.length : 0;
+  try { put(view, { claim: false, svg: !!svg, p: p || el }, got); } catch (e) { return drawFailed(inst, d, el, svg, p, e, view, n, m, hq); }
+  if (!el) return got;
+  el.append(...got);
+}
+
+// A component made here whose draw failed, its code's or its markup's (a typed view given a field of
+// a server fn's state, null while it loads), said once: it shows nothing, its states kept, and is
+// drawn again when one of them or of its props next changes; a draw that fails again waits for the
+// next change. It stayed empty for good, the place it was in emptied with it, and the answer that
+// came a moment later drew nothing (FEEDBACK88.md, Q-1380; branch feedback86-89). Standing by
+// itself (`el` null, see `bareIn`), its nodes go before a mark of its own, which the place it is in
+// takes them away with (see `nodesOf`).
+function drawFailed(inst, d, el, svg, p, e, view, n, m, hq) {
+  const first = !el && !inst.at;
+  if (!sameFailure(inst, e, (inst.failedAt | 0) + 1, (d.owned ? d.owned.length : 0) - n)) report(e);
+  if (first) { inst.at = document.createTextNode(""); inst.at.__part = { nodes: [] }; }
+  // Its view failed: what building it made goes (see `drawView`). Its code failed: what that made
+  // and started (an `every` that fills the state it needs) stays until the code runs again.
+  if (view !== null) disposeFrom(d, n, m);
+  recover(1, [inst, d, el, svg, p, view, hq]);
+  return first ? [inst.at] : undefined;
+}
+// The rest of `drawFailed`, which only a failure runs (see `recover`).
+function drawWaitsFor(inst, d, el, svg, p, view, hq) {
+  const at = inst.at, o = Owner;
+  let w = null;
+  Owner = inst;
+  // It waits by an effect of its own, which runs its view again as a probe, or its `let`s that
+  // threw, first, and draws for real only once that passes: woken by a state of its ticking, it
+  // made the components ahead of the failure again each time, and each loaded its state.
+  w = effect(() => {
+    // (Its look once its file came: see `ProbeStopped`.)
+    const late = w !== null && w.late === true;
+    if (late) w.late = false;
+    drawWaits(inst);
+    let e2 = null;
+    let skipped = false;
+    ProbeStopped = false;
+    if (view !== null) { e2 = probe(Listener, () => put(view, { claim: false, svg: !!svg, p: null }, []), inst); skipped = ProbeSkippedFailed; }
+    else if (d.owned) for (const k of d.owned) if (k.state === FAILED) try { k.v; } catch (e) { e2 = e2 || e || true; }
+    // A probe that fails otherwise than the draw last did, or further on, says so; one that failed so
+    // after a write it skipped is drawn for real, which says it if it fails (see `probe`).
+    if (e2 && failsAgain(inst, e2, (inst.failedAt | 0) + 1, view !== null ? ProbeAt : inst.failedIn, skipped)) return;
+    if (w === null || late && ProbeStopped) return;
+    dispose(w);
+    // Nor drawn where it never stood: its place failed too, after making it.
+    if (!(el || at).isConnected) return;
+    const made = partsMade, to = at ? at.parentNode : p, h = hydrating;
+    // A live state follows the arguments a draw gives it once its code succeeds (see `drawView`); a
+    // draw whose code fails keeps what it followed: given a new `now()` at each, it loaded again
+    // for ever.
+    if (view === null) { dispose(d); inst.repoint = []; }
+    hydrating = null;
+    if (hq) hydrating = heldStates(hq); // dev
+    let got;
+    try { got = view === null ? run(inst, el, false, svg, to) : again(inst, d, view, el, svg, to, hq); } finally { hydrating = h; inst.repoint = null; }
+    // Options drawn again: their select shows its value, as a place's do (see `dynApply`).
+    if (got) { for (const n of got) to.insertBefore(n, at); at.__part.nodes = own(got, made); bareRoot(got, inst, inst.def.$name); selFollow(to); }
+    // A row or an SVG element that is its own root, made in a wrapper (taken up again, swapped
+    // under --watch): its own island once drawn, as after a first draw (see `asOwnRoot`), where it
+    // stayed in the wrapper, out of its table's rows, and drew nothing in <svg>.
+    else if (el) { const r = asOwnRoot(el, inst, svg); if (r !== el) { el.replaceWith(r); r.__qi = el.__qi; r.__qp = el.__qp; } }
+  });
+  w.waits = true;
+  Owner = o;
+  return w;
+}
+// Its view put again, in the draw it was built in.
+function again(inst, d, view, el, svg, p, hq) {
+  const wr = Writer;
+  Writer = null;
+  try { return within(d, () => drawView(inst, d, view, el, svg, p, hq)); } finally { Writer = wr; }
+}
+// A copy of the states a swap keeps for the components made again inside (see `hydrating`).
+function heldStates(h) {
+  const o = {};
+  for (const k in h) o[k] = h[k].slice();
+  return o;
+}
+// What scope `d` made from its `n`th scope and `m`th cleanup on goes.
+function disposeFrom(d, n, m) {
+  const o = d.owned, c = d.clean;
+  if (o && o.length > n) for (const k of o.splice(n)) { k.up = null; dispose(k); }
+  if (c && c.length > m) for (const f of c.splice(m)) { try { f(); } catch (e) { report(e); } }
+}
+// What a draw that failed waits on: its component's states and props (see `drawFailed`, `runCalc`,
+// `rowFailed`).
+function drawWaits(inst) {
+  for (const k in inst.sigs) inst.sigs[k].v;
+  for (const k in inst.props) try { inst.props[k]; } catch (_) {}
+}
+// Whether `o` (a place, a component, a row) fails with `e` as it did at its run before (its `n`th),
+// as far into its draw (`at`, what the draw had made): one failure that lasts is said once, and two
+// in one draw with the same words (a view given one loading state, then another) are two (the
+// reviews of slice C). Noted; one noted with no `at` (see `resume`) is any.
+function sameFailure(o, e, n, at) {
+  const m = String(e && e.message || e), same = o.failed === m && o.failedAt >= n - 1 && (o.failedIn === at || o.failedIn === undefined);
+  o.failed = m;
+  o.failedAt = n;
+  o.failedIn = at;
+  return same;
+}
+// Whether a waiter's probe that failed with `e` (`true`: nothing to say) leaves `o` failing again,
+// said when not as it last did; one that `skipped` a write and failed otherwise does not: the draw is
+// made for real, which says it if it fails so (see `probe`).
+function failsAgain(o, e, n, at, skipped) {
+  if (e === true) return true;
+  if (skipped && !(o.failed === String(e && e.message || e) && o.failedAt >= n - 1 && (o.failedIn === at || o.failedIn === undefined))) return false;
+  if (!sameFailure(o, e, n, at)) report(e);
+  return true;
+}
+
+// The code only a failure runs (`effectWaits`, `drawWaitsFor`, `rowWaits` and what they call: the
+// probe, its waiters, telling failures apart) is a file of its own in a runtime file's program,
+// fetched the first time a draw fails, which a page that never fails does not load; a failure
+// before it comes is held, and handled once it has (the user's decision, the thirteenth review of
+// slice C; FEEDBACK88.md, Q-1380; branch feedback86-89). `RecAt` is its address, given by the
+// runtime file (null: its code is here, as in development); `RecWith` makes what it reads of the
+// runtime's names (see `recovery_file` in client.rs).
+const LAZY = [effectWaits, drawWaitsFor, rowWaits, probeWrite];
+let Rec = null, RecAt = null, RecWith = null, Held = null, RecWait = 500, RecTry = 0;
+// Runs failure code `k` (of `LAZY`) with `a`, or holds it until its file has come.
+function recover(k, a) {
+  if (Rec === null && RecAt === null) Rec = LAZY;
+  if (Rec !== null) return Rec[k].apply(null, a);
+  if (Held === null) { Held = []; recLoad(); }
+  Held.push(k, a);
+}
+// Fetches the failure code's file; once it runs it hands its code over (`QW.recover`), and what was
+// held runs, but what has gone meanwhile (a place, a component, a row whose list dropped it). Not
+// fetched (offline, no worker's copy): tried again later, each time after twice as long.
+function recLoad() {
+  QW.recover = (f) => {
+    if (Rec !== null) return;
+    Rec = f(RecWith());
+    const h = Held;
+    Held = null;
+    // Each waiter looks again at once: what it waits for may have come while the file did (`late`).
+    for (let i = 0; i < h.length; i += 2) { const o = h[i + 1][0]; if (!(o.dead || o.scope && o.scope.dead)) { const w = Rec[h[i]].apply(null, h[i + 1]); if (w) { w.late = true; stale(w, DIRTY); } } }
+  };
+  const s = document.createElement("script");
+  s.src = RecAt;
+  // Not had: a file this server does not have (404: a page from before the program changed, whose
+  // runtime its new code must not run with) loads the page again, once; otherwise (offline, no
+  // worker's copy) it is tried again later, each time after twice as long up to 30 s, or at once
+  // when the browser is back online (the fourteenth review of slice C).
+  s.onerror = () => {
+    s.remove();
+    const again = () => {
+      if (Rec !== null) return;
+      clearTimeout(RecTry);
+      RecTry = setTimeout(recLoad, RecWait = Math.min(RecWait * 2, 30000));
+      // One listener for all the tries: the same function is added once (the fifteenth and
+      // sixteenth reviews of slice C).
+      addEventListener("online", recOnline, { once: true });
+    };
+    fetch(RecAt, { method: "HEAD" }).then((r) => { if (r.status === 404) recStale(); else again(); }, again);
+  };
+  document.head.appendChild(s);
+}
+function recOnline() { if (Rec === null) { clearTimeout(RecTry); recLoad(); } }
+// The failure code's file is gone (see `recLoad`): the page again, once for each such file (the
+// last ones kept for the tab, space apart), not where its person has typed something it would
+// lose; what was held stays as its failure left it, said already (the fifteenth review of slice C).
+// Not loaded again, a failed draw stays missing even once its data comes good: the code that would
+// draw it again is in the file that is gone, and keeping it here for this would send it with every
+// page (decided in the sixteenth and seventeenth reviews of slice C; FEEDBACK88.md, Q-1380; branch
+// feedback86-89).
+function recStale() {
+  Held = null;
+  try {
+    const done = sessionStorage.getItem("quillo:rec") || "";
+    if (typed(document) || done.includes(RecAt)) return;
+    sessionStorage.setItem("quillo:rec", (done + " " + RecAt).slice(-600));
+  } catch (_) { return; }
+  location.reload();
+}
+// Whether the person has changed a field in `d`: typed, ticked, chosen (a `<select>`), in an open
+// shadow root or a frame of this origin too (another origin's `contentDocument` is null); the
+// sixteenth review of slice C (FEEDBACK88.md, Q-1380; branch feedback86-89). A field against a copy
+// of it a form has reset, which shows what it showed untouched: a range's middle, an empty
+// `<select>`'s nothing (the seventeenth review).
+function typed(d) {
+  for (const el of d.querySelectorAll("*")) {
+    const c = el.contentDocument, f = document.createElement("form");
+    if (el.shadowRoot && typed(el.shadowRoot) || c && typed(c)) return true;
+    if (el.isContentEditable ? el.textContent !== "" : /^(input|select|textarea)$/.test(el.localName) && (f.appendChild(el.cloneNode(true)), f.reset(), el.value !== f.firstChild.value || el.checked !== f.firstChild.checked || [...el.options || []].map((o) => o.selected) + "" !== [...f.firstChild.options || []].map((o) => o.selected) + "")) return true;
+  }
+}
+// Under Quillo's worker, the file is fetched as the page settles, so that the worker keeps it and a
+// failure offline is handled too.
+function recKeep() {
+  const sw = navigator.serviceWorker;
+  if (!sw) return;
+  const go = () => setTimeout(fetch, 1000, RecAt);
+  // The session that installs the worker has it once it takes the page (the fourteenth review).
+  if (!sw.controller) sw.addEventListener("controllerchange", go, { once: true });
+  else document.readyState === "complete" ? go() : addEventListener("load", go);
 }
 
 // Island JSON (and a server fn's answer), with error values
@@ -9796,6 +10401,8 @@ const placed = (e) => { // dev
 }; // dev
 
 function report(e) {
+  // What a probe runs again was said (see `probe`).
+  if (Probe !== null) return;
   const said = ["quillo:", e instanceof Error ? e.message : e];
   if (DEV && e instanceof Error) said.splice(1, 1, placed(e), e); // dev
   console.error(...said);
@@ -10231,7 +10838,7 @@ function resume(el) {
   let inst = new Inst(def, props, state, liveInfo);
   inst.el = el;
   if (DEV || QW.ip) { el.__qi = inst; el.__qp = props; }
-  let ok = true;
+  let ok = true, said = null;
   try {
     // What `page_head` says as it is taken up is what the server wrote (see `B.page_head`).
     Resuming++;
@@ -10242,6 +10849,7 @@ function resume(el) {
     if (e instanceof Mismatch) { if (!el.__kept) remade(el.dataset.c); }
     else {
       report(e);
+      said = e;
       QW.remade = (QW.remade || 0) + 1;
     }
     ok = false;
@@ -10263,6 +10871,9 @@ function resume(el) {
     }
     inst = new Inst(def, props, state, liveInfo);
     inst.el = el;
+    // Said as it was taken up, the same failure of the component made again is not said again
+    // (FEEDBACK88.md, Q-1380, the second review of slice C; branch feedback86-89).
+    if (said) sameFailure(inst, said, 0);
     const svg = inSvg(el.parentNode || el);
     run(inst, el, false, svg);
     const r = asOwnRoot(el, inst, svg);
@@ -10398,20 +11009,31 @@ function claimedBy(s, r) {
 // parallel(f, g)` has `f`'s and `g`'s calls, and the later is the latest.
 W.claim = (s) => {
   const r = Run;
-  if (r !== null) (r.held || (r.held = new WeakSet())).add(s);
-  if (r === null || s.r !== r) { s.r = r; s.n++; }
+  if (r === null) {
+    // Not by a probe, which only reads and runs as no run: it stops here, and the draw is made for
+    // real (see `probe`; FEEDBACK88.md, Q-1380, the seventh and eighth reviews of slice C; branch
+    // feedback86-89). The program's sets come this way (`W.put`, `W.to`), not `Sig.set`'s.
+    if (Probe !== null) throw PROBE_WRITES;
+    s.r = null;
+    s.n++;
+    return s.n;
+  }
+  (r.held || (r.held = new WeakSet())).add(s);
+  if (s.r !== r) { s.r = r; s.n++; }
   return s.n;
 };
 // At a later wait with the same answer: the claim it has, lost or not.
 W.again = (s, n) => (n === undefined ? W.claim(s) : n);
-W.latest = (s, n, v) => { if (s.n === n) s.set(v); return null; };
+W.latest = (s, n, v) => { if (s.n === n) { if (Probe !== null) return Rec[3](s, v); s.set(v); } return null; };
 // Any other set, a fold too: always made. It claims the state, so an older answer gives way to it,
 // unless its run claimed the state and lost it, for the rest of the run: then it takes nothing, and
 // the newest call's answer still lands. As it was, `let r = search(q); rows = r; rows = rows | f()`
 // typed quickly voided the last call and ended empty.
 W.put = (s, v) => {
   const r = Run;
-  if (r === null) { s.r = null; s.n++; }
+  // (Not by a probe: see `W.claim`.)
+  // (In a probe, the failure code's `probeWrite`.)
+  if (r === null) { if (Probe !== null) return Rec[3](s, v); s.r = null; s.n++; }
   else if (s.r !== r && !claimedBy(s, r)) { s.r = r; s.n++; }
   return s.set(v);
 };
@@ -10559,8 +11181,10 @@ W.typed = (s, t) => {
 };
 const NUMERIC = new WeakSet();
 const FLOATS = new WeakSet();
-W.component = (name, params, render) => {
+W.component = (name, params, render, facts) => {
   render.$name = name;
+  // What its draw reads and does, when it reads page states or writes (see `probeStopped`).
+  if (facts) render.$f = facts;
   render.$p = params;
   render.$comp = true;
   C[name] = render;
@@ -10600,7 +11224,16 @@ W.waiting = (sig) => waitSig(sig).v;
 // its arguments change (`live(load, id)` after `id` changed), it loads again.
 W.live = (inst, name, fname, args, every) => {
   const had0 = inst.sigs || (inst.sigs = {});
-  if (had0[name]) return had0[name];
+  // Asked again, as a component whose code failed is drawn again: the same subscription, the
+  // component's, which follows the arguments this draw gives it (a `let` it reads is made again)
+  // once the draw succeeds (see `drawFailed`; FEEDBACK88.md, Q-1380, the reviews of slice C;
+  // branch feedback86-89).
+  const s = had0[name];
+  if (s) {
+    const sub = s.$sub;
+    if (inst.repoint) inst.repoint.push(() => { dispose(sub.fx); sub.fx = within(inst, () => liveArgs(sub, args, false, false)); });
+    return s;
+  }
   return (had0[name] = within(inst, () => liveSig(inst, name, fname, args, every)));
 };
 function liveSig(inst, name, fname, args, every) {
@@ -10608,24 +11241,26 @@ function liveSig(inst, name, fname, args, every) {
   const had = hasOwn(inst.s0, name);
   const sig = new Sig(had ? inst.s0[name] : null);
   // `fails`: loads that failed in a row; `retry`: the timer of the next try (see `liveRefresh`).
-  const sub = { inst, sig, name, fname, every: every || 0, last: 0, args: null, topics: info ? info.t : [], h: had && info && info.h || "", base: had ? inst.s0[name] : undefined, fails: 0, retry: 0 };
+  const sub = { inst, sig, name, fname, every: every || 0, last: 0, args: null, topics: info ? info.t : [], h: had && info && info.h || "", base: had ? inst.s0[name] : undefined, fails: 0, retry: 0, fx: null };
   Live.subs.add(sub);
   onCleanup(() => { Live.subs.delete(sub); clearTimeout(sub.retry); liveRestart(); });
-  let first = true;
-  effect(() => {
-    const a = args();
-    untrack(() => {
-      if (first) {
-        first = false;
-        sub.args = a;
-        if (had) liveRestart(); else liveRefresh(sub, true);
-        return;
-      }
-      if (eq(sub.args, a)) return;
-      sub.args = a;
-      liveRefresh(sub, true);
-    });
-  });
+  sub.fx = liveArgs(sub, args, true, had);
+  sig.$sub = sub;
   return sig;
 }
+// What follows a live state's arguments: loads again when they change.
+const liveArgs = (sub, args, first, had) => effect(() => {
+  const a = args();
+  untrack(() => {
+    if (first) {
+      first = false;
+      sub.args = a;
+      if (had) liveRestart(); else liveRefresh(sub, true);
+      return;
+    }
+    if (eq(sub.args, a)) return;
+    sub.args = a;
+    liveRefresh(sub, true);
+  });
+});
 W.server = (name, idem) => meta((...args) => rpc(name, args, idem), name, null);

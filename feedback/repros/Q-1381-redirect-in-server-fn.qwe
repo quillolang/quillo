@@ -2,7 +2,6 @@
 // mode: browser
 // page: /
 // probe: document.getElementById("save").click(); await new Promise((r) => setTimeout(r, 1200)); return { path: location.pathname, shown: document.getElementById("out").textContent }
-// open-when: "path": "/"
 // fixed-when: /redirect|warning/
 // From FEEDBACK88.md §Q-1381 (found on 61997ab, 0.8.10; first seen on 0.8.8).
 
