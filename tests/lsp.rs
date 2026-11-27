@@ -856,7 +856,10 @@ fn names_of_files_are_found_as_each_file_wrote_them() {
 
     // In the code: the alias, and a name two files have.
     let hover = c.request("textDocument/hover", at(3, col("a_helper")), &mut notes);
-    assert!(shown(&hover).contains("fn helper(x: int) -> str") && !shown(&hover).contains("private"), "{}", hover);
+    // The function's own name as this file takes it, the rest as declared: changed from `fn
+    // helper(x: int) -> str` for the coordinator's decision on A2 round 4 (a use in this file shows
+    // this file's spelling for the name itself; FEEDBACK45.md, Q-523; branch feedback86-89).
+    assert!(shown(&hover).contains("fn a_helper(x: int) -> str") && !shown(&hover).contains("private"), "{}", hover);
     assert_eq!(goes(&c.request("textDocument/definition", at(3, col("a_helper")), &mut notes)), ("a.qwe".to_string(), Some(0)));
     let hover = c.request("textDocument/hover", at(3, col("helper(\"x\")")), &mut notes);
     assert!(shown(&hover).contains("fn helper(y: str") && !shown(&hover).contains("private"), "{}", hover);

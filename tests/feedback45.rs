@@ -526,8 +526,11 @@ fn the_reviews_cases_for_imports_and_scopes() {
     let d = |src: &str| diags_in(src, &dir);
     // A prop, a view's parameter or a local of the old name is the file's own.
     assert!(d("import lib/m.qwe use price as p\ncomponent Card(price: int) {\n    <div>{price}</div>\n}\nview Home() = <div><Card price={p(3)}/></div>\n").is_empty());
-    // A local of the other file's name is what the alias finds: still said.
-    assert_eq!(d("import lib/m.qwe use price as p\nroute GET /item/:price {\n    let n = int(price) ?? 0\n    p(n)\n}\n"), ["4 cannot call `price`: it is str, not a function"]);
+    // A local of the other file's name is what the alias finds: still said. Said of `p`, as the
+    // program wrote the call, not `price` (changed for the coordinator's decision on A2 rounds 2 and
+    // 4: a call is named as written, taken from its node; FEEDBACK45.md, Q-523; branch
+    // feedback86-89).
+    assert_eq!(d("import lib/m.qwe use price as p\nroute GET /item/:price {\n    let n = int(price) ?? 0\n    p(n)\n}\n"), ["4 cannot call `p`: it is str, not a function"]);
     // A name another file's import could not take is still said in this one.
     let sub = d("import lib/m.qwe use pricee\nimport lib/sub.qwe use helper\nprint(helper())\n");
     assert!(sub.iter().any(|w| w.contains("unknown name `pricee`")), "{:?}", sub);

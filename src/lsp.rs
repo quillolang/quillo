@@ -1678,9 +1678,17 @@ impl Server {
             }
         }
         let taken = doc.analysis.taken.iter().filter(|(f, _)| *f == file).map(|(_, s)| s);
+        // What this file took only `as` another name (`use price as p`): offered as `p`, by the
+        // taken list, and not by the other file's name, which this file does not have; the check
+        // says which from the file's parsed `use`s (FEEDBACK45.md, Q-523, found in review; branch
+        // feedback86-89).
+        let only_as: std::collections::HashSet<&str> = doc.analysis.taken_only_as.iter().filter(|(f, _)| *f == file).map(|(_, n)| n.as_str()).collect();
         for s in taken.chain(&doc.analysis.symbols) {
             // Another file's private names are not this file's to use (branch public-private).
             if crate::privacy::private_name(&s.name).is_some() && s.file != file {
+                continue;
+            }
+            if s.file != file && only_as.contains(s.name.as_str()) {
                 continue;
             }
             if s.kind != SymbolKind::Route && seen.insert(s.name.clone()) {

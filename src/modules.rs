@@ -524,6 +524,15 @@ impl Links {
         self.rust.get(file)
     }
 
+    /// Whether `file` takes `name` as itself from a file it takes whole, one that has it as a
+    /// public name (a private one is renamed when its file is parsed): by linking's own files,
+    /// however the `use` writes the path (FEEDBACK45.md, Q-523, found in review; branch
+    /// feedback86-89).
+    pub fn whole_gives(&self, file: &Path, name: &str) -> bool {
+        let Some(i) = self.imports.get(file) else { return false };
+        i.files.iter().any(|k| self.parsed.get(k).is_some_and(|s| defined(s).iter().any(|(n, _)| n == name)))
+    }
+
     /// Whether `file` took `name` by name: a browser library's, which only its own line gives.
     pub fn took(&self, file: &Path, name: &str) -> bool {
         self.imports.get(file).map_or(true, |i| i.names.contains(name))

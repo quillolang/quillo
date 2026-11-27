@@ -1076,17 +1076,26 @@ fn error_test_of(e: &Expr) -> Option<&str> {
 
 /// The first name `e` reads that is one of `names`, not one it binds itself (a lambda's
 /// parameter): what a state's initializer follows (`Checker::run_once_states`; FEEDBACK86.md,
-/// Q-1361; branch feedback86-89).
+/// Q-1361; branch feedback86-89). A binding hides the name only where it reaches, as `Hidden`
+/// reads it: `len(a) + len(xs.map((a) => a))` still reads the component's `a` (found in review;
+/// FEEDBACK86.md, Q-1361; branch feedback86-89).
 fn first_read(e: &Expr, names: &HashMap<String, String>) -> Option<String> {
     if names.is_empty() {
         return None;
     }
-    let mut own = HashSet::new();
-    bound_in(e, &mut own);
+    let mut any = false;
+    walk_expr(e, &mut |x| any |= matches!(x, Expr::Ident(n, _) if names.contains_key(n.as_str())));
+    if !any {
+        return None;
+    }
+    let wanted: HashSet<&str> = names.keys().map(String::as_str).collect();
+    let mut hidden = Hidden { wanted: &wanted, depth: HashMap::new(), reads: HashSet::new(), sets: HashSet::new() };
+    hidden.expr(e);
+    let hidden = hidden.reads;
     let mut found = None;
     walk_expr(e, &mut |x| {
         if let (None, Expr::Ident(n, _)) = (&found, x) {
-            if !own.contains(n.as_str()) && names.contains_key(n.as_str()) {
+            if names.contains_key(n.as_str()) && !hidden.contains(&(x as *const Expr)) {
                 found = Some(n.to_string());
             }
         }
@@ -1918,6 +1927,308 @@ fn only_called(src: &str, name: &str) -> bool {
     true
 }
 
+/// What `Checker` gathers of each component's parameters as it walks the component, which it
+/// does anyway (no walk of its own): what each component does with a parameter itself, shown as
+/// text (`facts[0]`) or called as it is drawn (`facts[1]`), and what it hands another component's
+/// parameter (`edges`, by mode), each parameter a number from its component's `base`. After the
+/// run, `Checker::prop_facts_settle` makes the least set that holds (FEEDBACK35.md, Q-431, found in
+/// review of FEEDBACK86-89: a read of every component apart cost up to +20%; branch feedback86-89).
+#[derive(Default)]
+struct PropCollect {
+    base: HashMap<usize, u32, BuildPtr>,
+    n: u32,
+    facts: [Vec<bool>; 2],
+    edges: [Vec<(u32, u32)>; 3],
+    settled: bool,
+    /// The component being walked, if it has parameters.
+    cur: Option<CurComp>,
+    /// Where the walk is: in a child's text, in what runs later, apart (a `let`'s lambda, a local
+    /// `fn`, a lambda given to a component), and in an attribute given to which parameter, with
+    /// whether that attribute is a lambda: only a lambda's calls are the component's to make; a
+    /// call in any other value runs as it is drawn (found in review of FEEDBACK86-89 round 9).
+    text: bool,
+    later: u32,
+    apart: u32,
+    attr: Option<(u32, bool)>,
+    /// While a `let`'s value or a local `fn` of the component is read: the parameters what it
+    /// reads (mode 0) and calls (mode 1) stand for, which it then stands for itself.
+    collect: Option<Vec<(u8, u32)>>,
+}
+
+/// The component `PropCollect` gathers for: its first parameter's number, each parameter's
+/// declaration (`Var::decl`), what its `let`s and `fn`s stand for, and its `let`s of maps (for a
+/// spread).
+impl CurComp {
+    /// The number of the parameter declared at `decl`, if it is one of this component's.
+    #[inline]
+    fn param(&self, decl: usize) -> Option<u32> {
+        let size = std::mem::size_of::<Param>();
+        (decl >= self.first && decl < self.first + self.count * size && (decl - self.first) % size == 0).then(|| self.base + ((decl - self.first) / size) as u32)
+    }
+}
+
+struct CurComp {
+    base: u32,
+    /// Where its parameters are (a parameter's declaration is its place in this list), and how
+    /// many.
+    first: usize,
+    count: usize,
+    derived: HashMap<usize, Vec<(u8, u32)>, BuildPtr>,
+    def: Arc<FnDef>,
+}
+
+/// Whether a program's text may call `js(...)` or `js_new(...)`, the only page values
+/// (`Checker::note_page_let`): a quick look at its bytes for either name as a word of its own, true
+/// for more than it need be (a comment, a string, a name not called), never false for one, whatever
+/// comes between the name and its `(` (`js /* c */ (...)`; found in review of FEEDBACK86-89 round
+/// 10b).
+fn may_call_js(text: &str) -> bool {
+    let word = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b >= 0x80);
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(k) = text[from..].find("js") {
+        let at = from + k;
+        let mut after = at + 2;
+        if bytes[after..].starts_with(b"_new") && !word(bytes.get(after + 4)) {
+            after += 4;
+        }
+        if !word(at.checked_sub(1).and_then(|i| bytes.get(i))) && !word(bytes.get(after)) {
+            return true;
+        }
+        from = at + 2;
+    }
+    false
+}
+
+/// A hasher for addresses (a declaration's, a node's) and names: Fx's product, its middle bits
+/// taken for the table's index, since an address's low bits are all zero and Fx's low bits are
+/// made of its input's low bits only (FEEDBACK35.md, Q-431, found in review of FEEDBACK86-89;
+/// branch feedback86-89).
+#[derive(Default, Clone, Copy)]
+struct PtrHasher(u64);
+
+impl std::hash::Hasher for PtrHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        const K: u64 = 0x517c_c1b7_2722_0a95;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let w = u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]);
+            self.0 = (self.0.rotate_left(5) ^ w).wrapping_mul(K);
+        }
+        for &b in chunks.remainder() {
+            self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(K);
+        }
+    }
+
+    fn write_u8(&mut self, b: u8) {
+        self.0 = (self.0.rotate_left(5) ^ b as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline(always)]
+    fn write_usize(&mut self, n: usize) {
+        self.0 = (self.0.rotate_left(5) ^ n as u64).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    #[inline(always)]
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(32)
+    }
+}
+
+type BuildPtr = std::hash::BuildHasherDefault<PtrHasher>;
+
+/// A page value read where it may be shown (`Checker::page_value_shown`), said after the run, in
+/// the walk's order, when every condition holds (a component's parameter shown as text or called
+/// as drawn, `conds`) and the value was not said before (FEEDBACK35.md, Q-431; branch feedback86-89).
+/// Its name and component are the page value's own (`page_lets`), as it was found by them; its
+/// conditions are `Checker::page_conds[conds.0..conds.1]`.
+struct PageEvent {
+    decl: usize,
+    file: Arc<str>,
+    line: u32,
+    conds: (u32, u32),
+    /// How many diagnostics were said before it: where it goes among them, as said in the walk.
+    at: usize,
+}
+
+/// What a spread hands a component, `{...{x: w}}` or `{...m}` with a `let m = {...}` of the
+/// component's that nothing assigns again: each key with its value, the last of a key written
+/// twice; another spread is unknown, so nothing (FEEDBACK35.md, Q-431, found in review of
+/// FEEDBACK86-89; branch feedback86-89).
+fn spread_entries<'a>(e: &'a Expr, maps: &HashMap<&str, &'a Expr, crate::value::BuildFx>) -> Vec<(&'a str, &'a Expr)> {
+    let m = match e {
+        Expr::Map(_) => e,
+        Expr::Ident(n, _) => match maps.get(n.as_str()) {
+            Some(m) => m,
+            None => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    let Expr::Map(es) = m else { return Vec::new() };
+    let mut out: Vec<(&'a str, &'a Expr)> = Vec::new();
+    for (k, v) in es {
+        out.retain(|(o, _)| *o != k.as_str());
+        out.push((k.as_str(), v));
+    }
+    out
+}
+
+/// What an element hands a component, by attribute, as the program does (`Interp::eval_attrs`):
+/// an attribute written out wins over a spread wherever it is written, and of spreads the later
+/// wins (FEEDBACK35.md, Q-431, found in review of FEEDBACK86-89; branch feedback86-89).
+fn given_attrs<'a>(el: &'a HtmlEl, maps: &HashMap<&str, &'a Expr, crate::value::BuildFx>) -> Vec<(&'a str, &'a Expr)> {
+    let mut spread: Vec<(&'a str, &'a Expr)> = Vec::new();
+    let mut out: Vec<(&'a str, &'a Expr)> = Vec::new();
+    for (name, v) in &el.attrs {
+        match v {
+            AttrVal::Expr(e) => out.push((name.as_str(), e)),
+            AttrVal::Spread(e) => {
+                for (k, x) in spread_entries(e, maps) {
+                    spread.retain(|(o, _)| *o != k);
+                    spread.push((k, x));
+                }
+            }
+            AttrVal::Bool => {}
+        }
+    }
+    spread.retain(|(k, _)| !el.attrs.iter().any(|(n, v)| n == k && !matches!(v, AttrVal::Spread(_))));
+    out.extend(spread);
+    out
+}
+
+/// A component's `let`s of a map written out that nothing in it assigns again: what a spread of
+/// one hands (`spread_entries`; found in review: `m = {...}` after `let m` was followed as before).
+fn local_maps(stmts: &[Stmt]) -> HashMap<&str, &Expr, crate::value::BuildFx> {
+    let mut maps: HashMap<&str, &Expr, crate::value::BuildFx> = HashMap::default();
+    for st in stmts {
+        if let Stmt::Let(Pattern::Bind(n), m @ Expr::Map(_), _) = st {
+            maps.insert(n.as_str(), m);
+        }
+    }
+    if maps.is_empty() {
+        return maps;
+    }
+    let mut assigned: Vec<String> = Vec::new();
+    walk_stmts(stmts, &mut |x| {
+        if let Expr::Block(ss) = x {
+            for st in ss.iter() {
+                match st {
+                    Stmt::Assign(n, ..) => assigned.push(n.to_string()),
+                    Stmt::SetField(Expr::Ident(n, _), ..) => assigned.push(n.to_string()),
+                    _ => {}
+                }
+            }
+        }
+    });
+    for st in stmts {
+        match st {
+            Stmt::Assign(n, ..) => assigned.push(n.to_string()),
+            Stmt::SetField(Expr::Ident(n, _), ..) => assigned.push(n.to_string()),
+            _ => {}
+        }
+    }
+    maps.retain(|n, _| !assigned.iter().any(|a| a == n));
+    maps
+}
+
+/// A name's place in the code (`name_sites`): an identifier by its node, a binding by its
+/// declaration as `Checker::define` numbers it.
+enum Site {
+    Expr(usize),
+    Decl(usize),
+}
+
+/// Each identifier and each binding (a `let`'s, a parameter, a `for`'s) in `st`, in one order
+/// that a copy of it, or the same code renamed, gives again: its line, its name and its site
+/// (`Checker::written_pos`; FEEDBACK45.md, Q-523, found in review; branch feedback86-89).
+fn name_sites(st: &Stmt, f: &mut dyn FnMut(u32, &str, Site)) {
+    let params = |d: &FnDef, f: &mut dyn FnMut(u32, &str, Site)| {
+        for p in &d.params {
+            f(d.line, p.name.as_str(), Site::Decl(p as *const Param as usize));
+        }
+    };
+    if let Stmt::Fn(d) = st {
+        params(d, f);
+    }
+    // A route's path parameters, then its query's, groups' and body's names, as
+    // `Checker::route_body` numbers them.
+    if let Stmt::Route(r) = st {
+        let at = &**r as *const RouteDef as usize;
+        let mut nth = 0;
+        for seg in &r.path {
+            if let Seg::Param(n, _, _) | Seg::Rest(n) = seg {
+                f(r.line, n.as_str(), Site::Decl(decl_id(at, nth)));
+                nth += 1;
+            }
+        }
+        let mut ns = Vec::new();
+        for p in r.query.iter().chain(r.guards.iter()).chain(r.body_pat.iter()) {
+            pattern_names(p, &mut ns);
+        }
+        for (i, n) in ns.iter().enumerate() {
+            f(r.line, n, Site::Decl(decl_id(at, nth + i)));
+        }
+    }
+    walk_stmts(std::slice::from_ref(st), &mut |x| match x {
+        Expr::Ident(n, line) => f(*line, n.as_str(), Site::Expr(x as *const Expr as usize)),
+        Expr::Block(ss) => {
+            for s in ss.iter() {
+                match s {
+                    Stmt::Let(p, _, line) => {
+                        let mut ns = Vec::new();
+                        pattern_names(p, &mut ns);
+                        for (i, n) in ns.iter().enumerate() {
+                            f(*line, n, Site::Decl(decl_id(s as *const Stmt as usize, i)));
+                        }
+                    }
+                    Stmt::Fn(d) => params(d, f),
+                    _ => {}
+                }
+            }
+        }
+        Expr::Lambda(d) => params(d, f),
+        // A match arm's names, as `Checker::expr` numbers them (found in review: "`price` takes
+        // any value" of `match 3 { p => 1 }`).
+        Expr::Match(_, arms, _) => {
+            for arm in arms {
+                let mut ns = Vec::new();
+                pattern_names(&arm.pat, &mut ns);
+                for (i, n) in ns.iter().enumerate() {
+                    f(arm.line, n, Site::Decl(decl_id(arm as *const Arm as usize, i)));
+                }
+            }
+        }
+        Expr::For(p, _, _, line) => {
+            let mut ns = Vec::new();
+            pattern_names(p, &mut ns);
+            for (i, n) in ns.iter().enumerate() {
+                f(*line, n, Site::Decl(decl_id(x as *const Expr as usize, i)));
+            }
+        }
+        _ => {}
+    });
+}
+
+/// `detail` (a function's signature, `fn price(n: int) -> int`, or a variable's, `param price: int`)
+/// with its own name, and only that, said as `to` (`Checker::as_written`; FEEDBACK45.md, Q-523, found in review; branch
+/// feedback86-89).
+fn head_as(detail: &str, from: &str, to: &str) -> String {
+    if from == to {
+        return detail.to_string();
+    }
+    // A variable's: `param price: int`.
+    for kw in ["param ", "let ", "state "] {
+        if let Some(rest) = detail.strip_prefix(kw).and_then(|r| r.strip_prefix(from)).filter(|r| r.starts_with(':')) {
+            return format!("{}{}{}", kw, to, rest);
+        }
+    }
+    let head = format!("fn {}(", from);
+    match detail.find(&head) {
+        Some(at) if !detail[..at].contains('(') => format!("{}fn {}({}", &detail[..at], to, &detail[at + head.len()..]),
+        _ => detail.to_string(),
+    }
+}
+
 /// The mark on a name a file took only `as` another (Checker::renames_for).
 const OLD: char = '\u{1}';
 
@@ -2519,6 +2830,12 @@ impl Sig {
 
 /// Source-like text for a definition: `fn add(a: int, b: int = 10) -> int`.
 pub fn def_text(d: &FnDef) -> String {
+    def_text_with(d, &|p| p.name.to_string())
+}
+
+/// `def_text`, each parameter named by `name`: as its file wrote it, where linking renamed it
+/// (`Checker::def_text_written`; FEEDBACK45.md, Q-523, found in review; branch feedback86-89).
+fn def_text_with(d: &FnDef, name: &dyn Fn(&Param) -> String) -> String {
     // A tool says so, in the editor's hover and outline (FEEDBACK56.md, Q-853; branch feedback56).
     let kw = match (d.component, d.server, d.mcp) {
         (true, ..) => "component",
@@ -2531,7 +2848,7 @@ pub fn def_text(d: &FnDef) -> String {
         .params
         .iter()
         .map(|p| {
-            let mut s = p.name.to_string();
+            let mut s = name(p);
             if let Some(t) = &p.ty {
                 s.push_str(&format!(": {}", t.text()));
             }
@@ -2688,6 +3005,10 @@ pub struct Analysis {
     /// What a file took and calls something of its own, or that two files define: the
     /// file, and the symbol under the name it has there (src/modules.rs).
     pub taken: Vec<(String, Symbol)>,
+    /// By file, the names it took only `as` another (`use price as p`, and no `use price` or whole
+    /// `import` of that file): not its own to offer (src/lsp.rs completion; FEEDBACK45.md, Q-523,
+    /// found in review; branch feedback86-89).
+    pub taken_only_as: Vec<(String, String)>,
     /// The program's tools (`fn mcp`), in the order the program declares them, each with what
     /// its code was found to do, for the MCP door (src/mcp.rs; FEEDBACK56.md, Q-858; branch
     /// feedback56).
@@ -3024,6 +3345,28 @@ fn check_file_budgeted(path: &Path, overrides: HashMap<PathBuf, String>, opts: O
     }
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static PROP_WORK: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `n` steps of what the check does with components' parameters and page values
+/// (`PropCollect`, `showing`): a debug build's measure of that work, which a test holds linear in
+/// the program, where a time can fail under load (found in review of FEEDBACK86-89 round 9;
+/// branch feedback86-89). Nothing in a release build.
+#[inline(always)]
+fn prop_work(n: u64) {
+    #[cfg(debug_assertions)]
+    PROP_WORK.with(|w| w.set(w.get() + n));
+    let _ = n;
+}
+
+/// Debug builds: the steps `prop_work` counted on this thread so far.
+#[cfg(debug_assertions)]
+pub fn prop_work_done() -> u64 {
+    PROP_WORK.with(|w| w.get())
+}
+
 /// Checks source text (the main file need not be saved); `use`d files are
 /// read from `base_dir`.
 pub fn check_source(src: &str, file: &str, base_dir: &Path) -> Analysis {
@@ -3152,6 +3495,7 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
     c.root = base_dir.to_path_buf();
     c.overrides = overrides;
     let main: Arc<str> = Arc::from(file);
+    c.page_possible |= may_call_js(src);
     let mut parser = Parser::new(src);
     // And the comments right after a value (FEEDBACK72.md, Q-1016; branch feedback72-81).
     let (parsed, noted) = crate::lexer::noting_value_comments(|| parser.parse_program());
@@ -3216,7 +3560,13 @@ fn check_source_in(src: &str, file: &str, base_dir: &Path, overrides: HashMap<Pa
                     })
                     .collect()
             };
+            c.resolve_written(&order);
             c.run(order);
+            // The page values whose showing waited on what components do with their parameters.
+            c.page_values_said();
+            // Kept by what `order` held, which is gone.
+            c.written_exprs.clear();
+            c.written_decls.clear();
             c.server_fn_redirects();
             c.loading_reads_said();
             c.unused_said();
@@ -3368,6 +3718,9 @@ struct FnCtx {
     /// What the function gives back other than at the end of its body:
     /// values of `return`, and the errors `?` passes on.
     exits: T,
+    /// A component's own frame: the names of its page values so far (`Checker::page_lets_here`;
+    /// FEEDBACK35.md, Q-431, found in review of FEEDBACK86-89; branch feedback86-89).
+    page_names: Vec<Sym>,
 }
 
 /// One test a `let` holds (`Checker::aliases`): as written, the way it holds there (true or
@@ -3394,7 +3747,7 @@ struct Checker {
     /// The files that take a file whole that could not be read (FEEDBACK55.md, Q-819).
     failed_whole: HashSet<PathBuf>,
     /// Top-level functions and `let` lambdas, by name (Q-514).
-    bodies: HashMap<String, Arc<FnDef>>,
+    bodies: HashMap<String, Arc<FnDef>, BuildPtr>,
     /// The route's path parameters with no type, while its body is checked (Q-513).
     text_params: Vec<String>,
     /// How many scopes deep the route's own is, so a local of the same name is not taken
@@ -3426,8 +3779,65 @@ struct Checker {
     set_fields: Vec<(String, String)>,
     /// A component's `let`s whose value comes from the page (`js(...)`), by component: shown in
     /// markup, they make the browser remake the component (FEEDBACK35.md, Q-431; branch
-    /// feedback27-35-fixes).
-    page_lets: Vec<(String, String)>,
+    /// feedback27-35-fixes). Each with where it is declared (`Var::decl`; FEEDBACK35.md, Q-431, found
+    /// in review of FEEDBACK86-89; branch feedback86-89).
+    page_lets: HashMap<usize, (String, Sym), BuildPtr>,
+    /// Where a file wrote a name it took `as` another (`use inv as total`), which linking renames
+    /// to the other file's (`inv`): each use by its node, each binding of the name by its
+    /// declaration (`Var::decl`), with the name as written. What the check says of that use or
+    /// binding names it so (`said_name`, `cur_written`); nothing else of the other file's is said
+    /// any other way (`Checker::reparsed_written`; FEEDBACK45.md, Q-523, found in review; branch
+    /// feedback86-89).
+    written_exprs: HashMap<usize, String>,
+    written_decls: HashMap<usize, String>,
+    /// Where those are, by file, line and place among the names on the line (`name_sites`), as the
+    /// file was parsed; `resolve_written` finds them on what the check reads, which holds them
+    /// while it runs (found in review: kept by a node's address, a dropped file's nodes were
+    /// another's later).
+    written_pos: HashMap<(Arc<str>, u32, u32), String>,
+    /// A route whose path names a parameter so, by file and line: its path and `shown()` as written.
+    written_routes: HashMap<(Arc<str>, u32, String), (String, String)>,
+    /// The name as written of the identifier being read (`written_exprs`), while it is.
+    cur_written: Option<String>,
+    /// The name as written of the function being called, for `apply`'s messages.
+    said_name: Option<String>,
+    /// A component's own `let`s that hold a lambda, by declaration: a call of one in markup shows
+    /// what it reads (`page_lets`; FEEDBACK35.md, Q-431, found in review of FEEDBACK86-89; branch
+    /// feedback86-89).
+    /// Each with what its body reads and calls, by the binding each name has where the lambda is
+    /// written (found in review: read where it was called, a `map`'s `(r) => f()` hid the page's `r`).
+    page_lambdas: HashMap<usize, (Vec<(String, usize)>, Vec<usize>), BuildPtr>,
+    /// Names a file took only `as` another, with the files it took whole, which may give the name
+    /// as itself (`Analysis::taken_only_as`, decided in `as_written`).
+    taken_as_open: Vec<(String, PathBuf, String)>,
+    /// What components do with their parameters, gathered as the walk goes (`PropCollect`).
+    prop: PropCollect,
+    /// The page values' showings, said after the run (`page_values_said`).
+    page_events: Vec<PageEvent>,
+    page_conds: Vec<(u32, u8)>,
+    /// How many diagnostics were said when `showing` started.
+    showing_at: usize,
+    /// Whether a source read writes `js(` or `js_new(` (`may_call_js`): without one there is no page
+    /// value, and what components do with their parameters is not gathered (found in review of
+    /// FEEDBACK86-89 round 10: a program with none should pay nothing for it).
+    page_possible: bool,
+    /// Whether a local or parameter is named `js` or `js_new` (set as one is declared, and kept),
+    /// and whether the program's `js` and `js_new` are the builtins (found once the bodies are
+    /// read, when the program's names are all in): for `note_page_let`.
+    js_locals: bool,
+    js_global: std::cell::Cell<[Option<bool>; 2]>,
+    /// Whether any local or parameter has a capitalised name, which an element's tag may then be
+    /// (`tag_body`): set as one is declared, and kept.
+    upper_locals: bool,
+    /// While `showing`: the conditions of what it shows, and of a node in an attribute of a
+    /// component inside it.
+    showing_conds: Vec<(u32, u8)>,
+    showing_node_conds: HashMap<*const Expr, Vec<(u32, u8)>, BuildPtr>,
+    /// While a child of markup in a component is read: its element's line (`page_lets`; FEEDBACK35.md, Q-431, found in review of FEEDBACK86-89;
+    /// branch feedback86-89).
+    showing: Option<u32>,
+    /// What runs later in that child (`runs_later`), where a name is not shown.
+    showing_later: HashSet<*const Expr, BuildPtr>,
     /// The `let`s and `state`s set from a call that can fail (`state news = load_news()`, a server
     /// fn declared `! str`), by where each is declared: shown in markup as they are, they may show
     /// an error value (FEEDBACK81.md, Q-1272; branch feedback72-81).
@@ -3812,7 +4222,27 @@ impl Checker {
             );
         }
         Checker {
-            page_lets: Vec::new(),
+            page_lets: HashMap::default(),
+            showing: None,
+            written_exprs: HashMap::new(),
+            written_decls: HashMap::new(),
+            written_routes: HashMap::new(),
+            written_pos: HashMap::new(),
+            cur_written: None,
+            said_name: None,
+            page_lambdas: HashMap::default(),
+            prop: PropCollect::default(),
+            page_events: Vec::new(),
+            page_conds: Vec::new(),
+            showing_at: 0,
+            upper_locals: false,
+            page_possible: false,
+            js_locals: false,
+            js_global: std::cell::Cell::new([None, None]),
+            showing_conds: Vec::new(),
+            showing_node_conds: HashMap::default(),
+            taken_as_open: Vec::new(),
+            showing_later: HashSet::default(),
             failing_vars: HashSet::new(),
             fail_lets: HashMap::new(),
             matching: Vec::new(),
@@ -3914,7 +4344,7 @@ impl Checker {
             text_params: Vec::new(),
             text_params_depth: 0,
             path_params: Vec::new(),
-            bodies: HashMap::new(),
+            bodies: HashMap::default(),
             failed_imports: HashSet::new(),
             failed_whole: HashSet::new(),
             confined: false,
@@ -4022,12 +4452,14 @@ impl Checker {
         let mut dollars: Vec<(String, String, String)> = Vec::new();
         // And the comments right after a value (FEEDBACK72.md, Q-1016; branch feedback72-81).
         let mut comments: Vec<(Arc<str>, u32, String, String)> = Vec::new();
+        let mut js_seen = false;
         self.links = crate::modules::link(Path::new(file), stmts.clone(), base, &mut |path, full| {
             // As `file_at` judges it (FEEDBACK55.md, Q-703; branch feedback55).
             if confined && (!Path::new(path).components().all(|c| matches!(c, std::path::Component::Normal(_))) || !crate::builtins::stays_in(&root, full) || !confined_reads(&root, path, full, false)) {
                 return None;
             }
             let text = overrides.get(full).cloned().map_or_else(|| crate::error::read_source(full), Ok).ok()?;
+            js_seen |= may_call_js(&text);
             let mut p = Parser::new(&text);
             let (parsed, noted) = crate::lexer::noting_value_comments(|| p.parse_program().ok().map(Arc::new));
             let shown = full.display().to_string();
@@ -4037,6 +4469,7 @@ impl Checker {
             parsed
         });
         self.plain_dollars.extend(dollars);
+        self.page_possible |= js_seen;
         self.value_comments.extend(comments);
         // Said at the import line, by the path the program wrote, and once: the name it could
         // not take is not said again where it is used (FEEDBACK45.md, Q-523).
@@ -4057,8 +4490,90 @@ impl Checker {
         }
         let main_real = self.real_of(file).unwrap_or_else(|| PathBuf::from(file));
         match self.renames_for(&main_real, src) {
-            Some(names) => reparsed(src, &names).map(Arc::new),
+            Some(names) => self.reparsed_written(src, &names, file, &main_real).map(Arc::new),
             None => Ok(stmts),
+        }
+    }
+
+    /// `reparsed`, noting first where the file writes a name it took `as` another
+    /// (`written_exprs`, `written_decls`): a lowercase alias of a name linking renames.
+    fn reparsed_written(&mut self, src: &str, names: &HashMap<String, String>, file: &str, key: &Path) -> Result<Vec<Stmt>, crate::error::QuilloError> {
+        let mut stmts = Parser::new(src).parse_program()?;
+        let aliases: HashSet<String> = stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Use(_, Some(list), _, _) => Some(list),
+                _ => None,
+            })
+            .flatten()
+            .filter(|(n, a)| n != a && a.starts_with(|c: char| c.is_lowercase()) && names.contains_key(a.as_str()))
+            .map(|(_, a)| a.clone())
+            .collect();
+        let mut routes: Vec<(usize, String, String)> = Vec::new();
+        // The names taken only `as` another, from the parsed `use`s, as linking reads them: not
+        // one taken as itself, from any file; one a file taken whole gives as a public name is
+        // decided by linking's own files, once the program is read (`as_written`).
+        for st in &stmts {
+            let Stmt::Use(_, Some(list), _, _) = st else { continue };
+            for (n, a) in list {
+                let itself = stmts.iter().any(|o| matches!(o, Stmt::Use(_, Some(l), _, _) if l.iter().any(|(m, b)| m == n && b == n)));
+                if n != a && n != "*" && !itself && !self.taken_as_open.iter().any(|(f, _, m)| f == file && m == n) {
+                    self.taken_as_open.push((file.to_string(), key.to_path_buf(), n.clone()));
+                }
+            }
+        }
+        if !aliases.is_empty() {
+            let file: Arc<str> = Arc::from(file);
+            let mut on_line: HashMap<u32, u32> = HashMap::new();
+            routes = stmts
+                .iter()
+                .enumerate()
+                .filter_map(|(i, st)| match st {
+                    Stmt::Route(r) if r.path.iter().any(|g| matches!(g, Seg::Param(n, _, _) | Seg::Rest(n) if aliases.contains(n.as_str()))) => Some((i, route_path(r), r.shown())),
+                    _ => None,
+                })
+                .collect();
+            for st in &stmts {
+                name_sites(st, &mut |line, name, _| {
+                    let k = on_line.entry(line).or_insert(0);
+                    if aliases.contains(name) {
+                        self.written_pos.insert((file.clone(), line, *k), name.to_string());
+                    }
+                    *k += 1;
+                });
+            }
+        }
+        crate::privacy::rename_as(&mut stmts, names, "a name another file has too")?;
+        // Each route by its line and its path as linking renamed it, which two on one line do not
+        // share (found in review: by line alone, `route GET /a/:p = ...; route GET /b = ...` were one).
+        for (i, path, shown) in routes {
+            if let Stmt::Route(r) = &stmts[i] {
+                self.written_routes.insert((Arc::from(file), r.line, route_path(r)), (path, shown));
+            }
+        }
+        Ok(stmts)
+    }
+
+    /// The uses and bindings of `written_pos`, found on the statements the check reads (`order`,
+    /// which holds them while it runs): each by its file, line and place among the names on that
+    /// line, which a copy keeps (FEEDBACK45.md, Q-523, found in review; branch feedback86-89).
+    fn resolve_written(&mut self, order: &[Item]) {
+        if self.written_pos.is_empty() {
+            return;
+        }
+        let mut on_line: HashMap<(Arc<str>, u32), u32> = HashMap::new();
+        let (pos, exprs, decls) = (&self.written_pos, &mut self.written_exprs, &mut self.written_decls);
+        for it in order {
+            name_sites(&it.stmt, &mut |line, _, site| {
+                let k = on_line.entry((it.file.clone(), line)).or_insert(0);
+                if let Some(n) = pos.get(&(it.file.clone(), line, *k)) {
+                    match site {
+                        Site::Expr(at) => exprs.insert(at, n.clone()),
+                        Site::Decl(id) => decls.insert(id, n.clone()),
+                    };
+                }
+                *k += 1;
+            });
         }
     }
 
@@ -4234,6 +4749,9 @@ impl Checker {
                 }
                 let fname: Arc<str> = Arc::from(full.display().to_string());
                 let text = self.overrides.get(&full).cloned().map_or_else(|| crate::error::read_source(&full), Ok);
+                if let Ok(t) = &text {
+                    self.page_possible |= may_call_js(t);
+                }
                 // Rust: its functions' signatures, read without building it.
                 if crate::native::is_rust(&path) {
                     if let Err(e) = crate::native::plugin_allowed(&full) {
@@ -4319,7 +4837,7 @@ impl Checker {
                 }
                 match text {
                     Ok(src) => match match (self.renames_for(&key, &src), self.links.parsed.get(&key)) {
-                        (Some(names), _) => reparsed(&src, &names).map(Arc::new),
+                        (Some(names), _) => self.reparsed_written(&src, &names, &fname, &key).map(Arc::new),
                         (None, Some(parsed)) => Ok(parsed.clone()),
                         (None, None) => Parser::new(&src).parse_program().map(Arc::new),
                     } {
@@ -4710,7 +5228,8 @@ impl Checker {
                     } else {
                         SymbolKind::Function
                     };
-                    self.out.symbols.push(Symbol { name: d.name.clone(), kind, file: it.file.to_string(), line: d.line, detail: def_text(d) });
+                    let detail = self.def_text_written(d);
+                    self.out.symbols.push(Symbol { name: d.name.clone(), kind, file: it.file.to_string(), line: d.line, detail });
                 }
                 Stmt::Service(name, _, _, _, _, _) => {
                     if let Some(g) = self.globals.get_mut(name) {
@@ -4723,12 +5242,15 @@ impl Checker {
                 // A guarded group's hidden route is no route of the program's (Q-539).
                 Stmt::Route(r) if r.method == crate::ast::GUARD_METHOD => {}
                 Stmt::Route(r) => {
+                    // As written, where a parameter has the name of one taken `as` another
+                    // (`written_routes`; FEEDBACK45.md, Q-523, found in review; branch feedback86-89).
+                    let (path, _) = self.route_said(&it.file, r);
                     self.out.symbols.push(Symbol {
-                        name: format!("{} {}", r.method, route_path(r)),
+                        name: format!("{} {}", r.method, path),
                         kind: SymbolKind::Route,
                         file: it.file.to_string(),
                         line: r.line,
-                        detail: format!("route {} {}", r.method, route_path(r)),
+                        detail: format!("route {} {}", r.method, path),
                     });
                 }
                 Stmt::Let(p, e, line) => {
@@ -5803,6 +6325,12 @@ impl Checker {
         self.scope_ids.truncate(self.scopes.len());
         if let Some(scope) = popped {
             for (name, v) in scope {
+                // A binding of a name the file took `as` another, as written (`written_decls`;
+                // FEEDBACK45.md, Q-523, found in review; branch feedback86-89).
+                let name = match self.written_decls.get(&v.decl) {
+                    Some(w) if v.decl != 0 => w.clone(),
+                    _ => name,
+                };
                 // Quillo's own names (`__request`) are no editor's to offer (FEEDBACK47.md, Q-535).
                 // Also for Q-1016's `//` warning, which reads a local's type here, where a file has
                 // such a comment (`value_comments_said`; found in review of the 0.8.10 release
@@ -5878,9 +6406,12 @@ impl Checker {
                 };
                 // Another file's route by its file too (found in review).
                 let at = if efile == file { format!("line {}", e.line) } else { self.shown_at(efile, e.line) };
+                // As its file wrote it (`route_said`; FEEDBACK45.md, Q-523, found in review; branch
+                // feedback86-89).
+                let shown = self.route_said(efile, e).1;
                 self.diag_at(file.clone(), r.line, Severity::Warning, format!(
                     "this route is never reached: `{}` ({}) takes every request it would{}",
-                    e.shown(), at, unguarded
+                    shown, at, unguarded
                 ));
             }
         }
@@ -6038,6 +6569,8 @@ impl Checker {
             d => d,
         };
         let v = Var { t, sig, file: self.file.clone(), line: self.line, kind, used: false, ready: true, decl };
+        self.upper_locals |= !self.scopes.is_empty() && name.starts_with(|c: char| c.is_uppercase());
+        self.js_locals |= !self.scopes.is_empty() && (name == "js" || name == "js_new");
         let read_before = kind == Kind::Let && self.read_before(name);
         match self.scopes.last_mut() {
             Some(s) => {
@@ -6064,14 +6597,25 @@ impl Checker {
             return;
         }
         let def = if &*v.file == "<builtin>" { None } else { Some((v.file.to_string(), v.line)) };
-        let detail = var_detail(name, v);
         if v.kind == Kind::State {
             let at = self.out.references.len();
             if let Some(e) = self.state_types.get_mut(&(v.file.clone(), v.line, name.to_string())) {
                 e.1.push(at);
             }
         }
-        self.out.references.push(Reference { file: self.file.to_string(), line: self.line, name: name.to_string(), def, detail });
+        // A use written as an alias, by that name, and only its own name in its detail
+        // (`written_exprs`; FEEDBACK45.md, Q-523, found in review; branch feedback86-89).
+        let detail = match (self.cur_written.clone(), self.written_decls.get(&v.decl).filter(|_| v.decl != 0)) {
+            (_, Some(w)) => var_detail(w, v),
+            (Some(w), None) => head_as(&var_detail(name, v), name, &w),
+            // This file's own function, its parameters as written.
+            (None, None) => match v.sig.as_ref().and_then(|s| s.def.as_ref()) {
+                Some(d) if !self.written_decls.is_empty() && v.file == self.file => self.def_text_written(d),
+                _ => var_detail(name, v),
+            },
+        };
+        let shown = self.cur_written.clone().unwrap_or_else(|| name.to_string());
+        self.out.references.push(Reference { file: self.file.to_string(), line: self.line, name: shown, def, detail });
     }
 
     /// A global of another file must be one this file took (FEEDBACK19.md, Q-154; branch
@@ -6161,6 +6705,14 @@ impl Checker {
     /// what linking made of them, which reads as a private name and is the same word for
     /// two functions (FEEDBACK19.md, Q-154; branch feedback19-fixes).
     fn as_written(&mut self) {
+        // A name taken only `as` another, unless a file it takes whole has it as a public name:
+        // then it is this file's as itself too (found in review: any `use *` kept the name offered,
+        // a file matched by its path's end, and a private name counted).
+        for (file, key, n) in std::mem::take(&mut self.taken_as_open) {
+            if !self.links.whole_gives(&key, &n) {
+                self.out.taken_only_as.push((file, n));
+            }
+        }
         let links = std::mem::take(&mut self.links);
         let mut written: HashMap<String, HashMap<String, String>> = HashMap::new();
         for file in self.out.files.clone() {
@@ -6169,20 +6721,27 @@ impl Checker {
             // Q-821; branch feedback55).
             let mut names: Vec<(&String, &String)> = names.iter().filter(|(n, _)| !n.starts_with(crate::privacy::TYPE_ALIAS)).collect();
             names.sort();
-            for (name, inner) in names.iter().rev() {
+            // A name taken `as` another is told by where it is written (`written_exprs`), not by
+            // the name it has here, which the other file's declarations have too (FEEDBACK45.md,
+            // Q-523, found in review; branch feedback86-89).
+            for (name, inner) in names.iter().rev().filter(|(n, i)| crate::privacy::demangle(i) == **n) {
                 written.entry(file.clone()).or_default().insert(inner.to_string(), name.to_string());
             }
             for (name, inner) in names {
                 if let Some(s) = self.out.symbols.iter().find(|s| s.name == *inner && s.file != file) {
-                    let shown = Symbol { name: name.clone(), detail: crate::privacy::demangle(&s.detail), ..s.clone() };
+                    // Its own name said as this file takes it, `fn p(n: int)` of `use price as p`, and
+                    // nothing else of the other file's declaration (`head_as`; FEEDBACK45.md, Q-523,
+                    // found in review; branch feedback86-89).
+                    let shown = Symbol { name: name.clone(), detail: crate::privacy::demangle(&head_as(&s.detail, inner, name)), ..s.clone() };
                     self.out.taken.push((file.clone(), shown));
                 }
             }
         }
         let shown = |file: &str, name: &mut String, detail: &mut String| {
             if let Some(w) = written.get(file).and_then(|names| names.get(name.as_str())) {
+                // The name itself in its detail too, as above.
+                *detail = crate::privacy::demangle(&head_as(detail, name, w));
                 *name = w.clone();
-                *detail = crate::privacy::demangle(detail);
             }
         };
         for r in &mut self.out.references {
@@ -6239,6 +6798,571 @@ impl Checker {
                 Some(v.clone())
             }
             None => self.globals.get(name).cloned().or_else(|| self.old_name(name)),
+        }
+    }
+
+    /// `def_text` with the parameters as the file wrote them (`written_decls`).
+    fn def_text_written(&self, d: &FnDef) -> String {
+        if self.written_decls.is_empty() {
+            return def_text(d);
+        }
+        def_text_with(d, &|p| self.written_decls.get(&(p as *const Param as usize)).cloned().unwrap_or_else(|| p.name.to_string()))
+    }
+
+    /// A route as its file wrote it (`written_routes`): its path, and as messages show it.
+    fn route_said(&self, file: &Arc<str>, r: &RouteDef) -> (String, String) {
+        match self.written_routes.get(&(file.clone(), r.line, route_path(r))) {
+            Some(w) => w.clone(),
+            None => (route_path(r), r.shown()),
+        }
+    }
+
+    /// Whether `e` names one of the component's page values at all: only then is what a component
+    /// does with it asked (found in review: 2,000 attributes asked of a component of 2,000
+    /// parameters).
+    fn reads_page_value(&self, e: &Expr) -> bool {
+        let Some(mine) = self.page_frame().map(|f| &f.page_names) else { return false };
+        let mut found = false;
+        walk_expr(e, &mut |y| {
+            if let (false, Expr::Ident(m, _)) = (found, y) {
+                found = mine.iter().any(|pn| pn.as_str() == m.as_str());
+            }
+        });
+        found
+    }
+
+    /// The frame of the component being checked: its own, not a handler's or a local fn's inside it.
+    #[inline]
+    fn page_frame(&self) -> Option<&FnCtx> {
+        self.fns.iter().rev().find(|f| f.component.is_some() && !f.nested)
+    }
+
+    /// Whether the component being checked has page values (`page_lets`), the only place a showing
+    /// can say anything.
+    #[inline]
+    fn page_lets_here(&self) -> bool {
+        self.page_frame().is_some_and(|f| !f.page_names.is_empty())
+    }
+
+    // ---- a component's parameters, gathered as the walk goes (`PropCollect`) ----------------
+
+    /// The number of the component `d`'s first parameter: given when first needed.
+    fn prop_base(&mut self, d: &FnDef) -> u32 {
+        let at = d as *const FnDef as usize;
+        if let Some(b) = self.prop.base.get(&at) {
+            return *b;
+        }
+        let b = self.prop.n;
+        self.prop.base.insert(at, b);
+        self.prop.n += d.params.len() as u32;
+        let n = self.prop.n as usize;
+        self.prop.facts[0].resize(n, false);
+        self.prop.facts[1].resize(n, false);
+        b
+    }
+
+    /// The parameter `prop` of the component `tag`, numbered; none for a component the program
+    /// does not have (a parameter's, a browser library's, a typo), which is taken to do neither:
+    /// unknown is false until proven (the coordinator's decision on A2 round 7).
+    fn prop_pair(&mut self, tag: &str, prop: &str) -> Option<u32> {
+        let d = self.tag_body(tag)?;
+        let i = d.params.iter().position(|p| p.name.as_str() == prop)?;
+        Some(self.prop_base(&d) + i as u32)
+    }
+
+    /// The program's component an element's tag is, by the binding the tag has here: none where a
+    /// parameter or a local holds the name (`<Show>` with a parameter `Show`), which is unknown (found
+    /// in review of FEEDBACK86-89 round 9).
+    fn tag_body(&self, tag: &str) -> Option<Arc<FnDef>> {
+        let d = self.bodies.get(tag)?;
+        (!(self.upper_locals && self.is_local(tag))).then(|| d.clone())
+    }
+
+    /// The parameters the declaration `decl` stands for in the component being walked, by mode: a
+    /// parameter itself (both modes, found by its place among the parameters), or a `let` or local
+    /// `fn` made from one. Fed to `f` one by one, nothing made.
+    #[inline]
+    fn prop_each(cur: &CurComp, decl: usize, mut f: impl FnMut(u8, u32)) {
+        if decl == 0 {
+            return;
+        }
+        if let Some(p) = cur.param(decl) {
+            f(0, p);
+            f(1, p);
+            return;
+        }
+        if cur.derived.is_empty() {
+            return;
+        }
+        if let Some(es) = cur.derived.get(&decl) {
+            for (m, p) in es {
+                f(*m, *p);
+            }
+        }
+    }
+
+    /// `prop_each` into a list, for the few places that keep them.
+    fn prop_entries(&self, decl: usize) -> Vec<(u8, u32)> {
+        let mut out = Vec::new();
+        if let Some(c) = &self.prop.cur {
+            Self::prop_each(c, decl, |m, p| out.push((m, p)));
+        }
+        out
+    }
+
+    /// A name read, resolved to `decl`: shown as text where it is in a child's text and not in what
+    /// runs later; handed on where it is in an attribute given to a component; made into what a
+    /// `let` being read holds.
+    #[inline(never)]
+    fn prop_ident(&mut self, decl: usize) {
+        prop_work(1);
+        let PropCollect { cur, facts, edges, collect, later, attr, text, .. } = &mut self.prop;
+        let Some(cur) = cur.as_ref() else { return };
+        let (later, attr, text) = (*later, *attr, *text);
+        Self::prop_each(cur, decl, |m, p| {
+            if m != 0 {
+                return;
+            }
+            if let Some(c) = collect.as_mut() {
+                c.push((0, p));
+            }
+            if later == 0 {
+                if let Some((t, _)) = attr {
+                    edges[0].push((p, t));
+                }
+                if text {
+                    facts[0][p as usize] = true;
+                }
+            }
+        });
+    }
+
+    /// A call of a name resolved to `decl`: called as drawn where nothing makes it later or apart;
+    /// handed on in a lambda given to a component; made into what a `let` or `fn` holds. The name
+    /// is read too.
+    #[inline(never)]
+    fn prop_call(&mut self, decl: usize) {
+        prop_work(1);
+        self.prop_ident(decl);
+        let PropCollect { cur, facts, edges, collect, later, attr, apart, .. } = &mut self.prop;
+        let Some(cur) = cur.as_ref() else { return };
+        let (later, attr, apart) = (*later, *attr, *apart);
+        Self::prop_each(cur, decl, |m, p| {
+            if m != 1 {
+                return;
+            }
+            if let Some(c) = collect.as_mut() {
+                c.push((1, p));
+            }
+            if later == 0 {
+                match attr {
+                    Some((t, true)) => edges[1].push((p, t)),
+                    _ if apart == 0 => facts[1][p as usize] = true,
+                    _ => {}
+                }
+            }
+        });
+    }
+
+    /// What a spread given to a component hands its parameters, as the program does (`given_attrs`):
+    /// each live entry's names resolved here, each to its parameter.
+    #[inline(never)]
+    fn prop_spread_given(&mut self, el: &HtmlEl, e: &Expr) {
+        let Some(def) = self.prop.cur.as_ref().map(|c| c.def.clone()) else { return };
+        let stmts: &[Stmt] = match &def.body {
+            Expr::Block(ss) => ss,
+            _ => &[],
+        };
+        let maps = local_maps(stmts);
+        let given = given_attrs(el, &maps);
+        for (k, v) in spread_entries(e, &maps) {
+            if !given.iter().any(|(gk, gv)| *gk == k && std::ptr::eq(*gv, v)) {
+                continue;
+            }
+            let Some(t) = self.prop_pair(&el.tag, k) else { continue };
+            let resolve = |c: &Self, n: &str| c.scopes.iter().rev().find_map(|s| s.get(n)).map(|v| v.decl).unwrap_or(0);
+            let mut shown: Vec<usize> = Vec::new();
+            let mut called: Vec<usize> = Vec::new();
+            walk_expr(v, &mut |z| match z {
+                Expr::Ident(n, _) => shown.push(resolve(self, n.as_str())),
+                Expr::Call(c, _, _) if matches!(v, Expr::Lambda(_)) => {
+                    if let Expr::Ident(n, _) = &**c {
+                        called.push(resolve(self, n.as_str()));
+                    }
+                }
+                _ => {}
+            });
+            if let Expr::Ident(n, _) = v {
+                called.push(resolve(self, n.as_str()));
+            }
+            for d in shown {
+                let es = self.prop_entries(d);
+                self.prop.edges[0].extend(es.into_iter().filter(|(m, _)| *m == 0).map(|(_, p)| (p, t)));
+            }
+            for d in called {
+                let es = self.prop_entries(d);
+                self.prop.edges[1].extend(es.into_iter().filter(|(m, _)| *m == 1).map(|(_, p)| (p, t)));
+            }
+        }
+    }
+
+    /// After the run: the least set that holds, backward from each parameter a component uses
+    /// itself along what hands it on (a reversed index of the edges, by counts), each once. A cycle
+    /// (a component that draws itself) is false until something in it is proven. Linear, and past
+    /// the check's budget what is not found is false.
+    fn prop_facts_settle(&mut self) {
+        if self.prop.settled {
+            return;
+        }
+        self.prop.settled = true;
+        let n = self.prop.n as usize;
+        let mut work = 0usize;
+        let both = std::mem::take(&mut self.prop.edges[2]);
+        for mode in 0..2 {
+            let mine = std::mem::take(&mut self.prop.edges[mode]);
+            prop_work((n + mine.len() + both.len()) as u64);
+            let es = || mine.iter().chain(both.iter());
+            let mut start = vec![0u32; n + 1];
+            for (_, to) in es() {
+                start[*to as usize + 1] += 1;
+            }
+            for i in 0..n {
+                start[i + 1] += start[i];
+            }
+            let mut fill = start.clone();
+            let mut from = vec![0u32; mine.len() + both.len()];
+            for (f, to) in es() {
+                from[fill[*to as usize] as usize] = *f;
+                fill[*to as usize] += 1;
+            }
+            let facts = &mut self.prop.facts[mode];
+            let mut todo: Vec<u32> = (0..n as u32).filter(|i| facts[*i as usize]).collect();
+            while let Some(t) = todo.pop() {
+                work += 1;
+                prop_work(1);
+                if budget_spent(work) {
+                    break;
+                }
+                for f in &from[start[t as usize] as usize..start[t as usize + 1] as usize] {
+                    if !facts[*f as usize] {
+                        facts[*f as usize] = true;
+                        todo.push(*f);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the numbered parameter `p` holds in `mode`, once settled.
+    fn prop_holds(&self, p: u32, mode: u8) -> bool {
+        self.prop.facts[mode as usize].get(p as usize).copied().unwrap_or(false)
+    }
+
+    /// Starts `showing` for the child `x` of an element at `line`, in a component: whether it did.
+    /// In the markup it makes, an HTML element's attribute is no showing (the browser keeps its own
+    /// value without making the component again: runtime.js `attrDiffers`; FEEDBACK55.md, Q-774);
+    /// a component's attribute is shown only if that component shows it as text or calls it as drawn,
+    /// which is known after the run: each of its nodes carries that condition (`showing_node_conds`).
+    #[inline(never)]
+    fn start_showing(&mut self, x: &Expr, line: u32) -> bool {
+        if self.quiet > 0 || !self.page_lets_here() {
+            return false;
+        }
+        self.showing = Some(line);
+        prop_work(1);
+        // Its page values are said where it starts, before what the walk says inside it, as they
+        // were said before they waited for the run (found in review of FEEDBACK86-89 round 9).
+        self.showing_at = self.out.diagnostics.len();
+        // A name or a literal: nothing in it runs later, and no component's attribute.
+        if matches!(x, Expr::Ident(..) | Expr::Lit(_)) {
+            self.showing_later.clear();
+            return true;
+        }
+        self.showing_later = runs_later(x);
+        // Each component's attribute in it, in order, with its parameter's number (none for one the
+        // program does not have), then each one's nodes marked in the same order.
+        let mut named: Vec<(String, String, u8)> = Vec::new();
+        walk_expr(x, &mut |y| {
+            if let Expr::Html(el, _) = y {
+                walk_html_els(el, &mut |h| {
+                    if h.tag.starts_with(|c: char| c.is_uppercase()) {
+                        for (n, v) in &h.attrs {
+                            if let AttrVal::Expr(e) = v {
+                                named.push((h.tag.clone(), n.clone(), matches!(e, Expr::Lambda(_)) as u8));
+                            }
+                        }
+                    }
+                })
+            }
+        });
+        let pairs: Vec<Option<(u32, u8)>> = named.iter().map(|(t, n, m)| self.prop_pair(t, n).map(|p| (p, *m))).collect();
+        let mut k = 0usize;
+        let mut later: Vec<*const Expr> = Vec::new();
+        let mut conds: Vec<(*const Expr, (u32, u8))> = Vec::new();
+        walk_expr(x, &mut |y| {
+            if let Expr::Html(el, _) = y {
+                walk_html_els(el, &mut |h| {
+                    let component = h.tag.starts_with(|c: char| c.is_uppercase());
+                    for (_, v) in &h.attrs {
+                        match v {
+                            AttrVal::Expr(e) if component => {
+                                let pair = pairs[k];
+                                k += 1;
+                                walk_expr(e, &mut |z| match pair {
+                                    Some(c) => conds.push((z as *const Expr, c)),
+                                    None => later.push(z as *const Expr),
+                                });
+                            }
+                            AttrVal::Expr(e) | AttrVal::Spread(e) => walk_expr(e, &mut |z| later.push(z as *const Expr)),
+                            AttrVal::Bool => {}
+                        }
+                    }
+                })
+            }
+        });
+        prop_work((conds.len() + later.len()) as u64);
+        for (z, c) in conds {
+            self.showing_node_conds.entry(z).or_default().push(c);
+        }
+        self.showing_later.extend(later);
+        true
+    }
+
+    /// Ends `showing`.
+    fn stop_showing(&mut self) {
+        self.showing = None;
+        self.showing_later.clear();
+        self.showing_conds.clear();
+        self.showing_node_conds.clear();
+    }
+
+    /// `start_showing` for an attribute of the component `el` given `e`: its parameter numbered `p`,
+    /// shown only if that component shows it as text, or calls it as drawn for a function
+    /// (`showing_conds`). An HTML element's attribute is no showing, and is not asked (runtime.js
+    /// `attrDiffers`; FEEDBACK55.md, Q-774; the coordinator's decision on A2 round 5).
+    #[inline(never)]
+    fn start_showing_attr(&mut self, el: &HtmlEl, p: u32, e: &Expr) -> bool {
+        // A name is asked as it is read (`page_value_shown`); what else is given is looked
+        // through first.
+        if self.quiet > 0 || !(matches!(e, Expr::Ident(..)) || self.reads_page_value(e)) {
+            return false;
+        }
+        if !self.start_showing(e, el.line) {
+            return false;
+        }
+        self.showing_conds.push((p, matches!(e, Expr::Lambda(_)) as u8));
+        true
+    }
+
+    /// `start_showing_attr` for a spread given to a component: the entries it hands on as the
+    /// program does (`given_attrs`), each with its own condition; another spread is unknown, so
+    /// nothing (FEEDBACK35.md, Q-431, found in review of FEEDBACK86-89; branch feedback86-89).
+    #[inline(never)]
+    fn start_showing_spread(&mut self, el: &HtmlEl, e: &Expr) -> bool {
+        if !el.tag.starts_with(|c: char| c.is_uppercase()) || self.quiet > 0 || !self.page_lets_here() {
+            return false;
+        }
+        let Some(body) = self.in_component().and_then(|c| self.bodies.get(&c).cloned()) else { return false };
+        let stmts: &[Stmt] = match &body.body {
+            Expr::Block(ss) => ss,
+            _ => &[],
+        };
+        let maps = local_maps(stmts);
+        let given = given_attrs(el, &maps);
+        let entries: Vec<(&str, &Expr)> = spread_entries(e, &maps);
+        let live = |k: &str, v: &Expr| given.iter().any(|(gk, gv)| *gk == k && std::ptr::eq(*gv, v));
+        match e {
+            // Written out: shown as the child it is, each entry under its own condition, and none
+            // that does not reach the component.
+            Expr::Map(es) => {
+                if !self.start_showing(e, el.line) {
+                    return false;
+                }
+                let mut later: Vec<*const Expr> = Vec::new();
+                for (k, v) in es {
+                    let pair = if live(k, v) { self.prop_pair(&el.tag, k) } else { None };
+                    match pair {
+                        Some(p) => {
+                            let m = matches!(v, Expr::Lambda(_)) as u8;
+                            walk_expr(v, &mut |z| self.showing_node_conds.entry(z as *const Expr).or_default().push((p, m)));
+                        }
+                        None => walk_expr(v, &mut |z| later.push(z as *const Expr)),
+                    }
+                }
+                self.showing_later.extend(later);
+                true
+            }
+            // A `let` of a map: what its live entries read, by the binding each name has here,
+            // each under its entry's condition.
+            _ => {
+                let mut read: Vec<(String, usize, u32, u8)> = Vec::new();
+                for (k, v) in &entries {
+                    if !live(k, v) {
+                        continue;
+                    }
+                    let Some(p) = self.prop_pair(&el.tag, k) else { continue };
+                    let m = matches!(v, Expr::Lambda(_)) as u8;
+                    let later = runs_later(v);
+                    walk_expr(v, &mut |z| {
+                        if let Expr::Ident(n, _) = z {
+                            if !later.contains(&(z as *const Expr)) {
+                                if let Some(d) = self.scopes.iter().rev().find_map(|s| s.get(n.as_str())).map(|v| v.decl) {
+                                    read.push((n.to_string(), d, p, m));
+                                }
+                            }
+                        }
+                    });
+                }
+                for (n, d, p, m) in read {
+                    self.page_event(&n, d, el.line, (p, m));
+                }
+                false
+            }
+        }
+    }
+
+    /// `name`, read at `e` in a child of markup at `line`: one of the component's page values
+    /// shown, under the conditions `showing` holds there, said after the run (`page_values_said`).
+    #[inline(never)]
+    fn page_value_shown(&mut self, name: &str, e: &Expr, line: u32) {
+        let at = e as *const Expr;
+        if self.quiet > 0 || (!self.showing_later.is_empty() && self.showing_later.contains(&at)) {
+            return;
+        }
+        let decl = self.last_ident.0;
+        prop_work(1);
+        if !self.page_value_here(name, decl) {
+            return;
+        }
+        let from = self.page_conds.len() as u32;
+        self.page_conds.extend_from_slice(&self.showing_conds);
+        if let Some(more) = (!self.showing_node_conds.is_empty()).then(|| self.showing_node_conds.get(&at)).flatten() {
+            self.page_conds.extend_from_slice(more);
+        }
+        let to = self.page_conds.len() as u32;
+        let at = self.showing_at;
+        self.page_events.push(PageEvent { decl, file: self.file.clone(), line, conds: (from, to), at });
+    }
+
+    /// Keeps a page value's showing for `page_values_said`.
+    fn page_event(&mut self, name: &str, decl: usize, line: u32, cond: (u32, u8)) {
+        if self.page_value_here(name, decl) {
+            let from = self.page_conds.len() as u32;
+            self.page_conds.push(cond);
+            let at = self.out.diagnostics.len();
+            self.page_events.push(PageEvent { decl, file: self.file.clone(), line, conds: (from, from + 1), at });
+        }
+    }
+
+    /// Whether `name`, resolved to `decl`, is one of the page values of the component being checked.
+    fn page_value_here(&self, name: &str, decl: usize) -> bool {
+        let Some(c) = self.fns.iter().rev().find_map(|f| f.component.as_deref()) else { return false };
+        self.page_lets.get(&decl).is_some_and(|(pc, pn)| pn.as_str() == name && pc == c)
+    }
+
+    /// After the run: each page value's first showing whose conditions hold, said at its line, in
+    /// the walk's order (FEEDBACK35.md, Q-431; branch feedback27-35-fixes).
+    fn page_values_said(&mut self) {
+        self.prop_facts_settle();
+        let conds = std::mem::take(&mut self.page_conds);
+        // Each said where the walk reached it among the others, so one line's warnings keep their
+        // order: put in at the end, then moved there in one pass.
+        let before = self.out.diagnostics.len();
+        let mut places: Vec<usize> = Vec::new();
+        for ev in std::mem::take(&mut self.page_events) {
+            if !self.page_lets.contains_key(&ev.decl) {
+                continue;
+            }
+            if !conds[ev.conds.0 as usize..ev.conds.1 as usize].iter().all(|(p, m)| self.prop_holds(*p, *m)) {
+                continue;
+            }
+            let Some((c, name)) = self.page_lets.remove(&ev.decl) else { continue };
+            let (name, c) = (&name, &c);
+            let n = self.out.diagnostics.len();
+            self.diag_at(ev.file.clone(), ev.line, Severity::Warning, format!("`{name}` is a value from the page shown in markup: the server has null for it, so the browser makes <{c}> again on each load. Write `state {name} = ...`, which is set once the component is on the page"));
+            if self.out.diagnostics.len() > n {
+                places.push(ev.at);
+            }
+        }
+        if places.is_empty() {
+            return;
+        }
+        let said = self.out.diagnostics.split_off(before);
+        let walked = std::mem::take(&mut self.out.diagnostics);
+        let mut out = Vec::with_capacity(walked.len() + said.len());
+        let mut walked = walked.into_iter().enumerate().peekable();
+        for (at, d) in places.into_iter().zip(said) {
+            while let Some((_, w)) = walked.next_if(|(i, _)| *i < at) {
+                out.push(w);
+            }
+            out.push(d);
+        }
+        out.extend(walked.map(|(_, w)| w));
+        self.out.diagnostics = out;
+    }
+
+    /// What the lambda `d` reads and calls, outside what runs later in it and not its own names,
+    /// each by the binding it has here, where it is written (`page_lambdas`).
+    fn lambda_reads(&self, d: &FnDef) -> (Vec<(String, usize)>, Vec<usize>) {
+        let mut all: HashSet<&str> = HashSet::new();
+        walk_expr(&d.body, &mut |y| {
+            if let Expr::Ident(n, _) = y {
+                all.insert(n.as_str());
+            }
+        });
+        let mut hidden = Hidden { wanted: &all, depth: HashMap::new(), reads: HashSet::new(), sets: HashSet::new() };
+        hidden.func(d);
+        let hidden = hidden.reads;
+        let later = runs_later(&d.body);
+        let here = |n: &str| self.scopes.iter().rev().find_map(|s| s.get(n)).map(|v| v.decl);
+        let (mut reads, mut calls) = (Vec::new(), Vec::new());
+        walk_expr(&d.body, &mut |y| {
+            let at = y as *const Expr;
+            if later.contains(&at) {
+                return;
+            }
+            match y {
+                Expr::Ident(n, _) if !hidden.contains(&at) => {
+                    if let Some(decl) = here(n.as_str()) {
+                        reads.push((n.to_string(), decl));
+                    }
+                }
+                Expr::Call(c, _, _) => {
+                    if let Expr::Ident(n, _) = &**c {
+                        if !hidden.contains(&(&**c as *const Expr)) {
+                            calls.extend(here(n.as_str()));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        });
+        (reads, calls)
+    }
+
+    /// While `showing`: a call of one of the component's `let`s that holds a lambda shows what the
+    /// lambda reads (`page_lambdas`), and what the lambdas it calls read: `let shown = () => r`,
+    /// then `{shown()}`.
+    #[inline(never)]
+    fn page_lambda_called(&mut self, callee: &Expr, line: u32) {
+        let Expr::Ident(n, _) = callee else { return };
+        let Some(decl) = self.scopes.iter().rev().find_map(|s| s.get(n.as_str())).map(|v| v.decl) else { return };
+        let mut todo = vec![decl];
+        let mut seen: HashSet<usize> = HashSet::new();
+        let mut read: Vec<(String, usize)> = Vec::new();
+        while let Some(d) = todo.pop() {
+            if !seen.insert(d) || seen.len() > 64 {
+                continue;
+            }
+            if let Some((r, c)) = self.page_lambdas.get(&d) {
+                read.extend(r.iter().cloned());
+                todo.extend(c.iter().copied());
+            }
+        }
+        for (m, d) in read {
+            let at = std::mem::replace(&mut self.last_ident, (d, Kind::Let));
+            self.page_value_shown(&m, callee, line);
+            self.last_ident = at;
         }
     }
 
@@ -6577,9 +7701,12 @@ impl Checker {
         // (FEEDBACK28.md, Q-348; branch feedback29-fixes).
         if self.assigned_globals.contains(name) {
             let c = self.in_component().unwrap();
+            // As the file wrote it (`cur_written`; FEEDBACK45.md, Q-523, found in review; branch
+            // feedback86-89).
+            let said = self.cur_written.clone().unwrap_or_else(|| name.to_string());
             self.error(format!(
                 "<{}> runs in the browser, but `{}` is a server variable that changes; pass it as a prop or read it with a `server fn`, or, for one each page has of its own, write `state {} = ...` at the top",
-                c, name, name
+                c, said, said
             ));
         }
     }
@@ -6613,6 +7740,7 @@ impl Checker {
             state_init: false,
             on_server: (d.server && !d.component).then_some("in a `server fn`"),
             exits: T::NEVER,
+            page_names: Vec::new(),
         });
         self.push();
         if d.server {
@@ -6623,7 +7751,23 @@ impl Checker {
         if d.component {
             self.bound_here.clear();
         }
+        // What it does with its parameters, gathered as it is walked (`PropCollect`).
+        let gathering = self.page_possible && (d.component || is_view(d)) && !d.params.is_empty() && self.quiet == 0;
+        let prop_was = if gathering {
+            prop_work(1);
+            let base = self.prop_base(d);
+            let cur = CurComp { base, first: d.params.as_ptr() as usize, count: d.params.len(), derived: HashMap::default(), def: d.clone() };
+            let was = (self.prop.cur.replace(cur), self.prop.text, self.prop.later, self.prop.apart, self.prop.attr, self.prop.collect.take());
+            (self.prop.text, self.prop.later, self.prop.apart, self.prop.attr) = (false, 0, 0, None);
+            Some(was)
+        } else {
+            None
+        };
         let t = self.expr(&d.body);
+        if let Some((cur, text, later, apart, attr, collect)) = prop_was {
+            self.prop.cur = cur;
+            (self.prop.text, self.prop.later, self.prop.apart, self.prop.attr, self.prop.collect) = (text, later, apart, attr, collect);
+        }
         self.check_return_expr(&d.body, t);
         if d.component {
             self.run_once_assignments(d);
@@ -7191,6 +8335,7 @@ impl Checker {
             state_init: false,
             on_server: Some("in a route"),
             exits: T::NEVER,
+            page_names: Vec::new(),
         });
         self.push();
         self.define("request", request_t(), None, Kind::Bound);
@@ -7340,6 +8485,69 @@ impl Checker {
         }
     }
 
+    /// A component's own `let` whose value comes from the page (`js(...)`), kept in `page_lets` by
+    /// its binding (FEEDBACK35.md, Q-431; branch feedback27-35-fixes): not one in a handler or a
+    /// local fn (`nested`) (found in review: a lambda's `let r = js(...)` was said where a `for r`
+    /// showed `r`; found in review of FEEDBACK86-89; branch feedback86-89). Out of line, so
+    /// `stmt`'s frame stays as it was.
+    #[inline(never)]
+    fn note_page_let(&mut self, n: Sym, e: &Expr, s: &Stmt) {
+        if !self.page_possible {
+            return;
+        }
+        if self.scopes.is_empty() || self.fns.last().is_none_or(|f| f.nested) {
+            return;
+        }
+        if self.fns.last().is_none_or(|f| f.component.is_none()) {
+            return;
+        }
+        if let Expr::Lambda(d) = e {
+            // Only where a page value is in reach: one is a `let` above it.
+            if !self.page_lets_here() {
+                return;
+            }
+            let seen = self.lambda_reads(d);
+            self.page_lambdas.insert(decl_id(s as *const Stmt as usize, 0), seen);
+            return;
+        }
+        // A `js(...)` in it, then one not in what runs later (looked for only where there is one).
+        // The builtin, as the program's `js` calls are checked: not a local or the program's own
+        // `fn js`, nor a module's taken under another name (found in review of FEEDBACK86-89 round
+        // 10b; from 0.8.11).
+        let builtin = |c: &Self, n: &str| {
+            let i = (n == "js_new") as usize;
+            let global = match c.js_global.get()[i] {
+                Some(b) => b,
+                None => {
+                    let b = c.globals.get(n).is_some_and(|v| &*v.file == "<builtin>");
+                    let mut known = c.js_global.get();
+                    known[i] = Some(b);
+                    c.js_global.set(known);
+                    b
+                }
+            };
+            global && !(c.js_locals && c.is_local(n))
+        };
+        let named = |x: &Expr| matches!(x, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "js" || n == "js_new"));
+        let mut any = false;
+        walk_expr(e, &mut |x| any |= named(x));
+        if !any {
+            return;
+        }
+        let mut from_page = false;
+        let later = runs_later(e);
+        walk_expr(e, &mut |x| {
+            from_page = from_page || (named(x) && !later.contains(&(x as *const Expr)) && matches!(x, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if builtin(self, n))));
+        });
+        let Some(c) = self.fns.last().and_then(|f| f.component.clone()) else { return };
+        if from_page {
+            if let Some(f) = self.fns.last_mut() {
+                f.page_names.push(n);
+            }
+            self.page_lets.insert(decl_id(s as *const Stmt as usize, 0), (c, n));
+        }
+    }
+
     fn stmt(&mut self, s: &Stmt, last: bool) -> T {
         match s {
             Stmt::Expr(e) => {
@@ -7377,7 +8585,32 @@ impl Checker {
                 if let (true, Pattern::Bind(n)) = (making, p) {
                     self.letting.push(n.to_string());
                 }
+                // A `let` of the component's own: what parameters its value is made from, which it
+                // then stands for (`PropCollect`); a lambda it holds is apart.
+                let gathering = matches!(p, Pattern::Bind(_)) && self.prop.cur.is_some() && self.quiet == 0 && self.fns.last().is_some_and(|f| !f.nested);
+                let collect_was = if gathering { Some(self.prop.collect.replace(Vec::new())) } else { None };
+                self.prop.apart += (gathering && making) as u32;
                 let t = self.expr(e);
+                self.prop.apart -= (gathering && making) as u32;
+                if let Some(was) = collect_was {
+                    let mut got = std::mem::replace(&mut self.prop.collect, was).unwrap_or_default();
+                    match e {
+                        Expr::Ident(..) => {
+                            let calls: Vec<(u8, u32)> = got.iter().filter(|(m, _)| *m == 0).map(|(_, p)| (1, *p)).collect();
+                            got.extend(calls);
+                        }
+                        Expr::Lambda(_) => {}
+                        _ => got.retain(|(m, _)| *m == 0),
+                    }
+                    got.sort_unstable();
+                    got.dedup();
+                    if let Some(outer) = self.prop.collect.as_mut() {
+                        outer.extend(got.iter().copied());
+                    }
+                    if let Some(c) = self.prop.cur.as_mut() {
+                        c.derived.insert(decl_id(s as *const Stmt as usize, 0), got);
+                    }
+                }
                 if making {
                     self.letting.pop();
                 }
@@ -7386,15 +8619,8 @@ impl Checker {
                         self.sites.insert(n.to_string());
                     }
                 }
-                if let (Pattern::Bind(n), Some(c)) = (p, self.fns.last().and_then(|f| f.component.clone())) {
-                    let mut from_page = false;
-                    let later = runs_later(e);
-                    walk_expr(e, &mut |x| {
-                        from_page |= matches!(x, Expr::Call(f, _, _) if matches!(&**f, Expr::Ident(n, _) if n == "js" || n == "js_new")) && !later.contains(&(x as *const Expr));
-                    });
-                    if from_page && !matches!(e, Expr::Lambda(_)) {
-                        self.page_lets.push((c, n.to_string()));
-                    }
+                if let Pattern::Bind(n) = p {
+                    self.note_page_let(*n, e, s);
                 }
                 let mut binds = Vec::new();
                 self.bind_pattern(p, t, &mut binds);
@@ -7607,7 +8833,21 @@ impl Checker {
                     let sig = Arc::new(Sig::of_def(d));
                     self.next_decl = s as *const Stmt as usize;
                     self.define(&d.name, T::of(FN), Some(sig), Kind::Fn);
+                    // A local `fn` of the component's: apart, and it stands for what it reads and
+                    // calls (`PropCollect`; found in review: `fn h() { return cb() }` then `{h()}`).
+                    let gathering = self.prop.cur.is_some() && self.quiet == 0 && self.fns.last().is_some_and(|f| !f.nested);
+                    let collect_was = if gathering { Some(self.prop.collect.replace(Vec::new())) } else { None };
+                    self.prop.apart += gathering as u32;
                     self.lambda_body(d);
+                    self.prop.apart -= gathering as u32;
+                    if let Some(was) = collect_was {
+                        let mut got = std::mem::replace(&mut self.prop.collect, was).unwrap_or_default();
+                        got.sort_unstable();
+                        got.dedup();
+                        if let Some(c) = self.prop.cur.as_mut() {
+                            c.derived.insert(s as *const Stmt as usize, got);
+                        }
+                    }
                 }
                 T::of(NIL)
             }
@@ -7837,6 +9077,7 @@ impl Checker {
             state_init: false,
             on_server,
             exits: T::NEVER,
+            page_names: Vec::new(),
         });
         let saved_seq = self.sequential;
         self.sequential = false;
@@ -7890,6 +9131,7 @@ impl Checker {
             state_init: false,
             on_server: None,
             exits: T::NEVER,
+            page_names: Vec::new(),
         });
         self.push();
         if d.server {
@@ -8069,7 +9311,7 @@ impl Checker {
             let mut found: Vec<((Arc<str>, Effects, u8), (bool, (String, String, String, String), Vec<String>))> = found.into_iter().collect();
             found.sort_by(|a, b| (&a.0 .0, a.0 .1, a.0 .2).cmp(&(&b.0 .0, b.0 .1, b.0 .2)));
             for ((n, missing, kind), (error, msg, components)) in found {
-                let route = (file.clone(), r.line, r.shown(), decl.join(", "));
+                let route = (file.clone(), r.line, self.route_said(&file, &r).1, decl.join(", "));
                 match said.iter_mut().find(|(k, _)| *k == (n.clone(), missing, error, kind)) {
                     Some((_, s)) => {
                         s.routes.push(route);
@@ -8404,7 +9646,7 @@ impl Checker {
             let Some(v) = facts.reads else {
                 let ws: Vec<GetWrite> = facts.writes.into_iter().filter(|w| !passing_write(&w.what)).collect();
                 if !ws.is_empty() {
-                    let route = (it.file.clone(), r.line, r.shown(), String::new());
+                    let route = (it.file.clone(), r.line, self.route_said(&it.file, r).1, String::new());
                     match by_prefetch.iter_mut().find(|(k, _)| *k == ws) {
                         Some((_, routes)) => routes.push(route),
                         None => by_prefetch.push((ws, vec![route])),
@@ -8419,7 +9661,7 @@ impl Checker {
                 (r, Some(f)) => format!("{}, in `{}`", r, f),
                 (r, None) => r,
             };
-            let route = (it.file.clone(), r.line, r.shown(), read);
+            let route = (it.file.clone(), r.line, self.route_said(&it.file, r).1, read);
             // Grouped only with routes whose writes are the same, all of them: a route that does
             // another write is said by itself, with each.
             let mut key = facts.writes.clone();
@@ -8941,7 +10183,18 @@ impl Checker {
             }
             Expr::Ident(n, line) => {
                 self.line = *line;
+                if !self.written_exprs.is_empty() {
+                    self.cur_written = self.written_exprs.get(&(e as *const Expr as usize)).cloned();
+                }
                 let (t, _) = self.ident(n);
+                self.cur_written = None;
+                // Only where a read does something (`prop_ident`).
+                if self.prop.cur.is_some() && (self.prop.text || self.prop.attr.is_some() || self.prop.collect.is_some()) && self.quiet == 0 {
+                    self.prop_ident(self.last_ident.0);
+                }
+                if let Some(at) = self.showing {
+                    self.page_value_shown(n, e, at);
+                }
                 t
             }
             Expr::List(items) => {
@@ -9356,6 +10609,9 @@ impl Checker {
                         let unused = self.scopes.last().and_then(|s| s.get(&**n)).is_some_and(|v| !v.used);
                         if unused && !n.starts_with('_') && arm.guard.is_none() {
                             self.line = arm.line;
+                            // As written, where it is a name taken `as` another (`written_decls`;
+                            // FEEDBACK45.md, Q-523, found in review; branch feedback86-89).
+                            let n = &self.written_decls.get(&decl_id(arm as *const Arm as usize, 0)).cloned().unwrap_or_else(|| n.to_string());
                             match type_typo(n) {
                                 Some(ty) => self.warn(format!("`{n}` here is a name, which takes any value: for the type, `{ty}`")),
                                 None => self.warn(format!("`{n}` takes any value and is not used: write `_` for that")),
@@ -9551,7 +10807,12 @@ impl Checker {
         match e {
             Expr::Ident(n, line) => {
                 self.line = *line;
-                self.ident(n)
+                if !self.written_exprs.is_empty() {
+                    self.cur_written = self.written_exprs.get(&(e as *const Expr as usize)).cloned();
+                }
+                let r = self.ident(n);
+                self.cur_written = None;
+                r
             }
             Expr::Lambda(d) => {
                 self.line = d.line;
@@ -11548,6 +12809,9 @@ impl Checker {
             self.warn_shadowed_builtin(n);
         }
         let (ft, sig) = self.callee(callee);
+        if let (Expr::Ident(..), true) = (callee, self.prop.cur.is_some() && self.quiet == 0) {
+            self.prop_call(self.last_ident.0);
+        }
         self.note_local_call(callee);
         // A server fn a component calls, for a `redirect` in it (`server_fn_redirects`;
         // FEEDBACK88.md, Q-1381; branch feedback86-89).
@@ -11560,12 +12824,26 @@ impl Checker {
         }
         self.line = line;
         let mut argts: Vec<T> = pre.into_iter().collect();
+        // A callback of `every`, `listen`, `run_after` or `receive` runs later (`PropCollect`).
+        let later_call = matches!(callee, Expr::Ident(n, _) if ["every", "listen", "run_after", "receive"].contains(&n.as_str()));
         for a in args {
             self.hint = lambda_hint(sig.as_deref(), &argts, a);
+            let later = later_call && matches!(a, Expr::Lambda(_));
+            self.prop.later += later as u32;
             argts.push(self.expr(a));
+            self.prop.later -= later as u32;
             self.hint = None;
         }
         self.line = line;
+        if let (Some(at), false) = (self.showing, self.page_lambdas.is_empty()) {
+            if !self.showing_later.contains(&(callee as *const Expr)) {
+                self.page_lambda_called(callee, at);
+            }
+        }
+        // Said as the file wrote it, where it took the function `as` another (`written_exprs`).
+        if !self.written_exprs.is_empty() {
+            self.said_name = self.written_exprs.get(&(callee as *const Expr as usize)).cloned();
+        }
         self.apply(ft, sig, argts, args, &callee_name(callee))
     }
 
@@ -11988,8 +13266,13 @@ impl Checker {
         let piped = pre.is_some();
         let full = if f.is_empty() { m.to_string() } else { format!("{}.{}", m, f) };
         let mut argts: Vec<T> = pre.into_iter().collect();
+        // `channel.open`'s callbacks run later (`PropCollect`).
+        let later_call = m == "channel" && f == "open";
         for a in args {
+            let later = later_call && matches!(a, Expr::Lambda(_));
+            self.prop.later += later as u32;
             argts.push(self.expr(a));
+            self.prop.later -= later as u32;
         }
         self.line = line;
         let Some((_, p, r)) = BUILTINS.iter().find(|(n, _, _)| *n == full) else {
@@ -12997,6 +14280,11 @@ impl Checker {
     /// A call of something of type `ft`: arguments, effects, browser rules
     /// and the result type.
     fn apply(&mut self, ft: T, sig: Option<Arc<Sig>>, args: Vec<T>, arg_exprs: &[Expr], name: &str) -> T {
+        // The function as the call names it, in what is said of the call (`said_name`).
+        let said_owned = self.said_name.take();
+        let said: &str = said_owned.as_deref().unwrap_or(name);
+        // Where the function is, for `hides_as`, when the call names it another way.
+        let said_at: Option<String> = (said != name).then(|| self.globals.get(name).map(|g| self.shown_at(&g.file, g.line))).flatten();
         if ft.bits != 0 && ft.bits & FN == 0 {
             // A top-level variable with a builtin's name takes it from every
             // file: say whose it is, here and where it is made (FEEDBACK3.md,
@@ -13015,13 +14303,13 @@ impl Checker {
                         name, name, here
                     ));
                 }
-                _ => self.error(format!("cannot call `{}`: it is {}, not a function", name, bits_text(ft.bits))),
+                _ => self.error(format!("cannot call `{}`: it is {}, not a function", said, bits_text(ft.bits))),
             }
             return T::ANY;
         }
         let Some(sig) = sig else { return T::ANY };
         if sig.component {
-            self.error(format!("`{}` is a component; write <{} ... /> instead of calling it", name, sig.name));
+            self.error(format!("`{}` is a component; write <{} ... /> instead of calling it", said, sig.name));
         }
         let n = sig.params.len();
         // A builtin's call as its docs write it: `reduce(xs, start, f)` (Q-525).
@@ -13032,13 +14320,13 @@ impl Checker {
         let shape = || {
             let last = sig.params.len().saturating_sub(1);
             let ps: Vec<String> = sig.params.iter().enumerate().map(|(i, p)| if spread_last && i == last { format!("...{}", p.name) } else { p.name.clone() }).collect();
-            format!("{}({})", name, ps.join(", "))
+            format!("{}({})", said, ps.join(", "))
         };
         let too_many = args.len() > n && !sig.variadic;
         if too_many {
             // `max(1, 2)`: one list, said once, not also as argument 1's type.
             if sig.builtin && n == 1 && sig.params[0].ty & !NIL == LIST && args.first().is_some_and(|a| a.bits != 0 && a.bits & LIST == 0) {
-                self.error(format!("`{}` takes one list: put the items in it, `{}([...])`", name, name));
+                self.error(format!("`{}` takes one list: put the items in it, `{}([...])`", said, said));
                 return sig.ret.unwrap_or(T::ANY);
             }
             if sig.builtin && sig.name == "ask" {
@@ -13048,7 +14336,7 @@ impl Checker {
                 self.error(crate::mcp::ASK_OF_THREE);
             } else {
                 let shown = if sig.builtin { format!(": {}", shape()) } else { String::new() };
-                self.error(format!("`{}` takes {} argument{}, got {}{}{}", name, n, if n == 1 { "" } else { "s" }, args.len(), shown, hides(&sig, name)));
+                self.error(format!("`{}` takes {} argument{}, got {}{}{}", said, n, if n == 1 { "" } else { "s" }, args.len(), shown, hides_as(&sig, name, said, said_at.as_deref())));
             }
         }
         // `set(xs, [0], v)`: on a list the index is the item's place, an int, as it runs; a map
@@ -13069,12 +14357,12 @@ impl Checker {
                     let given_fn = i > 0 && args.get(i - 1).is_some_and(|a| a.bits == FN) && sig.params[i - 1].ty != FN;
                     if sig.builtin && given_fn && p.ty == FN {
                         // `reduce(xs, (a, x) => a + x)`: the start value left out.
-                        self.error(format!("`{}` takes `{}` before the function: {}", name, sig.params[i - 1].name, shape()));
+                        self.error(format!("`{}` takes `{}` before the function: {}", said, sig.params[i - 1].name, shape()));
                     } else if sig.builtin {
                         let kind = if p.ty == FN { ", a function," } else { "" };
-                        self.error(format!("missing argument `{}`{} in call to `{}`: {}", p.name, kind, name, shape()));
+                        self.error(format!("missing argument `{}`{} in call to `{}`: {}", p.name, kind, said, shape()));
                     } else {
-                        self.error(format!("missing argument `{}` in call to `{}`{}", p.name, name, hides(&sig, name)));
+                        self.error(format!("missing argument `{}` in call to `{}`{}", p.name, said, hides_as(&sig, name, said, said_at.as_deref())));
                     }
                     break;
                 }
@@ -13084,7 +14372,7 @@ impl Checker {
                     self.error(format!("`{}` spreads {} (or null), but x is {}", form, of, bits_text(a.bits)));
                 }
                 Some(a) if p.annotated && a.bits != 0 && a.bits & p.ty == 0 => {
-                    self.error(format!("{} of `{}` must be {}, got {}{}", what(), name, bits_text(p.ty), bits_text(a.bits), hides(&sig, name)));
+                    self.error(format!("{} of `{}` must be {}, got {}{}", what(), said, bits_text(p.ty), bits_text(a.bits), hides_as(&sig, name, said, said_at.as_deref())));
                 }
                 Some(a) if p.annotated => {
                     // `range(0, n / 4)`: a whole number only when `/` divides
@@ -13117,18 +14405,18 @@ impl Checker {
                         _ => None,
                     };
                     if let Some(why) = mismatch(*a, p.full) {
-                        self.error(format!("{} of `{}` {}{}", what(), name, why, hides(&sig, name)));
+                        self.error(format!("{} of `{}` {}{}", what(), said, why, hides_as(&sig, name, said, said_at.as_deref())));
                     } else if let Some((k, it, we)) = bad_item {
-                        self.error(format!("{} of `{}` must be {}, but its item {} is {}, not {}{}", what(), name, t_text(p.full), k, t_text(it), t_text(we), hides(&sig, name)));
+                        self.error(format!("{} of `{}` must be {}, but its item {} is {}, not {}{}", what(), said, t_text(p.full), k, t_text(it), t_text(we), hides_as(&sig, name, said, said_at.as_deref())));
                     // A parameter that takes decimals takes what `/` gives: rounding
                     // it would lose the cents (FEEDBACK25.md, Q-321; branch feedback26-fixes).
                     } else if divided && p.ty & INT != 0 && p.ty & FLOAT == 0 && p.ty & DEC == 0 && a.bits & FLOAT != 0 {
                         self.warn(format!(
                             "{} of `{}` must be an int, and `/` gives one only when it divides evenly (`7 / 2` is 3.5): write `floor(...)` or `round(...)`",
-                            what(), name
+                            what(), said
                         ));
                     } else if self.strict_null && !a.vague() && a.bits & NIL != 0 && a.bits != NIL && p.ty & NIL == 0 {
-                        self.warn(format!("{} of `{}` may be null here (it is {}), but it must be {}", what(), name, t_text(*a), bits_text(p.ty)));
+                        self.warn(format!("{} of `{}` may be null here (it is {}), but it must be {}", what(), said, t_text(*a), bits_text(p.ty)));
                     }
                 }
                 _ => {}
@@ -13459,6 +14747,13 @@ impl Checker {
     }
 
     fn html(&mut self, el: &HtmlEl) {
+        // An element's attributes are no child's text (`PropCollect::text`); its children say.
+        let text_was = std::mem::replace(&mut self.prop.text, false);
+        self.html_here(el);
+        self.prop.text = text_was;
+    }
+
+    fn html_here(&mut self, el: &HtmlEl) {
         for line in &el.dollars {
             self.line = *line;
             self.warn("the `$` before this `{` is text, and shows on the page: `{name}` alone gives the value here (`${name}` is for templates); write `{\"$\"}{name}` if the `$` is meant");
@@ -13502,7 +14797,17 @@ impl Checker {
             "animate", "animatetransform", "animatemotion", "set", "desc", "metadata", "switch", "view", "fegaussianblur", "feoffset",
             "feblend", "fecolormatrix", "feflood", "fecomposite", "femerge", "femergenode", "feturbulence", "fedisplacementmap",
         ];
-        if !is_view && !el.tag.contains('-') && !ELEMENTS.contains(&el.tag.to_ascii_lowercase().as_str()) && !self.is_local(&el.tag) {
+        // Looked up in a set made once, and lowercased only where the tag has a capital (a speed
+        // fix found in review of FEEDBACK86-89 round 9; branch feedback86-89).
+        static ELEMENT_SET: std::sync::OnceLock<HashSet<&'static str, BuildPtr>> = std::sync::OnceLock::new();
+        let known = |tag: &str| {
+            let set = ELEMENT_SET.get_or_init(|| ELEMENTS.iter().copied().collect());
+            match tag.bytes().any(|b| b.is_ascii_uppercase()) {
+                true => set.contains(tag.to_ascii_lowercase().as_str()),
+                false => set.contains(tag),
+            }
+        };
+        if !is_view && !el.tag.contains('-') && !known(&el.tag) && !self.is_local(&el.tag) {
             let mut cap = el.tag.clone();
             if let Some(f) = cap.get_mut(0..1) {
                 f.make_ascii_uppercase();
@@ -13526,9 +14831,54 @@ impl Checker {
                 }
             }
         }
-        let mut given: Vec<(String, T)> = Vec::new();
+        let mut given: Vec<(&str, T)> = Vec::new();
         let mut spread = false;
+        // The component this element is, for what its attributes hand on (`PropCollect`): found
+        // once for the element, for gathering and for a page value shown here alike.
+        let gathering = self.prop.cur.is_some() && self.quiet == 0;
+        let prop_target: Option<(u32, Arc<FnDef>)> = match is_view && self.quiet == 0 && (gathering || (self.showing.is_none() && self.page_lets_here())) {
+            true => self.tag_body(&el.tag).map(|d| (self.prop_base(&d), d)),
+            false => None,
+        };
+        let mut prop_next = 0usize;
         for (name, v) in &el.attrs {
+            // The component's parameter this attribute is given to. Attributes are mostly written
+            // in the parameters' order: the one after the last found is tried first.
+            let pair = match v {
+                AttrVal::Expr(_) => prop_target.as_ref().and_then(|(b, d)| {
+                    let i = match d.params.get(prop_next) {
+                        Some(p) if p.name.as_str() == name.as_str() => Some(prop_next),
+                        _ => d.params.iter().position(|p| p.name.as_str() == name.as_str()),
+                    }?;
+                    prop_next = i + 1;
+                    Some(b + i as u32)
+                }),
+                _ => None,
+            };
+            // An attribute shows a page value as a child does (`showing`; FEEDBACK35.md, Q-431,
+            // found in review of FEEDBACK86-89; branch feedback86-89).
+            let showing = match (v, pair) {
+                (AttrVal::Expr(e), Some(p)) if self.showing.is_none() && self.page_lets_here() => self.start_showing_attr(el, p, e),
+                (AttrVal::Spread(e), _) if self.showing.is_none() && self.page_lets_here() => self.start_showing_spread(el, e),
+                _ => false,
+            };
+            // Where the walk is, for what a component does with its parameters (`PropCollect`): an
+            // attribute given to a component's parameter, a lambda given to one apart; an HTML
+            // element's handler later.
+            let prop_saved = (self.prop.later, self.prop.apart, self.prop.attr);
+            if gathering {
+                match v {
+                    AttrVal::Expr(e) if is_view => {
+                        self.prop.attr = if matches!(e, Expr::Ident(..)) { None } else { pair.map(|t| (t, matches!(e, Expr::Lambda(_)))) };
+                        if matches!(e, Expr::Lambda(_)) {
+                            self.prop.apart += 1;
+                        }
+                    }
+                    AttrVal::Spread(_) if is_view => self.prop.attr = None,
+                    AttrVal::Expr(e) | AttrVal::Spread(e) if matches!(e, Expr::Lambda(_)) && (name.starts_with('@') || name.starts_with("on")) => self.prop.later += 1,
+                    _ => self.prop.attr = None,
+                }
+            }
             let t = match v {
                 AttrVal::Bool => T::of(BOOL),
                 // A handler, and what a view or component is given (a function it may call in
@@ -13549,14 +14899,40 @@ impl Checker {
                 AttrVal::Expr(e) => self.expr(e),
                 AttrVal::Spread(e) => {
                     let t = self.expr(e);
+                    if showing {
+                        self.stop_showing();
+                    }
+                    if is_view && self.prop.cur.is_some() && self.quiet == 0 && self.prop.later == 0 {
+                        self.prop_spread_given(el, e);
+                    }
                     self.line = el.line;
                     if t.bits != 0 && t.bits & (MAP | NIL) == 0 {
                         self.error(format!("`{{...}}` in <{}> needs a map, got {}", el.tag, bits_text(t.bits)));
                     }
                     spread = true;
+                    (self.prop.later, self.prop.apart, self.prop.attr) = prop_saved;
                     continue;
                 }
             };
+            if showing {
+                self.stop_showing();
+            }
+            // A name handed straight on, `v={v}` or `cb={cb}`: shown where the component shows it,
+            // a call where it calls it (its `prop.attr` was left unset for this, so the name's own
+            // read hands nothing on).
+            if let (true, AttrVal::Expr(Expr::Ident(..)), Some(t), 0) = (gathering && is_view, v, pair, self.prop.later) {
+                let decl = self.last_ident.0;
+                prop_work(1);
+                let PropCollect { cur, edges, .. } = &mut self.prop;
+                if let Some(cur) = cur.as_ref() {
+                    // A parameter itself hands on both ways: one edge, kept for both.
+                    match cur.param(decl) {
+                        Some(p) => edges[2].push((p, t)),
+                        None => Self::prop_each(cur, decl, |m, p| edges[m as usize].push((p, t))),
+                    }
+                }
+            }
+            (self.prop.later, self.prop.apart, self.prop.attr) = prop_saved;
             self.line = el.line;
             if !is_view {
                 self.attr_typo(&el.tag, name);
@@ -13599,7 +14975,7 @@ impl Checker {
                     _ => self.error(format!("`bind:{}` needs a variable: bind:{}={{name}}", prop, prop)),
                 }
             }
-            given.push((name.clone(), t));
+            given.push((name.as_str(), t));
         }
         // `<form @input={...}>`: what is typed inside reaches it (Checker::shown_only).
         let bubbles = el.attrs.iter().any(|(a, _)| a == "@input" || a == "@change");
@@ -13643,31 +15019,24 @@ impl Checker {
                         }
                         _ => {}
                     }
-                    if let Some(c) = self.in_component() {
-                        let mut shown = Vec::new();
-                        let later = runs_later(x);
-                        walk_expr(x, &mut |y| {
-                            if let Expr::Ident(n, _) = y {
-                                if !later.contains(&(y as *const Expr)) {
-                                    shown.push(n.clone());
-                                }
-                            }
-                        });
-                        for n in shown {
-                            if let Some(i) = self.page_lets.iter().position(|(pc, pn)| *pc == c && *pn == n) {
-                                self.page_lets.remove(i);
-                                self.line = el.line;
-                                self.warn(format!("`{n}` is a value from the page shown in markup: the server has null for it, so the browser makes <{c}> again on each load. Write `state {n} = ...`, which is set once the component is on the page"));
-                            }
-                        }
-                    }
+                    // A page value shown is found as the check reads the child (`ident`), by the
+                    // binding its name has there: not where a `for`, a lambda's parameter or a `let`
+                    // inside the markup hides it, and not in a handler or another function that runs
+                    // later (FEEDBACK35.md, Q-431, found in review of FEEDBACK86-89; branch
+                    // feedback86-89). Said at the outermost element.
+                    let showing = self.showing.is_none() && self.page_lets_here() && self.start_showing(x, el.line);
                     // What `quillo run` refuses in a component's script, refused here too (found in
                     // review of FEEDBACK53.md, Q-682).
                     if el.tag == "script" && self.in_component().is_some() && matches!(x, Expr::Template(p) if matches!(p.as_slice(), [TPart::Expr(Expr::Lit(Lit::Str(_)))])) {
                         self.line = el.line;
                         self.error("a string in braces in a <script> is a value, written as JSON: write the code without the braces and quotes, as the script's own text");
                     }
+                    let text_was = std::mem::replace(&mut self.prop.text, true);
                     let t = self.expr(x);
+                    self.prop.text = text_was;
+                    if showing {
+                        self.stop_showing();
+                    }
                     // An error value shown as it is, `{news}` with `state news = load_news()` and
                     // `load_news` declared `! str`: nothing a visitor should read. A fallback
                     // (`??`), `?`, and an `if` or a `match` that tests it take the error out of its
@@ -13722,8 +15091,8 @@ impl Checker {
         // React's `function Card(props)`: a view's parameters are its props, each by its name
         // (FEEDBACK48.md, Q-577; branch main).
         if let [only] = sig.params.as_slice() {
-            if only.name == "props" && given.iter().any(|(n, _)| n != "props" && n != "key" && !n.starts_with('@')) {
-                let names: Vec<&str> = given.iter().map(|(n, _)| n.as_str()).filter(|n| *n != "key" && !n.starts_with('@')).collect();
+            if only.name == "props" && given.iter().any(|&(n, _)| n != "props" && n != "key" && !n.starts_with('@')) {
+                let names: Vec<&str> = given.iter().map(|(n, _)| *n).filter(|n| *n != "key" && !n.starts_with('@')).collect();
                 self.error(format!("a view's parameters are its props, each by name: write `view {}({})`, not one `props`", el.tag, names.join(", ")));
                 return;
             }
@@ -13733,11 +15102,19 @@ impl Checker {
         if !el.children.is_empty() && !spread && !sig.params.iter().any(|p| p.name == "children") {
             self.error(format!("<{}> takes no children, so what is between its tags is lost: give it a `children` parameter, or write <{} .../>", el.tag, el.tag));
         }
-        for (n, t) in &given {
+        // Each parameter given, marked as its attribute is found, for the ones it needs; one not
+        // marked (missing, past the 128th, or named twice) is looked for again: a speed fix found
+        // in review of FEEDBACK86-89 round 9 (branch feedback86-89).
+        let mut marked: u128 = 0;
+        for &(n, t) in &given {
+            let at = sig.params.iter().position(|p| p.name == n);
+            if let Some(i) = at.filter(|i| *i < 128) {
+                marked |= 1 << i;
+            }
             if n == "key" || n.starts_with('@') {
                 continue;
             }
-            match sig.params.iter().find(|p| &p.name == n) {
+            match at.map(|i| &sig.params[i]) {
                 // `<Card.big #main>` is `class` and `id` given to it (Q-568).
                 None if n == "class" || n == "id" => self.error(format!(
                     "<{}> has no parameter `{}`: a view's attributes are its parameters, `.name` giving `class` and `#name` giving `id`; give it {} `{}` parameter and put it on its element",
@@ -13753,8 +15130,9 @@ impl Checker {
                 }
             }
         }
-        for p in &sig.params {
-            if p.name != "children" && !p.optional && !spread && !given.iter().any(|(n, _)| n == &p.name) {
+        for (i, p) in sig.params.iter().enumerate() {
+            let given_it = || (i < 128 && marked & (1 << i) != 0) || given.iter().any(|(n, _)| *n == p.name);
+            if p.name != "children" && !p.optional && !spread && !given_it() {
                 self.error(format!("<{}> needs `{}`", el.tag, p.name));
             }
         }
@@ -15571,13 +16949,6 @@ fn dotted(e: &Expr) -> Option<String> {
     }
 }
 
-/// A file parsed again, with its names as they are called in the program.
-fn reparsed(src: &str, names: &HashMap<String, String>) -> Result<Vec<Stmt>, crate::error::QuilloError> {
-    let mut stmts = Parser::new(src).parse_program()?;
-    crate::privacy::rename_as(&mut stmts, names, "a name another file has too")?;
-    Ok(stmts)
-}
-
 /// `alias` as a name a type can have: `P` and `PT` are `Pt` (Q-821).
 pub(crate) fn type_like(alias: &str) -> String {
     let mut cs = alias.chars();
@@ -16950,8 +18321,8 @@ fn unstyled_classes(order: &[Item], base: &Path, rules: &[(String, String, u32)]
 /// comes from: both made `quillo check` say a page's value was shown, with a fix that did not
 /// compile (FEEDBACK66.md, Q-952; branch feedback66). A function called at once (`map`'s) runs
 /// as `e` does.
-fn runs_later(e: &Expr) -> HashSet<*const Expr> {
-    let mut out = HashSet::new();
+fn runs_later(e: &Expr) -> HashSet<*const Expr, BuildPtr> {
+    let mut out = HashSet::default();
     each_later(e, &mut |l| {
         walk_expr(l, &mut |x| {
             out.insert(x as *const Expr);
@@ -18502,6 +19873,16 @@ fn is_connect(e: &Expr) -> bool {
 
 /// For an error in a call of the program's own function named like a
 /// builtin (`notify`, `first`): says that it is not the builtin.
+/// `hides`, for a call that names the function `said`, taken `as` that from where it is, `at`:
+/// `(`c` is the program's `count`, from lib.qwe:1, which hides the builtin `count`)` (FEEDBACK45.md,
+/// Q-523, found in review; branch feedback86-89).
+fn hides_as(sig: &Sig, name: &str, said: &str, at: Option<&str>) -> String {
+    match at {
+        Some(at) if said != name && !hides(sig, name).is_empty() => format!(" (`{}` is the program's `{}`, from {}, which hides the builtin `{}`)", said, name, at, name),
+        _ => hides(sig, name),
+    }
+}
+
 fn hides(sig: &Sig, name: &str) -> String {
     match &sig.def {
         Some(d) if !sig.builtin && BUILTINS.iter().any(|(n, _, _)| *n == name) => {
