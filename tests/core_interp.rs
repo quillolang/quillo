@@ -371,6 +371,8 @@ fn rpc(it: &mut Interp, name: &str, live: bool) -> serde_json::Value {
 }
 
 fn changed_since(it: &mut Interp, since: u64, topics: &str) -> serde_json::Value {
+    // Each topic signed, as the server gives it to a page (changed for 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89).
+    let topics = topics.split(',').filter(|t| !t.is_empty()).map(|t| quillo::server::signed_topic("", None, t)).collect::<Vec<_>>().join(",");
     serde_json::from_str(&get(it, &format!("/_quillo/live?since={}&t={}", since, topics)).text()).unwrap()
 }
 

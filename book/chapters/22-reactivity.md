@@ -31,12 +31,13 @@ list is not touched. The page shows the new total once the keystroke's handler i
 
 | Written in a component | Becomes | Is worked out again |
 |---|---|---|
-| `state x = v` (or `~x = v`) | a signal, set once | never: it changes when assigned |
+| `state x = v` (or `~x = v`) | a signal, set once | never: it changes when assigned, and `quillo check` warns *(since 0.8.12)* when `v` reads a state that changes and nothing assigns `x` (write `let`) |
 | `let y = ...` that reads something that changes | a derived value | when something it read changed, and only once something reads it |
 | `let y = ...` that reads nothing that changes | a constant | never |
-| `let y = ...` whose name is assigned somewhere (`y = 5`) | a plain variable | never by itself |
+| `let y = ...` whose name is assigned in a function or a handler (`onclick={() => { y = 5 }}`) | a plain variable | never by itself |
+| a `let` or a prop assigned on a line of the body itself (`label = open ? "Hide" : "Show"`), or a `return` or `?` in the body | the whole body as one part *(since 0.8.12 in this table; it always was)* | all of it, when a state or a prop it read changed: its `let`s and assignments run again, its states keep their values |
 | a statement that reads something that changes (`if running { every(...) }`) | an effect | after what it read changed |
-| an assignment alone in the body (`count = len(items)`, `n += 1`) | a step as it starts | never: it runs once, and `quillo check` warns when it reads a prop or another state (write `let`) |
+| an assignment alone in the body (`count = len(items)`, `n += 1`) | a step as it starts | never: it runs once, and `quillo check` warns when it reads a prop or another state (write `let`); in a body that runs again whole (the row above) it runs again with it, and nothing is said |
 | `{expr}` in markup, an attribute's or a class's `{...}` | a place on the page | when what it read changed; text that comes out the same is not written |
 | `cond ? <a/> : <b/>`, `if`, `match`, `cond && <x/>` in markup | a branch | made again only when another branch is chosen |
 | `for x in xs => <row/>` | a row for each item | rows are kept by `key` (else by place) and given their new item; a `key` that reads other state makes its rows again when that changes |

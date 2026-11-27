@@ -15,7 +15,7 @@ use bytes::{BufMut, BytesMut};
 use postgres::types::{FromSql, IsNull, Kind, ToSql, Type};
 use std::collections::HashMap;
 use std::error::Error;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -76,6 +76,25 @@ pub struct Conn {
     /// The pool's schema changes, and the count of them its statements were prepared under
     /// (`Pool::schema`).
     schema: (Arc<Schema>, u64),
+    /// Whose statement ran here last, outside the lanes (`Owner`). On a database whose code uses a
+    /// session's state, another's statement goes after a reset (FEEDBACK75.md, Q-1060, the third
+    /// and fourth reviews; branch feedback86-89).
+    pub(crate) owner: Owner,
+    /// A statement ran here while the database counted as using a session's state: set back
+    /// before another's, whatever it counts as now (FEEDBACK75.md, Q-1060, the fifth review;
+    /// branch feedback86-89).
+    pub(crate) dirty: bool,
+}
+
+/// Whose statements a connection's session holds what of.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Owner {
+    /// No one's: new, or set back.
+    Nobody,
+    /// The program's own code outside any request: its start, its jobs and timers.
+    Program,
+    /// A request's, by its number.
+    Request(usize),
 }
 
 pub struct Pool {
@@ -90,6 +109,13 @@ pub struct Pool {
     /// Names called as functions, and whether one of them is not PostgreSQL's own (a function
     /// of the program's may change the session: see `db::isolated`).
     own_fns: Mutex<HashMap<String, bool>>,
+    /// Its database's state, shared by every pool of the process on that database (`DbState`).
+    /// What the process knows of the database (`DbState`), found at the first need: a script's
+    /// statements, one after another, never need it.
+    state: OnceLock<Arc<DbState>>,
+    /// Its `?schema=`, where Quillo's own tables are `quillo_<schema>` when a role holds them
+    /// (`own_tables`; the user's decision of 2026-11-26, branch feedback86-89).
+    schema_name: Option<String>,
     /// Its tables known to have changed: by a schema's statement run here, or a kept statement
     /// PostgreSQL refused as prepared before one ("cached plan must not change result type").
     /// Each connection lets go its statements on what changed when it is behind, so one that
@@ -99,8 +125,282 @@ pub struct Pool {
 }
 
 /// What a session changed is set back with, its prepared statements kept (Quillo's own among
-/// them): `discard all` but `deallocate all` (FEEDBACK44.md, Q-581).
-pub const RESET: &str = "set session authorization default; reset all; close all; discard temp; select pg_advisory_unlock_all(); unlisten *";
+/// them): `discard all` but `deallocate all` (FEEDBACK44.md, Q-581). Its sequences' last values
+/// too, so a transaction's `lastval()` never reads the one before it on the same connection
+/// (FEEDBACK75.md, Q-1060; branch feedback86-89).
+pub const RESET: &str = "set session authorization default; reset all; close all; discard temp; discard sequences; select pg_advisory_unlock_all(); unlisten *";
+
+/// The built-in functions of `pg_catalog` (by oid: below 16384) a database's stored trees may call
+/// and still count as using no session state: plain value functions (text, numbers, dates, JSON, arrays), none of which runs
+/// SQL text, takes a lock, reads or changes a setting, makes a temporary object or reads a file.
+/// Beside these, every aggregate and window function of `pg_catalog`, and the functions behind its
+/// operators and casts. Anything else a database's code calls makes it pay the reset: the cost
+/// goes to unusual databases, never a leak (FEEDBACK75.md, Q-1060, the fourth review's whitelist;
+/// branch feedback86-89). Each name is in PostgreSQL 17's `pg_proc` (tests/f812_db.rs).
+pub const SAFE_FUNCTIONS: &[&str] = &[
+    // text
+    "lower", "upper", "initcap", "length", "char_length", "character_length", "octet_length", "substr", "replace", "btrim", "ltrim", "rtrim",
+    "lpad", "rpad", "concat", "concat_ws", "format", "left", "right", "split_part", "strpos", "starts_with", "repeat", "reverse", "translate",
+    "regexp_replace", "regexp_match", "regexp_matches", "regexp_split_to_array", "regexp_split_to_table", "regexp_count", "regexp_like",
+    "md5", "sha256", "encode", "decode", "to_char", "to_number", "to_date", "to_timestamp", "quote_ident", "quote_literal", "quote_nullable",
+    "string_to_array", "array_to_string", "ascii", "chr", "to_hex",
+    // numbers
+    "abs", "ceil", "ceiling", "floor", "round", "trunc", "mod", "power", "sqrt", "exp", "ln", "log", "sign", "div", "gcd", "lcm", "width_bucket",
+    "random", "num_nonnulls", "num_nulls",
+    // dates
+    "now", "clock_timestamp", "statement_timestamp", "transaction_timestamp", "date_trunc", "date_part", "age", "make_date", "make_time",
+    "make_timestamp", "make_timestamptz", "make_interval", "justify_days", "justify_hours", "justify_interval", "isfinite", "date_bin",
+    // JSON
+    "to_json", "to_jsonb", "row_to_json", "array_to_json", "json_build_object", "jsonb_build_object", "json_build_array", "jsonb_build_array",
+    "json_object", "jsonb_object", "json_array_elements", "jsonb_array_elements", "json_array_elements_text", "jsonb_array_elements_text",
+    "json_each", "jsonb_each", "json_each_text", "jsonb_each_text", "json_object_keys", "jsonb_object_keys", "json_array_length",
+    "jsonb_array_length", "json_typeof", "jsonb_typeof", "json_extract_path", "jsonb_extract_path", "json_extract_path_text",
+    "jsonb_extract_path_text", "jsonb_set", "jsonb_set_lax", "jsonb_insert", "jsonb_strip_nulls", "json_strip_nulls", "jsonb_pretty",
+    "json_populate_record", "jsonb_populate_record", "json_to_record", "jsonb_to_record", "json_to_recordset", "jsonb_to_recordset",
+    "jsonb_path_query", "jsonb_path_query_array", "jsonb_path_query_first", "jsonb_path_exists", "jsonb_path_match",
+    // arrays and sets
+    "array_length", "array_upper", "array_lower", "array_append", "array_prepend", "array_cat", "array_remove", "array_replace",
+    "array_position", "array_positions", "cardinality", "unnest", "generate_series", "generate_subscripts", "array_fill", "array_ndims",
+    "array_dims", "trim_array",
+    // casts written as calls
+    "date", "text", "int4", "int8", "float8", "bool", "timezone",
+    // other values
+    "gen_random_uuid", "nextval", "pg_typeof",
+];
+
+/// Whether a database's own code may use a session's state, from its parsed trees only, never its
+/// text (the user's decision after the fifth review: every reading of text missed a spelling).
+/// `$1` is `SAFE_FUNCTIONS`; `$2` the bodies of Quillo's own functions there, which pass as they
+/// are (slice E). It is clean (`bad` false) only when all of these hold:
+/// - every function of its own (outside `pg_catalog` and `information_schema`, an extension's
+///   members aside) is in SQL with a stored body (`begin atomic` or `return`), or one of `$2`;
+///   PL/pgSQL, a text body, any other language: using it;
+/// - it has no event trigger;
+/// - each function its stored trees call, and each operator's function, by the trees' oid fields
+///   (`:funcid`, `:opfuncid`, `:aggfnoid`, `:winfnoid`, `:hashfuncid`, `:negfuncid`; `:opno`,
+///   `:opnos`, `:sortop`, `:eqop` through `oprcode`), is its own (so held to the above) or safe:
+///   built in (oid below 16384, so no extension's or anyone's of a name; in C or `internal`, so
+///   not one of the SQL built-ins a superuser could replace in place) and on `$1`, or a built-in
+///   aggregate or window function, or a built-in operator's or cast's. An extension's member is
+///   not safe by its name: it counts as the database's own;
+/// - the trees: views' and rules' actions and conditions (`ev_action`, `ev_qual`), policies,
+///   column and domain defaults, checks, index and partition expressions, extended statistics'
+///   expressions, triggers' `when`, functions' argument defaults and stored bodies; and the
+///   functions of its aggregates, operators, casts and triggers;
+/// - none reads `pg_settings`, whose rule runs `set_config`.
+///
+/// (FEEDBACK75.md, Q-1060, the fifth review; branch feedback86-89.)
+pub const USES_SESSION: &str = r"with
+sysns(oid) as (
+    select oid from pg_catalog.pg_namespace where nspname in ('pg_catalog', 'information_schema') or nspname like 'pg\_toast%'
+),
+ext(objid) as (
+    select objid from pg_catalog.pg_depend where deptype = 'e' and classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+),
+own_fn(oid, lang, kind, src, args, body) as (
+    select p.oid, p.prolang, p.prokind, p.prosrc, p.proargdefaults::text, p.prosqlbody::text from pg_catalog.pg_proc p
+    where p.pronamespace not in (select oid from sysns) and p.oid not in (select objid from ext)
+),
+builtin(oid) as (
+    select p.oid from pg_catalog.pg_proc p where p.oid < 16384 and p.pronamespace = 'pg_catalog'::pg_catalog.regnamespace
+      and p.prolang in (select oid from pg_catalog.pg_language where lanname in ('internal', 'c'))
+),
+safe_fn(oid) as (
+    select p.oid from pg_catalog.pg_proc p where p.oid in (select oid from builtin) and (p.proname = any($1::text[]) or p.prokind in ('a', 'w'))
+    union select o.oprcode from pg_catalog.pg_operator o where o.oid < 16384 and o.oprcode in (select oid from builtin)
+    union select k.castfunc from pg_catalog.pg_cast k where k.oid < 16384 and k.castfunc in (select oid from builtin)
+),
+fine(oid) as (
+    select oid from own_fn union select oid from safe_fn union select 0::pg_catalog.oid
+),
+trees(t) as (
+    select w.ev_action::text || coalesce(w.ev_qual::text, '') from pg_catalog.pg_rewrite w join pg_catalog.pg_class c on c.oid = w.ev_class
+    where c.relnamespace not in (select oid from sysns)
+    union all select coalesce(p.polqual::text, '') || coalesce(p.polwithcheck::text, '') from pg_catalog.pg_policy p
+    union all select a.adbin::text from pg_catalog.pg_attrdef a join pg_catalog.pg_class c on c.oid = a.adrelid where c.relnamespace not in (select oid from sysns)
+    union all select k.conbin::text from pg_catalog.pg_constraint k where k.connamespace not in (select oid from sysns) and k.conbin is not null
+    union all select coalesce(x.indexprs::text, '') || coalesce(x.indpred::text, '') from pg_catalog.pg_index x join pg_catalog.pg_class c on c.oid = x.indexrelid
+    where c.relnamespace not in (select oid from sysns)
+    union all select pt.partexprs::text from pg_catalog.pg_partitioned_table pt where pt.partexprs is not null
+    union all select se.stxexprs::text from pg_catalog.pg_statistic_ext se where se.stxexprs is not null
+    union all select t.tgqual::text from pg_catalog.pg_trigger t where not t.tgisinternal and t.tgqual is not null
+    union all select y.typdefaultbin::text from pg_catalog.pg_type y where y.typnamespace not in (select oid from sysns) and y.typdefaultbin is not null
+    union all select coalesce(f.args, '') || coalesce(f.body, '') from own_fn f
+),
+fref(oid) as (
+    select (pg_catalog.regexp_matches(t, ':(?:funcid|opfuncid|aggfnoid|winfnoid|hashfuncid|negfuncid) (\d+)', 'g'))[1]::pg_catalog.oid from trees
+),
+oref(oid) as (
+    select (pg_catalog.regexp_matches(t, ':(?:opno|sortop|eqop) (\d+)', 'g'))[1]::pg_catalog.oid from trees
+    union all select pg_catalog.unnest(pg_catalog.string_to_array(pg_catalog.btrim((pg_catalog.regexp_matches(t, ':opnos \(o([ 0-9]+)\)', 'g'))[1]), ' '))::pg_catalog.oid from trees
+)
+select exists (select 1 from own_fn f where f.kind <> 'a' and not (f.src = any($2::text[]))
+                 and (f.lang <> (select oid from pg_catalog.pg_language where lanname = 'sql') or f.body is null))
+    or exists (select 1 from pg_catalog.pg_event_trigger)
+    or exists (select 1 from fref where oid not in (select oid from fine))
+    or exists (select 1 from oref r join pg_catalog.pg_operator o on o.oid = r.oid where o.oprcode not in (select oid from fine))
+    or exists (select 1 from trees where t ~ (':relid ' || 'pg_catalog.pg_settings'::pg_catalog.regclass::pg_catalog.oid || ' '))
+    or exists (select 1 from pg_catalog.pg_operator o where o.oid >= 16384 and o.oprcode not in (select oid from fine))
+    or exists (select 1 from pg_catalog.pg_aggregate g where g.aggfnoid >= 16384
+               and (g.aggtransfn not in (select oid from fine) or g.aggfinalfn not in (select oid from fine) or g.aggcombinefn not in (select oid from fine)
+                  or g.aggserialfn not in (select oid from fine) or g.aggdeserialfn not in (select oid from fine) or g.aggmtransfn not in (select oid from fine)
+                  or g.aggminvtransfn not in (select oid from fine) or g.aggmfinalfn not in (select oid from fine)))
+    or exists (select 1 from pg_catalog.pg_cast k where k.oid >= 16384 and k.castfunc not in (select oid from fine))
+    or exists (select 1 from pg_catalog.pg_trigger t where not t.tgisinternal and t.tgfoid not in (select oid from fine)) as bad";
+
+/// What changes when anything `USES_SESSION` reads changes, cheaply: each catalog's rows of the
+/// database's own (oid 16384 and up; every function, built-ins too, which a superuser can replace
+/// in place: the sixth review), counted and their `xmin`s summed, and every role's or the
+/// database's settings. Asked every `RECHECK_MS` (FEEDBACK75.md, Q-1060, the fifth review; branch
+/// feedback86-89).
+pub const FINGERPRINT: &str = r"select pg_catalog.concat_ws('|',
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_proc),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_rewrite where oid >= 16384),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_trigger where oid >= 16384),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_policy),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_attrdef),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_constraint where oid >= 16384),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_index where indexrelid >= 16384),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_type where oid >= 16384),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_aggregate where aggfnoid >= 16384),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_operator where oid >= 16384),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_cast where oid >= 16384),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_event_trigger),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_extension),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_partitioned_table),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_statistic_ext),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_db_role_setting),
+    (select count(*) || ':' || coalesce(sum(xmin::text::bigint), 0) from pg_catalog.pg_depend where deptype = 'e')) as f";
+
+/// How often the watcher asks `FINGERPRINT`: DDL from another process (or a pool the process has
+/// not seen it through) is seen within this.
+pub const RECHECK_MS: u64 = 2000;
+
+/// How long an answer of the watcher holds with no newer one: then nothing is known, and every
+/// statement is set back until it answers again.
+pub const STALE_MS: u64 = 10_000;
+
+/// Quillo's own function bodies that pass `USES_SESSION` as they are (`own_tables`, byte for byte).
+pub(crate) fn own_bodies() -> Vec<Value> {
+    crate::db::own_tables::bodies().iter().map(|b| Value::str(b)).collect()
+}
+
+/// `USES_SESSION` on `c`.
+fn session_use(c: &mut Conn) -> Result<bool, String> {
+    let safe: Vec<Value> = SAFE_FUNCTIONS.iter().map(|n| Value::str(n)).collect();
+    let rows = c.query(USES_SESSION, &[Value::list(safe), Value::list(own_bodies())], Some(1))?;
+    match rows.first() {
+        Some(Value::Map(m)) => Ok(!matches!(m.get("bad"), Some(Value::Bool(false)))),
+        _ => Ok(true),
+    }
+}
+
+/// What the process knows of one database (its hosts, ports and name), whichever of its pools
+/// asks: how often its catalog changed (`epoch`), and what `USES_SESSION` said at which epoch
+/// (`said`: the epoch, shifted, with 2 for known and 1 for uses).
+pub struct DbState {
+    /// The program's schema changes under way (`Pool::begin_change`), and a check under way
+    /// after the catalog changed (`watch`): every statement counts the database as using a
+    /// session's state meanwhile.
+    changing: AtomicU64,
+    epoch: AtomicU64,
+    said: AtomicU64,
+    /// Rung when the program changed the catalog: the watcher checks again at once.
+    wake: (Mutex<bool>, Condvar),
+    /// When the watcher last had an answer (`clock`): past `STALE_MS`, nothing is known.
+    answered: AtomicU64,
+}
+
+/// Every database's state, by the server it is on and its oid there, as the server says (its
+/// start time and port), so that `localhost` and `127.0.0.1`, or two spellings of a host, share
+/// one; by the URL's hosts, ports and name when the server cannot say (FEEDBACK75.md, Q-1060, the
+/// third review; branch feedback86-89). A new one's watcher starts with it.
+fn db_state(config: &postgres::Config, tls: &Connector, c: &mut Conn) -> Arc<DbState> {
+    static ALL: OnceLock<Mutex<HashMap<String, Arc<DbState>>>> = OnceLock::new();
+    const WHO: &str = "select pg_catalog.pg_postmaster_start_time()::text || '|' || coalesce(pg_catalog.inet_server_port()::text, '') || '|' || d.oid::text as k \
+                       from pg_catalog.pg_database d where d.datname = pg_catalog.current_database()";
+    let key = match c.query(WHO, &[], Some(1)).ok().as_ref().and_then(|r| r.first()) {
+        Some(Value::Map(m)) if matches!(m.get("k"), Some(Value::Str(_))) => m.get("k").map(|k| k.display().to_string()).unwrap_or_default(),
+        _ => format!("{:?}|{:?}|{}", config.get_hosts(), config.get_ports(), config.get_dbname().or(config.get_user()).unwrap_or("postgres")),
+    };
+    let mut all = ALL.get_or_init(Default::default).lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(st) = all.get(&key) {
+        return st.clone();
+    }
+    let st = Arc::new(DbState { changing: AtomicU64::new(0), epoch: AtomicU64::new(0), said: AtomicU64::new(0), wake: (Mutex::new(false), Condvar::new()), answered: AtomicU64::new(0) });
+    all.insert(key, st.clone());
+    let (watched, config, tls) = (st.clone(), config.clone(), tls.clone());
+    std::thread::Builder::new().name("quillo-pg-watch".into()).spawn(move || watch(&watched, &config, tls)).ok();
+    st
+}
+
+/// The watcher of one database, beside the program: the check (`USES_SESSION`) at once, then the
+/// catalog's fingerprint (`FINGERPRINT`) every `RECHECK_MS`, or at once when the program changed
+/// the catalog, and the check again when it moved; meanwhile the database counts as using a
+/// session's state. No request ever waits for it: one that comes before an answer is set back. A
+/// connection or a check that fails is tried again later, 1 s at first, then up to 30 s
+/// (FEEDBACK75.md, Q-1060, the fifth review; branch feedback86-89).
+fn watch(st: &DbState, config: &postgres::Config, tls: Connector) {
+    // A deadline on all it asks, and on the connection: a server that stops answering leaves the
+    // database unknown (`STALE_MS`), so every statement is set back, never a verdict kept on
+    // (FEEDBACK75.md, Q-1060, the sixth review; branch feedback86-89).
+    let mut config = config.clone();
+    let options = format!("{} -c statement_timeout={} -c lock_timeout={}", config.get_options().unwrap_or(""), STALE_MS, STALE_MS);
+    config.options(options.trim());
+    config.connect_timeout(std::time::Duration::from_millis(STALE_MS));
+    config.keepalives(true);
+    config.keepalives_idle(std::time::Duration::from_secs(5));
+    let mut backoff = 1000u64;
+    let mut seen: Option<String> = None;
+    let mut c: Option<Conn> = None;
+    loop {
+        let epoch = st.epoch.load(Relaxed);
+        let known = { let said = st.said.load(Relaxed); said & 2 != 0 && said >> 2 == epoch };
+        let r = (|| -> Result<(), String> {
+            if c.as_ref().map_or(true, |c| c.client.is_closed()) {
+                let client = config.connect(tls.clone()).map_err(|e| describe(&e))?;
+                c = Some(Conn { client, stmts: HashMap::new(), conflict: None, aside: false, money: None, typed: HashMap::new(), in_tx: false, schema: (Arc::default(), 0), owner: Owner::Nobody, dirty: false });
+            }
+            let conn = c.as_mut().expect("connected");
+            let print = match conn.query(FINGERPRINT, &[], Some(1))?.first() {
+                Some(Value::Map(m)) => m.get("f").map(|v| v.display().to_string()).unwrap_or_default(),
+                _ => String::new(),
+            };
+            if known && seen.as_deref() == Some(print.as_str()) {
+                st.answered.store(clock(), Relaxed);
+                return Ok(());
+            }
+            // Changed, or never asked: using a session's state until the check says.
+            st.changing.fetch_add(1, Relaxed);
+            let epoch = st.epoch.fetch_add(1, Relaxed) + 1;
+            let uses = session_use(conn);
+            st.changing.fetch_sub(1, Relaxed);
+            let uses = uses?;
+            if st.epoch.load(Relaxed) == epoch {
+                st.said.store(epoch << 2 | 2 | uses as u64, Relaxed);
+                st.answered.store(clock(), Relaxed);
+                seen = Some(print);
+            }
+            Ok(())
+        })();
+        let wait = match r {
+            Ok(()) => {
+                backoff = 1000;
+                RECHECK_MS
+            }
+            Err(_) => {
+                c = None;
+                let w = backoff;
+                backoff = (backoff * 2).min(30_000);
+                w
+            }
+        };
+        let (m, cv) = &st.wake;
+        let g = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (mut g, _) = cv.wait_timeout_while(g, std::time::Duration::from_millis(wait), |rung| !*rung).unwrap_or_else(std::sync::PoisonError::into_inner);
+        *g = false;
+    }
+}
 
 /// Which of the names given are functions of the database's own (not in `pg_catalog`).
 const OWN_FNS: &str = "select distinct p.proname::text as name from pg_proc p join pg_namespace n on n.oid = p.pronamespace \
@@ -120,12 +420,19 @@ impl Pool {
 
     /// Looks the names up (on a connection of the pool's), and keeps what they are.
     pub fn look_up_fns(&self, names: &[Box<str>]) -> Result<bool, String> {
+        // Kept only when no function was made or dropped meanwhile (the review of Q-1060's first
+        // fix; branch feedback86-89).
+        let epoch = || self.state.get().map_or(0, |st| st.epoch.load(Relaxed));
+        let forgot = epoch();
         let mut c = self.checkout_nested()?;
         let list: Vec<Value> = names.iter().map(|n| Value::str(&**n)).collect();
         let rows = c.query(OWN_FNS, &[Value::list(list)], None);
         self.give_back(c);
         let rows = rows?;
         let own: Vec<String> = rows.iter().filter_map(|r| if let Value::Map(m) = r { m.get("name").map(|v| v.display().to_string()) } else { None }).collect();
+        if epoch() != forgot {
+            return Ok(!own.is_empty());
+        }
         let mut known = self.own_fns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if known.len() >= 4096 {
             known.clear();
@@ -136,9 +443,91 @@ impl Pool {
         Ok(!own.is_empty())
     }
 
+    /// The database's name, as PostgreSQL takes it from the URL (the user's when none is given).
+    pub fn dbname(&self) -> String {
+        self.config.get_dbname().or(self.config.get_user()).unwrap_or("postgres").to_string()
+    }
+
+    /// Its `?schema=`, if it has one.
+    pub fn schema_name(&self) -> Option<&str> {
+        self.schema_name.as_deref()
+    }
+
     /// The program made, replaced or dropped functions: what names are is looked up again.
     pub fn forget_fns(&self) {
         self.own_fns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+    }
+
+    /// Whether the database's own code uses a session's state (`USES_SESSION`), as its watcher
+    /// last found since the catalog changed; None while not known (FEEDBACK75.md, Q-1060; branch
+    /// feedback86-89).
+    #[inline]
+    pub fn uses_session(&self) -> Option<bool> {
+        let st = self.state.get()?;
+        if st.changing.load(Relaxed) > 0 {
+            return Some(true);
+        }
+        let said = st.said.load(Relaxed);
+        if clock().saturating_sub(st.answered.load(Relaxed)) > STALE_MS {
+            return None;
+        }
+        (said & 2 != 0 && said >> 2 == st.epoch.load(Relaxed)).then_some(said & 1 == 1)
+    }
+
+    /// The database's state, found now if it was not (`db_state`, on a connection of its own),
+    /// which starts its watcher.
+    pub fn state(&self) -> Result<&Arc<DbState>, String> {
+        if let Some(st) = self.state.get() {
+            return Ok(st);
+        }
+        let mut c = self.connect()?;
+        let st = db_state(&self.config, &self.tls, &mut c);
+        Ok(self.state.get_or_init(|| st))
+    }
+
+    /// `USES_SESSION` now, on a connection of the pool's, for tests and tools; nothing kept.
+    pub fn ask_session_use(&self) -> Result<bool, String> {
+        let mut c = self.checkout()?;
+        let r = session_use(&mut c);
+        self.give_back(c);
+        r
+    }
+
+    /// Rings the watcher: the program changed the catalog.
+    fn wake(st: &DbState) {
+        let (m, cv) = &st.wake;
+        *m.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        cv.notify_all();
+    }
+
+    /// The database's catalog changed through the program (its migrations): checked again
+    /// (FEEDBACK75.md, Q-1060; branch feedback86-89). Before anything needed the state (a
+    /// script's, a program's start), nothing to tell: its first check comes after.
+    pub fn catalog_changed(&self) {
+        if let Some(st) = self.state.get() {
+            st.epoch.fetch_add(1, Relaxed);
+            Self::wake(st);
+        }
+    }
+
+    /// A schema's statement of the program's is about to be sent: until `end_change`, every
+    /// statement on the database counts it as using a session's state (FEEDBACK75.md, Q-1060, the
+    /// fourth review; branch feedback86-89). False before anything needed the state (a script's
+    /// schema, a program's at its start, which no watcher or reset depends on yet): nothing to end.
+    pub fn begin_change(&self) -> bool {
+        let Some(st) = self.state.get() else { return false };
+        st.changing.fetch_add(1, Relaxed);
+        st.epoch.fetch_add(1, Relaxed);
+        true
+    }
+
+    /// The change `begin_change` announced is done (or its transaction ended): checked again.
+    pub fn end_change(&self) {
+        if let Some(st) = self.state.get() {
+            st.epoch.fetch_add(1, Relaxed);
+            st.changing.fetch_sub(1, Relaxed);
+            Self::wake(st);
+        }
     }
 
     /// Parses the URL and opens one connection to check it. TLS is required,
@@ -174,6 +563,8 @@ impl Pool {
             max,
             lanes: OnceLock::new(),
             own_fns: Mutex::new(HashMap::new()),
+            state: OnceLock::new(),
+            schema_name: schema.clone(),
             schema: Arc::default(),
         };
         let mut first = pool.checkout()?;
@@ -215,6 +606,9 @@ impl Pool {
             max,
             lanes: OnceLock::new(),
             own_fns: Mutex::new(HashMap::new()),
+            // Only makes a schema, and is let go.
+            state: OnceLock::new(),
+            schema_name: Some(schema.clone()),
             schema: Arc::default(),
         };
         let mut c = pool.checkout()?;
@@ -228,7 +622,7 @@ impl Pool {
     fn connect(&self) -> Result<Conn, String> {
         let client = self.config.connect(self.tls.clone()).map_err(|e| describe(&e))?;
         let schema = (self.schema.clone(), self.schema.count.load(Relaxed));
-        Ok(Conn { client, stmts: HashMap::new(), conflict: None, aside: false, money: None, typed: HashMap::new(), in_tx: false, schema })
+        Ok(Conn { client, stmts: HashMap::new(), conflict: None, aside: false, money: None, typed: HashMap::new(), in_tx: false, schema, owner: Owner::Nobody, dirty: false })
     }
 
     /// An idle connection or a new one, or None when all `max` are taken.
@@ -777,6 +1171,19 @@ fn let_go<V>(schema: &Schema, seen: u64, stmts: &mut HashMap<String, V>, typed: 
 }
 
 impl Conn {
+    /// Before Quillo's own statements (its tables, a migration) on a connection someone's
+    /// statement ran on: set back where the database uses a session's state, is not known to use
+    /// none, or did when that statement ran, so that neither a role nor a `search_path` left there
+    /// reaches them (FEEDBACK75.md, Q-1060, the sixth review; branch feedback86-89).
+    pub fn set_back_if_used(&mut self, uses: Option<bool>) -> Result<(), String> {
+        if self.owner != Owner::Nobody && (uses != Some(false) || self.dirty) {
+            self.batch(LANE_RESET)?;
+            self.owner = Owner::Nobody;
+            self.dirty = false;
+        }
+        Ok(())
+    }
+
     /// Its statements on what changed let go, when the pool's tables changed since they were
     /// prepared.
     fn current(&mut self) {
@@ -977,6 +1384,16 @@ fn money_digits<E: std::fmt::Display>(row: Result<postgres::Row, E>) -> Result<u
     Ok(scale.clamp(0, 28) as u32)
 }
 
+/// `money_digits`, from a simple query's answer.
+fn money_digits_text(got: Result<Vec<tokio_postgres::SimpleQueryMessage>, tokio_postgres::Error>) -> Result<u32, String> {
+    let got = got.map_err(|e| describe(&e))?;
+    let scale = got.iter().find_map(|m| match m {
+        tokio_postgres::SimpleQueryMessage::Row(r) => r.get(0).and_then(|v| v.parse::<i32>().ok()),
+        _ => None,
+    });
+    Ok(scale.ok_or("no money scale")?.clamp(0, 28) as u32)
+}
+
 /// Whether a result has a `money` column.
 fn has_money(rows: &[postgres::Row]) -> bool {
     rows.first().map_or(false, |r| r.columns().iter().any(|c| *c.type_() == Type::MONEY))
@@ -1075,6 +1492,174 @@ struct Lane {
     money: OnceLock<u32>,
     /// The pool's count of schema changes its statements were prepared under (`Pool::schema`).
     seen: AtomicU64,
+    /// Held while a statement and the reset in front of it are sent, so that no other request's
+    /// statement comes between them in the pipeline (`after_reset`).
+    order: Mutex<()>,
+    /// Its reset failed: what its session holds is unknown, and it answers no one again.
+    broken: AtomicBool,
+    /// Statements sent here while the database counted as using a session's state, and how many of
+    /// them a reset has followed since: while fewer, every statement goes after a reset, whatever
+    /// the database counts as now (FEEDBACK75.md, Q-1060, the fifth review; branch feedback86-89).
+    old_sent: AtomicU64,
+    cleaned: AtomicU64,
+    /// `LANE_RESET_PARTS` prepared once, as the lane connects, so that a reset is bound and run
+    /// with no parse (the sixth review's latency); None where one could not be (a function
+    /// revoked): a statement that needs the reset then fails, and nothing runs.
+    parts: Option<Vec<tokio_postgres::Statement>>,
+}
+
+/// What a statement on a shared connection can leave for the next one, set back in front of each
+/// on a database whose own code uses a session's state: its settings, its role, its temporary
+/// objects, its sequences' last values, its holdable cursors, what it listens to and its session
+/// advisory locks (FEEDBACK75.md, Q-1060, the user's choice of cost and the third review; branch
+/// feedback86-89). `RESET`'s, in another order, so that a server's log tells the two apart.
+pub const LANE_RESET: &str = "set session authorization default; reset all; discard temp; discard sequences; close all; unlisten *; select pg_advisory_unlock_all()";
+
+/// The lane's session set back, then `f`'s statement, sent one after the other with nothing
+/// between them in the lane's pipeline and no round trip more: `begin` and `LANE_RESET` in one
+/// query, the statement, then `commit`. Whatever the last statement left there, through a view, a
+/// rule, a trigger, a domain's check, a default or a function of the database's own, is gone
+/// before this one runs; and where the reset fails, PostgreSQL itself skips the statement in the
+/// transaction the failure aborted. The lane is then let go, and the reset's error is the answer.
+/// Set back too where a statement of the time the database counted as using a session's state ran
+/// on the lane and no reset has followed it (`old_sent`, `cleaned`; the fifth review). Each request
+/// is sent as its future is first polled; all are polled once under `order`, which every statement
+/// on a lane takes, before any is waited for. What tokio-postgres sends later by itself, the
+/// lookup of a type it has not seen after a prepare, may land inside another statement's burst: it
+/// is a read of `pg_catalog`'s type tables, which changes no session state and reads none a reset
+/// sets back, so it cannot carry a session's state across; where it lands in a burst whose reset
+/// failed it fails with it, and the lane is let go (FEEDBACK75.md, Q-1060; branch feedback86-89).
+async fn after_reset<T>(lane: &Lane, reset: bool, f: impl std::future::Future<Output = Result<T, tokio_postgres::Error>>) -> Result<Result<T, tokio_postgres::Error>, String> {
+    use std::future::Future;
+    use std::task::Poll;
+    static BEGIN: OnceLock<String> = OnceLock::new();
+    let mut f = std::pin::pin!(f);
+    // Decided, and the first poll made (which sends each request), under `order`, so that no other
+    // statement comes between a reset and its statement, nor between the count of statements sent
+    // under the reset and the choice to send this one without.
+    let mut first = true;
+    let mut burst: Option<(std::pin::Pin<Box<dyn Future<Output = Result<(), tokio_postgres::Error>> + Send + '_>>, std::pin::Pin<Box<dyn Future<Output = Result<(), tokio_postgres::Error>> + Send + '_>>)> = None;
+    let mut upto = 0;
+    let (mut a, mut b, mut z) = (None, None, None);
+    std::future::poll_fn(|cx| {
+        let _order = first.then(|| lane.order.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        if first {
+            first = false;
+            if reset {
+                lane.old_sent.fetch_add(1, Relaxed);
+            }
+            upto = lane.old_sent.load(Relaxed);
+            if reset || lane.cleaned.load(Relaxed) < upto {
+                let begin = BEGIN.get_or_init(|| format!("begin; {}", LANE_RESET));
+                burst = Some((Box::pin(lane.client.batch_execute(begin)), Box::pin(lane.client.batch_execute("commit"))));
+            }
+        }
+        let Some((reset_f, commit_f)) = burst.as_mut() else {
+            return match f.as_mut().poll(cx) {
+                Poll::Ready(r) => {
+                    b = Some(r);
+                    Poll::Ready(())
+                }
+                Poll::Pending => Poll::Pending,
+            };
+        };
+        if a.is_none() {
+            if let Poll::Ready(r) = reset_f.as_mut().poll(cx) {
+                a = Some(r);
+            }
+        }
+        if b.is_none() {
+            if let Poll::Ready(r) = f.as_mut().poll(cx) {
+                b = Some(r);
+            }
+        }
+        if z.is_none() {
+            if let Poll::Ready(r) = commit_f.as_mut().poll(cx) {
+                z = Some(r);
+            }
+        }
+        if a.is_some() && b.is_some() && z.is_some() { Poll::Ready(()) } else { Poll::Pending }
+    })
+    .await;
+    if burst.is_none() {
+        return b.ok_or_else(|| "the lane's answer was lost".to_string());
+    }
+    match (a, b, z) {
+        (Some(Ok(())), Some(r), Some(Ok(()))) => {
+            // A statement of the plain database after a reset: the earlier ones are set back.
+            if !reset {
+                lane.cleaned.fetch_max(upto, Relaxed);
+            }
+            Ok(r)
+        }
+        // The statement failed, and so its transaction: its own error.
+        (Some(Ok(())), Some(Err(e)), _) => Ok(Err(e)),
+        // `commit` refused it (a deferred constraint): nothing of it was kept.
+        (Some(Ok(())), Some(Ok(_)), Some(Err(e))) => Ok(Err(e)),
+        (Some(Err(e)), _, _) => {
+            lane.broken.store(true, Relaxed);
+            Err(format!("the connection's session could not be set back, so the statement was not run: {}", describe(&e)))
+        }
+        _ => {
+            lane.broken.store(true, Relaxed);
+            Err("the lane's answer was lost".into())
+        }
+    }
+}
+
+/// `LANE_RESET`'s statements one by one, for `statement_after`.
+const LANE_RESET_PARTS: &[&str] = &["set session authorization default", "reset all", "discard temp", "discard sequences", "close all", "unlisten *", "select pg_advisory_unlock_all()"];
+
+/// A prepared statement on a lane, after the reset where it needs one (as `after_reset` decides):
+/// the reset's statements and it in one request under ONE Sync (`together`, the vendored
+/// tokio-postgres's `Client::query_after`), so that where the reset fails PostgreSQL skips the
+/// statement, with no `begin` or `commit` of its own (FEEDBACK75.md, Q-1060, the fifth review;
+/// vendor/tokio-postgres-0.7.18/README-QUILLO.md; branch feedback86-89).
+async fn statement_after<T>(
+    lane: &Lane,
+    reset: bool,
+    plain: impl std::future::Future<Output = Result<T, tokio_postgres::Error>>,
+    together: impl std::future::Future<Output = Result<Result<T, tokio_postgres::Error>, String>>,
+) -> Result<Result<T, tokio_postgres::Error>, String> {
+    let (mut plain, mut together) = (std::pin::pin!(plain), std::pin::pin!(together));
+    let (mut first, mut need, mut upto) = (true, false, 0);
+    let got = std::future::poll_fn(|cx| {
+        let _order = first.then(|| lane.order.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+        if first {
+            first = false;
+            if reset {
+                lane.old_sent.fetch_add(1, Relaxed);
+            }
+            upto = lane.old_sent.load(Relaxed);
+            need = reset || lane.cleaned.load(Relaxed) < upto;
+        }
+        if need {
+            together.as_mut().poll(cx)
+        } else {
+            plain.as_mut().poll(cx).map(Ok)
+        }
+    })
+    .await;
+    match got {
+        Ok(r) => {
+            // Only where the statement ran: one that failed rolled its reset back with it, in the
+            // one transaction they share (the sixth review).
+            if need && !reset && r.is_ok() {
+                lane.cleaned.fetch_max(upto, Relaxed);
+            }
+            Ok(r)
+        }
+        Err(e) => {
+            lane.broken.store(true, Relaxed);
+            Err(format!("the connection's session could not be set back, so the statement was not run: {}", e))
+        }
+    }
+}
+
+/// `query_after` with the lane's reset prepared (`Lane::parts`): none there, nothing runs.
+async fn query_after(lane: &Lane, stmt: &tokio_postgres::Statement, refs: &[&(dyn ToSql + Sync)]) -> Result<Result<(Vec<tokio_postgres::Row>, u64), tokio_postgres::Error>, String> {
+    let Some(parts) = &lane.parts else { return Err("its reset could not be prepared".into()) };
+    lane.client.query_after(parts, stmt, refs).await.map_err(|e| describe(&e))
 }
 
 /// Milliseconds since the first call.
@@ -1084,6 +1669,11 @@ fn clock() -> u64 {
 }
 
 impl Lane {
+    /// Closed by the server, or let go after a failed reset.
+    fn gone(&self) -> bool {
+        self.client.is_closed() || self.broken.load(Relaxed)
+    }
+
     fn stuck(&self, now: u64) -> bool {
         self.waiting.load(Relaxed) > 0 && now.saturating_sub(self.moved.load(Relaxed)) > STUCK_MS
     }
@@ -1119,7 +1709,7 @@ impl Lanes {
         for i in order {
             let l = self.slots[i].lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
             match l {
-                Some(l) if l.client.is_closed() => {
+                Some(l) if l.gone() => {
                     pick = i;
                     break;
                 }
@@ -1132,7 +1722,7 @@ impl Lanes {
             }
         }
         if let Some(l) = self.slots[pick].lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone() {
-            if !l.client.is_closed() {
+            if !l.gone() {
                 return Ok(l);
             }
         }
@@ -1140,6 +1730,16 @@ impl Lanes {
         tokio::spawn(async move {
             let _ = conn.await;
         });
+        let mut parts = Some(Vec::with_capacity(LANE_RESET_PARTS.len()));
+        for p in LANE_RESET_PARTS {
+            match client.prepare(p).await {
+                Ok(st) => parts.as_mut().expect("parts").push(st),
+                Err(_) => {
+                    parts = None;
+                    break;
+                }
+            }
+        }
         let l = Arc::new(Lane {
             client,
             stmts: Mutex::new(HashMap::new()),
@@ -1148,16 +1748,24 @@ impl Lanes {
             moved: AtomicU64::new(0),
             money: OnceLock::new(),
             seen: AtomicU64::new(self.schema.count.load(Relaxed)),
+            order: Mutex::new(()),
+            broken: AtomicBool::new(false),
+            old_sent: AtomicU64::new(0),
+            cleaned: AtomicU64::new(0),
+            parts,
         });
         *self.slots[pick].lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(l.clone());
         Ok(l)
     }
 
-    async fn prepare(lane: &Lane, sql: &str) -> Result<tokio_postgres::Statement, String> {
+    async fn prepare(lane: &Lane, sql: &str, reset: bool) -> Result<tokio_postgres::Statement, String> {
         if let Some(s) = lane.stmts.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(sql) {
             return Ok(s.clone());
         }
-        let s = lane.client.prepare(sql).await.map_err(|e| describe(&e))?;
+        // Parsed on a session set back too: a literal is read as it is parsed, under the
+        // `TimeZone` or `DateStyle` the last statement left, and the statement is kept
+        // (FEEDBACK75.md, Q-1060, the third review; branch feedback86-89).
+        let s = after_reset(lane, reset, lane.client.prepare(sql)).await?.map_err(|e| describe(&e))?;
         let mut g = lane.stmts.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if g.len() >= 256 {
             g.clear();
@@ -1177,22 +1785,22 @@ impl Lanes {
         }
     }
 
-    async fn statement(&self, lane: &Lane, sql: &str, params: &[Value]) -> Result<(tokio_postgres::Statement, tokio_postgres::Statement), String> {
+    async fn statement(&self, lane: &Lane, sql: &str, params: &[Value], reset: bool) -> Result<(tokio_postgres::Statement, tokio_postgres::Statement), String> {
         self.current(lane);
-        let stmt = Self::prepare(lane, sql).await?;
+        let stmt = Self::prepare(lane, sql, reset).await?;
         let want = stmt.params().len();
         if want != params.len() {
             return Err(crate::sql::wrong_count(want, params.len()));
         }
         let casts = casts_for(sql, stmt.params());
         if let Some(types) = declared(stmt.params(), params) {
-            if let Some(s) = Self::typed(lane, casts.as_deref().unwrap_or(sql), types).await {
+            if let Some(s) = Self::typed(lane, casts.as_deref().unwrap_or(sql), types, reset).await {
                 return Ok((s, stmt));
             }
         }
         match casts {
             None => Ok((stmt.clone(), stmt)),
-            Some(cast_sql) => Ok((Self::prepare(lane, &cast_sql).await?, stmt)),
+            Some(cast_sql) => Ok((Self::prepare(lane, &cast_sql, reset).await?, stmt)),
         }
     }
 
@@ -1207,14 +1815,14 @@ impl Lanes {
     }
 
     /// As `Conn::typed`.
-    async fn typed(lane: &Lane, sql: &str, (sent, mut want): (Vec<Type>, Vec<Type>)) -> Option<tokio_postgres::Statement> {
+    async fn typed(lane: &Lane, sql: &str, (sent, mut want): (Vec<Type>, Vec<Type>), reset: bool) -> Option<tokio_postgres::Statement> {
         let key = typed_key(sql, &want);
         if let Some(s) = lane.typed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key) {
             return s.clone();
         }
         let mut s = None;
         for _ in 0..TRIES {
-            match lane.client.prepare_typed(sql, &want).await {
+            match after_reset(lane, reset, lane.client.prepare_typed(sql, &want)).await.ok()? {
                 Ok(st) => {
                     s = Some(st);
                     break;
@@ -1235,16 +1843,16 @@ impl Lanes {
     }
 
     /// Runs a query for request `n` (see `lane`).
-    pub async fn query(self: Arc<Self>, n: usize, sql: String, params: Vec<Value>, limit: Option<usize>) -> Result<Vec<Value>, String> {
+    pub async fn query(self: Arc<Self>, n: usize, sql: String, params: Vec<Value>, limit: Option<usize>, reset: bool) -> Result<Vec<Value>, String> {
         let (scan, params) = translate(&sql, &params)?;
         let lane = self.lane(n).await?;
         let _sent = lane.send();
         let mut again = true;
         let rows = loop {
-            let (stmt, inferred) = self.statement(&lane, scan.native(), &params).await?;
+            let (stmt, inferred) = self.statement(&lane, scan.native(), &params, reset).await?;
             let args = pg_params(&params, &inferred, &scan);
             let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-            match lane.client.query(&stmt, &refs).await {
+            match statement_after(&lane, reset, lane.client.query(&stmt, &refs), async { query_after(&lane, &stmt, &refs).await.map(|r| r.map(|(rows, _)| rows)) }).await? {
                 Ok(rows) => break rows,
                 Err(e) if again && self.replanned(&lane, &e, &scan) => again = false,
                 Err(e) => return Err(describe(&e)),
@@ -1254,27 +1862,28 @@ impl Lanes {
             (false, _) => 2,
             (true, Some(d)) => *d,
             (true, None) => {
-                let d = money_digits(lane.client.query_one(MONEY_DIGITS, &[]).await)?;
+                // One whole statement, sent beside its reset (a `query_one` parses first).
+                let d = money_digits_text(after_reset(&lane, reset, lane.client.simple_query(MONEY_DIGITS)).await?)?;
                 *lane.money.get_or_init(|| d)
             }
         };
         values(&rows, limit, digits)
     }
 
-    pub async fn exec(self: Arc<Self>, n: usize, sql: String, params: Vec<Value>) -> Result<Value, String> {
+    pub async fn exec(self: Arc<Self>, n: usize, sql: String, params: Vec<Value>, reset: bool) -> Result<Value, String> {
         let lane = self.lane(n).await?;
         let _sent = lane.send();
         let scan = crate::sql::scan(crate::sql::Dialect::Postgres, &sql);
         let changes = if params.is_empty() && scan.stmts.len() > 1 {
-            last_count(&scan, &lane.client.simple_query(&sql).await.map_err(|e| describe(&e))?)
+            last_count(&scan, &after_reset(&lane, reset, lane.client.simple_query(&sql)).await?.map_err(|e| describe(&e))?)
         } else {
             let params = scan.values(&params)?;
             let mut again = true;
             let n = loop {
-                let (stmt, inferred) = self.statement(&lane, scan.native(), &params).await?;
+                let (stmt, inferred) = self.statement(&lane, scan.native(), &params, reset).await?;
                 let args = pg_params(&params, &inferred, &scan);
                 let refs: Vec<&(dyn ToSql + Sync)> = args.iter().map(|a| a as &(dyn ToSql + Sync)).collect();
-                match lane.client.execute(&stmt, &refs).await {
+                match statement_after(&lane, reset, lane.client.execute(&stmt, &refs), async { query_after(&lane, &stmt, &refs).await.map(|r| r.map(|(_, n)| n)) }).await? {
                     Ok(n) => break n,
                     Err(e) if again && self.replanned(&lane, &e, &scan) => again = false,
                     Err(e) => return Err(describe(&e)),

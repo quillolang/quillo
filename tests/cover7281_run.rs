@@ -756,6 +756,8 @@ server fn to_text() { world = { ...world, name: "w" } }
         serde_json::from_str(&r.text()).unwrap_or_else(|e| panic!("{}: {}", e, r.text()))
     };
     let live = |it: &mut Interp, since: u64, topics: &str| -> serde_json::Value {
+        // Each topic signed, as the server gives it to a page (changed for 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89).
+        let topics = topics.split(',').filter(|t| !t.is_empty()).map(|t| quillo::server::signed_topic("", None, t)).collect::<Vec<_>>().join(",");
         let r = send(it, "GET", &format!("/_quillo/live?since={}&t={}", since, topics), &[], "");
         serde_json::from_str(&r.text()).unwrap_or_else(|e| panic!("{}: {}", e, r.text()))
     };
@@ -813,13 +815,14 @@ fn a_deferred_part_says_it_listens_to_scrolls() {
         island[..island.find('>').unwrap() + 1].to_string()
     };
     let a = send(&mut it, "GET", "/", &[], "");
-    let body = a.text();
+    // Without the answer's nonce (changed for 0.8.12: FEEDBACK51.md, Q-667; branch feedback86-89).
+    let body = support::no_nonce(&a.text());
     assert_eq!(a.status, 200, "{}", body);
     assert!(island(&body, "<body>").ends_with(" data-qd=\"0\" data-sc>"), "{}", body);
     let part = island(&body, "<template data-qt=\"0\">");
     assert!(part.ends_with("data-sc>") && !part.contains("data-qm"), "{}", body);
     assert!(body.contains("<p>2 0</p>"), "{}", body);
-    let body = send(&mut it, "GET", "/rows", &[], "").text();
+    let body = support::no_nonce(&send(&mut it, "GET", "/rows", &[], "").text());
     assert!(island(&body, "<template data-qt=\"0\">").ends_with(" data-qm data-sc>"), "{}", body);
     assert!(body.contains("<td>a 7</td>") && body.contains("<td>b 7</td>"), "{}", body);
     let body = send(&mut it, "GET", "/still", &[], "").text();

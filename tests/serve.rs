@@ -159,7 +159,8 @@ fn instances_take_connections_in_turn_and_share_the_database() {
         ),
     )
     .unwrap();
-    let srv = start(&f, &["--instances", "3"]);
+    // A secret, so that the test signs the page's topic as the server does (changed for 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89).
+    let srv = start_with_env(&f, &["--instances", "3"], &[("QUILLO_SECRET", "test secret for the tests")]);
     // Each request is a new connection; they go to the instances in turn,
     // and each instance has a counter of its own.
     let hits: Vec<String> = (0..6).map(|_| get(srv.port, "/hits").1).collect();
@@ -175,7 +176,7 @@ fn instances_take_connections_in_turn_and_share_the_database() {
     let port = srv.port;
     let waiting = std::thread::spawn(move || {
         let t0 = Instant::now();
-        (get(port, "/_quillo/live?since=1&t=ping").1, t0.elapsed())
+        (get(port, &format!("/_quillo/live?since=1&t={}", support::signed("ping"))).1, t0.elapsed())
     });
     std::thread::sleep(Duration::from_millis(400));
     assert_eq!(request(srv.port, "POST", "/ping", "").1, "ok");

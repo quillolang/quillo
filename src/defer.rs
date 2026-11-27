@@ -49,10 +49,13 @@ pub(crate) struct Page {
 }
 
 /// Swaps a waiting island for the one that came: defined once, before the first part, in the
-/// object the runtime shares with the page's scripts (FEEDBACK42.md, Q-486).
+/// object the runtime shares with the page's scripts (FEEDBACK42.md, Q-486). The document read
+/// through `Document.prototype`, past what the page names `querySelector` (`<form
+/// name="querySelector">` left the part waiting for good; the second review of slice W1,
+/// FEEDBACK51.md, Q-667; branch feedback86-89).
 pub const SWAP: &str = concat!(
-    "<script>(function(w){w.swap=function(i){var d=document,t=d.querySelector('template[data-qt=\"'+i+'\"]'),",
-    "o=d.querySelector('[data-qd=\"'+i+'\"]');if(!t)return;if(o){var n=t.content.firstElementChild;o.replaceWith(t.content);",
+    "<script>(function(w){w.swap=function(i){var d=document,q=Document.prototype.querySelector,t=q.call(d,'template[data-qt=\"'+i+'\"]'),",
+    "o=q.call(d,'[data-qd=\"'+i+'\"]');if(!t)return;if(o){var n=t.content.firstElementChild;o.replaceWith(t.content);",
     "if(n&&w.resume&&(n.hasAttribute('data-e')||n.hasAttribute('data-l')))w.resume(n)}t.remove()}})",
     "(window[Symbol.for('quillo')]||(window[Symbol.for('quillo')]={}))</script>"
 );
@@ -62,8 +65,9 @@ pub fn part(id: usize, island: &str) -> String {
     format!("<template data-qt=\"{}\">{}</template><script>window[Symbol.for(\"quillo\")].swap(\"{}\")</script>", id, island, id)
 }
 
-/// The line that swaps in the part it follows, whichever it is: one text for every part.
-pub const ONE_SWAP: &str = "window[Symbol.for(\"quillo\")].swap(document.currentScript.previousElementSibling.getAttribute(\"data-qt\"))";
+/// The line that swaps in the part it follows, whichever it is: one text for every part. Its own
+/// script through `Document.prototype`, as `SWAP` reads the document.
+pub const ONE_SWAP: &str = "window[Symbol.for(\"quillo\")].swap(Object.getOwnPropertyDescriptor(Document.prototype,\"currentScript\").get.call(document).previousElementSibling.getAttribute(\"data-qt\"))";
 
 /// `part`, swapped in by `ONE_SWAP`.
 pub fn part_one_swap(id: usize, island: &str) -> String {

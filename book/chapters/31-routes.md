@@ -102,7 +102,9 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
 - **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them. A blank value (`?page=`, as a search
   form sends a field left empty) is one not sent when the field has a default, so `page`
   is 1 *(since 0.7)*. `bool` takes `true`, `on`, `1` and `yes`, and `false`, `off`, `0` and
-  `no`, in any case. A list (`{ tag: [str] }`) takes every `tag`, or every `tag[]` when
+  `no`, in any case; a bare flag in the query string with no `=` (`?on`, *(since 0.8.12)*) also
+  matches a `bool` field as `true`, while `?on=` stays blank text (using the default or returning
+  400 when required). A list (`{ tag: [str] }`) takes every `tag`, or every `tag[]` when
   no `tag` came, as PHP- and Rails-shaped forms name them. An unchecked checkbox sends
   nothing, so its field needs a default: `{ form: { agree: bool = false } }`.
   A name sent more than once keeps its last value in `request.query` and `request.form`;
@@ -1335,19 +1337,45 @@ commits: the work and its answer are kept together, or neither is.
   (as Stripe does), since part of the work may have happened. A server that stops there
   leaves the key running: it is not known whether the work happened, so requests with
   the key get 409 until it expires. Give the provider the same key, if it takes one,
-  so that it too makes the payment once.
-- A [service](#services)'s function that changes data is such work too: it commits in the
-  service, not in this transaction. When its answer is lost (the service stopped part way,
-  the network dropped it), the call fails, the transaction rolls back and gives the key up,
-  and the client's retry with it calls the service again, under a new call id, so the
-  service changes its data twice. `quillo check` warns where an `idempotent` run in its
-  transaction reaches such a function, a site's too, directly or through the program's
-  functions, and through a service that calls another: ``main.qwe:6: warning: `idempotent`
-  reaches `billing.charge`, which may change data in another program, outside its
-  transaction: ...``. Give it `{ transaction: false }`, or send an id the service's change
-  is keyed by (`insert ... on conflict do nothing` on an order's id), so that a second run
-  changes nothing. A call made later (`billing.later.charge(...)`) waits in this
-  transaction's database, and is not warned of.
+  so that it too makes the payment once. When the run ends after a call to a Quillo
+  [service](#services) that was never sent (no connection, an open circuit), with an early reply
+  (`?? reply 503`), a `?` that passes its error on or a failure after it, that end is not kept
+  *(since 0.8.12; it was replayed to every retry)*: nothing reached the service, so the retry
+  with the key runs again. After a call that may have run (no answer in its time, a 503, a
+  502 or 504 the service did not sign), after the service answered (a value, an error value,
+  a 4xx; a failure further down the chain is the service's answer), and once the run has made
+  any other outbound call (`http.*`, push, UDP), its end is kept. The run has no transaction,
+  so what it wrote to its own database before the call is written again by the retry.
+- A [service](#services)'s function that changes data commits in the service, not in this
+  transaction. When its answer is lost (the service stopped part way, the network dropped
+  it), the call fails, the transaction rolls back and gives the key up, and the client's
+  retry calls the service again *under the same call id* *(since 0.8.12; a new one before, so
+  the service changed its data twice)*: a call made inside an `idempotent` run takes its id from
+  the run's key and its place in the run (the n-th call of that function), and the service
+  gives the answer it kept for that id when its function uses `idempotent` too. The chain
+  goes on down: the service's own calls inside its run get ids from it, signed to it in the
+  `x-quillo-root` header, so shop → billing → ledger, each `idempotent`, posts once after a
+  crash anywhere along it. Ids follow the key, the request and the call's place, signed
+  with the program's own secret, so another request with the same key gets other ids; a
+  service refuses an id it knows that comes with other arguments, from another caller or
+  for another function, and never answers it from its record. Calls inside `parallel`'s
+  functions get ids of their own and are not chained. A retry after a restart sends the same
+  ids only with `QUILLO_SECRET` (or the services' secret) set; without one, ids last as long as
+  the process. The same signed call sent again is refused (409). Stripping `x-quillo-root` or
+  replaying a signed answer takes someone on the path between the programs: use TLS between
+  them. Upgrade services before
+  their callers: a 0.8.11 service remembers an error value it gave for 11 minutes, which a
+  0.8.12 caller's retry then gets again.
+- Work at another site is not made safe that way. `quillo check` warns where an
+  `idempotent` run in its transaction reaches `http.post`, `put`, `patch`, `delete` or an
+  `http.request` that is not `GET`, `HEAD` or `OPTIONS` *(since 0.8.12; before, the warning was
+  for service calls)*, directly or through the program's functions: ``main.qwe:6: warning:
+  `idempotent` reaches `http.post`, which may change data at another site, outside its
+  transaction: ...``. Send the site a key of its own that is the same on each try (its
+  `Idempotency-Key` header, made from this request's key, which silences the warning); where
+  it takes none, look up whether the first request's change is there before sending it
+  again; or give `idempotent` `{ transaction: false }`. A call made later
+  (`billing.later.charge(...)`) waits in this transaction's database.
 
 ## Prefetching {#routes-prefetching}
 
@@ -2459,7 +2487,10 @@ answers the same, with billing in a process of its own.
 - **The service's file**, beside the app, is how the app knows what `billing.add` takes.
   As the app loads, it reads only the file's `server fn` headers (and those of the files
   it `use`s), so a mistake in one of its routes or bodies does not stop an app run with
-  `--no-check` (`quillo check`, and [`--split`](#options-of-quillo-run), still check the file whole). A service
+  `--no-check` (`quillo check`, and [`--split`](#options-of-quillo-run), still check the file whole, once
+  however many of the app's programs declare it *(since 0.8.12; its warnings were said twice)*;
+  a call takes and gives the service's own types, even where the app has a type of the same
+  name). A service
   that runs elsewhere need not be here at all: with no file and an address
   (`--service-url` or `QUILLO_SERVICE_BILLING`), the app asks the running service for its
   functions as it starts, as a call like any other (signed, each address in turn), and

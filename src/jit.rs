@@ -438,6 +438,23 @@ pub fn compiled() -> usize {
     JIT.with(|j| j.borrow().as_ref().map_or(0, |j| j.done.values().filter(|c| c.is_some()).count()))
 }
 
+/// For the fuzz targets (fuzz/): this thread's machine code forgotten and its memory given back,
+/// between two programs. The machine code is kept for good otherwise (as a server's functions do
+/// not change), so a fuzz run of millions of programs grew until libFuzzer stopped it for memory
+/// (FEEDBACK49.md, Q-608; branch feedback86-89). Called only once nothing it made can run again:
+/// the caller has let the programs go.
+#[cfg(fuzzing)]
+pub mod fuzzing {
+    pub fn forget() {
+        super::LAST.set(None);
+        if let Some(super::Jit { module, done, keep, over }) = super::JIT.with(|j| j.borrow_mut().take()) {
+            drop((done, keep, over));
+            // SAFETY: the only references to its code were in `done` and `LAST`, both gone.
+            unsafe { module.free_memory() };
+        }
+    }
+}
+
 thread_local! {
     /// The function `refuse_for_tests` names, and whether Cranelift is the one to refuse it.
     static REFUSE: RefCell<(String, bool)> = const { RefCell::new((String::new(), false)) };

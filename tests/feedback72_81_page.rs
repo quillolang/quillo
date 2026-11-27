@@ -1209,7 +1209,10 @@ component Plain() {
     <form id="g"><input id="x"/><button id="clear2" type="reset" onclick={() => { n += 1 }}>Clear</button><p id="n">{n}</p></form>
 }
 // Counts the page's `reset` listeners (the runtime's is on `document`).
-let COUNT = "window.__resets = 0; const add = document.addEventListener; document.addEventListener = function (t, ...r) { if (t === 'reset') window.__resets++; return add.call(this, t, ...r) };"
+// The runtime adds its listeners to the document through `EventTarget.prototype`, past what the page
+// names `addEventListener` (changed for 0.8.12: FEEDBACK51.md, Q-667, the review of slice W1; branch
+// feedback86-89).
+let COUNT = "window.__resets = 0; const add = EventTarget.prototype.addEventListener; EventTarget.prototype.addEventListener = function (t, ...r) { if (this === document && t === 'reset') window.__resets++; return add.call(this, t, ...r) };"
 route GET / = <html><head><script>{raw(COUNT)}</script></head><body><Reset/><Kept/></body></html>
 route GET /plain = <html><head><script>{raw(COUNT)}</script></head><body><Plain/></body></html>
 "#;
@@ -1388,7 +1391,10 @@ fn only_a_page_with_a_scroll_handler_listens_to_scrolls() {
     let s = served("scroll-html", SCROLLER);
     let a = s.get("/");
     assert!(a.body.contains("data-sc"), "{}", a.body);
-    assert!(a.body.contains("w.sc=1;d.addEventListener(\"scroll\""), "{}", a.body);
+    // Its listener added through `EventTarget.prototype` (`on`), past what the page names
+    // `addEventListener` (changed for 0.8.12: FEEDBACK51.md, Q-667, the review of slice W1; branch
+    // feedback86-89).
+    assert!(a.body.contains("w.sc=1;on(\"scroll\""), "{}", a.body);
     let a = s.get("/none");
     assert!(a.body.contains("<quillo-island"), "{}", a.body);
     assert!(!a.body.contains("data-sc") && !a.body.contains("\"scroll\"") && !a.body.contains("w.sc"), "{}", a.body);

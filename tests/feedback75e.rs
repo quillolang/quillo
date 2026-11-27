@@ -166,7 +166,8 @@ fn q1080_a_recursive_record_nested_past_64_levels_is_checked_through_server_fns_
 /// The program's own values keep 0.8.8's checks and cost (the review's decision): a record made
 /// (`Node(v)`) and an argument checked (`fn f(t: Node)`) 300 deep, and a 513-long `Link` passed to
 /// `fn f(l: Link)`, are taken (they were a 500 with a 2.6 KB message); a wrong leaf below 64 levels
-/// is taken unchecked as before, one above refused; a chain of types naming types (`type Ty1 =
+/// is taken unchecked by an argument's check as before, and refused by a constructor since Q-1122;
+/// one above refused by both; a chain of types naming types (`type Ty1 =
 /// Ty2`) is followed; empty, one node and unicode (FEEDBACK75.md, Q-1080 and its reviews; branch
 /// feedback75).
 #[test]
@@ -206,7 +207,12 @@ print(deep_value(chain(10, wrong)))
     let (out, err) = run_script(&d);
     let lines: Vec<&str> = out.lines().collect();
     assert_eq!(lines.len(), 8, "{}\n{}", out, err);
-    assert_eq!(&lines[..5], ["made", "300", "513", "made", "40"], "{}", out);
+    // A record's constructor now checks to the end (FEEDBACK75.md, Q-1122, the user's decision;
+    // branch feedback86-89): the wrong leaf 80 levels down is refused there, the argument's check
+    // keeping its 64 levels.
+    assert_eq!(&lines[..3], ["made", "300", "513"], "{}", out);
+    assert!(lines[3].starts_with("Node: `…") && lines[3].ends_with(".kids[0].value` must be int, got str \"x\""), "{}", out);
+    assert_eq!(lines[4], "40", "{}", out);
     assert_eq!(lines[5], "err(\"Node: `value` is missing\")");
     assert_eq!(lines[6], "{ value: 1, kids: [] }");
     assert_eq!(lines[7], "err(\"Node: `value` must be int, got str \\\"ü\\\"\")");

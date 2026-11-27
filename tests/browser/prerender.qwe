@@ -2,7 +2,9 @@
 // cannot be driven here, as a debugger turns prerendering off, so the page says it is one
 // until prerender.js says it is shown (FEEDBACK22.md, Q-178; branch feedback22-fixes).
 
-let SAY = "Object.defineProperty(document, 'prerendering', { value: true, configurable: true });"
+// On `Document.prototype`, where the runtime reads it, past what the page names `prerendering`
+// (changed for 0.8.12: FEEDBACK51.md, Q-667, the review of slice W1; branch feedback86-89).
+let SAY = "Object.defineProperty(Document.prototype, 'prerendering', { get: () => true, configurable: true });"
 
 server fn touch() = "ran"
 

@@ -1384,8 +1384,8 @@ fn let_go_of_many() {
     }
 
     /// `n` rows, unicode in them.
-    fn rows(n: usize) -> Arc<Vec<Value>> {
-        Arc::new((0..n).map(|i| Value::str(format!("row {} é😀", i))).collect())
+    fn rows(n: usize) -> Arc<quillo::value::Items> {
+        Arc::new(quillo::value::Items::new((0..n).map(|i| Value::str(format!("row {} é😀", i))).collect()))
     }
 
     fn call(it: &mut Interp, f: &Value, args: Vec<Value>) -> Result<Value, ()> {
@@ -1399,7 +1399,7 @@ fn let_go_of_many() {
 
     /// `name(rows, extra...)` called `times` times: what the last call gave, shown, and the holds
     /// left on the rows besides this test's.
-    fn left(it: &mut Interp, name: &str, rows: &Arc<Vec<Value>>, extra: &[Value], times: usize) -> (String, usize) {
+    fn left(it: &mut Interp, name: &str, rows: &Arc<quillo::value::Items>, extra: &[Value], times: usize) -> (String, usize) {
         let f = lookup(&it.globals, name).unwrap_or_else(|| panic!("no {}", name));
         let mut last = String::new();
         for _ in 0..times {

@@ -6,7 +6,6 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub type Map = IndexMap<Key, Value>;
 
 /// A map key, kept in place when short (as nearly all are), so a map such as
 /// a database row needs no allocation for its keys. It hashes, compares and
@@ -171,7 +170,7 @@ pub enum Value {
     /// An exact decimal: `12.50m` (src/decimal.rs).
     Dec(crate::decimal::Dec),
     Str(Arc<str>),
-    List(Arc<Vec<Value>>),
+    List(Arc<Items>),
     Map(Arc<Map>),
     Func(Arc<Closure>),
     Builtin(&'static str, BuiltinFn),
@@ -182,7 +181,7 @@ pub enum Value {
     /// to be read: what a builtin makes can say what no visitor should see, so it has to be
     /// marked, as the text cannot tell them apart (FEEDBACK21.md, Q-171; branch
     /// feedback20-fixes). The place is where it was made (FEEDBACK21.md, Q-174).
-    Err(Arc<Value>, bool, Place),
+    Err(Arc<Inner>, bool, Place),
     /// Trusted CSS: what a css`...` written in the program makes, whose values the parser gave
     /// to `__css_value` (or a literal's text). A style's `__css_value` writes it as it is, through
     /// names, props, lists, maps, a fn's answer and an island's props; anywhere else it is a
@@ -192,6 +191,594 @@ pub enum Value {
     /// Last, beside `Err`: every other value's tag is as it was, and one test finds either
     /// (`Interp::call`).
     Css(Arc<str>),
+}
+
+// ---- lists' and maps' insides: freed without recursion ----------------------------------------
+//
+// A value nested a million deep (`x = [x]` in a loop, a reply chain, a tree built from data) was
+// freed by Rust's drop glue one level inside the other, a few frames a level, and the stack ran out:
+// the server stopped with no log line, every other request with it (FEEDBACK49.md, Q-592;
+// FEEDBACK51.md, Q-661; coverage of 0.8.7, Q-1114; branch feedback86-89). A list's items and a map's
+// fields are kept in these two, whose `Drop` lets the glue free what goes no further than one
+// level, and takes a list or map it was the last to hold whose own items go on down apart in a loop
+// (`drop_value_at`, `free_owned`): down to `FREE_DEEP` levels by plain calls, deeper from a list of
+// what is still to free, so a shallow value is freed as it was and a deep one in constant stack. A
+// function's scope and an error value's are taken apart the same way (`free_items`).
+
+/// A list's items: a `Vec` (which it reads and changes as, through `Deref`), freed without recursion
+/// however deep (see above).
+#[derive(Clone, Default)]
+#[repr(transparent)]
+pub struct Items(Vec<Value>);
+
+/// A map: its keys and values in order, which it reads and changes as an `IndexMap` (through
+/// `Deref`), freed without recursion however deep (see above); and the record type that made it,
+/// if one did and nothing has changed it since: a record's constructor and a typed check take such
+/// a map as that type without walking it again (`Map::made_as`; FEEDBACK75.md, Q-1122, the user's
+/// decision; branch feedback86-89). Eight bytes a map, which also say whether it may hold a list
+/// or map (`NESTS`): one that cannot is freed as before, with no look at its values.
+#[derive(Clone, Default)]
+pub struct Map {
+    map: IndexMap<Key, Value>,
+    /// `TypeDef::id` of the record type that made it, or 0: cleared by any change (`DerefMut`,
+    /// `insert`); and `NESTS`.
+    mark: u64,
+}
+
+/// The bit of `Map::mark` saying that the map may hold a list or a map, set by `insert` given one
+/// and by any other change (`DerefMut`): without it, nothing in the map can go on down, and its
+/// `Drop` passes its values by. Freeing a map of two numbers had cost 20 to 30 instructions more
+/// for the look (a page's rows; FEEDBACK49.md, Q-592; branch feedback86-89).
+const NESTS: u64 = 1 << 63;
+
+/// Whether `v` is a list or a map, for `NESTS`.
+#[inline(always)]
+fn list_or_map(v: &Value) -> bool {
+    matches!(v, Value::List(_) | Value::Map(_))
+}
+
+/// What an error value holds (`err(x)`'s `x`): the value, which it reads as (`Deref`), freed
+/// without recursion however many error values nest one in another (`x = err(x)` in a loop; see
+/// above).
+#[derive(Clone)]
+#[repr(transparent)]
+pub struct Inner(Value);
+
+impl Inner {
+    #[inline(always)]
+    pub fn new(v: Value) -> Inner {
+        Inner(v)
+    }
+
+    /// The value it holds.
+    #[inline(always)]
+    pub fn value(&self) -> &Value {
+        &self.0
+    }
+
+    /// The value, taken out.
+    #[inline(always)]
+    pub fn into_value(mut self) -> Value {
+        std::mem::replace(&mut self.0, Value::Nil)
+    }
+}
+
+impl std::ops::Deref for Inner {
+    type Target = Value;
+    #[inline(always)]
+    fn deref(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl From<Value> for Inner {
+    #[inline(always)]
+    fn from(v: Value) -> Inner {
+        Inner(v)
+    }
+}
+
+impl Drop for Inner {
+    #[inline]
+    fn drop(&mut self) {
+        if boxes(&self.0) {
+            free_items(std::iter::once(std::mem::replace(&mut self.0, Value::Nil)));
+        }
+    }
+}
+
+impl Items {
+    #[inline(always)]
+    pub fn new(items: Vec<Value>) -> Items {
+        Items(items)
+    }
+
+    /// The items, taken out.
+    #[inline(always)]
+    pub fn into_vec(mut self) -> Vec<Value> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl Map {
+    #[inline(always)]
+    pub fn new() -> Map {
+        Map { map: IndexMap::new(), mark: 0 }
+    }
+
+    #[inline(always)]
+    pub fn with_capacity(n: usize) -> Map {
+        Map { map: IndexMap::with_capacity(n), mark: 0 }
+    }
+
+    /// `IndexMap::with_capacity_and_hasher`, as a row is made (src/db.rs).
+    #[inline(always)]
+    pub fn with_capacity_and_hasher(n: usize, h: std::collections::hash_map::RandomState) -> Map {
+        Map { map: IndexMap::with_capacity_and_hasher(n, h), mark: 0 }
+    }
+
+    /// The same keys and values, marked as made by the record type `mark` (`made_as`).
+    #[inline(always)]
+    pub fn made(mut self, mark: u64) -> Map {
+        self.mark = (self.mark & NESTS) | mark;
+        self
+    }
+
+    /// `IndexMap::insert`, which clears the record mark (a change) and notes a list or map put in
+    /// (`NESTS`). In place of the `DerefMut` one, which would take any value for one.
+    #[inline(always)]
+    pub fn insert(&mut self, k: Key, v: Value) -> Option<Value> {
+        // The commonest, a plain value into a map no type made: nothing to note.
+        if self.mark != 0 || list_or_map(&v) {
+            self.mark = (self.mark & NESTS) | if list_or_map(&v) { NESTS } else { 0 };
+        }
+        self.map.insert(k, v)
+    }
+
+    /// The record type that made it (its `TypeDef::id`), if one did and it is as that made it;
+    /// else 0.
+    #[inline(always)]
+    pub fn made_as(&self) -> u64 {
+        self.mark & !NESTS
+    }
+
+    /// Its keys and values as an `IndexMap`, taken out.
+    #[inline(always)]
+    pub fn into_inner(mut self) -> IndexMap<Key, Value> {
+        std::mem::take(&mut self.map)
+    }
+
+    #[inline(always)]
+    pub fn into_values(self) -> indexmap::map::IntoValues<Key, Value> {
+        self.into_inner().into_values()
+    }
+
+    #[inline(always)]
+    pub fn into_keys(self) -> indexmap::map::IntoKeys<Key, Value> {
+        self.into_inner().into_keys()
+    }
+}
+
+impl std::ops::Deref for Items {
+    type Target = Vec<Value>;
+    #[inline(always)]
+    fn deref(&self) -> &Vec<Value> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Items {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Vec<Value> {
+        &mut self.0
+    }
+}
+
+impl std::ops::Deref for Map {
+    type Target = IndexMap<Key, Value>;
+    #[inline(always)]
+    fn deref(&self) -> &IndexMap<Key, Value> {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for Map {
+    /// Changed: no longer what its record type made, and may hold a list or map now, as far as
+    /// anything knows.
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut IndexMap<Key, Value> {
+        self.mark = NESTS;
+        &mut self.map
+    }
+}
+
+impl From<Vec<Value>> for Items {
+    #[inline(always)]
+    fn from(v: Vec<Value>) -> Items {
+        Items(v)
+    }
+}
+
+impl From<IndexMap<Key, Value>> for Map {
+    #[inline(always)]
+    fn from(map: IndexMap<Key, Value>) -> Map {
+        Map { map, mark: NESTS }
+    }
+}
+
+impl<const N: usize> From<[(Key, Value); N]> for Map {
+    fn from(a: [(Key, Value); N]) -> Map {
+        let mark = if a.iter().any(|(_, v)| list_or_map(v)) { NESTS } else { 0 };
+        Map { map: IndexMap::from(a), mark }
+    }
+}
+
+impl FromIterator<(Key, Value)> for Map {
+    #[inline]
+    fn from_iter<I: IntoIterator<Item = (Key, Value)>>(it: I) -> Map {
+        let mut nests = false;
+        let map = IndexMap::from_iter(it.into_iter().inspect(|(_, v)| nests |= list_or_map(v)));
+        Map { map, mark: if nests { NESTS } else { 0 } }
+    }
+}
+
+impl Extend<(Key, Value)> for Map {
+    #[inline]
+    fn extend<I: IntoIterator<Item = (Key, Value)>>(&mut self, it: I) {
+        self.mark = NESTS;
+        self.map.extend(it)
+    }
+}
+
+impl IntoIterator for Map {
+    type Item = (Key, Value);
+    type IntoIter = indexmap::map::IntoIter<Key, Value>;
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_inner().into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Map {
+    type Item = (&'a Key, &'a mut Value);
+    type IntoIter = indexmap::map::IterMut<'a, Key, Value>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.mark = NESTS;
+        self.map.iter_mut()
+    }
+}
+
+impl<'a> IntoIterator for &'a Items {
+    type Item = &'a Value;
+    type IntoIter = std::slice::Iter<'a, Value>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a Map {
+    type Item = (&'a Key, &'a Value);
+    type IntoIter = indexmap::map::Iter<'a, Key, Value>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.map.iter()
+    }
+}
+
+impl Drop for Items {
+    /// Each item dropped where it is, in the drop glue's loop: numbers and the like pass; text and
+    /// maps go by the glue's own step (a map's `Drop` looks after what it holds, `NESTS`); a list,
+    /// function, error value or answer by `drop_value_at`, apart, which takes one that goes on down
+    /// apart in a loop. Empty when `free_owned` took it apart. With the whole look in line every
+    /// list paid ~20 instructions more; with a look at the count before the glue's step, ~5 an
+    /// item (FEEDBACK49.md, Q-592; branch feedback86-89).
+    #[inline(always)]
+    fn drop(&mut self) {
+        let n = self.0.len();
+        // SAFETY: the length is set to 0 first, so each item is dropped exactly once, here, and
+        // none after (`Vec`'s own drop frees the room alone). Dropping a value does not panic.
+        unsafe {
+            self.0.set_len(0);
+            let at = self.0.as_mut_ptr();
+            for i in 0..n {
+                let x = at.add(i);
+                match &*x {
+                    Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Builtin(..) => {}
+                    Value::Str(_) | Value::Html(_) | Value::Css(_) | Value::Map(_) => std::ptr::drop_in_place(x),
+                    _ => drop_value_out(x),
+                }
+            }
+        }
+    }
+}
+
+/// `drop_value_at`, apart: what may go on down (`Items::drop`).
+///
+/// # Safety
+/// As `drop_value_at`.
+#[inline(never)]
+unsafe fn drop_value_out(x: *mut Value) {
+    drop_value_at(x)
+}
+
+
+/// Whether `v` is a list, map, error value, function or answer it alone holds: freeing it could
+/// go on down, so it is taken apart in a loop (`free_owned`).
+#[inline(always)]
+fn owns(v: &Value) -> bool {
+    match v {
+        Value::List(a) => Arc::strong_count(a) == 1,
+        Value::Map(a) => Arc::strong_count(a) == 1,
+        Value::Func(a) => Arc::strong_count(a) == 1,
+        Value::Err(a, ..) => Arc::strong_count(a) == 1,
+        Value::Response(a) => Arc::strong_count(a) == 1,
+        _ => false,
+    }
+}
+
+/// Empties `items`, the insides of a list `free_owned` took apart, each dropped in place where it
+/// holds nothing to take apart or something others hold too; one it alone holds freed `depth`
+/// levels down onto `later` (`free_owned`).
+#[inline(always)]
+fn free_in_place(items: &mut Vec<Value>, depth: u32, later: &mut Vec<Value>) {
+    let n = items.len();
+    // SAFETY: the length is set to 0 first, so each item is read or dropped exactly once, here,
+    // and none after (`Vec`'s own drop frees the room alone). Dropping a value does not panic.
+    unsafe {
+        items.set_len(0);
+        let at = items.as_mut_ptr();
+        for i in 0..n {
+            let x = at.add(i);
+            match &*x {
+                Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Builtin(..) => {}
+                v if owns(v) => free_owned(std::ptr::read(x), depth, later),
+                _ => std::ptr::drop_in_place(x),
+            }
+        }
+    }
+}
+
+/// Whether `v` may hold other values for `free_value` to take apart.
+#[inline(always)]
+fn boxes(v: &Value) -> bool {
+    matches!(v, Value::List(_) | Value::Map(_) | Value::Err(..) | Value::Func(_) | Value::Response(_))
+}
+
+impl Drop for Map {
+    /// As a list's (`Items::drop`): only one that may hold a list or map (`NESTS`) looks at its
+    /// values (`free_map_deep`); the rest left to the map's own drop.
+    #[inline(always)]
+    fn drop(&mut self) {
+        // One that holds no list or map, the commonest (a page's rows), as before (`NESTS`).
+        if self.mark & NESTS != 0 {
+            free_map_deep(&mut self.map);
+        }
+    }
+}
+
+/// `Map::drop` of one that may hold a list or map: each value dropped as a list's items are
+/// (`drop_value_at`), the rest left to the map's own drop.
+#[inline(never)]
+fn free_map_deep(m: &mut IndexMap<Key, Value>) {
+    for x in m.values_mut() {
+        if list_or_map(x) {
+            // SAFETY: the value is read out once and `Nil` put in its place.
+            unsafe {
+                let v = std::ptr::replace(x, Value::Nil);
+                let mut v = std::mem::ManuallyDrop::new(v);
+                drop_value_at(&mut *v);
+            }
+        }
+    }
+}
+
+/// Drops the value at `x`, which no one reads again, as the drop glue does: numbers and the like
+/// hold nothing; a list or map is let go of with the glue's one atomic step (`Arc::into_inner`),
+/// and when that was the last hold, freed by its own `Drop` if what it holds goes no further than
+/// one level (`deep_inner`), else taken apart in a loop (`free_list_owned`, `free_map_owned`); the
+/// rest by the glue. With a look at the count first and the glue's step after, each list's item
+/// paid ~5 instructions more, and a page's lists of shared rows +1.3% (FEEDBACK49.md, Q-592;
+/// branch feedback86-89).
+///
+/// # Safety
+/// `x` points to a value no one reads or drops again.
+#[inline(always)]
+unsafe fn drop_value_at(x: *mut Value) {
+    match &*x {
+        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Builtin(..) => {}
+        // Let go of with the glue's one atomic step; when that was the last hold, freed by its own
+        // `Drop` unless its items go on down.
+        Value::List(_) => {
+            let Value::List(a) = std::ptr::read(x) else { std::hint::unreachable_unchecked() };
+            if let Some(items) = Arc::into_inner(a) {
+                if items.iter().any(nests) {
+                    free_list_owned(items);
+                }
+            }
+        }
+        // A map that holds no list or map (`NESTS`, which no one changes while it is shared) goes
+        // no further than its own `Drop`: the glue's step alone, in place.
+        Value::Map(a) if a.mark & NESTS == 0 => {
+            let Value::Map(a) = std::ptr::read(x) else { std::hint::unreachable_unchecked() };
+            drop(a);
+        }
+        Value::Map(_) => {
+            let Value::Map(a) = std::ptr::read(x) else { std::hint::unreachable_unchecked() };
+            if let Some(m) = Arc::into_inner(a) {
+                if m.values().any(nests) {
+                    free_map_owned(m);
+                }
+            }
+        }
+        _ => std::ptr::drop_in_place(x),
+    }
+}
+
+/// Whether `x` is a list or a map only its holder holds: what could go on down.
+#[inline(always)]
+fn nests(x: &Value) -> bool {
+    match x {
+        Value::List(a) => Arc::strong_count(a) == 1,
+        Value::Map(a) => Arc::strong_count(a) == 1,
+        _ => false,
+    }
+}
+
+/// A list nothing else holds, whose items go on down, taken apart in a loop (`free_owned`).
+#[cold]
+#[inline(never)]
+fn free_list_owned(items: Items) {
+    let items = std::mem::ManuallyDrop::new(items);
+    // SAFETY: `items` is never dropped, so its `Vec` is moved out once.
+    let mut inner: Vec<Value> = unsafe { std::ptr::read(&items.0) };
+    let mut later: Vec<Value> = Vec::new();
+    free_in_place(&mut inner, 1, &mut later);
+    drop(inner);
+    while let Some(v) = later.pop() {
+        free_value(v, 0, &mut later);
+    }
+}
+
+/// A map nothing else holds, whose values go on down, taken apart in a loop (`free_owned`).
+#[cold]
+#[inline(never)]
+fn free_map_owned(m: Map) {
+    let m = std::mem::ManuallyDrop::new(m);
+    // SAFETY: `m` is never dropped, so its map is moved out once.
+    let mut inner: IndexMap<Key, Value> = unsafe { std::ptr::read(&m.map) };
+    let mut later: Vec<Value> = Vec::new();
+    free_map_at(&mut inner, 1, &mut later);
+    drop(inner);
+    while let Some(v) = later.pop() {
+        free_value(v, 0, &mut later);
+    }
+}
+
+/// Each value of `m` that this map alone holds and could go on down taken out and freed `depth`
+/// levels down (`free_owned`).
+#[inline(always)]
+fn free_map_at(m: &mut IndexMap<Key, Value>, depth: u32, later: &mut Vec<Value>) {
+    for x in m.values_mut() {
+        if owns(x) {
+            free_owned(std::mem::replace(x, Value::Nil), depth, later);
+        }
+    }
+}
+
+/// How many levels `free_value` goes down by plain calls; deeper, what is left goes on a list.
+/// A level takes a frame of under 200 bytes in a release build (a few KB in a debug one): little
+/// enough for a `parallel` call's 512 KB stack, wherever on it a value is let go of.
+const FREE_DEEP: u32 = 32;
+
+/// Frees `items`, the insides of a list, map or scope that was let go of, and each container in
+/// them that this was the last hold on, without recursion past `FREE_DEEP`.
+#[inline(never)]
+fn free_items(items: impl Iterator<Item = Value>) {
+    let mut later: Vec<Value> = Vec::new();
+    for v in items {
+        free_at(v, 0, &mut later);
+    }
+    while let Some(v) = later.pop() {
+        free_value(v, 0, &mut later);
+    }
+}
+
+/// `free_value` of what may hold others, the rest dropped in place: a list of 100 numbers paid a
+/// call for each, +40% on a function keeping one (Q-955's cases).
+#[inline(always)]
+fn free_at(v: Value, depth: u32, later: &mut Vec<Value>) {
+    if boxes(&v) {
+        free_value(v, depth, later);
+    } else {
+        drop(v);
+    }
+}
+
+/// Lets go of `v`, `depth` levels into what is being freed: a list, map, error value, function or
+/// answer it was the last hold on taken apart here (each emptied before it is dropped, so its own
+/// `Drop` has nothing to do), its insides freed one level down, or put on `later` past `FREE_DEEP`.
+/// Holds the same three atomic steps as the drop glue (`Arc::into_inner`). One something else
+/// holds too (a page's rows shared with a global list) let go of in line, as the glue does, with no
+/// call: Fortunes' 13 shared rows paid one each.
+#[inline(always)]
+fn free_value(v: Value, depth: u32, later: &mut Vec<Value>) {
+    let shared = match &v {
+        Value::List(a) => Arc::strong_count(a) != 1,
+        Value::Map(a) => Arc::strong_count(a) != 1,
+        Value::Func(a) => Arc::strong_count(a) != 1,
+        Value::Err(a, ..) => Arc::strong_count(a) != 1,
+        _ => false,
+    };
+    if shared {
+        // Another may let go of its hold meanwhile: this one is then the last, and its `Drop`
+        // frees it, one level down, as above.
+        drop(v);
+    } else {
+        free_owned(v, depth, later);
+    }
+}
+
+/// `free_value` of one it may be the last hold on.
+#[inline(never)]
+fn free_owned(v: Value, depth: u32, later: &mut Vec<Value>) {
+    match v {
+        Value::List(a) => {
+            if let Some(items) = Arc::into_inner(a) {
+                // Its items taken out whole, so that its own `Drop` does not look at them again.
+                let items = std::mem::ManuallyDrop::new(items);
+                // SAFETY: `items` is never dropped, so its `Vec` is moved out once.
+                let mut inner: Vec<Value> = unsafe { std::ptr::read(&items.0) };
+                if depth >= FREE_DEEP {
+                    later.append(&mut inner);
+                } else {
+                    free_in_place(&mut inner, depth + 1, later);
+                }
+            }
+        }
+        Value::Map(a) => {
+            if let Some(fields) = Arc::into_inner(a) {
+                // As a list's: its own `Drop` passed by.
+                let fields = std::mem::ManuallyDrop::new(fields);
+                // SAFETY: `fields` is never dropped, so its map is moved out once.
+                let mut inner: IndexMap<Key, Value> = unsafe { std::ptr::read(&fields.map) };
+                if depth >= FREE_DEEP {
+                    later.extend(inner.values_mut().filter(|x| owns(x)).map(|x| std::mem::replace(x, Value::Nil)));
+                } else {
+                    free_map_at(&mut inner, depth + 1, later);
+                }
+            }
+        }
+        Value::Err(x, ..) => {
+            if let Some(x) = Arc::into_inner(x) {
+                free_deeper(x.into_value(), depth, later);
+            }
+        }
+        Value::Func(c) => {
+            if let Some(c) = Arc::into_inner(c) {
+                if let Some(s) = Arc::into_inner(c.env) {
+                    s.free_into(depth, later);
+                }
+            }
+        }
+        Value::Response(r) => {
+            if let Some(mut r) = Arc::into_inner(r) {
+                match &mut r.body {
+                    Body::Value(x) | Body::Stream { f: x, .. } => free_deeper(std::mem::replace(x, Value::Nil), depth, later),
+                    Body::Bytes(_) => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `free_value` of one value one level down, or on `later` past `FREE_DEEP`.
+#[inline(always)]
+fn free_deeper(x: Value, depth: u32, later: &mut Vec<Value>) {
+    if depth >= FREE_DEEP {
+        later.push(x);
+    } else {
+        free_at(x, depth + 1, later);
+    }
 }
 
 /// Where an error value was made, for the log: a file and a line in four bytes, which fit
@@ -263,13 +850,34 @@ pub enum Body {
     Stream { f: Value, events: bool },
 }
 
+impl Drop for Body {
+    /// What it holds freed as an error value's is (`Inner`), without recursion however many
+    /// answers nest one in another (`r = respond(200, r)` in a loop; found in review of
+    /// FEEDBACK49.md's Q-592; branch feedback86-89).
+    #[inline]
+    fn drop(&mut self) {
+        if let Body::Value(v) | Body::Stream { f: v, .. } = self {
+            if boxes(v) {
+                free_body(v);
+            }
+        }
+    }
+}
+
+/// `Body::drop` of a value that may hold others, apart from every answer's drop.
+#[cold]
+#[inline(never)]
+fn free_body(v: &mut Value) {
+    free_items(std::iter::once(std::mem::replace(v, Value::Nil)));
+}
+
 impl Value {
     pub fn str(s: impl AsRef<str>) -> Value {
         Value::Str(Arc::from(s.as_ref()))
     }
 
     pub fn list(items: Vec<Value>) -> Value {
-        Value::List(Arc::new(items))
+        Value::List(Arc::new(Items(items)))
     }
 
     pub fn map(m: Map) -> Value {
@@ -299,12 +907,12 @@ impl Value {
     }
 
     pub fn err(v: Value) -> Value {
-        Value::Err(Arc::new(v), false, Place::NONE)
+        Value::Err(Arc::new(Inner(v)), false, Place::NONE)
     }
 
     /// An error the program means a visitor to read.
     pub fn own_err(v: Value) -> Value {
-        Value::Err(Arc::new(v), true, Place::NONE)
+        Value::Err(Arc::new(Inner(v)), true, Place::NONE)
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -1120,7 +1728,7 @@ fn plain_at(v: &Value, depth: usize) -> Option<Value> {
             }
             Some(Value::map(o))
         }
-        Value::Err(e, own, at) => next(e).map(|y| Value::Err(Arc::new(y), *own, *at)),
+        Value::Err(e, own, at) => next(e).map(|y| Value::Err(Arc::new(Inner(y)), *own, *at)),
         _ => None,
     }
 }
@@ -2189,18 +2797,7 @@ fn compare_at(a: &Value, b: &Value, depth: usize) -> Option<Ordering> {
         (Value::Int(x), Value::Dec(y)) => Some(crate::decimal::Dec::from_i64(*x).cmp(*y)),
         // Item by item, which is how to sort by several keys: `sort_by(rows, (r) =>
         // [r.a, r.b])` (FEEDBACK25.md, Q-320; branch feedback26-fixes).
-        (Value::List(x), Value::List(y)) => {
-            if depth > DEEPEST {
-                return None;
-            }
-            for (p, q) in x.iter().zip(y.iter()) {
-                match compare_at(p, q, depth + 1)? {
-                    Ordering::Equal => {}
-                    other => return Some(other),
-                }
-            }
-            Some(x.len().cmp(&y.len()))
-        }
+        (Value::List(x), Value::List(y)) => compare_lists(x, y, depth),
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
         // An int and a float exactly, not the int made a float: `sort` put 9007199254740993
         // before 9007199254740992.0 (FEEDBACK55.md, Q-787; branch feedback55).
@@ -2208,6 +2805,24 @@ fn compare_at(a: &Value, b: &Value, depth: usize) -> Option<Ordering> {
         (Value::Float(f), Value::Int(i)) => int_float_cmp(*i, *f).map(Ordering::reverse),
         _ => None,
     }
+}
+
+/// `compare_at` of two lists, item by item, apart: in line, its growing of the stack kept
+/// `compare_at` from being in line where `sort_by` compares text, +300 instructions on Fortunes.
+/// On a new piece of stack where this one runs low: `parallel`'s 512 KB, in a debug build, did not
+/// hold 10,000 levels (FEEDBACK51.md, Q-661; branch feedback86-89).
+#[inline(never)]
+fn compare_lists(x: &[Value], y: &[Value], depth: usize) -> Option<Ordering> {
+    if depth > DEEPEST {
+        return None;
+    }
+    for (p, q) in x.iter().zip(y.iter()) {
+        match deeper(depth, || compare_at(p, q, depth + 1))? {
+            Ordering::Equal => {}
+            other => return Some(other),
+        }
+    }
+    Some(x.len().cmp(&y.len()))
 }
 
 /// An int against a float, exactly (None for NaN), as Python compares them: the int as a float
@@ -2688,6 +3303,35 @@ pub struct Scope {
     parent: Option<Env>,
 }
 
+impl Drop for Scope {
+    /// Its variables freed as a list's items are, without recursion however deep what they hold
+    /// nests: a chain of lambdas, each kept in the scope of the next, is as deep as a list
+    /// (FEEDBACK49.md, Q-592; FEEDBACK51.md, Q-661; branch feedback86-89). A scope `done` keeps for
+    /// reuse has none; the parent, as deep as the program's text nests, is let go of as before.
+    fn drop(&mut self) {
+        let vars = self.vars.vars.get_mut();
+        if matches!(vars, Vars::Few([None, ..], more, _) if more.is_empty()) {
+            return;
+        }
+        let vars = std::mem::replace(vars, Vars::few());
+        let mut later: Vec<Value> = Vec::new();
+        vars.free_into(0, &mut later);
+        while let Some(v) = later.pop() {
+            free_value(v, 0, &mut later);
+        }
+    }
+}
+
+impl Scope {
+    /// `free_value` of a function's scope that was its last hold (`depth` as there): its variables
+    /// one level down, emptied before it is dropped.
+    fn free_into(mut self, depth: u32, later: &mut Vec<Value>) {
+        let vars = std::mem::replace(self.vars.vars.get_mut(), Vars::few());
+        drop(self);
+        vars.free_into(depth, later);
+    }
+}
+
 /// The lock on the globals' variables. Quillo code runs under the interpreter
 /// lock, so this is never contended; unlike `std::sync::Mutex` (which on
 /// some systems allocates an OS lock), it is one flag in place. A scope inside
@@ -2876,6 +3520,25 @@ impl Vars {
         }
     }
 
+    /// Each value freed one level below `depth` (`free_value`).
+    fn free_into(self, depth: u32, later: &mut Vec<Value>) {
+        match self {
+            Vars::Few(slots, more, _) => {
+                for (_, v) in slots.into_iter().flatten() {
+                    free_deeper(v, depth, later);
+                }
+                for (_, v) in more {
+                    free_deeper(v, depth, later);
+                }
+            }
+            Vars::Many(m) => {
+                for (_, v) in m {
+                    free_deeper(v, depth, later);
+                }
+            }
+        }
+    }
+
     fn entries(&self) -> Vec<(String, Value)> {
         match self {
             Vars::Few(slots, more, _) => slots.iter().flatten().chain(more.iter()).map(|(k, x)| (k.to_string(), x.clone())).collect(),
@@ -3045,7 +3708,7 @@ impl Scope {
                 empty_own(&e);
                 Scope::done(e);
             }
-            Own::Outside => watch(e),
+            Own::Outside(w) => watch_as(e, w),
             Own::Look => match ring(&e, 1) {
                 Ring::Broken if Arc::get_mut(&mut e).is_some() => Scope::done(e),
                 Ring::Held(w) => watch_as(e, w),
@@ -3069,7 +3732,7 @@ impl Scope {
                 Arc::strong_count(e) == 1
             }
             Own::None => false,
-            Own::Outside => {
+            Own::Outside(_) => {
                 *outside = true;
                 false
             }
@@ -3244,33 +3907,31 @@ enum Own {
     /// or map, no function made inside it): every hold on them and on it is theirs and the
     /// caller's. Nothing outside can reach them.
     Closed,
-    /// The same, but something besides holds it or one of them: a ring held from outside.
-    Outside,
+    /// The same, but something besides holds it or one of them: a ring held from outside, and
+    /// what was seen held, for the next look to tell nothing changed at a glance (FEEDBACK65.md,
+    /// Q-955; branch feedback86-89).
+    Outside(Witness),
     /// More than that, for `ring` to count.
     Look,
 }
 
 /// The commonest rings told at once, without `ring`'s walk: `let f = (x) => ...` in a body,
 /// returned or not (FEEDBACK65.md, Q-941 review 3; branch feedback65). Exactly what `ring`
-/// would find of such a scope, which holds no list, map or function made inside it.
+/// would find of such a scope, which holds no function made inside it, and no list or map but
+/// those only it holds whose items, two levels down and `RING_ITEMS` of them in all, are plain
+/// values, its functions or such lists and maps: a lambda kept beside a list of numbers, or in a
+/// record with one (`{ go: (x) => ..., pad: range(120) }`), was walked by `ring` twice at its
+/// first look, its lists and maps read each time (FEEDBACK65.md, Q-955; branch feedback86-89).
 fn own(e: &Env, handles: usize) -> Own {
-    use std::sync::atomic::Ordering::Relaxed;
     let s = Arc::as_ptr(e);
     let mut fs: [(*const Arc<Closure>, usize); RING] = [(std::ptr::null(), 0); RING];
-    let (mut n, mut deep) = (0, false);
+    let (mut n, mut deep, mut boxes) = (0, false, false);
     e.vars().each_value(|v| {
         match v {
-            Value::Func(c) if std::ptr::eq(Arc::as_ptr(&c.env), s) => match fs[..n].iter_mut().find(|f| Arc::ptr_eq(unsafe { &*f.0 }, c)) {
-                Some(f) => f.1 += 1,
-                None if n == RING => deep = true,
-                None => {
-                    fs[n] = (c as *const Arc<Closure>, 1);
-                    n += 1;
-                }
-            },
+            Value::Func(c) if std::ptr::eq(Arc::as_ptr(&c.env), s) => deep |= !own_held(&mut fs, &mut n, c),
             Value::Func(c) => deep |= holds(c, s),
-            // One something else holds too cannot make its lambdas' other holds inside.
-            Value::List(_) | Value::Map(_) => deep |= !shared(v),
+            // Looked into below, shared or not (`shared_plain`).
+            Value::List(_) | Value::Map(_) => boxes = true,
             _ => {}
         }
         // On to the end, to know whether one made in it is there (no `keeps_own` then).
@@ -3279,19 +3940,120 @@ fn own(e: &Env, handles: usize) -> Own {
     if deep {
         return if n > 0 || keeps_own(e) { Own::Look } else { Own::None };
     }
+    // Every hold counted from its variables alone: no list or map of it can hold more, as
+    // `ring`'s first walk finds (FEEDBACK65.md, Q-955; branch feedback86-89).
+    if n > 0 && own_closed(e, &fs[..n], handles) {
+        return Own::Closed;
+    }
+    if boxes {
+        // Held besides, or its functions only in its lists and maps (a record's): their holds
+        // counted too, where they are plain enough; `ring` walks the rest.
+        // The lists and maps inside them first passed over, as `ring` passes them: closed
+        // without them, they hold nothing more (a record's long list beside its lambda unread).
+        let (vars_fs, vars_n) = (fs, n);
+        for nested in [false, true] {
+            let (mut left, mut passed) = (RING_ITEMS, false);
+            let counted = e.vars().each_value(|v| match v {
+                Value::List(_) | Value::Map(_) if shared(v) => shared_plain(v, s, &mut left),
+                Value::List(_) | Value::Map(_) => own_boxed(v, s, &mut fs, &mut n, &mut left, nested, &mut passed),
+                _ => true,
+            });
+            if !counted {
+                return if n > 0 || keeps_own(e) { Own::Look } else { Own::None };
+            }
+            if n > 0 && own_closed(e, &fs[..n], handles) {
+                return Own::Closed;
+            }
+            if !passed {
+                break;
+            }
+            (fs, n) = (vars_fs, vars_n);
+        }
+    }
     if n == 0 {
         return Own::None;
     }
+    // The first held besides, as `Walk::closed` names it: while its count stays, so does the
+    // verdict (FEEDBACK65.md, Q-955; branch feedback86-89).
     // SAFETY: the pointers are to handles in `e`'s variables, which nothing changes meanwhile.
-    let theirs = fs[..n].iter().all(|&(c, k)| {
+    let held = fs[..n].iter().find(|&&(c, k)| {
+        let c = unsafe { &*c };
+        Arc::strong_count(c) != k || Arc::weak_count(c) != 0
+    });
+    Own::Outside(match held {
+        Some(&(c, _)) => Witness::held(Value::Func(unsafe { &*c }.clone())),
+        None if Arc::weak_count(e) == 0 => Witness::Scope(Arc::strong_count(e)),
+        None => Witness::None,
+    })
+}
+
+/// Whether the holds `fs` counts on its functions, and theirs on `e` besides `handles` of the
+/// caller's and the watch list's, are every hold there is: nothing outside can reach them.
+#[inline]
+fn own_closed(e: &Env, fs: &[(*const Arc<Closure>, usize)], handles: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    // SAFETY: the pointers are to handles in `e`'s variables, or in its lists and maps, which
+    // nothing changes meanwhile.
+    let theirs = fs.iter().all(|&(c, k)| {
         let c = unsafe { &*c };
         Arc::strong_count(c) == k && Arc::weak_count(c) == 0
     });
     let more = usize::from(e.vars.watched.load(Relaxed)) + handles;
-    if theirs && Arc::strong_count(e) == n + more && Arc::weak_count(e) == 0 {
-        Own::Closed
-    } else {
-        Own::Outside
+    theirs && Arc::strong_count(e) == fs.len() + more && Arc::weak_count(e) == 0
+}
+
+/// `c`, a function made in the scope `own` looks at, counted once more; false past `RING` of them.
+#[inline]
+fn own_held(fs: &mut [(*const Arc<Closure>, usize); RING], n: &mut usize, c: &Arc<Closure>) -> bool {
+    match fs[..*n].iter_mut().find(|f| Arc::ptr_eq(unsafe { &*f.0 }, c)) {
+        Some(f) => f.1 += 1,
+        None if *n == RING => return false,
+        None => {
+            fs[*n] = (c as *const Arc<Closure>, 1);
+            *n += 1;
+        }
+    }
+    true
+}
+
+/// Whether `v`, a list or map only its holder holds, holds nothing `own` cannot count: plain
+/// values, functions made in `s` (counted in `fs`), and lists and maps of the same one level
+/// further in (`nested`; else passed over and `passed` said), among the `left` items still to look
+/// through (FEEDBACK65.md, Q-955; branch feedback86-89). A list or map something else holds too is passed over, as `own` passes one
+/// over in the scope's own variables. Plain values at a glance, a list of 100 numbers costing
+/// little more than its length.
+fn own_boxed(v: &Value, s: *const Scope, fs: &mut [(*const Arc<Closure>, usize); RING], n: &mut usize, left: &mut usize, nested: bool, passed: &mut bool) -> bool {
+    let mut each = |x: &Value, fs: &mut [(*const Arc<Closure>, usize); RING], n: &mut usize, left: &mut usize| match x {
+        Value::Func(c) if std::ptr::eq(Arc::as_ptr(&c.env), s) => own_held(fs, n, c),
+        Value::Func(c) => !holds(c, s),
+        Value::List(_) | Value::Map(_) if shared(x) => shared_plain(x, s, left),
+        Value::List(_) | Value::Map(_) if nested => own_boxed_in(x, s, fs, n, left),
+        Value::List(_) | Value::Map(_) => {
+            *passed = true;
+            true
+        }
+        _ => false,
+    };
+    match v {
+        Value::List(l) if l.len() <= *left => {
+            *left -= l.len();
+            for x in l.iter() {
+                if boxes(x) && !each(x, fs, n, left) {
+                    return false;
+                }
+            }
+            true
+        }
+        Value::Map(m) if m.len() <= *left => {
+            *left -= m.len();
+            for x in m.values() {
+                if boxes(x) && !each(x, fs, n, left) {
+                    return false;
+                }
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -3322,6 +4084,53 @@ fn boxes_own(v: &Value, s: *const Scope, left: &mut usize) -> bool {
             m.values().any(|x| look(x, left))
         }
         _ => false,
+    }
+}
+
+/// `own_boxed` of a list or map inside one: its items plain values or functions made in `s`.
+fn own_boxed_in(v: &Value, s: *const Scope, fs: &mut [(*const Arc<Closure>, usize); RING], n: &mut usize, left: &mut usize) -> bool {
+    let mut fine = |x: &Value, left: &mut usize| match x {
+        Value::Func(c) if std::ptr::eq(Arc::as_ptr(&c.env), s) => own_held(fs, n, c),
+        Value::Func(c) => !holds(c, s),
+        Value::List(_) | Value::Map(_) => shared(x) && shared_plain(x, s, left),
+        Value::Err(..) | Value::Response(_) => false,
+        _ => true,
+    };
+    match v {
+        Value::List(l) if l.len() <= *left => {
+            *left -= l.len();
+            l.iter().all(|x| fine(x, left))
+        }
+        Value::Map(m) if m.len() <= *left => {
+            *left -= m.len();
+            m.values().all(|x| fine(x, left))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `v`, a list or map something else holds too, cannot hold the scope `s` or its
+/// functions: its items plain values or functions made elsewhere, among the `left` items still to
+/// look through; one longer than that passed over, as `ring` passes it. A list or map another of
+/// the scope's own lists or variables holds as well (`let m2 = m`) was passed over unlooked at, and
+/// the lambda in it kept its scope for ever (found in review of FEEDBACK65.md's Q-955; branch
+/// feedback86-89): one that may hold them goes to `ring`, which counts its holds.
+fn shared_plain(v: &Value, s: *const Scope, left: &mut usize) -> bool {
+    let plain = |x: &Value| match x {
+        Value::Func(c) => !holds(c, s),
+        Value::List(_) | Value::Map(_) | Value::Err(..) | Value::Response(_) => false,
+        _ => true,
+    };
+    match v {
+        Value::List(l) if l.len() <= *left => {
+            *left -= l.len();
+            l.iter().all(plain)
+        }
+        Value::Map(m) if m.len() <= *left => {
+            *left -= m.len();
+            m.values().all(plain)
+        }
+        _ => true,
     }
 }
 
@@ -3557,6 +4366,7 @@ impl Walk {
 #[cold]
 #[inline(never)]
 fn ring(e: &Env, handles: usize) -> Ring {
+    RING_WALKS.with(|n| n.set(n.get() + 1));
     let mut w = Walk::new(e);
     w.scan(false);
     if w.room && w.nf > 0 && w.closed(handles).is_ok() {
@@ -3588,6 +4398,18 @@ fn ring(e: &Env, handles: usize) -> Ring {
         }
     }
     Ring::None
+}
+
+thread_local! {
+    /// `ring`'s walks on this thread, for the tests that count them (`ring_walks`).
+    static RING_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times `ring` walked a scope on this thread: what the tests of FEEDBACK65.md's Q-955
+/// count (branch feedback86-89).
+#[doc(hidden)]
+pub fn ring_walks() -> u64 {
+    RING_WALKS.with(|n| n.get())
 }
 
 /// What made a listed scope's last look find its ring held from outside, so that the next look
@@ -3719,7 +4541,8 @@ fn look(n: usize, until: Option<std::time::Instant>) {
             // Let go of before the look, which counts holds.
             drop(seen);
             match own(&e, 0) {
-                Own::Outside => Some(None),
+                Own::Outside(Witness::None) => Some(None),
+                Own::Outside(w) => Some(Some(Box::new(w))),
                 Own::Closed => {
                     empty_own(&e);
                     None
@@ -4787,12 +5610,12 @@ mod tests {
         // feedback75).
         assert!(matches!(none(&mut Interp::new(std::env::temp_dir()), Vec::new(), 0), Ok(Value::Nil)));
         let text: Arc<str> = Arc::from("held");
-        let small = Arc::new(vec![Value::Int(1)]);
+        let small = Arc::new(Items::new(vec![Value::Int(1)]));
         let small_map = Arc::new(Map::default());
         let html: Arc<str> = Arc::from("<b>held</b>");
         // Each time a large list the scope alone holds, followed by a weak holder.
         let fill = |vars: &mut Vars| {
-            let big = Arc::new((0..300).map(Value::Int).collect::<Vec<_>>());
+            let big = Arc::new(Items::new((0..300).map(Value::Int).collect::<Vec<_>>()));
             let weak = Arc::downgrade(&big);
             let all = [
                 Value::Nil,
@@ -4835,7 +5658,7 @@ mod tests {
         assert!(big.upgrade().is_none());
         // One another variable holds too is not the scope's to free: let go of, not kept.
         let mut other = Vars::few();
-        let shared = Arc::new((0..300).map(Value::Int).collect::<Vec<_>>());
+        let shared = Arc::new(Items::new((0..300).map(Value::Int).collect::<Vec<_>>()));
         other.insert(Sym::new("s"), Value::List(shared.clone()));
         other.clear();
         assert!(deferred_drops().is_empty());

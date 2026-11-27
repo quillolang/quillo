@@ -587,3 +587,43 @@ pub fn node(js: &str) -> std::io::Result<std::process::Output> {
     let _ = std::fs::remove_file(&file);
     out
 }
+
+/// `topic`, alone in its live state, as a page sends it to a server whose `QUILLO_SECRET` is
+/// `secret`: `~` and the state's signature for the program mounted at `base` and `tenant`, then the
+/// topic, written as `liveKey` writes it (`%`, `,` and a `~` it starts with) (src/server.rs,
+/// `set_sig`; FEEDBACK51.md, Q-666; branch feedback86-89). `serve`'s servers take
+/// `signed_topic("test secret for the tests", "", None, topic)`.
+#[allow(dead_code)]
+pub fn signed_topic(secret: &str, base: &str, tenant: Option<&str>, topic: &str) -> String {
+    let key = quillo::crypto::hmac_sha256(secret.as_bytes(), b"quillo page key 1");
+    let bare = if base.is_empty() { topic } else { topic.strip_prefix(base).and_then(|r| r.strip_prefix('|')).unwrap_or(topic) };
+    let tenant = if bare.starts_with("var:") { None } else { tenant };
+    let m = format!("{}\0{}\0{}:{}", base, tenant.unwrap_or(""), topic.len(), topic);
+    let mut t = topic.replace('%', "%25").replace(',', "%2C");
+    if t.starts_with('~') {
+        t.replace_range(..1, "%7E");
+    }
+    format!("~{},{}", quillo::crypto::b64url(&quillo::crypto::hmac_sha256(&key, m.as_bytes())[..12]), t)
+}
+
+/// `signed_topic` for a `serve` server, with no mount and no tenant.
+#[allow(dead_code)]
+pub fn signed(topic: &str) -> String {
+    signed_topic("test secret for the tests", "", None, topic)
+}
+
+/// `html` without the answer's islands' nonce, ` data-qn="…"` (on each island and the loader's
+/// tag), new with each answer (FEEDBACK51.md, Q-667; branch feedback86-89): the page as tests
+/// compared it before 0.8.12.
+#[allow(dead_code)]
+pub fn no_nonce(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(at) = rest.find(" data-qn=\"") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + " data-qn=\"".len()..];
+        rest = after.find('"').map_or("", |e| &after[e + 1..]);
+    }
+    out.push_str(rest);
+    out
+}

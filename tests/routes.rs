@@ -1,3 +1,5 @@
+mod support;
+
 use quillo::server::{HttpRequest, HttpResponse};
 use quillo::Interp;
 
@@ -291,7 +293,8 @@ route GET /bare = <Counter/>
 "#,
     );
     let r = get(&mut it, "/");
-    let page = r.text();
+    // Without the answer's nonce (changed for 0.8.12: FEEDBACK51.md, Q-667; branch feedback86-89).
+    let page = support::no_nonce(&r.text());
     assert!(page.contains(r#"<quillo-island style="display:contents" data-c="Counter" data-p="{&quot;start&quot;:2}" data-s="{&quot;count&quot;:2,&quot;text&quot;:&quot;n&quot;}">"#), "{}", page);
     assert!(page.contains("<span>n: 2 (4)</span><button>+</button><input value=\"n\"></div></quillo-island>"), "{}", page);
     // The bundle loads when it is needed (a loader, last in the body).
@@ -530,6 +533,8 @@ fn live_rpc(it: &mut Interp, name: &str, body: &str) -> serde_json::Value {
 }
 
 fn changed_since(it: &mut Interp, since: u64, topics: &str) -> serde_json::Value {
+    // Each topic signed, as the server gives it to a page (changed for 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89).
+    let topics = topics.split(',').filter(|t| !t.is_empty()).map(|t| quillo::server::signed_topic("", None, t)).collect::<Vec<_>>().join(",");
     serde_json::from_str(&get(it, &format!("/_quillo/live?since={}&t={}", since, topics)).text()).unwrap()
 }
 

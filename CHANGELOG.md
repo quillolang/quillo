@@ -1,5 +1,127 @@
 # Changelog
 
+## 0.8.12 (2026-11-28)
+
+Found by the sessions making videos 208, 210, 212, 222 and 224 and the Single-Page Apps course
+on 0.8.10 and 0.8.11 (FEEDBACK86.md to FEEDBACK90.md, Q-1360 to Q-1401), and the bugs left
+open from earlier reports (Q-603, Q-991, Q-1060 and others below).
+
+### Fixed
+
+- **A component whose draw failed in the browser stayed empty for good** (FEEDBACK88.md,
+  Q-1380): a typed view given a field of a server fn's `state`, null while it loads, failed
+  once, and the answer that came a moment later drew nothing (only the browser's console said
+  why). It shows nothing, with the error in the console, and is drawn again when one of its
+  states or props next changes; its `live` states and timers keep running, and a failure that
+  lasts is said once. A `for` row that fails so no longer empties its whole list.
+- **A server fn's redirect was followed by the page's call** (FEEDBACK88.md, Q-1381): the call
+  gave an error about an answer that was not its own, and the server's log said nothing. The
+  call gives the error value `"a server fn cannot redirect: return a value and navigate"`, the
+  log says so once for each function, and nothing is followed; a component's `state` given such
+  a redirect as the server draws the page gets the same error value (it answered 500); a
+  `reply` with a redirect there still ends the page's request with it, as a route's does.
+- **An attribute's `{` left open after a handler's block** (FEEDBACK87.md, Q-1371):
+  `onclick={() => { n += 1 }>♥</button>` was said to be an unexpected character `♥` in the
+  element's text, with the note that a newer Quillo might take it (Q-008, seen again). It is
+  said of the `{` that is never closed, with the `}` as a quick fix when the handler is the
+  attribute's whole value and holds no block of its own; a character no Quillo takes outside text gets no version note.
+- **`idempotent` carries down a chain of services** (FEEDBACK89.md, Q-1394): a call made
+  inside an `idempotent` run got a new call id when the run started again, so after a crash
+  mid-chain (shop → billing → ledger, all `idempotent`) the ledger posted twice. A call's id
+  now comes from the run's key, its request and its place in the run, signed with the
+  program's secret, and the chain's root goes to the service signed in `x-quillo-root`, so the
+  retry sends the same ids all the way down; a service refuses a known id that comes with
+  other arguments or from another caller. Calls
+  outside an `idempotent` run are as they were; a call inside one does about 1,100 more
+  instructions (the hash, signed once per call, in the CPU's SHA-2 instructions).
+- **An early reply after a service call that got no answer was kept** (FEEDBACK89.md, Q-1391):
+  with `idempotent({ transaction: false })`, `?? reply 503` after a service that could not be
+  reached was replayed to every retry until the key expired. An end of the run that follows a
+  Quillo service call never sent (no connection, an open circuit) is not kept; after a call
+  that may have run, after an answer, or once the run made another outbound call, it is, as
+  before.
+- **A service's calls are checked with the service's own types** (found in review of
+  FEEDBACK87.md's Q-1370): where the app had a type of the same name, its shape was used, so
+  `billing.invoice(x)?.total` was refused for a field billing's type has.
+- **Bare `?on` query flags for `bool` patterns** (FEEDBACK47.md, Q-543): `route GET /b ? { on: bool }`
+  takes `?on` (with no `=`) as `true`, while `?on=` stays blank text (using the default or returning
+  400 when required) and `request.query.on` stays `""`.
+- **Graceful stop with closed stderr or pipelined lingering sockets**: stop messages ignore broken
+  stderr pipes instead of panicking, and `Loop::linger` clears partial request state so `quiet()`
+  and `close_idle()` finish shutdown cleanly.
+- **Iterative drop for deeply nested values** (FEEDBACK51.md, Q-661, Q-955, Q-1122): dropping deep
+  value chains and `Body` values runs iteratively with bounded scope-hold scanning so deeply nested
+  inputs no longer overflow the stack or leak loop-step closures.
+
+### Security
+
+- **Live topics signed per page and islands authenticated per answer** (FEEDBACK51.md, Q-666,
+  Q-667): `/_quillo/live` accepts only topics signed for that page's mount and tenant (`~<sig>,...`),
+  and islands only hydrate when carrying the answer's `data-qn` nonce (and `data-qh` for
+  server-rendered HTML `children` props).
+- **Quillo's own `_quillo_*` tables isolated behind a dedicated database role (`db.own_setup`)** on
+  PostgreSQL and MySQL/MariaDB: Quillo's statements run inside `SECURITY DEFINER` routines checked
+  with `QUILLO_SECRET` MACs (clearing MySQL `@quillo_sql` before `EXECUTE` and in an exception
+  handler) while restricting direct access to `_quillo_idempotency` and `_quillo_secret`.
+- **Automated nightly fuzzing** (FEEDBACK49.md, Q-608): added `.github/workflows/fuzz.yml` and new
+  `dates` and JIT-vs-interpreter `run` fuzz targets in `fuzz/`.
+
+- **A session change through a view, rule or trigger reached other visitors on PostgreSQL**
+  (FEEDBACK75.md, Q-1060): outside `db.transaction` requests share connections, and what a
+  view, a rule, a trigger, a domain's check or a default ran (`set_config(..., false)`) stayed
+  on the connection, so the next visitors read through another's row-level security. Such a
+  statement runs on a connection of its own, reset after, judged from the database's catalog;
+  `lastval()` and `currval()` are refused outside a transaction.
+
+- **A WebTransport session broke or stalled when a page's HTTP/3 SETTINGS frame or session
+  capsule arrived split across packets** (FEEDBACK75.md, Q-1124): wtransport's control-stream
+  reads lost their bytes when cut short. Quillo builds with a patched wtransport 0.7.2
+  (vendor/wtransport-0.7.2) until upstream fixes it (wtransport #331).
+
+### Speed
+
+- **A wait for SQLite's write lock held every request** (FEEDBACK49.md, Q-603): while another
+  process held the lock, an unrelated `GET /ping` waited up to 5 s. The wait lets the other
+  requests run.
+- **`quillo check` of a large stylesheet** (FEEDBACK71.md, Q-991): each class's line was
+  counted from the sheet's start, so 2 MiB took 38 s; it is counted in one pass.
+
+### Upgrading
+
+- Upgrade services before the programs that call them: a 0.8.11 service remembers an error
+  value it gave for 11 minutes, and a 0.8.12 caller's retry sends the same call id, so it
+  gets that error again until then.
+
+### `quillo check`
+
+- **A dropped `map` or `filter`** (FEEDBACK86.md, Q-1360): `xs | map(f)` alone, whose function
+  does nothing else, is warned of as a dropped `push` is; so are chains and fields
+  (`m.items | map(f) | filter(g)`), for `push` too.
+- **A `state` set from another state** (FEEDBACK86.md, Q-1361): one whose initializer reads a
+  state that changes, or a `let` that reads one, is set once and never follows it; it is
+  warned of (write `let`), as the same thing written as an assignment was.
+- **A misspelt field of a record's value is an error** (FEEDBACK87.md, Q-1370): on a value
+  `Lamp({...})` makes or a `-> Lamp` function returns, and on any map whose fields are known,
+  it passed and read null.
+- **A field read on what may be an error** (FEEDBACK89.md, Q-1390): on a `-> T ! E`
+  function's or a service call's result, before `?`, `is_err`, `type_of`, `match` or a test, is
+  warned of; `r.f ?? d` is not.
+- **`n && <markup>` on a number state a handler assigns** (FEEDBACK90.md, Q-1400): the "0
+  counts as true" warning was lost once the state was assigned (`unread += 1`).
+- **"Runs once" said of a body that runs again** (FEEDBACK90.md, Q-1401): a component body with
+  a `return` or `?`, or that assigns a `let` or a prop on its own lines, runs again whole when
+  what it read changes; check no longer says its assignments run once, and the guide's table
+  says what runs again.
+- **`idempotent` reaching another program** (FEEDBACK89.md, Q-1392): the warning stayed for
+  service calls, which a retry now sends under the same id, and said nothing of `http.post`
+  and the like, which it sends again. It is said for `http.post`, `put`, `patch`, `delete` and
+  a non-`GET` `http.request`, unless the call sends an `Idempotency-Key` header.
+- **A service file declared by two programs** (FEEDBACK89.md, Q-1393) is checked once: its
+  warnings were said, and counted, twice.
+- **A server fn's state given to a typed view while it loads** (FEEDBACK88.md, Q-1380), with
+  no null test, and **a `redirect` in a server fn a component calls** (FEEDBACK88.md, Q-1381)
+  are warned of.
+
 ## 0.8.11 (2026-11-26)
 
 Found studying how a provider's policy holds on shared and edge hosting (FEEDBACK82.md, Q-1280

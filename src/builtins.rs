@@ -248,10 +248,10 @@ fn s_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Arc<str>, Ctrl>
     want(args, i, f, "a str", line, |v| if let Value::Str(s) = v { Some(s.clone()) } else { None })
 }
 
-fn l_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Arc<Vec<Value>>, Ctrl> {
+fn l_arg(args: &[Value], i: usize, f: &str, line: u32) -> Result<Arc<Items>, Ctrl> {
     want(args, i, f, "a list", line, |v| match v {
         Value::List(l) => Some(l.clone()),
-        Value::Nil => Some(Arc::new(Vec::new())),
+        Value::Nil => Some(Arc::new(Items::default())),
         _ => None,
     })
 }
@@ -371,7 +371,7 @@ fn exit_with(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 /// branch feedback26-fixes).
 fn error_of(_: &mut Interp, args: Vec<Value>, _: u32) -> R {
     Ok(match arg(&args, 0) {
-        Value::Err(e, _, _) => (*e).clone(),
+        Value::Err(e, _, _) => Value::clone(&e),
         _ => Value::Nil,
     })
 }
@@ -5464,6 +5464,9 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let mut info = Map::new();
     info.insert("f".into(), Value::str(&name));
     info.insert("a".into(), Value::list(rest));
+    // The topics signed for this page's place (its mount and tenant), one signature for the state:
+    // the live endpoint follows only those (FEEDBACK51.md, Q-666; branch feedback86-89).
+    let key = crate::server::topics_key(it, &topics);
     info.insert("t".into(), Value::list(topics.into_iter().map(Value::str).collect()));
     // The value's hash, kept: the page's first refresh can be a patch
     // (FEEDBACK2.md, Q-028; branch feedback6-fixes).
@@ -5480,6 +5483,9 @@ fn live(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             }
             info.insert("h".into(), Value::str(&crate::livecache::hash_text(a.h)));
         }
+    }
+    if let Some(key) = key {
+        info.insert("k".into(), Value::str(&key));
     }
     it.last_live = Some(Value::map(info));
     r
@@ -5892,13 +5898,13 @@ pub fn css_value_of(v: Value, line: u32) -> R {
         Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Css(_) => return Ok(v),
         Value::Str(s) if !crate::interp::css_special(s) => return Ok(v),
         Value::Err(e, own, at) => {
-            let t = match &**e {
+            let t = match e.value() {
                 Value::Str(s) | Value::Css(s) => s.to_string(),
                 other => other.display_held().map_err(|o| o.at(line))?,
             };
             let mut out = String::with_capacity(t.len() + 16);
             crate::interp::css_escape_into(&t, &mut out, false);
-            return Ok(Value::Err(Arc::new(Value::str(&out)), *own, *at));
+            return Ok(Value::Err(Arc::new(Value::str(&out).into()), *own, *at));
         }
         _ => {}
     }

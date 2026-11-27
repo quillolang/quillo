@@ -14,9 +14,10 @@ arbitrary = { version = "1", features = ["derive"] }
 num-bigint = "0.4"
 num-traits = "0.2"
 serde_json = { version = "1", features = ["preserve_order"] }
-# Without the JIT, MySQL and WebTransport: none of it is fuzzed, and they
-# would only make the build longer.
-quillo = { path = "..", default-features = false }
+# With the JIT, which `run` compares with the interpreter (FEEDBACK49.md,
+# Q-608); without MySQL and WebTransport: neither is fuzzed, and they would
+# only make the build longer.
+quillo = { path = "..", default-features = false, features = ["jit"] }
 
 # Its own workspace, so the main one's build is not touched.
 [workspace]
@@ -66,3 +67,23 @@ path = "fuzz_targets/decimal_ops.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dates"
+path = "fuzz_targets/dates.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "run"
+path = "fuzz_targets/run.rs"
+test = false
+doc = false
+bench = false
+
+# The main workspace's patches, which do not reach this one: src/pg.rs needs
+# Quillo's tokio-postgres (Cargo.toml says why). wtransport's is left out, as
+# this build has no WebTransport.
+[patch.crates-io]
+tokio-postgres = { path = "../vendor/tokio-postgres-0.7.18" }

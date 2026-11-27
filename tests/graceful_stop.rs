@@ -587,3 +587,51 @@ fn check_warns_where_idempotent_changes_data_in_another_program() {
     let said: Vec<&str> = err.lines().filter(|l| l.contains("warning: `idempotent` reaches `shop.order`")).map(|l| l.split(": warning").next().unwrap_or("")).collect();
     assert_eq!(said, ["./lib.qwe:4"], "{}", err);
 }
+
+#[test]
+fn graceful_stop_handles_closed_stderr_and_lingering_pipeline() {
+    let d = dir("stop-linger", &[("main.qwe", "route POST / = \"ok\"\n")]);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"));
+    // Start with piped stderr, read until ready, then close the read end so SIGTERM hits EPIPE on stderr.
+    c.arg("run").arg(d.join("main.qwe")).args(["--port", "0"]).current_dir(&d)
+        .env("QUILLO_SECRET", "test secret for the tests")
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    support::stop_with_tests(&child);
+    let err = child.stderr.take().unwrap();
+    let mut br = std::io::BufReader::new(err);
+    let mut port = None;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let mut line = String::new();
+        if std::io::BufRead::read_line(&mut br, &mut line).unwrap_or(0) == 0 {
+            break;
+        }
+        if let Some(p) = line.split("http://127.0.0.1:").nth(1).and_then(|s| s.split(|c: char| !c.is_ascii_digit()).next()).and_then(|n| n.parse().ok()) {
+            port = Some(p);
+            break;
+        }
+    }
+    drop(br);
+    let port = port.expect("server port");
+    // Open a keepalive socket sending a body that stops mid-request or refuses/lingers, then send another pipelined prefix.
+    let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    s.write_all(b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhiGET / HTTP/1.1\r\n").unwrap();
+    let mut buf = [0u8; 256];
+    let _ = s.read(&mut buf);
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let stop_deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        if Instant::now() >= stop_deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("server hung during graceful stop with closed stderr / lingering connection");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(status.code(), Some(0), "unexpected exit status: {:?}", status);
+}

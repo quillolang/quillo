@@ -636,6 +636,12 @@ impl LiveSocket {
         self.write(0x9, &[], WRITE_WAIT).await
     }
 
+    /// Ends the socket with 1008 (policy): a page's topics, none of them signed for it
+    /// (FEEDBACK51.md, Q-666; branch feedback86-89).
+    pub async fn refuse(&mut self) {
+        self.end_with(Some(1008)).await
+    }
+
     /// Whether something has come from the page (`None`: it hung up), without waiting: asked of
     /// the runtime, so that what it knows of the connection stays true.
     async fn pending(&mut self) -> Option<bool> {

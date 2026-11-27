@@ -225,13 +225,19 @@ fn live_seq(srv: &Srv) -> u64 {
     j["seq"].as_u64().unwrap()
 }
 
+/// The topic `t` as a page of `run`'s servers sends it (changed for 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89).
+fn signed_t() -> String {
+    support::signed_topic("a test secret of more than thirty-two bytes", "", None, "t")
+}
+
 #[test]
 fn one_client_cannot_hold_every_waiting_place() {
     let srv = run("waiters", WAITING, &[]);
     assert_eq!(send(srv.port, "POST", "/change", &[], "").body, "ok");
     let seq = live_seq(&srv);
     assert!(seq > 0);
-    let path = format!("/_quillo/live?since={}&t=t", seq);
+    // The topic signed, as the server gives it to a page (changed for 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89).
+    let path = format!("/_quillo/live?since={}&t={}", seq, signed_t());
     let held: Vec<TcpStream> = (0..256).map(|_| ask(srv.port, &path)).collect();
     // All 256 are in: the next is told to come back.
     let mut refused = None;
@@ -255,7 +261,7 @@ fn one_client_cannot_hold_every_waiting_place() {
     }
     assert!(until(|| {
         let seq = live_seq(&srv);
-        let mut s = ask(srv.port, &format!("/_quillo/live?since={}&t=t", seq));
+        let mut s = ask(srv.port, &format!("/_quillo/live?since={}&t={}", seq, signed_t()));
         s.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
         let mut b = [0u8; 12];
         !matches!(s.read_exact(&mut b), Ok(()) if b.starts_with(b"HTTP/1.1 503"))
@@ -519,10 +525,10 @@ fn a_waiting_websocket_is_pinged() {
     let srv = run("pings", "route POST /change { publish(\"t\"); \"ok\" }\nroute GET / = \"hi\"\n", &["--watch"]);
     assert_eq!(send(srv.port, "POST", "/change", &[], "").body, "ok");
     let seq = live_seq(&srv);
-    let mut live = websocket(srv.port, &format!("/_quillo/live?since={}&t=t", seq));
+    let mut live = websocket(srv.port, &format!("/_quillo/live?since={}&t={}", seq, signed_t()));
     let mut events = websocket(srv.port, &format!("/_quillo/events?v={}", version(&srv)));
     // Pages gone: their threads find out at the ping.
-    reset(websocket(srv.port, &format!("/_quillo/live?since={}&t=t", seq)));
+    reset(websocket(srv.port, &format!("/_quillo/live?since={}&t={}", seq, signed_t())));
     reset(websocket(srv.port, &format!("/_quillo/events?v={}", version(&srv))));
     live.set_read_timeout(Some(Duration::from_secs(25))).unwrap();
     events.set_read_timeout(Some(Duration::from_secs(25))).unwrap();

@@ -1691,6 +1691,9 @@ fn live_ws(port: u16, query: &str) -> Result<LiveWs, String> {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    // The topics in its address signed (changed for 0.8.12: FEEDBACK51.md, Q-666; branch
+    // feedback86-89).
+    let query = query.split('&').map(|p| match p.strip_prefix("t=") { Some(t) => format!("t={}", signed_list(t)), None => p.to_string() }).collect::<Vec<_>>().join("&");
     write!(s, "GET /_quillo/live?{} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", query).unwrap();
     let mut head = Vec::new();
     let mut b = [0u8; 1];
@@ -1715,8 +1718,9 @@ impl LiveWs {
         let _ = self.0.write_all(&ws_frame(op, fin, data));
     }
 
+    /// A message of topics, signed (`signed_message`; changed for 0.8.12).
     fn text(&mut self, t: &str) {
-        self.send(0x1, true, t.as_bytes());
+        self.send(0x1, true, signed_message(t).as_bytes());
     }
 
     /// The server's next frame within `wait`, its opcode and payload; none if none came.
@@ -1791,7 +1795,33 @@ fn ws_frame(op: u8, fin: bool, data: &[u8]) -> Vec<u8> {
 
 /// Topics as a page writes them (`liveKey`): each `%` and `,` in them written out.
 fn live_key(topics: &[&str]) -> String {
-    topics.iter().map(|t| t.replace('%', "%25").replace(',', "%2C")).collect::<Vec<_>>().join(",")
+    topics.iter().map(|t| support::signed_topic(LIVE_SECRET, "", None, t)).collect::<Vec<_>>().join(",")
+}
+
+/// `served`'s secret.
+const LIVE_SECRET: &str = "a test secret for live data, long enough to use";
+
+/// Topics as a page sends them, each signed as the server gives it (changed for 0.8.12:
+/// FEEDBACK51.md, Q-666; branch feedback86-89): those already signed, and empty ones, as they are.
+fn signed_list(list: &str) -> String {
+    let mut after_sig = false;
+    list.split(',')
+        .map(|t| {
+            let sig = t.starts_with('~') && t.len() == 17;
+            let out = if t.is_empty() || sig || after_sig { t.to_string() } else { support::signed_topic(LIVE_SECRET, "", None, t) };
+            after_sig = sig;
+            out
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// A message of topics as a page sends it (`signed_list`), after its line if it has one.
+fn signed_message(m: &str) -> String {
+    match m.split_once('\n') {
+        Some((line, list)) => format!("{}\n{}", line, signed_list(list)),
+        None => signed_list(m),
+    }
 }
 
 #[test]
@@ -1907,8 +1937,8 @@ fn topics_sent_down_the_open_socket_are_followed() {
     s.bump("y");
     assert_eq!(p.told(soon).unwrap()["changed"], serde_json::json!(["y"]));
     // Two sets in one write: the last is followed.
-    let mut two = ws_frame(0x1, true, format!("{}e", head(s.seq(), "")).as_bytes());
-    two.extend(ws_frame(0x1, true, format!("{}f", head(s.seq(), "")).as_bytes()));
+    let mut two = ws_frame(0x1, true, signed_message(&format!("{}e", head(s.seq(), ""))).as_bytes());
+    two.extend(ws_frame(0x1, true, signed_message(&format!("{}f", head(s.seq(), ""))).as_bytes()));
     use std::io::Write;
     p.0.write_all(&two).unwrap();
     while let Some(j) = p.told(quiet) {
@@ -1922,7 +1952,8 @@ fn topics_sent_down_the_open_socket_are_followed() {
     // before them counted: taken. One byte more: the socket is let go, as a first message that long
     // is (decided by the coordinator after review), with a close of 1009 when it is read before the
     // connection ends, so that its page opens another and is told there.
-    const MOST: usize = 128 + 256 * (448 * 3 + 1);
+    // Each topic after its signature and a `.` (changed for 0.8.12: FEEDBACK51.md, Q-666).
+    const MOST: usize = 128 + 256 * (448 * 3 + 1) + 256 * (16 + 2);
     let longest = ",".repeat(448);
     let mut topics = vec!["q900:t"];
     topics.extend((0..255).map(|_| longest.as_str()));
@@ -4513,17 +4544,21 @@ route GET /b = <html><head><title>t</title></head><body><Host now={false}/></bod
 fn markup_kept_from_a_removed_component_does_not_keep_its_page() {
     let body = r##"const out = {};
     await click("keep"); await tick(30);
-    const w = { big: new WeakRef(document.querySelector(".big")), row: new WeakRef(document.querySelectorAll(".row")[7]) };
+    // Construct and read the WeakRefs in synchronous helpers so Ignition bytecode registers in this
+    // async frame cannot hold the target elements, and prefer precise async major GC so Blink's
+    // conservative synchronous stack scan (Chrome 158) does not pin SSR-hydrated row nodes.
+    const mk = () => ({ big: new WeakRef(document.querySelector(".big")), row: new WeakRef(document.querySelectorAll(".row")[7]) });
+    const w = mk();
     await click("off"); await tick(100);
-    // Four collections, then more while either is still there, up to forty: on a loaded runner
-    // four were not always enough (3fb0408's CI). A deref keeps its target to the end of the
-    // task, so each is looked at after a collection's wait and the next collection waits a task.
+    const collect = async () => { try { await gc({ type: "major", execution: "async" }); } catch (_) { gc(); } };
+    const alive = () => [!!w.big.deref(), !!w.row.deref()];
     for (let k = 0; k < 40; k++) {
-        gc(); await tick(50);
-        if (k >= 3 && !w.big.deref() && !w.row.deref()) break;
+        await collect(); await tick(50);
+        if (k >= 1 && !alive().some(Boolean)) break;
         await tick(0);
     }
-    out.kept = $("k").textContent; out.big = !!w.big.deref(); out.row = !!w.row.deref();
+    const [big, row] = alive();
+    out.kept = $("k").textContent; out.big = big; out.row = row;
     return out;"##;
     let Some(rs) = in_pages("q901-kept-markup", KEPT_MARKUP, BOTH, body) else { return };
     for (r, path) in rs.iter().zip(BOTH) {
@@ -5143,7 +5178,8 @@ fn topics_passed_over_leave_the_topics_followed_and_a_close_between_parts_is_ans
     w.extend(ws_frame(0x1, false, format!("{}d", head(seq)).as_bytes()));
     w.extend(ws_frame(0x1, true, format!("{}e", head(seq)).as_bytes()));
     // The most a page follows (see topics_sent_down_the_open_socket_are_followed), and one byte more.
-    const MOST: usize = 128 + 256 * (448 * 3 + 1);
+    // Each topic after its signature and a `.` (changed for 0.8.12: FEEDBACK51.md, Q-666).
+    const MOST: usize = 128 + 256 * (448 * 3 + 1) + 256 * (16 + 2);
     let first = format!("{}g", head(seq));
     w.extend(ws_frame(0x1, false, first.as_bytes()));
     w.extend(bare_frame(0x0, true, ",".repeat(MOST + 1 - first.len()).as_bytes()));

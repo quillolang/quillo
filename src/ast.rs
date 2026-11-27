@@ -846,9 +846,18 @@ pub struct TypeDef {
     /// The fields that have a default, and its expression.
     pub defaults: Vec<(String, Expr)>,
     pub line: u32,
+    /// This definition's own number, never another's in the process: the mark a record it makes
+    /// carries (`value::Map::made_as`; FEEDBACK75.md, Q-1122; branch feedback86-89).
+    pub id: u64,
 }
 
 impl TypeDef {
+    /// A number for a new definition (`id`): from 1, as 0 marks no record.
+    pub fn next_id() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn is_record(&self) -> bool {
         self.ty.fields.is_some() && self.ty.names == ["map"]
     }

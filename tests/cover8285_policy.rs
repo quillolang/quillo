@@ -433,7 +433,10 @@ fn own_address() -> Option<String> {
 fn live_page(port: u16) -> Option<TcpStream> {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(s, "GET /_quillo/live?since=1&s=&t=db:nothing HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").unwrap();
+    // Its topic signed, as the server gives it (changed for 0.8.12: FEEDBACK51.md, Q-666; branch
+    // feedback86-89).
+    let t = support::signed_topic("test secret for the tests, 32 bytes or more", "", None, "db:nothing");
+    write!(s, "GET /_quillo/live?since=1&s=&t={} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", t).unwrap();
     let mut head = Vec::new();
     let mut b = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {

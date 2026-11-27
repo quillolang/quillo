@@ -7,6 +7,10 @@
 //
 // With a script, it is run in the page once it has loaded; it should set
 // data-result itself.
+//
+// The page's document is read through `Document.prototype`, so that a page whose elements are
+// named for its properties (`<img name="body">`) is still read (the review of slice W1;
+// FEEDBACK51.md, Q-667; branch feedback86-89).
 
 const { spawn } = require("child_process");
 const fs = require("fs");
@@ -105,7 +109,7 @@ async function main() {
         // our page, or the script would run in the blank one and be lost
         // when ours replaces it (which slow machines show).
         const origin = new URL(url).origin;
-        const ready = `location.origin === ${JSON.stringify(origin)} && document.readyState === "complete"`;
+        const ready = `location.origin === ${JSON.stringify(origin)} && Object.getOwnPropertyDescriptor(Document.prototype, 'readyState').get.call(document) === "complete"`;
         const r = await send("Runtime.evaluate", { expression: ready, returnByValue: true });
         if (r.result && r.result.result && r.result.result.value === true) break;
         await takeCoverage();
@@ -116,7 +120,7 @@ async function main() {
     for (;;) {
       if (Date.now() > deadline) {
         // Say where the page was, to tell a slow machine from a stuck page.
-        const r = await send("Runtime.evaluate", { expression: "JSON.stringify({ url: location.href, ready: document.readyState, quillo: !!window.quillo, errors: window.__quilloErrors || null, html: document.body ? document.body.innerHTML.slice(0, 400) : null })", returnByValue: true });
+        const r = await send("Runtime.evaluate", { expression: "JSON.stringify({ url: location.href, ready: Object.getOwnPropertyDescriptor(Document.prototype, 'readyState').get.call(document), quillo: !!window.quillo, errors: window.__quilloErrors || null, html: Object.getOwnPropertyDescriptor(Document.prototype, 'body').get.call(document) ? Object.getOwnPropertyDescriptor(Document.prototype, 'body').get.call(document).innerHTML.slice(0, 400) : null })", returnByValue: true });
         const where = r.result && r.result.result && r.result.result.value;
         throw new Error("the page did not finish its test in time: " + where);
       }
@@ -124,7 +128,7 @@ async function main() {
       // `data-cdp`, sent in turn, then the attribute taken away, so the page knows (an input
       // method's text, which a page cannot make itself; FEEDBACK61.md, Q-939; branch feedback61).
       if (process.env.QUILLO_PAGE_CDP) {
-        const q = await send("Runtime.evaluate", { expression: "document.body && document.body.getAttribute('data-cdp')", returnByValue: true });
+        const q = await send("Runtime.evaluate", { expression: "Object.getOwnPropertyDescriptor(Document.prototype, 'body').get.call(document) && Object.getOwnPropertyDescriptor(Document.prototype, 'body').get.call(document).getAttribute('data-cdp')", returnByValue: true });
         const asked = q.result && q.result.result && q.result.result.value;
         if (asked) {
           const answers = [];
@@ -136,12 +140,12 @@ async function main() {
           // What they answered, for a page that asks for it with `data-cdp-out`: Chrome's own
           // manifest and installability checks (FEEDBACK67.md, B.1; branch pwa).
           const out = JSON.stringify(JSON.stringify(answers));
-          await send("Runtime.evaluate", { expression: `document.body.hasAttribute('data-cdp-out') && document.body.setAttribute('data-cdp-out', ${out})` });
-          await send("Runtime.evaluate", { expression: "document.body.removeAttribute('data-cdp')" });
+          await send("Runtime.evaluate", { expression: `Object.getOwnPropertyDescriptor(Document.prototype, 'body').get.call(document).hasAttribute('data-cdp-out') && Object.getOwnPropertyDescriptor(Document.prototype, 'body').get.call(document).setAttribute('data-cdp-out', ${out})` });
+          await send("Runtime.evaluate", { expression: "Object.getOwnPropertyDescriptor(Document.prototype, 'body').get.call(document).removeAttribute('data-cdp')" });
           continue;
         }
       }
-      const r = await send("Runtime.evaluate", { expression: "document.body && document.body.getAttribute('data-result')", returnByValue: true });
+      const r = await send("Runtime.evaluate", { expression: "Object.getOwnPropertyDescriptor(Document.prototype, 'body').get.call(document) && Object.getOwnPropertyDescriptor(Document.prototype, 'body').get.call(document).getAttribute('data-result')", returnByValue: true });
       const v = r.result && r.result.result && r.result.result.value;
       await takeCoverage();
       if (v) { process.stdout.write(v); break; }

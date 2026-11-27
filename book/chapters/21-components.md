@@ -1672,8 +1672,15 @@ that gave any caller its file, line and message)*), and ``server fn `x` answered
 characters)`` when a 2xx came back that the server did not send, or cut short: a sign-in page a
 redirect led to, a proxy's page, an empty body. Quillo's server marks what it sends with
 `x-quillo-answer`, so `respond` and `reply` still give `null` (a proxy that drops the mark turns those
-into this error; ordinary answers go through). A `redirect` from the function itself is followed
-by the browser, and gives this error too. A function that returns `err(v)` gives an error value with `v`. A `reply 401
+into this error; ordinary answers go through). A `redirect` from the function itself (or a
+`respond` or `reply` with a 3xx) is not followed: the call gives the error value
+`"a server fn cannot redirect: return a value and navigate"`, and the server's log says so once
+for each function; return a value, and call `navigate` in the page. A component's `state` whose
+initializer calls such a function as the server draws the page is given the same error value,
+said once for each state, and `quillo check` warns of a `redirect` in a server fn a component
+calls; a `reply` with a redirect there still ends the page's request with it,
+as a route's `reply` does (a guard on a first load) *(before 0.8.12 the browser followed the redirect and the call gave the
+error above, with nothing in the log; a page whose state called it answered 500)*. A function that returns `err(v)` gives an error value with `v`. A `reply 401
 "Log in first"` inside it gives only the status (``failed (401)``), since its body is
 not JSON: return `err("Log in first")`, or `reply 401 { error: "Log in first" }`, and
 show the words with `r.error`, as `problem` above does (an error value itself shows
@@ -1742,7 +1749,16 @@ component Product(id: int) {
   and before the page counts as loaded.
 - Only a component placed in the page defers. Inside another component, and in the
   browser (a page made there after `navigate`), `defer(x)` is `x`: there a state that
-  calls the server is null until it answers anyway. Components inside a deferring one
+  calls the server is null until it answers anyway. A component whose markup fails on that
+  null (a field of it given to a typed view) shows nothing, with the error in the browser's
+  console, and is drawn again when one of its states or props next changes, so the answer
+  draws it; what its states started (a `live` subscription, an `every`) keeps running, and a
+  failure that lasts is said once, not on every change. A `for` row whose markup fails so
+  shows nothing while the other rows draw, and is drawn again the same way *(before 0.8.12 the
+  component stayed empty for good, and a list with such a row stayed empty)*. `quillo check` warns *(since 0.8.12)*
+  where such a state, or a field of it, goes to a typed parameter of a view or a component
+  with no null test (or a `let` holding one), in a component another component, or a view
+  or function it uses, makes. Components inside a deferring one
   render again with it, their initializers too.
 - Several deferred components follow in the order they are on the page, each as soon
   as the ones before it are sent. A deferred part cannot set cookies or the session

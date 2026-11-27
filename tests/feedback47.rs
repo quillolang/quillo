@@ -325,6 +325,7 @@ fn form_and_query_values_meet_their_patterns() {
 route GET /p ? { page: int = 1 } = `page=${page}`
 route GET /o ? { q: str = null, size: int = null } = json.stringify({ q, size })
 route GET /b ? { on: bool } = `on=${on}`
+route GET /bd ? { on: bool = false } = `on=${on}|raw=${request.query.on ?? ""}`
 route GET /l ? { id: [int] } = json.stringify(id)
 route POST /tags { form: { tag: [str] } } = json.stringify(tag)
 route POST /agree { form: { agree: bool = false } } = `agree=${agree}`
@@ -336,6 +337,9 @@ route POST /agree { form: { agree: bool = false } } = `agree=${agree}`
         // A blank text is text; a blank number is one not sent (found in review).
         ("/o?q=&size=", r#"{"q":"","size":null}"#), ("/o?q=x&size=2", r#"{"q":"x","size":2}"#),
         ("/b?on=TRUE", "on=true"), ("/b?on=True", "on=true"), ("/b?on=YES", "on=true"), ("/b?on=Off", "on=false"), ("/b?on=0", "on=false"),
+        // Bare query flag (?on, no `=`) coerces to true for a `bool` pattern while `?on=` stays blank (400 / default).
+        ("/b?on", "on=true"), ("/b?on=false&on", "on=true"), ("/b?on&on=false", "on=false"),
+        ("/bd?on", "on=true|raw="), ("/bd?on=", "on=false|raw="),
         ("/l?id[]=1&id[]=2", "[1,2]"), ("/l?id=1&id=2", "[1,2]"), ("/l", "[]"),
     ] {
         assert_eq!(get(&mut it, url, &[]).text(), want, "{}", url);

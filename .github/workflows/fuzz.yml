@@ -1,0 +1,79 @@
+# The fuzz targets in fuzz/, each for a few minutes every night, which nothing ran before
+# (FEEDBACK49.md, Q-608). What each finds is kept in the Actions cache as its corpus for the next
+# night, and a crash, a leak or a timeout fails the job and is uploaded as the `fuzz-<target>`
+# artifact; fuzz/README.md says how to run one again.
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds each target runs
+        default: "300"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse, check, http, json, decimal, decimal_ops, dates, run]
+    env:
+      SECONDS_EACH: ${{ github.event.inputs.seconds || '300' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          # One build for all the targets: cargo fuzz builds them together.
+          shared-key: fuzz
+          save-if: ${{ matrix.target == 'parse' }}
+      - name: The corpus from the last run
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Starting inputs, the first time
+        run: |
+          if [ -z "$(ls -A fuzz/corpus/${{ matrix.target }} 2>/dev/null)" ]; then sh fuzz/seed.sh; fi
+          echo "$(find fuzz/corpus/${{ matrix.target }} -type f | wc -l) inputs"
+      - name: Build
+        run: cargo fuzz build ${{ matrix.target }}
+      # -timeout: one input running 30 s is a hang. -rss_limit_mb: 2 GB is a leak, on a runner
+      # of 16 GB. QUILLO_FUZZ_STATS: `run` says how many programs it compared.
+      - name: Fuzz for ${{ env.SECONDS_EACH }} s
+        env:
+          QUILLO_FUZZ_STATS: "1"
+        run: >-
+          cargo fuzz run ${{ matrix.target }} --
+          -max_total_time=${{ env.SECONDS_EACH }} -timeout=30 -rss_limit_mb=2048
+          -print_final_stats=1
+      - name: The corpus, smaller, for the next run
+        if: always()
+        run: cargo fuzz cmin ${{ matrix.target }} -- -rss_limit_mb=2048 -timeout=30 || true
+      - name: Keep the corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      - name: Upload what it found
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30

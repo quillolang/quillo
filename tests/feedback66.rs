@@ -313,11 +313,17 @@ fn seq(port: u16) -> u64 {
     j["seq"].as_u64().unwrap()
 }
 
+/// Topics as a page sends them, each signed as the server gives it (changed for 0.8.12:
+/// FEEDBACK51.md, Q-666; branch feedback86-89).
+fn signed(list: &str) -> String {
+    list.split(',').map(support::signed).collect::<Vec<_>>().join(",")
+}
+
 /// A page waiting for changes to `topic` on its socket.
 fn live_page(port: u16, since: u64, topic: &str) -> Page {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    write!(s, "GET /_quillo/live?since={}&t={} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", since, topic).unwrap();
+    write!(s, "GET /_quillo/live?since={}&t={} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", since, signed(topic)).unwrap();
     let h = head(&mut s);
     assert!(h.starts_with(b"HTTP/1.1 101"), "{}", String::from_utf8_lossy(&h));
     Page(s)
@@ -331,7 +337,7 @@ fn live_page_when_free(port: u16, since: u64, topic: &str) -> Page {
     loop {
         let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        write!(s, "GET /_quillo/live?since={}&t={} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", since, topic).unwrap();
+        write!(s, "GET /_quillo/live?since={}&t={} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", since, signed(topic)).unwrap();
         let h = head(&mut s);
         if h.starts_with(b"HTTP/1.1 101") {
             return Page(s);
@@ -409,7 +415,7 @@ fn a_long_poll_is_answered_after_what_came_before_it_on_its_connection() {
     let at = seq(s.port);
     let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-    write!(c, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\nGET /_quillo/live?since={}&t=poll HTTP/1.1\r\nHost: localhost\r\n\r\n", at).unwrap();
+    write!(c, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\nGET /_quillo/live?since={}&t={} HTTP/1.1\r\nHost: localhost\r\n\r\n", at, signed("poll")).unwrap();
     let asked = Instant::now();
     let first = String::from_utf8_lossy(&head(&mut c)).into_owned();
     assert!(first.starts_with("HTTP/1.1 200"), "{}", first);
@@ -456,7 +462,7 @@ fn a_refused_live_upgrade_gives_its_place_back() {
     assert!(until(10, || {
         let mut t = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
         t.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        write!(t, "GET /_quillo/live?since={}&t=x HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\nSec-WebSocket-Version: 12\r\n\r\n", at).unwrap();
+        write!(t, "GET /_quillo/live?since={}&t={} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: k\r\nSec-WebSocket-Version: 12\r\n\r\n", at, signed("x")).unwrap();
         let h = head(&mut t);
         assert!(h.starts_with(b"HTTP/1.1 426") || h.starts_with(b"HTTP/1.1 503"), "{}", String::from_utf8_lossy(&h));
         c = h.starts_with(b"HTTP/1.1 426").then_some(t);
@@ -470,7 +476,7 @@ fn a_refused_live_upgrade_gives_its_place_back() {
     assert!(until(10, || {
         let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
-        write!(c, "GET /_quillo/live?since={}&t=x HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", at).unwrap();
+        write!(c, "GET /_quillo/live?since={}&t={} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", at, signed("x")).unwrap();
         let ok = head(&mut c).starts_with(b"HTTP/1.1 101");
         if ok {
             p = Some(Page(c));
@@ -527,7 +533,7 @@ fn changes_too_large_to_write_at_once_reach_a_page_whole() {
     write!(s2, "GET /_quillo/live?since={}&tm=1 HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", at).unwrap();
     assert!(head(&mut s2).starts_with(b"HTTP/1.1 101"));
     let mut p = Page(s2);
-    p.send(0x1, topics.join(",").as_bytes());
+    p.send(0x1, signed(&topics.join(",")).as_bytes());
     std::thread::sleep(Duration::from_millis(300));
     // Twenty changes to every topic, a gathering apart, none read.
     for _ in 0..20 {
@@ -582,7 +588,7 @@ fn a_live_page_gone_in_the_middle_of_a_frame_gives_its_place_back() {
     assert!(until(10, || {
         let mut c = TcpStream::connect(("127.0.0.1", s.port)).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-        write!(c, "GET /_quillo/live?since={}&t=cut HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", at).unwrap();
+        write!(c, "GET /_quillo/live?since={}&t={} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", at, signed("cut")).unwrap();
         head(&mut c).starts_with(b"HTTP/1.1 101")
     }), "the place was not given back");
 }
@@ -595,7 +601,7 @@ fn a_long_poll_ahead_of_the_server_is_told_its_number_at_once() {
     let s = support::serve_with(&d.join("main.qwe"), &[]);
     let now = seq(s.port);
     let t = Instant::now();
-    let a = support::send(s.port, "GET", "/_quillo/live?since=999999999&t=x", &[], "");
+    let a = support::send(s.port, "GET", &format!("/_quillo/live?since=999999999&t={}", signed("x")), &[], "");
     let j: serde_json::Value = serde_json::from_str(&a.body).unwrap();
     assert_eq!((j["seq"].as_u64(), j["changed"].clone()), (Some(now), serde_json::json!([])));
     assert!(t.elapsed() < Duration::from_secs(5), "after {:?}", t.elapsed());

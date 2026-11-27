@@ -352,7 +352,9 @@ fn moves_in_place_puts_the_whole_bundle_on_every_page_and_nothing_without_it() {
     let pages = "route GET / = <html><head><title>A</title></head><body><a href=\"/b\">b</a></body></html>\nroute GET /b = <html><head><title>B</title></head><body>b</body></html>\n";
     let s = served("ip", &format!("moves_in_place()\n{}", pages), &[]);
     let p = s.page("/");
-    assert!(p.contains("/_quillo/quillo.js") && p.contains("if(1||d.querySelector"), "{}", p);
+    // The loader reads the document through `Document.prototype` (changed for 0.8.12: FEEDBACK51.md,
+    // Q-667, the review of slice W1; branch feedback86-89).
+    assert!(p.contains("/_quillo/quillo.js") && p.contains("if(1||D.querySelector.call(d"), "{}", p);
     // The runtime asks for pages ahead itself: no prefetch script.
     assert!(p.contains("w.pf=1;") && !p.contains("speculationrules"), "{}", p);
     let js = s.page("/_quillo/quillo.js");
@@ -1321,7 +1323,10 @@ route offline GET /orders/:id(int) = <html><head><title>Order {id}</title></head
 "#;
     let s = served("offline-page", src, &[]);
     let p = s.page("/");
-    assert!(p.contains("<script data-quillo>") && p.contains("serviceWorker"), "{}", p);
+    // Said so by the answer's nonce on `data-quillo`, which the runtime has from the answer's
+    // header (changed for 0.8.12: FEEDBACK51.md, Q-667, the second review of slice W1; branch
+    // feedback86-89).
+    assert!(p.contains("<script data-quillo=\"") && p.contains("serviceWorker"), "{}", p);
     drop(s);
     let Some((v, _)) = in_chrome(
         "offline",

@@ -42,6 +42,26 @@ fn enc(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{:02X}", b) }).collect()
 }
 
+/// `html` without the answer's islands' nonce (` data-qn="…"`, and the loader's `w.qn="…";`), new
+/// with each answer (FEEDBACK51.md, Q-667; branch feedback86-89): what the tests below compared
+/// before 0.8.12.
+fn no_nonce(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(at) = [rest.find(" data-qn=\""), rest.find("w.qn=\"")].into_iter().flatten().min() {
+        out.push_str(&rest[..at]);
+        let after = &rest[at..];
+        let q = after.find('"').unwrap() + 1;
+        let end = q + after[q..].find('"').unwrap() + 1;
+        rest = &after[end..];
+        if after.starts_with("w.qn") {
+            rest = rest.strip_prefix(';').unwrap_or(rest);
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The start tag of the element with `id` in `html`.
 fn tag_of<'a>(html: &'a str, id: &str) -> &'a str {
     let at = html.find(&format!("id=\"{}\"", id)).unwrap_or_else(|| panic!("no #{} in {}", id, html));
@@ -202,7 +222,8 @@ route GET / = <html><head><title>t</title></head><body><table><tbody><Row c={req
     let b = support::send(s.port, "GET", "/?c=Card", &[], "").body;
     // The island's attributes once each, the server's; the row's others as written.
     let row = r#"<tr data-qi data-c="Row" data-p="{&quot;c&quot;:&quot;Card&quot;}" data-s="{&quot;n&quot;:1,&quot;cc&quot;:&quot;Card&quot;}" class="row" data-x="Card">"#;
-    assert!(b.contains(row), "{}", b);
+    // Without the answer's nonce (changed for 0.8.12: FEEDBACK51.md, Q-667; branch feedback86-89).
+    assert!(no_nonce(&b).contains(row), "{}", b);
     // Elsewhere they are the program's.
     assert_eq!(tag_of(&b, "own"), r#"<div id="own" data-c="Card" data-p="{}" data-s="{}" data-q="1" data-qix="2" data-quillo-devtools="1" data-e="true">"#);
     let Some(chrome) = chrome() else {
@@ -215,7 +236,7 @@ route GET / = <html><head><title>t</title></head><body><table><tbody><Row c={req
     let script = format!(
         r##"(async () => {{
   {BOOTED}
-  const attrs = (el) => [...el.attributes].map((a) => a.name + "=" + a.value).join(" ");
+  const attrs = (el) => [...el.attributes].filter((a) => a.name !== "data-qn").map((a) => a.name + "=" + a.value).join(" ");
   const tr = document.querySelector("tr");
   document.getElementById("own").click();
   document.getElementById("cell").click();
@@ -760,7 +781,8 @@ route GET / = <html><head><title>t</title></head><body><Chart/></body></html>
         r#"<quillo-island style="display:contents" data-c="Loose" data-p="{}" data-s="{}"><rect class="loose"></rect></quillo-island>"#,
         r#"<tr data-qi data-c="Row" data-p="{}" data-s="{}" class="row">"#,
     ] {
-        assert!(html.contains(want), "{} not in {}", want, html);
+        // Without the answer's nonce (changed for 0.8.12: FEEDBACK51.md, Q-667; branch feedback86-89).
+        assert!(no_nonce(&html).contains(want), "{} not in {}", want, html);
     }
     let want = serde_json::json!({
         "bars": "10x40 10x70", "grp": "true", "lnk": "10x10", "inner": "20x20", "tall": "10x80", "dot": "10x10 svg:svg true Dot", "grp2": "2 true svg:svg svg:g",
@@ -1102,7 +1124,8 @@ route GET / = <html><head><title>t</title></head><body><Parent/><Bump/><Calm/><O
         r#"<p id="x2">5 1</p>"#,
         r#"<option data-qi data-c="Opt" data-p="{}" data-s="{&quot;label&quot;:&quot;&quot;}" value="a">a!</option><option data-qi data-c="Opt" data-p="{}" data-s="{&quot;label&quot;:&quot;&quot;}" selected value="b">b!</option>"#,
     ] {
-        assert!(html.contains(want), "{} not in {}", want, html);
+        // Without the answer's nonce (changed for 0.8.12: FEEDBACK51.md, Q-667; branch feedback86-89).
+        assert!(no_nonce(&html).contains(want), "{} not in {}", want, html);
     }
     let want = serde_json::json!({ "parent": "5 5", "bump": "5 5", "calm": "0 0", "inner": "5 5", "mixed": "5 1 5 1", "pick": "b", "remade": 0, "errors": [] });
     assert_eq!(r, want);
@@ -1129,12 +1152,14 @@ fn components_setting_their_own_state_render_once() {
     let t = std::time::Instant::now();
     let b = support::send(s.port, "GET", "/", &[], "").body;
     assert!(t.elapsed() < std::time::Duration::from_secs(2), "{:?}", t.elapsed());
+    // Without the answer's nonce (changed for 0.8.12: FEEDBACK51.md, Q-667; branch feedback86-89).
+    let b = no_nonce(&b);
     assert!(b.contains(r#"<div class="d16"><quillo-island style="display:contents" data-c="Leaf" data-p="{}" data-s="{&quot;v&quot;:1}"><p class="leaf">1</p>"#), "{}", b);
     assert!(b.contains(r#"data-c="D1" data-p="{}" data-s="{&quot;c&quot;:0}">"#), "{}", b);
     assert_eq!(support::send(s.port, "GET", "/hits", &[], "").body, "<p>1</p>");
     // Out once and again (2 leaves each), In inside each, once more inside Out's first: 7 at most,
     // not 2 x 2 x 2 for each.
-    let b = support::send(s.port, "GET", "/two", &[], "").body;
+    let b = no_nonce(&support::send(s.port, "GET", "/two", &[], "").body);
     assert!(b.contains(r#"data-c="Out" data-p="{}" data-s="{&quot;count&quot;:5}"><div><p>5</p>"#), "{}", b);
     let hits: u32 = support::send(s.port, "GET", "/hits", &[], "").body.trim_start_matches("<p>").trim_end_matches("</p>").parse().unwrap();
     assert!(hits - 1 <= 7, "{} renders of the leaves", hits - 1);
@@ -4740,7 +4765,9 @@ fn a_header_named_null_is_no_header_anywhere() {
     assert!(plain.contains("</script></body>"), "{}", plain);
     for path in ["/etag", "/range"] {
         let a = get(path, &[]);
-        assert_eq!((a.status, a.header("etag"), a.header("content-range"), &a.body), (200, None, None, &plain), "{}", path);
+        // Each answer has its own islands' nonce (changed for 0.8.12: FEEDBACK51.md, Q-667; branch
+        // feedback86-89).
+        assert_eq!((a.status, a.header("etag"), a.header("content-range"), no_nonce(&a.body)), (200, None, None, no_nonce(&plain)), "{}", path);
     }
     assert_eq!(get("/srv", &[]).header("server"), None);
     assert_eq!(all_of(&get("/srv2", &[]), "server"), ["mine"]);
@@ -9950,7 +9977,9 @@ fn a_global_a_rolled_back_transaction_changed_is_announced() {
         let before = s7_seq(s.port);
         assert_eq!(get(path), value, "{}", path);
         assert!(s7_seq(s.port) > before, "{}: nothing announced", path);
-        let changed = s7_changed(s.port, before, &format!("{},db:t", topic));
+        // Signed, as the server gives them to a page (changed for 0.8.12: FEEDBACK51.md, Q-666;
+        // branch feedback86-89).
+        let changed = s7_changed(s.port, before, &s7_key(&[topic, "db:t"]));
         assert!(changed.contains(&topic.to_string()), "{}: {:?}", path, changed);
         // The table's rows went with the rollback, and so did its announcement; a commit's stays.
         assert_eq!(changed.contains(&"db:t".to_string()), path == "/ok" || path == "/inner", "{}: {:?}", path, changed);
@@ -10220,9 +10249,11 @@ route GET /long/:n(int) = { publish("é".repeat(n)); "ok" }
 route GET /emoji/:n(int) = { watch("😀".repeat(n)); "ok" }
 "#;
 
-/// `topics` as runtime.js's `liveKey` writes them.
+/// `topics` as runtime.js's `liveKey` writes them: each signed, as the server gives it to a page
+/// (changed for 0.8.12: FEEDBACK51.md, Q-666, the user's decision of 2026-11-26; branch
+/// feedback86-89).
 fn s7_key(topics: &[&str]) -> String {
-    topics.iter().map(|t| t.replace('%', "%25").replace(',', "%2C")).collect::<Vec<_>>().join(",")
+    topics.iter().map(|t| support::signed(t)).collect::<Vec<_>>().join(",")
 }
 
 #[test]
@@ -10242,10 +10273,13 @@ fn a_topic_is_one_name_on_the_wire_and_has_its_limits() {
         assert_eq!(get(&format!("/bump/{}", enc(topic))).status, 200);
         assert_eq!(s7_changed(s.port, before, &enc(&s7_key(&[topic, "other"]))), [topic], "{}", topic);
     }
-    // The old form, from a page loaded before: topics joined by commas.
+    // Topics joined by commas, signed; the old form, unsigned, from a page loaded before 0.8.12,
+    // is refused, and its runtime says so (changed for 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89).
     let before = s7_seq(s.port);
     get("/bump/y:2");
-    assert_eq!(s7_changed(s.port, before, "x:1,y:2"), ["y:2"]);
+    assert_eq!(s7_changed(s.port, before, &enc(&s7_key(&["x:1", "y:2"]))), ["y:2"]);
+    let a = support::send(s.port, "GET", &format!("/_quillo/live?since={}&t=x:1,y:2", before), &[], "");
+    assert_eq!(a.status, 403, "{}", a.body);
     // The wildcard is a wildcard.
     let before = s7_seq(s.port);
     get("/bump/room:*");
@@ -10521,7 +10555,9 @@ fn s7_rss(pid: u32) -> u64 {
 // for the socket's message and a POST's body alike; a 4 MiB one costs the server nothing.
 #[test]
 fn topics_after_the_address_are_held_to_what_a_page_follows() {
-    const MOST_TEXT: usize = 256 * (448 * 3 + 1);
+    // Each topic after its signature and a `.` (changed for 0.8.12: FEEDBACK51.md, Q-666; branch
+    // feedback86-89).
+    const MOST_TEXT: usize = 256 * (448 * 3 + 1) + 256 * (16 + 2);
     let d = s7_dir("q801-later", "route GET /bump/:t = {\n    publish(t)\n    \"ok\"\n}\nroute GET / = \"ok\"\n");
     let s = support::serve(&d.join("main.qwe"), &[]);
     // 255 topics of 448 commas each, the longest, and one to publish: padded to the limit.

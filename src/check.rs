@@ -2402,6 +2402,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("db.transaction", "map | fn, fn=", "any"),
     ("db.error_kind", "any", "str | null"),
     ("db.sql_name", "str | list", "str"),
+    ("db.own_setup", "str", "list | error(str)"),
     ("idempotent", "map | fn, fn=", "any"),
     // A failed migration stops what runs it, as it must at start (Q-602): no error value to
     // handle, which `list | error(str)` promised (FEEDBACK62.md, Q-923; branch cache-and-migrate).
@@ -4500,7 +4501,7 @@ impl Checker {
     }
 
     /// `reparsed`, noting first where the file writes a name it took `as` another
-    /// (`written_exprs`, `written_decls`): a lowercase alias of a name linking renames.
+    /// (`written_exprs`, `written_decls`): any alias of a name linking renames.
     fn reparsed_written(&mut self, src: &str, names: &HashMap<String, String>, file: &str, key: &Path) -> Result<Vec<Stmt>, crate::error::QuilloError> {
         let mut stmts = Parser::new(src).parse_program()?;
         let aliases: HashSet<String> = stmts
@@ -4510,7 +4511,7 @@ impl Checker {
                 _ => None,
             })
             .flatten()
-            .filter(|(n, a)| n != a && a.starts_with(|c: char| c.is_lowercase()) && names.contains_key(a.as_str()))
+            .filter(|(n, a)| n != a && names.contains_key(a.as_str()))
             .map(|(_, a)| a.clone())
             .collect();
         let mut routes: Vec<(usize, String, String)> = Vec::new();
@@ -18102,6 +18103,8 @@ fn focus_rings_removed(sheets: &[(Arc<str>, u32, String)]) -> Vec<(Arc<str>, u32
         }
         src.push_str(rest);
         let mut boundary = 0;
+        let mut cur_at = 0usize;
+        let mut cur_line = *line;
         for (i, c) in src.char_indices() {
             match c {
                 '{' => {
@@ -18109,8 +18112,10 @@ fn focus_rings_removed(sheets: &[(Arc<str>, u32, String)]) -> Vec<(Arc<str>, u32
                     let body_end = src[i + 1..].find(['{', '}']).map_or(src.len(), |k| i + 1 + k);
                     let body: String = src[i + 1..body_end].chars().filter(|c| !c.is_whitespace()).collect::<String>().to_ascii_lowercase();
                     let at = boundary + (selector.len() - selector.trim_start().len());
+                    cur_line += src[cur_at..at].as_bytes().iter().filter(|&&b| b == b'\n').count() as u32;
+                    cur_at = at;
                     let sels = selector.split(',').map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()).collect();
-                    rules.push((sels, body, file.clone(), line + src[..at].matches('\n').count() as u32));
+                    rules.push((sels, body, file.clone(), cur_line));
                     boundary = i + 1;
                 }
                 '}' | ';' => boundary = i + 1,
@@ -18132,12 +18137,20 @@ fn focus_rings_removed(sheets: &[(Arc<str>, u32, String)]) -> Vec<(Arc<str>, u32
             && !d.ends_with(":0")
             && ["box-shadow:", "border", "outline", "background", "color:"].iter().any(|p| d.starts_with(p))
     };
+    let mut ringed: HashSet<&str> = HashSet::new();
+    for (sels, body, _, _) in &rules {
+        if body.split(';').any(ring) {
+            for s in sels {
+                ringed.insert(s.as_str());
+            }
+        }
+    }
     let mut out = Vec::new();
     for (sels, body, file, line) in &rules {
         if !body.split(';').any(none) {
             continue;
         }
-        let bare = sels.iter().filter(|s| global(s)).any(|s| !rules.iter().any(|(o, b, _, _)| o.contains(s) && b.split(';').any(ring)));
+        let bare = sels.iter().filter(|s| global(s)).any(|s| !ringed.contains(s.as_str()));
         if bare {
             out.push((file.clone(), *line));
         }

@@ -264,6 +264,10 @@ impl Run {
 struct Page(TcpStream);
 
 fn open(port: u16, since: u64, topics: &str, xff: Option<&str>) -> Option<Page> {
+    // Each topic signed as the server gives it to a page, with `run`'s secret: a page follows only
+    // those (changed for 0.8.12: FEEDBACK51.md, Q-666, the user's decision of 2026-11-26; branch
+    // feedback86-89).
+    let topics = topics.split(',').map(|t| support::signed_topic("a test secret for live data, long enough to use", "", None, t)).collect::<Vec<_>>().join(",");
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let forwarded = xff.map_or(String::new(), |x| format!("X-Forwarded-For: {}\r\n", x));

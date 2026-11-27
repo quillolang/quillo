@@ -19,8 +19,8 @@ cargo build --release
 cargo test
 ```
 
-This guide is for Quillo 0.8.11, and [CHANGELOG.md](CHANGELOG.md) says what it changed.
-Features marked *(since 0.8.11)* are built and not released yet: they come in the next
+This guide is for Quillo 0.8.12, and [CHANGELOG.md](CHANGELOG.md) says what it changed.
+Features marked *(since 0.8.12)* are built and not released yet: they come in the next
 release, and its "Unreleased" part of the changelog lists them. Features marked *(since 0.7)* came in 0.7.0. On an older release, read that release's guide:
 https://github.com/quillolang/quillo/blob/v0.7.0/USERGUIDE.md or
 https://github.com/quillolang/quillo/blob/v0.6.0/USERGUIDE.md.
@@ -1194,6 +1194,11 @@ match v {
   (or another service) are made as `User(v)` makes them: checked the same way, with
   defaults put in and fields the record does not have left out, so a page cannot add
   `is_admin` to the profile it saves.
+- A field the record does not have, read on a value `User(...)` makes or a function
+  declared `-> User` returns, is an error in `quillo check` *(since 0.8.12; it read null)*,
+  as it is on a parameter typed `User`; so is one read on any map whose fields are known
+  (the program's own function that gives a map or `err(...)`), except `.len`, `.keys`,
+  `.values`, `.error` and `.message`.
 - In a pattern, a record matches what `User(v)` would make, and binds that: in a route,
   `{ json: User }` takes the body as a User, and `{ form: Signup }` a form, its text
   converted to the numbers and booleans the record asks for, as query values are. A
@@ -1398,6 +1403,10 @@ write `x.y`.
 `! T` in a signature declares what the function's errors contain. It is checked: a
 function declared `! str` that returns `err(42)` is a runtime error, and `quillo check`
 reports it, and a `?` that would pass on the wrong kind of error, before the program runs.
+A field read or a method called on what such a function gives (or a service call), straight
+off the call or kept in a `let` or `state`, with no `?`, `is_err`, `type_of`, `match` or test of
+it first, is warned of *(since 0.8.12)*: an error has none of its fields. `inv.id ?? 0` is
+fine: `??` takes a read that failed.
 
 Mistakes in the code itself (calling a non-function, adding a map to an int, a
 failed type check, recursion more than 10,000 calls deep) are runtime errors. In a
@@ -1849,13 +1858,12 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   <script>{raw(CODE)}</script>, or put it in a file of its own``. A component's `<script>` (made
   in the browser, which runs it) takes only text written in the program. Script built
   as text outside a `<script>` element (`raw("<script>" + ... )`) is not looked at.
-- `raw(s)` marks trusted HTML. HTML a visitor wrote, even cleaned by a sanitizer, must not
-  keep the attributes Quillo's islands are made of: `data-qi`, `data-qd`, `data-qt`,
-  `data-c`, `data-p`, `data-s`, `data-l`, `data-v` and `data-e`, nor `<quillo-island>`
-  elements. The page takes such an element up
-  as one of its components, with the props and state it says, and a `children` text in its
-  `data-p` as HTML (FEEDBACK51.md, Q-667). DOMPurify keeps `data-*` unless told not to
-  (`ALLOW_DATA_ATTR: false`).
+- `raw(s)` marks trusted HTML. *(Since 0.8.12, Quillo signs each answer's components with a
+  per-answer nonce `data-qn` and marks server-rendered `children` HTML with `data-qh`, so
+  injected `<quillo-island>` or `data-*` elements without that answer's nonce are ignored by the
+  runtime.)* Still strip `data-qi`, `data-qd`, `data-qt`, `data-c`, `data-p`, `data-s`, `data-l`,
+  `data-v`, `data-e`, `data-qn`, `data-qh` and `<quillo-island>` from untrusted HTML before `raw()`:
+  DOMPurify keeps `data-*` unless told not to (`ALLOW_DATA_ATTR: false`).
 - A capitalized tag calls a view: attributes fill parameters by name, and the element's body is passed as `children`.
   A view with no `children` parameter given a body is an error *(since 0.7: the body was
   dropped)*, as an attribute it has no parameter for is; spaces alone are no body.
@@ -3602,8 +3610,15 @@ that gave any caller its file, line and message)*), and ``server fn `x` answered
 characters)`` when a 2xx came back that the server did not send, or cut short: a sign-in page a
 redirect led to, a proxy's page, an empty body. Quillo's server marks what it sends with
 `x-quillo-answer`, so `respond` and `reply` still give `null` (a proxy that drops the mark turns those
-into this error; ordinary answers go through). A `redirect` from the function itself is followed
-by the browser, and gives this error too. A function that returns `err(v)` gives an error value with `v`. A `reply 401
+into this error; ordinary answers go through). A `redirect` from the function itself (or a
+`respond` or `reply` with a 3xx) is not followed: the call gives the error value
+`"a server fn cannot redirect: return a value and navigate"`, and the server's log says so once
+for each function; return a value, and call `navigate` in the page. A component's `state` whose
+initializer calls such a function as the server draws the page is given the same error value,
+said once for each state, and `quillo check` warns of a `redirect` in a server fn a component
+calls; a `reply` with a redirect there still ends the page's request with it,
+as a route's `reply` does (a guard on a first load) *(before 0.8.12 the browser followed the redirect and the call gave the
+error above, with nothing in the log; a page whose state called it answered 500)*. A function that returns `err(v)` gives an error value with `v`. A `reply 401
 "Log in first"` inside it gives only the status (``failed (401)``), since its body is
 not JSON: return `err("Log in first")`, or `reply 401 { error: "Log in first" }`, and
 show the words with `r.error`, as `problem` above does (an error value itself shows
@@ -3672,7 +3687,16 @@ component Product(id: int) {
   and before the page counts as loaded.
 - Only a component placed in the page defers. Inside another component, and in the
   browser (a page made there after `navigate`), `defer(x)` is `x`: there a state that
-  calls the server is null until it answers anyway. Components inside a deferring one
+  calls the server is null until it answers anyway. A component whose markup fails on that
+  null (a field of it given to a typed view) shows nothing, with the error in the browser's
+  console, and is drawn again when one of its states or props next changes, so the answer
+  draws it; what its states started (a `live` subscription, an `every`) keeps running, and a
+  failure that lasts is said once, not on every change. A `for` row whose markup fails so
+  shows nothing while the other rows draw, and is drawn again the same way *(before 0.8.12 the
+  component stayed empty for good, and a list with such a row stayed empty)*. `quillo check` warns *(since 0.8.12)*
+  where such a state, or a field of it, goes to a typed parameter of a view or a component
+  with no null test (or a `let` holding one), in a component another component, or a view
+  or function it uses, makes. Components inside a deferring one
   render again with it, their initializers too.
 - Several deferred components follow in the order they are on the page, each as soon
   as the ones before it are sent. A deferred part cannot set cookies or the session
@@ -4164,12 +4188,13 @@ list is not touched. The page shows the new total once the keystroke's handler i
 
 | Written in a component | Becomes | Is worked out again |
 |---|---|---|
-| `state x = v` (or `~x = v`) | a signal, set once | never: it changes when assigned |
+| `state x = v` (or `~x = v`) | a signal, set once | never: it changes when assigned, and `quillo check` warns *(since 0.8.12)* when `v` reads a state that changes and nothing assigns `x` (write `let`) |
 | `let y = ...` that reads something that changes | a derived value | when something it read changed, and only once something reads it |
 | `let y = ...` that reads nothing that changes | a constant | never |
-| `let y = ...` whose name is assigned somewhere (`y = 5`) | a plain variable | never by itself |
+| `let y = ...` whose name is assigned in a function or a handler (`onclick={() => { y = 5 }}`) | a plain variable | never by itself |
+| a `let` or a prop assigned on a line of the body itself (`label = open ? "Hide" : "Show"`), or a `return` or `?` in the body | the whole body as one part *(since 0.8.12 in this table; it always was)* | all of it, when a state or a prop it read changed: its `let`s and assignments run again, its states keep their values |
 | a statement that reads something that changes (`if running { every(...) }`) | an effect | after what it read changed |
-| an assignment alone in the body (`count = len(items)`, `n += 1`) | a step as it starts | never: it runs once, and `quillo check` warns when it reads a prop or another state (write `let`) |
+| an assignment alone in the body (`count = len(items)`, `n += 1`) | a step as it starts | never: it runs once, and `quillo check` warns when it reads a prop or another state (write `let`); in a body that runs again whole (the row above) it runs again with it, and nothing is said |
 | `{expr}` in markup, an attribute's or a class's `{...}` | a place on the page | when what it read changed; text that comes out the same is not written |
 | `cond ? <a/> : <b/>`, `if`, `match`, `cond && <x/>` in markup | a branch | made again only when another branch is chosen |
 | `for x in xs => <row/>` | a row for each item | rows are kept by `key` (else by place) and given their new item; a `key` that reads other state makes its rows again when that changes |
@@ -4603,7 +4628,9 @@ route [offline] [writes] METHOD /path [with effects] { ... block ... }
 - **Query pattern:** `? { q: str, page: int = 1 }`. Query values are text, so `int`, `float` and `bool` patterns convert them. A blank value (`?page=`, as a search
   form sends a field left empty) is one not sent when the field has a default, so `page`
   is 1 *(since 0.7)*. `bool` takes `true`, `on`, `1` and `yes`, and `false`, `off`, `0` and
-  `no`, in any case. A list (`{ tag: [str] }`) takes every `tag`, or every `tag[]` when
+  `no`, in any case; a bare flag in the query string with no `=` (`?on`, *(since 0.8.12)*) also
+  matches a `bool` field as `true`, while `?on=` stays blank text (using the default or returning
+  400 when required). A list (`{ tag: [str] }`) takes every `tag`, or every `tag[]` when
   no `tag` came, as PHP- and Rails-shaped forms name them. An unchecked checkbox sends
   nothing, so its field needs a default: `{ form: { agree: bool = false } }`.
   A name sent more than once keeps its last value in `request.query` and `request.form`;
@@ -5836,19 +5863,45 @@ commits: the work and its answer are kept together, or neither is.
   (as Stripe does), since part of the work may have happened. A server that stops there
   leaves the key running: it is not known whether the work happened, so requests with
   the key get 409 until it expires. Give the provider the same key, if it takes one,
-  so that it too makes the payment once.
-- A [service](#services)'s function that changes data is such work too: it commits in the
-  service, not in this transaction. When its answer is lost (the service stopped part way,
-  the network dropped it), the call fails, the transaction rolls back and gives the key up,
-  and the client's retry with it calls the service again, under a new call id, so the
-  service changes its data twice. `quillo check` warns where an `idempotent` run in its
-  transaction reaches such a function, a site's too, directly or through the program's
-  functions, and through a service that calls another: ``main.qwe:6: warning: `idempotent`
-  reaches `billing.charge`, which may change data in another program, outside its
-  transaction: ...``. Give it `{ transaction: false }`, or send an id the service's change
-  is keyed by (`insert ... on conflict do nothing` on an order's id), so that a second run
-  changes nothing. A call made later (`billing.later.charge(...)`) waits in this
-  transaction's database, and is not warned of.
+  so that it too makes the payment once. When the run ends after a call to a Quillo
+  [service](#services) that was never sent (no connection, an open circuit), with an early reply
+  (`?? reply 503`), a `?` that passes its error on or a failure after it, that end is not kept
+  *(since 0.8.12; it was replayed to every retry)*: nothing reached the service, so the retry
+  with the key runs again. After a call that may have run (no answer in its time, a 503, a
+  502 or 504 the service did not sign), after the service answered (a value, an error value,
+  a 4xx; a failure further down the chain is the service's answer), and once the run has made
+  any other outbound call (`http.*`, push, UDP), its end is kept. The run has no transaction,
+  so what it wrote to its own database before the call is written again by the retry.
+- A [service](#services)'s function that changes data commits in the service, not in this
+  transaction. When its answer is lost (the service stopped part way, the network dropped
+  it), the call fails, the transaction rolls back and gives the key up, and the client's
+  retry calls the service again *under the same call id* *(since 0.8.12; a new one before, so
+  the service changed its data twice)*: a call made inside an `idempotent` run takes its id from
+  the run's key and its place in the run (the n-th call of that function), and the service
+  gives the answer it kept for that id when its function uses `idempotent` too. The chain
+  goes on down: the service's own calls inside its run get ids from it, signed to it in the
+  `x-quillo-root` header, so shop → billing → ledger, each `idempotent`, posts once after a
+  crash anywhere along it. Ids follow the key, the request and the call's place, signed
+  with the program's own secret, so another request with the same key gets other ids; a
+  service refuses an id it knows that comes with other arguments, from another caller or
+  for another function, and never answers it from its record. Calls inside `parallel`'s
+  functions get ids of their own and are not chained. A retry after a restart sends the same
+  ids only with `QUILLO_SECRET` (or the services' secret) set; without one, ids last as long as
+  the process. The same signed call sent again is refused (409). Stripping `x-quillo-root` or
+  replaying a signed answer takes someone on the path between the programs: use TLS between
+  them. Upgrade services before
+  their callers: a 0.8.11 service remembers an error value it gave for 11 minutes, which a
+  0.8.12 caller's retry then gets again.
+- Work at another site is not made safe that way. `quillo check` warns where an
+  `idempotent` run in its transaction reaches `http.post`, `put`, `patch`, `delete` or an
+  `http.request` that is not `GET`, `HEAD` or `OPTIONS` *(since 0.8.12; before, the warning was
+  for service calls)*, directly or through the program's functions: ``main.qwe:6: warning:
+  `idempotent` reaches `http.post`, which may change data at another site, outside its
+  transaction: ...``. Send the site a key of its own that is the same on each try (its
+  `Idempotency-Key` header, made from this request's key, which silences the warning); where
+  it takes none, look up whether the first request's change is there before sending it
+  again; or give `idempotent` `{ transaction: false }`. A call made later
+  (`billing.later.charge(...)`) waits in this transaction's database.
 
 ### Prefetching
 
@@ -6960,7 +7013,10 @@ answers the same, with billing in a process of its own.
 - **The service's file**, beside the app, is how the app knows what `billing.add` takes.
   As the app loads, it reads only the file's `server fn` headers (and those of the files
   it `use`s), so a mistake in one of its routes or bodies does not stop an app run with
-  `--no-check` (`quillo check`, and [`--split`](#options-of-quillo-run), still check the file whole). A service
+  `--no-check` (`quillo check`, and [`--split`](#options-of-quillo-run), still check the file whole, once
+  however many of the app's programs declare it *(since 0.8.12; its warnings were said twice)*;
+  a call takes and gives the service's own types, even where the app has a type of the same
+  name). A service
   that runs elsewhere need not be here at all: with no file and an address
   (`--service-url` or `QUILLO_SERVICE_BILLING`), the app asks the running service for its
   functions as it starts, as a call like any other (signed, each address in turn), and
@@ -7681,9 +7737,6 @@ stays the simpler choice when the next move depends on the answer.
   once from each place (`[ab]*a[ab]{900}c` on a text of `a` and `b`) can take long on a long
   text, so a search whose work would pass a quarter of a second is run step by step,
   counted, and stops after 0.1 s and 0.15 µs a byte of the text (the thread's own time),
-  within [`--max-compute`](#options-of-quillo-run), and before its own work takes 256 MiB or
-  [`--max-memory`](#concurrency-and-reloading); the call is then an error value (`` `re.test`:
-  the pattern is too costly for this text: ...; repeat less, or search a shorter text ``), in
   every `re.*` call *(since 0.8.9: one search held an instance for seconds to minutes, past
   `--max-compute`)*. Ordinary patterns, a long one on a long text too, answer as before, and
   a pattern of literals alone (`cat|dog`, `\d`, a list of 5,000 words) is searched as
@@ -8978,7 +9031,10 @@ fn withdraw(account: int, cents: int) -> map with db =
   immediate`, taking the write lock at once (another process holding it is then a
   conflict, tried again, rather than a failure half way). Without options a SQLite
   transaction is a savepoint that takes the lock when it first writes, and a busy
-  database is not tried again.
+  database is not tried again. A statement outside a transaction that meets another
+  process's write lock waits for it up to 5 s, as before, but no longer holds up the other
+  requests while it waits *(since 0.8.12)*; inside a transaction (its commit too), or with the
+  program's own `pragma busy_timeout`, it waits in place.
 - On PostgreSQL and MySQL a transaction waits up to 30 s for a free connection, then
   fails (`no PostgreSQL connection free after 30 s`).
 - `retries` (0 to 20; 0 by default) runs the whole function again after a serialization
@@ -9158,9 +9214,19 @@ reaches](#what-a-program-reaches)).
   on a connection of its own, reset after it; so do PostgreSQL's functions that run SQL
   given as text or read tables and views by name, `query_to_xml` and its kin
   (`cursor_to_xml`, `table_to_xml`, `schema_to_xml`, `database_to_xml`), `ts_stat` and
-  `ts_rewrite` *(since 0.8.9: they ran on the shared connection)*. What a view, a rule or a
-  trigger changes of the session is not seen: keep session changes (`set_config(...,
-  false)`, `set`) out of the functions they call. `prepare` is refused everywhere: pass values as
+  `ts_rewrite` *(since 0.8.9: they ran on the shared connection)*. So does, *since 0.8.12*, a
+  statement that reads a view, or writes a table with rules, triggers, domain columns, or
+  checks, defaults or indexes that call the database's own functions or `currval`, or reads a
+  table whose policies call such functions or read such views, or names a domain or a type of
+  the database's own (what those run may change the session: it reached other visitors, and
+  row-level security with it); Quillo reads the database's catalog once, and again after the
+  program's own schema statements and migrations; a schema change made by another process is
+  seen at the program's next one, its migrations or a restart. Reading a table
+  with triggers stays on the shared connection (a read runs none of them), and so does what an
+  extension adds (citext, PostGIS). On a database with operators or casts of its own every
+  statement outside a transaction runs apart. `lastval()` and `currval()` are refused outside a
+  transaction *(since 0.8.12: they read another request's value)*: write `insert ... returning
+  id`. `prepare` is refused everywhere: pass values as
   parameters (`?`), which Quillo prepares itself. Inside a SQLite transaction a PostgreSQL
   query takes a free connection at once or is an error, as waiting would hold every request. Row-level
   security's setting per request is therefore written inside the transaction, as local:
@@ -9465,6 +9531,15 @@ something must be kept in it (calls made later, `db.atomic`'s decisions, a devic
 subscription in a program with no database);
 `$QUILLO_SYSTEM_DB` may be a URL.
 
+*(Since 0.8.12)* On PostgreSQL and MySQL/MariaDB, an operator can isolate Quillo's own tables from
+the program's SQL under a separate database role (one the program's role cannot `SET ROLE` into or
+read directly) by running `db.own_setup(q_url)` once with `QUILLO_SECRET` set. Quillo moves any
+existing `_quillo_*` tables into `quillo` / `quillo_<schema>` (PostgreSQL) or `<db>_quillo`
+(MySQL/MariaDB), creates `SECURITY DEFINER` routines authenticated with per-statement MACs derived
+from `QUILLO_SECRET`, and exposes restricted `_quillo_migrations` and `_quillo_later` views so
+`select name from _quillo_migrations` and `update _quillo_later set at = 0, tries = 0 where tries < 0`
+continue to work while direct reads of `_quillo_idempotency` or `_quillo_secret` are denied.
+
 ### Many tenants
 
 One program can serve many tenants (customers, teams, sites), each with its own data:
@@ -9754,7 +9829,18 @@ seconds write `sleep(200)` ``); `c.query(...)` on an untyped parameter in a `wit
 function without `db`; a service whose file is not here; a name in a pattern that takes
 any value and goes unused, or reads like a type (`intt =>`); an arm that never runs
 after one that takes any value, or with a value an arm before it has; `xs.push(2)`,
-`sort(xs)` or `i + 1` alone, which make a value and drop it; a `return` that leaves the
+`sort(xs)` or `i + 1` alone, which make a value and drop it, and `xs | map(f)` or
+`filter(xs, f)` alone whose function does nothing else (assigns nothing, calls nothing that
+acts), a chain of them (`xs | map(f) | filter(g)`) and one on a field (`m.items | map(f)`)
+*(since 0.8.12)*; a component's `state` set from a state that changes (assigned,
+`bind:`, `live`, loaded by a server fn) or from a `let` that reads one, which is set once and
+does not follow it (write `let`), unless the component assigns or binds the state itself or
+reads it beside what it was set from (a snapshot) *(since 0.8.12)*; a field read or a method
+called on what a `-> T ! E` function or a service call gives, with no `?`, `??` after it,
+`is_err`, `type_of`, `match`, or a test by the program's own function first (or a `let` that
+holds such a test) *(since 0.8.12)*; `n && <markup>`, `!n`, `if n` or `n ? a : b` on a state
+that holds a number, assigned or not, where 0 counts as true *(since 0.8.12 for an assigned
+one)*; a `return` that leaves the
 function from a value that is kept (a block, a `for` body, an `if` or `match` every way
 of which leaves); code after a `return` or a `reply`, which never runs; a function
 that returns a value on one path and gives null at its end (see [Coming from
@@ -9873,8 +9959,18 @@ A `"""` or `'''`, as Python and Kotlin write text over several lines, is told wh
 writes *(since 0.8.11)*: ``tq.qwe:1: error: `"""` is not a string here: text over several lines
 is a backtick string, `line one ...` (`${` interpolates)``.
 
-After a syntax error that a newer Quillo might accept (an unknown character or escape,
-an unexpected keyword, an unknown word), `quillo check`, `quillo run` and the language
+An attribute's `{` left open, as after a handler's block (`onclick={() => { n += 1 }>`), is said
+of that `{` *(since 0.8.12; it was the element's text, "unexpected character")*:
+``main.qwe:3: error: `onclick={` on line 3, column 21 is never closed: add `}` before the tag's `>`;
+without it, that `>` is read as greater than and the text of <button> as code``, with the `}`
+as a quick fix when the handler is the attribute's whole value and holds no block of its own
+(before a `/>` the same); where
+it wanted a value's `}` and found something else, it names that `{`: ``main.qwe:3: error:
+`title={` on line 3, column 14: expected `}` to close it, found `c` ``.
+
+After a syntax error that a newer Quillo might accept (an unknown ASCII character or an
+escape, an unexpected keyword, an unknown word; not a character such as `♥`, which no Quillo
+takes outside text *(since 0.8.12)*), `quillo check`, `quillo run` and the language
 server say which quillo they are (`note: this is quillo 0.6.0 (f1695a3, 2026-10-29),
 built 2026-10-27 at ...`): code written for a newer Quillo fails to parse in an older
 one, such as an old build left on the `PATH`. `quillo --version` names the commit too: `QUILLO_COMMIT` when
@@ -11825,8 +11921,6 @@ does not do it today; the way around it follows.
 - splitting a page's bundle by route, and components loaded lazily
 - a caller finding a service by name through limer's pool, and [`--join`](#options-of-quillo-run) for copies behind NAT
 - `{{ ... }}` blocks of JavaScript in a component (a design only)
-- in the browser, a map's keys that look like integers keep their order of insertion:
-  there `keys({ "10": 1, "2": 2 })` is `["2", "10"]`, as JavaScript orders them
 - Linux builds linked with musl, or static: not planned, since a static binary cannot
   load plugins. The releases from 0.7.0 on are linked against glibc 2.17 instead
 - a catalog whose entries are signed, and its plugins prebuilt for Linux (a policy's

@@ -43,7 +43,8 @@ fn page(it: &mut Interp, path: &str) -> String {
     let sep = if path.contains('?') { "&" } else { "?" };
     let url = format!("{}{}q={}", path, sep, enc(Q));
     let r = it.handle(&HttpRequest { method: "GET".into(), url: url.clone(), headers: vec![("Host".into(), "localhost".into())], body: Vec::new(), remote: "127.0.0.1".into() });
-    let text = r.text();
+    // Without the answer's nonce, new with each answer (changed for 0.8.12: FEEDBACK51.md, Q-667; branch feedback86-89).
+    let text = support::no_nonce(&r.text());
     assert_eq!(r.status, 200, "{}: {}", url, text);
     let from = text.find("<body>").map_or(0, |i| i + 6);
     let to = text[from..].find("<script>(()=>").or_else(|| text[from..].find("</body>")).map_or(text.len(), |i| from + i);
@@ -1217,7 +1218,8 @@ fn whole(it: &mut Interp, path: &str) -> String {
     let url = format!("{}?q={}", path, enc(Q));
     let r = it.handle(&HttpRequest { method: "GET".into(), url: url.clone(), headers: vec![("Host".into(), "localhost".into())], body: Vec::new(), remote: "127.0.0.1".into() });
     assert_eq!(r.status, 200, "{}: {}", url, r.text());
-    r.text()
+    // Without the answer's nonce (changed for 0.8.12: FEEDBACK51.md, Q-667; branch feedback86-89).
+    support::no_nonce(&r.text())
 }
 
 /// The deferred part's `<template>`, from its start tag to its end tag.
@@ -1364,7 +1366,9 @@ fn a_deferred_part_that_loses_the_place_leaves_it_lost_for_the_parts_after() {
         // Under a policy that refuses inline scripts: each part swapped in by the one line, which
         // finds its template as the element before it; the `<span>` after the line.
         let p = whole(&mut it, "/two-csp");
-        let one = "<script>window[Symbol.for(\"quillo\")].swap(document.currentScript.previousElementSibling.getAttribute(\"data-qt\"))</script>";
+        // Its own script through `Document.prototype` (changed for 0.8.12: FEEDBACK51.md, Q-667, the
+        // second review of slice W1; branch feedback86-89).
+        let one = "<script>window[Symbol.for(\"quillo\")].swap(Object.getOwnPropertyDescriptor(Document.prototype,\"currentScript\").get.call(document).previousElementSibling.getAttribute(\"data-qt\"))</script>";
         let plain = |s: String| s.replace(" style=\"display:contents\"", "");
         assert_eq!(
             parts(&p),

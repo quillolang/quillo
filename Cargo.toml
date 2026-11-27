@@ -1,6 +1,6 @@
 [package]
 name = "quillo"
-version = "0.8.11"
+version = "0.8.12"
 edition = "2021"
 # The oldest Rust the locked dependencies build with (Cranelift's); scripts/doctor.sh checks it.
 rust-version = "1.94"
@@ -121,3 +121,4 @@ opt-level = 3
 # and why are in vendor/wtransport-0.7.2/README-QUILLO.md; drop this once upstream fixes it.
 [patch.crates-io]
 wtransport = { path = "vendor/wtransport-0.7.2" }
+tokio-postgres = { path = "vendor/tokio-postgres-0.7.18" }

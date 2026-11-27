@@ -36,6 +36,11 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Quillo's own tables held by a database role (the user's decision of 2026-11-26; branch
+/// feedback86-89).
+#[path = "own_tables.rs"]
+pub(crate) mod own_tables;
+
 type R = Result<Value, Ctrl>;
 
 pub fn install(m: &mut Map) {
@@ -55,6 +60,7 @@ pub fn install(m: &mut Map) {
         ("db.atomic", atomic),
         ("db.error_kind", error_kind),
         ("db.sql_name", sql_name_on),
+        ("db.own_setup", own_setup),
     ];
     for (name, f) in fns {
         m.insert(name.trim_start_matches("db.").into(), Value::Builtin(name, *f));
@@ -393,16 +399,81 @@ pub struct TxConn {
     backend: Arc<Backend>,
     conn: Option<Pinned>,
     depth: usize,
+    /// A statement of it changed the catalog: until the transaction ends, and however it ends (a
+    /// panic too), every statement counts the database as using a session's state
+    /// (`catalog_changing`).
+    catalog: Option<Changing>,
 }
 
 /// What a session changed is set back, its prepared statements kept (Quillo's own among them):
 /// whether that worked. One that did not is closed, not given back (found in review).
 fn reset_session(c: &mut Pinned) -> bool {
     match c {
-        Pinned::Pg(_) => c.batch(pg::RESET).is_ok(),
+        Pinned::Pg(conn) => {
+            let ok = conn.batch(pg::RESET).is_ok();
+            // Set back: anyone's next statement needs no reset of its own (FEEDBACK75.md, Q-1060;
+            // branch feedback86-89).
+            if ok {
+                conn.owner = pg::Owner::Nobody;
+                conn.dirty = false;
+            }
+            ok
+        }
         #[allow(unreachable_patterns)]
         _ => true,
     }
+}
+
+/// A transaction's `begin`, after a reset, apart, where someone else's statement ran on its
+/// connection last and the database uses a session's state, is not known to use none, or did when
+/// that statement ran (`set_back_for`; FEEDBACK75.md, Q-1060, the fifth review; branch
+/// feedback86-89).
+fn begin_on(b: &Backend, c: &mut Pinned, known: Option<bool>, me: pg::Owner, begin: &str) -> Result<(), String> {
+    let other = matches!(c, Pinned::Pg(conn) if conn.owner != pg::Owner::Nobody && conn.owner != me);
+    if set_back_for(b, c, known, me)? || !other {
+        return c.batch(begin);
+    }
+    // Someone else's statement ran here last, on a database that uses no session state: its
+    // sequences' last values are let go, in the same query, so that the transaction's first
+    // `lastval()` or `currval()` never reads another request's id. `begin; commit` ends the
+    // transaction `discard sequences` ran in (a bare `commit` warned, on every transaction), so
+    // the `begin` after it still sets its isolation level, and a `set transaction` after it is
+    // still taken (FEEDBACK75.md, Q-1060, reviewS1f's f3; branch feedback86-89).
+    c.batch(&format!("discard sequences; begin; commit; {}", begin))
+}
+
+/// Who runs a statement now: the request, or the program's own code outside any.
+fn owner_now() -> pg::Owner {
+    if crate::httpd::in_task() { pg::Owner::Request(crate::httpd::request_number()) } else { pg::Owner::Program }
+}
+
+/// On a database whose code uses a session's state (`reset`), a connection someone else's
+/// statement ran on last is set back before `me`'s; it is `me`'s after. A reset that fails is
+/// the answer, and the connection is closed (`Taken`), never handed on (FEEDBACK75.md, Q-1060,
+/// the third and fourth reviews; branch feedback86-89).
+fn set_back_for(b: &Backend, c: &mut Pinned, reset: Option<bool>, me: pg::Owner) -> Result<bool, String> {
+    let mut did = false;
+    if let (Pinned::Pg(conn), Backend::Postgres(pool)) = (c, b) {
+        if conn.owner != pg::Owner::Nobody && conn.owner != me {
+            // Not known: set back, and the watcher started (a script's statements, one after
+            // another, never come here). A statement of a time the database counted as using a
+            // session's state ran here: set back too (the fifth review).
+            let uses = reset.unwrap_or_else(|| {
+                let _ = pool.state();
+                true
+            });
+            if uses || conn.dirty {
+                conn.batch(pg::LANE_RESET)?;
+                conn.dirty = false;
+                did = true;
+            }
+        }
+        conn.owner = me;
+        if reset != Some(false) {
+            conn.dirty = true;
+        }
+    }
+    Ok(did)
 }
 
 /// A statement that changes the session, on PostgreSQL: refused outside a transaction, where
@@ -418,6 +489,17 @@ fn session_change(it: &Interp, b: &Arc<Backend>, scan: &crate::sql::Scan, params
     // own (found in review).
     if scan.prepares() {
         return Err("`prepare` makes a statement for the whole session: pass the values as parameters (`?`) instead, which Quillo prepares itself".to_string());
+    }
+    // A sequence's last value, and the random numbers' seed, are the session's, any request's on
+    // the shared connection: `select lastval()` gave another request's id (FEEDBACK75.md, Q-1060,
+    // and its second review; branch feedback86-89).
+    // The seed outlives a transaction too (`reset all` leaves it): refused everywhere (the sixth
+    // review).
+    if scan.calls.iter().any(|c| &**c == "setseed") {
+        return Err("`setseed()` sets the random numbers of the whole connection, which outlives a transaction and is shared by every request: there is no seed of a request's own here".to_string());
+    }
+    if scan.reads_last_value() && !in_tx_on(it, b) {
+        return Err("outside `db.transaction` this connection is shared by every request, so `lastval()` and `currval()` would read another request's value: write `insert ... returning id`, or call them inside `db.transaction` (`lastval` after the `nextval` it reads)".to_string());
     }
     if !scan.changes_session(params) {
         return Ok(());
@@ -439,6 +521,7 @@ fn in_tx_on(it: &Interp, b: &Arc<Backend>) -> bool {
 /// in `pg_proc`). It then runs on a connection of its own, reset before it goes back
 /// (`isolated_run`), not on one other requests share. Inside a transaction every connection is
 /// reset as it ends (FEEDBACK55.md, Q-708; branch feedback55).
+#[inline]
 fn isolated(it: &mut Interp, b: &Arc<Backend>, scan: &crate::sql::Scan) -> bool {
     let Backend::Postgres(pool) = &**b else { return false };
     if (!scan.unseen && scan.calls.is_empty()) || in_tx_on(it, b) {
@@ -459,9 +542,86 @@ fn isolated(it: &mut Interp, b: &Arc<Backend>, scan: &crate::sql::Scan) -> bool 
     .unwrap_or(true)
 }
 
+/// Whether a statement on a connection requests share goes after a reset of what the one before
+/// it left (`pg::LANE_RESET`, in the same pipeline): on a database whose own code uses a session's
+/// state (`pg::USES_SESSION`: a function, view, rule, policy, default, check or index expression
+/// mentioning `set_config`, `current_setting`, `currval`, `lastval` or `setseed`, or operators,
+/// casts and operator classes of its own in SQL). No reading of a statement could see all that it
+/// reaches (a view, a trigger, a domain's check, a function in attribute notation, a row type), and
+/// a view's `set_config(..., false)` reached the next requests on the shared connection, past
+/// row-level security. On one whose code uses none, nothing changes. Asked once for each state of
+/// the catalog; while unknown, yes (FEEDBACK75.md, Q-1060, the user's decisions after its second
+/// review; branch feedback86-89).
+#[inline]
+fn session_reset(it: &mut Interp, b: &Arc<Backend>) -> bool {
+    let Backend::Postgres(pool) = &**b else { return false };
+    match pool.uses_session() {
+        Some(uses) => uses,
+        None => not_known(it, b),
+    }
+}
+
+/// Not known yet: set back, and the database's watcher started if it was not (`pg::Pool::state`).
+/// A request never waits for the check (FEEDBACK75.md, Q-1060, the fifth review; branch
+/// feedback86-89).
+#[inline(never)]
+fn not_known(it: &mut Interp, b: &Arc<Backend>) -> bool {
+    if let Backend::Postgres(p) = &**b {
+        if p.uses_session().is_none() {
+            let b = b.clone();
+            let _ = it.unlocked(move || match &*b {
+                Backend::Postgres(p) => p.state().map(|_| ()),
+                _ => Ok(()),
+            });
+        }
+    }
+    true
+}
+
+/// Before a statement of the program's that changes the catalog on PostgreSQL
+/// (`sql::Scan::changes_catalog`): from before it is sent until after it ends, or, in a
+/// transaction, until the transaction ends (`attempt`), when what it made is seen by others, every
+/// statement on that database, by every pool of the process, counts it as using a session's state
+/// (`pg::Pool::begin_change`), and it is asked again after. A call of the database's own function
+/// is not one: a database whose functions may run DDL counts as using a session's state from the
+/// start (`pg::USES_SESSION`); each call asked again, about 12 ms, and the statements meanwhile
+/// were set back (FEEDBACK75.md, Q-1060, its reviews; the fourth: the change was counted only after
+/// it was made; branch feedback86-89).
+fn catalog_changing(it: &Interp, b: &Arc<Backend>, scan: &crate::sql::Scan) -> Option<Changing> {
+    let Backend::Postgres(pool) = &**b else { return None };
+    if !scan.changes_catalog() {
+        return None;
+    }
+    if let Some(tx) = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|t| Arc::ptr_eq(&t.backend, b)) {
+        if tx.catalog.is_none() && pool.begin_change() {
+            tx.catalog = Some(Changing(b.clone()));
+        }
+        return None;
+    }
+    pool.begin_change().then(|| Changing(b.clone()))
+}
+
+/// A schema's statement outside a transaction, under way (`catalog_changing`).
+struct Changing(Arc<Backend>);
+
+impl Drop for Changing {
+    fn drop(&mut self) {
+        if let Backend::Postgres(p) = &*self.0 {
+            p.end_change();
+        }
+    }
+}
+
 /// `f` on a connection of the pool's own, reset before it goes back, or closed when that
 /// fails (see `isolated`).
 fn isolated_run<T: Send>(it: &mut Interp, b: &Arc<Backend>, f: impl FnOnce(&mut Pinned) -> Result<T, String> + Send) -> Result<T, String> {
+    // Set back first too, where another's statement ran on it last (FEEDBACK75.md, Q-1060, the
+    // fourth review: a pooled statement's view left `boss` for the next request's own function).
+    let reset = match &**b {
+        Backend::Postgres(p) => p.uses_session(),
+        _ => Some(false),
+    };
+    let me = owner_now();
     let c = checkout_for_tx(it, b)?;
     let b = b.clone();
     let boom = fault();
@@ -470,6 +630,7 @@ fn isolated_run<T: Send>(it: &mut Interp, b: &Arc<Backend>, f: impl FnOnce(&mut 
         // feedback56); and when its session cannot be reset.
         let mut c = Taken { b: &b, conn: Some(c) };
         faulted(boom);
+        set_back_for(&b, c.conn(), reset, me)?;
         let r = f(c.conn());
         if reset_session(c.conn()) {
             b.give_back(c.keep());
@@ -747,7 +908,7 @@ fn sqlite_refused_at(e: &str) -> Option<usize> {
 /// words itself (FEEDBACK5.md, Q-053; branch stays-fixes).
 fn error_kind(_it: &mut Interp, args: Vec<Value>, _line: u32) -> R {
     let kind = match args.first() {
-        Some(Value::Err(e, _, _)) => match &**e {
+        Some(Value::Err(e, _, _)) => match e.value() {
             Value::Str(s) | Value::Css(s) => s.strip_prefix("db: ").and_then(kind_of),
             _ => None,
         },
@@ -822,6 +983,204 @@ fn mysql_codes(m: &str) -> Option<(&str, &str)> {
 }
 
 
+/// How long a statement waits for SQLite's lock in all, as rusqlite's busy timeout had it.
+const BUSY_WAIT_MS: u64 = 5000;
+
+thread_local! {
+    /// The connection (its handle) whose statement on this thread SQLite gave up on at once, on a
+    /// lock another holds, to be tried again with the interpreter released (`sqlite_released`); 0:
+    /// none (FEEDBACK49.md, Q-603; branch feedback86-89).
+    static GAVE_UP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The statements this thread runs wait for SQLite's lock in place: a script's after its first,
+    /// whose first ones have committed, and a transaction's beginning (`in_place`).
+    static IN_PLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How long to wait before the next try for a lock, after `count` waits: SQLite's own steps
+/// (`sqliteDefaultBusyCallback`), within `budget` ms in all; None when it is spent.
+fn lock_wait(count: usize, budget: u64) -> Option<u64> {
+    const DELAYS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+    const TOTALS: [u64; 12] = [0, 1, 3, 8, 18, 33, 53, 78, 103, 128, 178, 228];
+    let (delay, prior) = match DELAYS.get(count) {
+        Some(&d) => (d, TOTALS[count]),
+        None => (100, 228 + 100 * (count as u64 - 11)),
+    };
+    let delay = delay.min(budget.saturating_sub(prior));
+    (delay > 0).then_some(delay)
+}
+
+/// The busy handler of every SQLite connection Quillo opens (`connect`; `h` its handle), asked only
+/// when another holds a lock it needs. A program's statement outside a transaction, in a request
+/// that can let the interpreter go, gives up at once and is tried again so (`sqlite_released`);
+/// any other waits in place as SQLite's own did, up to `BUSY_WAIT_MS`: in a transaction (where no
+/// other request may run meanwhile), Quillo's own statements, a script's later statements, a
+/// program's script run outside a request. Nothing is asked of a statement that meets no lock
+/// (FEEDBACK49.md, Q-603; branch feedback86-89).
+fn sqlite_busy(h: usize, count: i32) -> bool {
+    // SAFETY: the connection whose handler this is lives while SQLite calls it.
+    let alone = unsafe { rusqlite::ffi::sqlite3_get_autocommit(h as *mut rusqlite::ffi::sqlite3) } != 0;
+    if alone && crate::httpd::in_task() && !crate::httpd::held() && OWN_SQL.with(|c| c.get()) == 0 && !IN_PLACE.with(|c| c.get()) {
+        GAVE_UP.with(|g| g.set(h));
+        return false;
+    }
+    match lock_wait(count.max(0) as usize, BUSY_WAIT_MS) {
+        Some(ms) => {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+            true
+        }
+        None => false,
+    }
+}
+
+/// `f` with the statements it runs waiting for SQLite's lock in place (`sqlite_busy`).
+fn in_place<R>(f: impl FnOnce() -> R) -> R {
+    struct Back(bool);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            IN_PLACE.with(|c| c.set(self.0));
+        }
+    }
+    let _back = Back(IN_PLACE.with(|c| c.replace(true)));
+    f()
+}
+
+/// While it lives, a script's later statements wait for SQLite's lock in place, and no earlier give-up
+/// is taken for theirs (`sqlite_exec`).
+struct LaterInPlace(bool);
+
+impl LaterInPlace {
+    fn new() -> LaterInPlace {
+        GAVE_UP.with(|g| g.set(0));
+        LaterInPlace(IN_PLACE.with(|c| c.replace(true)))
+    }
+}
+
+impl Drop for LaterInPlace {
+    fn drop(&mut self) {
+        IN_PLACE.with(|c| c.set(self.0));
+    }
+}
+
+/// A program's statement on SQLite (`db.exec`, `db.query`): outside a transaction, SQLite's wait
+/// for another process's write lock held the interpreter, so every other request waited with it
+/// (an unrelated `GET /ping` 2.7 s). There SQLite gives up at once (`sqlite_busy`), and the
+/// statement is tried again after a pause with the connection let go and the interpreter
+/// released, as `sleep` is, up to the same 5 s in all, by SQLite's own steps; then its error is
+/// SQLite's, as before. A statement that meets no lock costs nothing more (FEEDBACK49.md, Q-603;
+/// branch feedback86-89).
+#[inline(always)]
+fn sqlite_released<T>(it: &mut Interp, m: &Mutex<Connection>, mut f: impl FnMut(&Connection) -> Result<T, String>) -> Result<T, String> {
+    let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let r = f(&c);
+    if r.is_ok() {
+        return r;
+    }
+    let busy = busy_now(&c);
+    drop(c);
+    sqlite_again(it, m, f, r, busy)
+}
+
+/// Whether the connection's last statement ended on another's lock (`SQLITE_BUSY`, any of its
+/// kinds), and SQLite gave up on it at once for this thread (`sqlite_busy`): only then is it tried
+/// again (found in review). Its handle is the record's, its code the statement's, read under the
+/// same lock as the statement ran.
+fn busy_now(c: &Connection) -> bool {
+    // SAFETY: the connection is open and held; its handle is only read.
+    let h = unsafe { c.handle() };
+    let busy = unsafe { rusqlite::ffi::sqlite3_errcode(h) } & 0xff == rusqlite::ffi::SQLITE_BUSY;
+    GAVE_UP.with(|g| g.replace(0)) == h as usize && busy
+}
+
+/// `sqlite_released` after a statement failed: tried again while SQLite gave up on it at once.
+#[cold]
+#[inline(never)]
+fn sqlite_again<T>(it: &mut Interp, m: &Mutex<Connection>, mut f: impl FnMut(&Connection) -> Result<T, String>, mut r: Result<T, String>, mut busy: bool) -> Result<T, String> {
+    let mut tries = 0;
+    // The 5 s are the clock's as well as the sleeps': waits for the interpreter lock and the
+    // statements' own time between them count (FEEDBACK49.md, Q-603, the third review; branch
+    // feedback86-89).
+    let start = std::time::Instant::now();
+    loop {
+        if !busy || it.sqlite_tx > 0 {
+            return r;
+        }
+        let left = BUSY_WAIT_MS.saturating_sub(start.elapsed().as_millis() as u64);
+        let Some(ms) = lock_wait(tries, BUSY_WAIT_MS) else { return r };
+        let ms = ms.min(left);
+        if ms == 0 {
+            return r;
+        }
+        tries += 1;
+        it.unlocked(move || std::thread::sleep(std::time::Duration::from_millis(ms)));
+        let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        r = f(&c);
+        if r.is_ok() {
+            return r;
+        }
+        busy = busy_now(&c);
+    }
+}
+
+/// One of Quillo's own statements on a database whose own tables a role holds (`own_tables`): run
+/// as that role, through its definer function, where the program's statement would run: in the
+/// program's transaction on its connection (so it commits with the program's writes), or else on a
+/// connection requests share, as the call leaves nothing in the session.
+fn own_routed(it: &mut Interp, b: &Arc<Backend>, own: &own_tables::Own, sql: &str, params: Vec<Value>, rows: bool) -> Result<Value, String> {
+    let (call, p) = own_tables::call(own, sql, &params, rows);
+    let got = match &**b {
+        Backend::Postgres(pool) => match shared_lanes(it, b, pool) {
+            Some(lanes) => {
+                let reset = session_reset(it, b);
+                awaited(crate::httpd::await_elsewhere(Box::pin(lanes.query(crate::httpd::request_number(), call, p, None, reset))))
+            }
+            None => pooled_run(it, b, move |c| c.query(&call, &p, None)),
+        },
+        _ => pooled_run(it, b, move |c| c.query(&call, &p, None)),
+    }?;
+    Ok(own_tables::result(own, got, rows))
+}
+
+/// `db.own_setup(url)`: run once by the program's operator with the URL of Quillo's role, a role of
+/// its own the program's role is not granted, on the same database: makes the schema (MySQL: the
+/// database) of Quillo's own tables, its functions and its key's pads, moves 0.8.11's tables, and
+/// makes the views the program's own SQL reads them through. Says what it did, a line each; from
+/// then on the role holds them, in this run too. The main file's only (the user's decision of
+/// 2026-11-26; branch feedback86-89).
+fn own_setup(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    let on = it.db_on.take();
+    let q = match args.first() {
+        Some(Value::Str(s) | Value::Css(s)) => s.to_string(),
+        _ => return fail(line, "`db.own_setup` expects the URL of Quillo's role, as text"),
+    };
+    if crate::confirm::held() && crate::confirm::held_taken(it.cur_file.as_deref()) {
+        return Ok(db_err(format!("`db.own_setup` is the main file's: {} may not set up Quillo's own tables", crate::confirm::held_name(it.cur_file.as_deref()))));
+    }
+    let b = match backend_on(it, on) {
+        Ok(b) => b,
+        Err(e) => return Ok(db_err(e)),
+    };
+    let b2 = b.clone();
+    let done = it.unlocked(move || match &*b2 {
+        Backend::Postgres(p) => own_tables::pg_setup(p, &q),
+        #[cfg(feature = "mysql")]
+        Backend::Mysql(p) => own_tables::my_setup(p, &q),
+        #[allow(unreachable_patterns)]
+        _ => Err("a role holds Quillo's own tables on PostgreSQL and MySQL; SQLite's are held by statement, as they are".to_string()),
+    });
+    match done {
+        Ok(lines) => {
+            for l in &lines {
+                eprintln!("quillo: own tables: {}", l);
+            }
+            if let Err(e) = own_tables::probe(it, &b) {
+                return Ok(db_err(e));
+            }
+            Ok(Value::list(lines.into_iter().map(Value::str).collect()))
+        }
+        Err(e) => Ok(db_err(e)),
+    }
+}
+
 fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
     // A new file is its owner's alone, and so its `-wal` and `-shm`, which SQLite makes with
     // the database's mode: sessions and password hashes were readable by every user of the
@@ -841,7 +1200,7 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
         let _ = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path);
     }
     quillo_opens();
-    let c = if path == ":memory:" { Connection::open_in_memory()? } else { Connection::open(path)? };
+    let mut c = if path == ":memory:" { Connection::open_in_memory()? } else { Connection::open(path)? };
     // Where a `quillo.confirmed` holds the run, which is known before any program code runs: each
     // statement's other files judged as it is compiled (`authorize`) (FEEDBACK83.md, Q-1300,
     // found in review of the coverage fixes; branch feedback82-85). Where none does, `db.open`
@@ -857,6 +1216,12 @@ fn connect(path: &str) -> Result<Connection, rusqlite::Error> {
     let _own = OwnSql::enter();
     c.execute_batch("pragma foreign_keys = on")?;
     wal(&c)?;
+    // SQLite's wait for a lock another connection holds, Quillo's own: in place as SQLite's was, or
+    // at once for a statement tried again with the interpreter released (`sqlite_released`;
+    // FEEDBACK49.md, Q-603; branch feedback86-89).
+    // SAFETY: the handle is the connection's own, which the handler lives no longer than.
+    let h = unsafe { c.handle() } as usize;
+    c.busy_handler(Some(move |count| sqlite_busy(h, count)))?;
     // The statements a program makes, compiled once each (see `rows`).
     c.set_prepared_statement_cache_capacity(64);
     // Kept from being written over while it is open (FEEDBACK55.md, Q-702; branch feedback55).
@@ -3111,14 +3476,19 @@ fn open_backend_as(it: &mut Interp, target: &str, make: bool, tenant: bool) -> R
         {
             let url = target.to_string();
             let make = make && tenant;
-            return it.unlocked(move || crate::my::Pool::open_as(&url, make)).map(|p| Arc::new(Backend::Mysql(p)));
+            let b = it.unlocked(move || crate::my::Pool::open_as(&url, make)).map(|p| Arc::new(Backend::Mysql(p)))?;
+            own_tables::probe(it, &b)?;
+            return Ok(b);
         }
         #[cfg(not(feature = "mysql"))]
         return Err("this Quillo was built without MySQL (cargo build --features mysql)".into());
     }
     if pg::is_url(target) {
         let url = target.to_string();
-        return it.unlocked(move || pg::Pool::open_as(&url, make)).map(|p| Arc::new(Backend::Postgres(p)));
+        let b = it.unlocked(move || pg::Pool::open_as(&url, make)).map(|p| Arc::new(Backend::Postgres(p)))?;
+        // Whether a role holds Quillo's own tables here (`own_tables`).
+        own_tables::probe(it, &b)?;
+        return Ok(b);
     }
     let full = if target == ":memory:" || Path::new(target).is_absolute() {
         target.to_string()
@@ -3349,7 +3719,9 @@ fn tenant_backend(it: &mut Interp, dbs: &Arc<TenantDbs>) -> Result<Arc<Backend>,
         let prefix = migration_prefix(by.as_deref(), &it.base_dir, &dir);
         let code = (by, it.base_dir.clone());
         let judge = migration_judge(code.clone(), b.dialect(), String::new());
-        let applied = it.unlocked(move || migrate_as(code, || crate::migrate::run_keyed(&mb, &dir, &judge, &prefix))).map_err(|e| format!("tenant {}: {}", name, e))?;
+        let applied = it.unlocked(move || migrate_as(code, || crate::migrate::run_keyed(&mb, &dir, &judge, &prefix)));
+        migrated(&b);
+        let applied = applied.map_err(|e| format!("tenant {}: {}", name, e))?;
         for m in applied {
             eprintln!("quillo: applied migration {} for tenant {}", m, name);
         }
@@ -3808,10 +4180,17 @@ pub(crate) fn pooled_run<T: Send>(
         Some(c) => {
             // The transaction's own: before other waits, past the threads' limit (FEEDBACK78.md,
             // Q-1168; branch feedback75).
+            // What a transaction leaves is its request's (FEEDBACK75.md, Q-1060; branch
+            // feedback86-89).
+            let me = owner_now();
             let (c, r) = it.unlocked_in_transaction(move || {
                 let mut c = Taken { b: pool, conn: Some(c) };
                 faulted(boom);
+                // After `f`: a transaction's `begin` reads whose statement ran here last.
                 let r = f(c.conn());
+                if let Pinned::Pg(conn) = c.conn() {
+                    conn.owner = me;
+                }
                 (c.keep(), r)
             });
             if let Some(tx) = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter_mut().find(|tx| Arc::ptr_eq(&tx.backend, b)) {
@@ -3821,6 +4200,16 @@ pub(crate) fn pooled_run<T: Send>(
         }
         None => {
             let held = crate::httpd::held();
+            // A statement on a pooled connection outside a transaction (the lanes not in use: a
+            // request's, or the program's own at its start or in its jobs), on a database whose
+            // code uses a session's state: after a reset when another's ran there last, as on a
+            // lane (FEEDBACK75.md, Q-1060, the third review; branch feedback86-89). A script's
+            // statements, one after another, pay none.
+            let reset = match pool {
+                Backend::Postgres(p) => p.uses_session(),
+                _ => Some(false),
+            };
+            let me = owner_now();
             it.unlocked(move || {
                 let c = match (held, pool) {
                     // As above: in a SQLite transaction, one free now or none.
@@ -3829,6 +4218,7 @@ pub(crate) fn pooled_run<T: Send>(
                 };
                 let mut c = Taken { b: pool, conn: Some(c) };
                 faulted(boom);
+                set_back_for(pool, c.conn(), reset, me)?;
                 let r = f(c.conn());
                 pool.give_back(c.keep());
                 r
@@ -4453,11 +4843,11 @@ thread_local! {
     /// The error value of the last `db.open` that failed as the program loaded (Q-602), held
     /// weakly: its address is not given to another value while this is held, where an error
     /// made later in the same place was taken for it (found in review).
-    static OPEN_FAILED: std::cell::RefCell<std::sync::Weak<Value>> = std::cell::RefCell::new(std::sync::Weak::new());
+    static OPEN_FAILED: std::cell::RefCell<std::sync::Weak<crate::value::Inner>> = std::cell::RefCell::new(std::sync::Weak::new());
 }
 
 /// Whether `inner` is the error a `db.open` gave as the program loaded.
-pub fn open_failed(inner: &Arc<Value>) -> bool {
+pub fn open_failed(inner: &Arc<crate::value::Inner>) -> bool {
     OPEN_FAILED.with(|f| f.borrow().upgrade().is_some_and(|e| Arc::ptr_eq(&e, inner)))
 }
 
@@ -4755,7 +5145,10 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let prefix = migration_prefix(it.cur_file.as_deref(), &it.base_dir, &full);
     let code = (it.cur_file.clone(), it.base_dir.clone());
     let judge = migration_judge(code.clone(), b.dialect(), folder.clone());
-    match it.unlocked(move || migrate_as(code, || crate::migrate::run_keyed(&b, &to, &judge, &prefix))) {
+    let ran = b.clone();
+    let r = it.unlocked(move || migrate_as(code, || crate::migrate::run_keyed(&b, &to, &judge, &prefix)));
+    migrated(&ran);
+    match r {
         Ok(applied) => {
             for name in &applied {
                 eprintln!("quillo: applied migration {}", name);
@@ -4763,6 +5156,16 @@ fn migrate(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             Ok(Value::list(applied.into_iter().map(Value::str).collect()))
         }
         Err(e) => fail(line, format!("db.migrate: {}", e)),
+    }
+}
+
+/// The program's migrations ran on `b`: whether its code uses a session's state, and what the
+/// functions statements call are, is asked again (see `isolated`; FEEDBACK75.md, Q-1060; branch
+/// feedback86-89).
+fn migrated(b: &Backend) {
+    if let Backend::Postgres(p) = b {
+        p.forget_fns();
+        p.catalog_changed();
     }
 }
 
@@ -4922,8 +5325,15 @@ fn sqlite_exec(c: &Connection, scan: &crate::sql::Scan, sql: &str, params: &[Val
     };
     if params.is_empty() {
         let mut batch = rusqlite::Batch::new(c, sql);
+        let mut later = None;
         while let Some(mut stmt) = rusqlite::fallible_iterator::FallibleIterator::next(&mut batch).map_err(|e| e.to_string())? {
             run(&mut stmt)?;
+            // The first committed: the statements after it, from the next one's preparing on,
+            // wait for SQLite's lock in place, as the script is not run again (`sqlite_released`;
+            // FEEDBACK49.md, Q-603, found in review; branch feedback86-89).
+            if later.is_none() {
+                later = Some(LaterInPlace::new());
+            }
         }
     } else if crate::confirm::held() {
         // Kept for the code that runs it (`prepared_apart`); apart, as one statement made either
@@ -4956,6 +5366,13 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
     };
     // Quillo's own statement writes its own tables; a taken file's names none (`own_table_named`).
     let _own = own.then(OwnSql::enter);
+    // On a database a role holds them in, as that role (`own_tables`).
+    if own {
+        if let Some(o) = own_tables::mode(&b) {
+            it.wrote_req = Some(crate::httpd::request_number());
+            return Ok(own_routed(it, &b, &o, &sql, args[1..].to_vec(), false).unwrap_or_else(db_err));
+        }
+    }
     if !own {
         if let Some(e) = own_tables_refused(it, on, &b, &sql) {
             return Ok(db_err(e));
@@ -4987,17 +5404,19 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
     let alone = isolated(it, &b, &scan);
     // Timed for /_quillo/health/queries (branch query-stats).
     let started = std::time::Instant::now();
+    let change = catalog_changing(it, &b, &scan);
     let res = match &*b {
         Backend::Sqlite(m) => {
             // SQLite takes no parameters in a `create table`.
             if params.is_empty() {
                 warn_lossy_columns(&sql);
             }
-            let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            (|| {
-                tx_gone(&b, &c)?;
+            // Another process's write lock waited for with the interpreter released (FEEDBACK49.md,
+            // Q-603; branch feedback86-89).
+            sqlite_released(it, m, |c| {
+                tx_gone(&b, c)?;
                 let before = c.is_autocommit();
-                let r = sqlite_exec(&c, &scan, &sql, &params);
+                let r = sqlite_exec(c, &scan, &sql, &params);
                 // A script run whole (`sqlite3 .dump`'s `BEGIN TRANSACTION; ... COMMIT;`) may
                 // hold its own transaction, but must end it: one left open took every
                 // later request's writes into it (FEEDBACK44.md, Q-580).
@@ -5007,7 +5426,7 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
                     return Err("this SQL left a transaction open, so it was rolled back: write `db.transaction(() => ...)`, which commits, rolls back when something fails, and keeps other requests out of it".to_string());
                 }
                 r
-            })()
+            })
         }
         Backend::Postgres(_) if alone => {
             let sql = sql.clone();
@@ -5016,8 +5435,14 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
         Backend::Postgres(pool) => match shared_lanes(it, &b, pool) {
             Some(lanes) => {
                 let sql = sql.clone();
-                // Boxed here, so the (large) future is not moved again.
-                awaited(crate::httpd::await_elsewhere(Box::pin(lanes.exec(crate::httpd::request_number(), sql, params))))
+                let reset = session_reset(it, &b);
+                if reset && scan.outside_tx() {
+                    // On a lane it would run inside its reset's transaction (`pg::after_reset`).
+                    isolated_run(it, &b, move |c| c.exec(&sql, &params))
+                } else {
+                    // Boxed here, so the (large) future is not moved again.
+                    awaited(crate::httpd::await_elsewhere(Box::pin(lanes.exec(crate::httpd::request_number(), sql, params, reset))))
+                }
             }
             None => {
                 let sql = sql.clone();
@@ -5031,6 +5456,9 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
         }
     };
     crate::querystats::record(&sql, started.elapsed().as_secs_f64() * 1000.0, res.is_ok());
+    // A schema's statement, by this path too (the review of Q-1060's first fix; branch
+    // feedback86-89).
+    drop(change);
     // Functions made or dropped: what the names called are is looked up again (see `isolated`).
     match (scan.defines, &*b) {
         (true, Backend::Postgres(p)) => p.forget_fns(),
@@ -5854,17 +6282,25 @@ fn select_in(
     if !only_reads(scan) {
         it.wrote_req = Some(crate::httpd::request_number());
     }
+    let change = catalog_changing(it, &b, scan);
     let res = match &*b {
-        Backend::Sqlite(m) => {
-            let c = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            tx_gone(&b, &c).and_then(|_| rows(&c, &sql, &params, limit))
-        }
+        // As `db.exec`'s (FEEDBACK49.md, Q-603; branch feedback86-89).
+        Backend::Sqlite(m) => sqlite_released(it, m, |c| tx_gone(&b, c).and_then(|_| rows(c, &sql, &params, limit))),
         Backend::Postgres(_) if alone => {
             let sql = sql.clone();
             isolated_run(it, &b, move |c| c.query(&sql, &params, limit))
         }
         Backend::Postgres(pool) => match shared_lanes(it, &b, pool) {
-            Some(lanes) => awaited(crate::httpd::await_elsewhere(Box::pin(lanes.query(crate::httpd::request_number(), sql.clone(), params, limit)))),
+            Some(lanes) => {
+                let reset = session_reset(it, &b);
+                if reset && scan.outside_tx() {
+                    // As `db.exec`'s: a reset's pipeline cannot hold it (the sixth review).
+                    let sql = sql.clone();
+                    isolated_run(it, &b, move |c| c.query(&sql, &params, limit))
+                } else {
+                    awaited(crate::httpd::await_elsewhere(Box::pin(lanes.query(crate::httpd::request_number(), sql.clone(), params, limit, reset))))
+                }
+            }
             None => {
                 let sql = sql.clone();
                 pooled_run(it, &b, move |c| c.query(&sql, &params, limit))
@@ -5877,6 +6313,9 @@ fn select_in(
         }
     };
     crate::querystats::record(&sql, started.elapsed().as_secs_f64() * 1000.0, res.is_ok());
+    // A schema's statement sent as a query (`db.query("create view ...")`) too (the review of Q-1060's
+    // first fix; branch feedback86-89).
+    drop(change);
     if res.is_ok() {
         announce(it, scan, on);
     }
@@ -5936,6 +6375,16 @@ fn query_as(it: &mut Interp, args: Vec<Value>, line: u32, limit: Option<usize>, 
         Err(e) => return Ok(db_err(e)),
     };
     let _own = own.then(OwnSql::enter);
+    if own {
+        if let Some(o) = own_tables::mode(&b) {
+            let rows = own_routed(it, &b, &o, &sql, args[1..].to_vec(), true);
+            return Ok(match (rows, limit) {
+                (Ok(Value::List(l)), Some(_)) => l.first().cloned().unwrap_or(Value::Nil),
+                (Ok(v), _) => v,
+                (Err(e), _) => db_err(e),
+            });
+        }
+    }
     if let Some(e) = (!own).then(|| own_tables_refused(it, on, &b, &sql)).flatten() {
         return Ok(db_err(e));
     }
@@ -6069,7 +6518,9 @@ pub(crate) fn attempt(
             let immediate = outermost && opts.given;
             let run = |sql: &str| m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch(sql);
             let busy = |e: &rusqlite::Error| e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy);
-            if let Err(e) = run(if immediate { "begin immediate" } else { "savepoint quillo_tx" }) {
+            // Its beginning waits for another's write lock in place, as before (FEEDBACK49.md,
+            // Q-603; branch feedback86-89).
+            if let Err(e) = in_place(|| run(if immediate { "begin immediate" } else { "savepoint quillo_tx" })) {
                 return (Ok(db_err(&e)), immediate && busy(&e));
             }
             // SQLite's read-only transaction: the connection refuses every change while it runs.
@@ -6154,7 +6605,10 @@ pub(crate) fn attempt(
                 (true, false) => "release quillo_tx",
                 (false, false) => "rollback to quillo_tx; release quillo_tx",
             };
-            let ended = run(end);
+            // Its commit waits for another's lock in place, as its beginning does: the hold on
+            // other requests is let go by now, and a commit given up at once failed against a
+            // reader in 0.02 s (FEEDBACK49.md, Q-603, found in review; branch feedback86-89).
+            let ended = in_place(|| run(end));
             // The outermost `release` is a commit, and one that fails leaves the transaction
             // open, as `commit` does (FEEDBACK16.md, Q-108; branch feedback20-fixes).
             if ended.is_err() && outermost && commit {
@@ -6180,13 +6634,23 @@ pub(crate) fn attempt(
             if pinned && opts.read_only {
                 return (nested_read_only(), false);
             }
+            // On a database whose code uses a session's state, a transaction begins on a session
+            // set back, whoever had its connection last (FEEDBACK75.md, Q-1060; branch
+            // feedback86-89). Asked before a connection is pinned. Sent before the `begin`, apart:
+            // in one query string with it, `discard sequences` took the transaction's snapshot
+            // before the `begin`'s isolation level, which PostgreSQL refused (tests/isolation.rs).
+            let known = match &*b {
+                Backend::Postgres(p) if !pinned => p.uses_session(),
+                _ => Some(false),
+            };
+            let me = owner_now();
             if !pinned {
                 let mut c = match checkout_for_tx(it, &b) {
                     Ok(c) => c,
                     Err(e) => return (Ok(db_err(e)), false),
                 };
                 c.watch_conflicts(true);
-                it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: b.clone(), conn: Some(c), depth: 0 });
+                it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: b.clone(), conn: Some(c), depth: 0, catalog: None });
             }
             let depth = {
                 let mut g = it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6195,6 +6659,7 @@ pub(crate) fn attempt(
                 tx.depth
             };
             let begin = if depth == 1 { crate::txn::begin_sql(b.is_mysql(), opts.isolation, opts.read_only) } else { format!("savepoint quillo_tx_{}", depth) };
+
             // A panic as it begins or in the body: the transaction is rolled back and its
             // connection let go, not left pinned to this program with a transaction open
             // (FEEDBACK56.md, Q-858, found in review; branch feedback56). The begin was outside
@@ -6202,7 +6667,7 @@ pub(crate) fn attempt(
             // transaction on it nested, a read-only one refused (found in review).
             let mut mark = None;
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut started = { let begin = begin.clone(); pooled_run(it, &b, move |c| c.batch(&begin)) };
+                let mut started = { let (begin, b2) = (begin.clone(), b.clone()); pooled_run(it, &b, move |c| begin_on(&b2, c, known, me, &begin)) };
                 // A pooled connection the server ended while it sat idle (a restart, a failover)
                 // fails its first statement: nothing has run, so another is taken and the
                 // transaction begun on it, where the program was given "internal error"
@@ -6233,8 +6698,8 @@ pub(crate) fn attempt(
                             break;
                         }
                     }
-                    let begin = begin.clone();
-                    started = pooled_run(it, &b, move |c| c.batch(&begin));
+                    let (begin, b2) = (begin.clone(), b.clone());
+                    started = pooled_run(it, &b, move |c| begin_on(&b2, c, known, me, &begin));
                 }
                 mark = Some(tx_begin(it));
                 match started {
@@ -6309,6 +6774,8 @@ pub(crate) fn attempt(
                     None
                 }
             };
+            // What it made is seen by others from its commit on: checked again as `done` goes
+            // (its `catalog`; the review of Q-1060's first fix; branch feedback86-89).
             if let Some(TxConn { conn: Some(mut c), .. }) = done {
                 c.watch_conflicts(false);
                 // Reset with its end, or now where that failed; closed where that fails too.
@@ -6501,8 +6968,26 @@ fn apart(it: &mut Interp, b: &Arc<Backend>, sql: String, params: Vec<Value>) -> 
         }
         _ => {
             let b = b.clone();
+            // Quillo's own table, on a database a role holds them in: as that role (`own_tables`).
+            let own = if sql.to_ascii_lowercase().contains("_quillo_") { own_tables::mode(&b) } else { None };
             it.unlocked(move || {
                 let mut c = b.checkout_nested()?;
+                if let (Pinned::Pg(conn), Backend::Postgres(pool)) = (&mut c, &*b) {
+                    if let Err(e) = conn.set_back_if_used(pool.uses_session()) {
+                        b.discard(c);
+                        return Err(e);
+                    }
+                }
+                if let Some(o) = own {
+                    let rows = sql.trim_start().to_ascii_lowercase().starts_with("select");
+                    let (call, p) = own_tables::call(&o, &sql, &params, rows);
+                    let r = c.query(&call, &p, None).map(|got| match own_tables::result(&o, got, rows) {
+                        Value::List(l) if rows => l.to_vec(),
+                        _ => Vec::new(),
+                    });
+                    b.give_back(c);
+                    return r;
+                }
                 let lower = sql.trim_start().to_ascii_lowercase();
                 let r = if lower.starts_with("select") || lower.starts_with("xa recover") {
                     c.query(&sql, &params, None)
@@ -6635,15 +7120,23 @@ fn atomic(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             let p = &parts[k];
             let r = match p.kind {
                 Kind::Sqlite => match &*p.b {
-                    Backend::Sqlite(m) => m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch("savepoint quillo_tx").map_err(|e| e.to_string()),
+                    Backend::Sqlite(m) => in_place(|| m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch("savepoint quillo_tx")).map_err(|e| e.to_string()),
                     _ => unreachable!(),
                 },
                 _ => {
                     match checkout_for_tx(it, &p.b) {
                         Ok(c) => {
-                            it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1 });
+                            it.pg_tx.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(TxConn { backend: p.b.clone(), conn: Some(c), depth: 1, catalog: None });
                             let begin = if p.kind == Kind::Pg { "begin".to_string() } else { format!("xa start '{}'", p.gid) };
-                            pooled_run(it, &p.b, move |c| c.batch(&begin))
+                            // Set back first where another's statement ran on it last, as every
+                            // transaction's `begin` is (FEEDBACK75.md, Q-1060, the sixth review:
+                            // `db.atomic` read the role a view had left; branch feedback86-89).
+                            let known = match &*p.b {
+                                Backend::Postgres(pool) => pool.uses_session(),
+                                _ => Some(false),
+                            };
+                            let (me, b2) = (owner_now(), p.b.clone());
+                            pooled_run(it, &p.b, move |c| begin_on(&b2, c, known, me, &begin))
                         }
                         Err(e) => Err(e),
                     }
@@ -6742,7 +7235,8 @@ fn commit_parts(it: &mut Interp, parts: &mut [Part], sys: &Arc<Backend>, gid: &s
     for p in parts.iter() {
         if let (Kind::Sqlite, Backend::Sqlite(m)) = (p.kind, &*p.b) {
             faulted(fault());
-            if let Err(e) = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch("release quillo_tx") {
+            // In place, as a transaction's commit (FEEDBACK49.md, Q-603; branch feedback86-89).
+            if let Err(e) = in_place(|| m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute_batch("release quillo_tx")) {
                 if !sys_is_part {
                     let _ = apart(it, sys, "delete from _quillo_atomic where gid = ?".into(), vec![Value::str(gid)]);
                 }

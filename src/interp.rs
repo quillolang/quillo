@@ -136,7 +136,7 @@ fn refused_an_error(msg: &str) -> bool {
 }
 
 /// What an error given to a builtin was: `it failed before: read_file: cannot read x.json`.
-fn earlier((inner, at): &(Arc<Value>, Place)) -> String {
+fn earlier((inner, at): &(Arc<crate::value::Inner>, Place)) -> String {
     let text = crate::value::told(|| inner.display());
     format!("it failed before this call, {}", at.before(&text))
 }
@@ -597,6 +597,18 @@ pub struct Interp {
     /// Whether the response being made has a component island, and so
     /// needs the browser bundle.
     pub rendered_island: bool,
+    /// This answer's nonce, written on each island the server writes and in the page's loader: the
+    /// runtime takes up only islands that carry it, so markup a program or a visitor put in with a
+    /// `data-qi` is no island (FEEDBACK51.md, Q-667; branch feedback86-89). Kept as the attribute,
+    /// ` data-qn="…"` (`server::island_nonce`); made at the answer's first island, let go as the next
+    /// request starts.
+    pub island_nonce: Option<crate::server::IslandNonce>,
+    /// The markup the program made while it loaded with an island in it (`server::LoadKept`), whose
+    /// load nonce each answer writes as its own; `None` for a program with none, which pays nothing
+    /// for it. The interpreter's own, made again at each load, copied by a fork, so the answer
+    /// making it, and no other, is the one it writes for (the fourth review of slice W1;
+    /// FEEDBACK51.md, Q-667; branch feedback86-89).
+    pub(crate) load_kept: Option<Arc<crate::server::LoadKept>>,
     /// And one whose component listens to scrolls (`data-sc`), which the page's loader takes up on
     /// a scroll (FEEDBACK72.md, Q-1010; branch feedback72-81).
     pub scroll_island: bool,
@@ -794,7 +806,7 @@ pub(crate) fn room_for(cap: usize, need: usize) -> usize {
 /// compared with `--max-memory` first.
 #[cold]
 #[inline(never)]
-fn list_may_extend(l: &Arc<Vec<Value>>, added: usize) -> bool {
+fn list_may_extend(l: &Arc<crate::value::Items>, added: usize) -> bool {
     let need = l.len() + added;
     need <= l.capacity() || crate::httpd::making(room_for(l.capacity(), need).saturating_mul(crate::value::ITEM_BYTES)).is_ok()
 }
@@ -1619,7 +1631,9 @@ fn runtime_attr(key: &str) -> bool {
 /// (src/defer.rs), its component, props, state, live data and whether it starts by itself.
 pub(crate) fn island_attr(key: &str) -> bool {
     // `data-qm`: an island holding some marked by comments (FEEDBACK61.md, Q-892; branch feedback61).
-    matches!(key, "data-qi" | "data-qd" | "data-qt" | "data-c" | "data-p" | "data-s" | "data-l" | "data-v" | "data-e" | "data-qm")
+    // `data-qn`: the answer's nonce, `data-qh`: a `children` that is the server's HTML
+    // (FEEDBACK51.md, Q-667; branch feedback86-89).
+    matches!(key, "data-qi" | "data-qd" | "data-qt" | "data-c" | "data-p" | "data-s" | "data-l" | "data-v" | "data-e" | "data-qm" | "data-qn" | "data-qh")
 }
 
 /// A list's or map's JSON as an attribute's value: a builtin's error in it says `internal error`
@@ -2856,7 +2870,8 @@ fn large_plus(a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
         (List(x), List(y)) => {
             large((x.len() + y.len()).saturating_mul(std::mem::size_of::<Value>()), line)?;
             let mut v = match Arc::try_unwrap(x) {
-                std::result::Result::Ok(mut v) => {
+                std::result::Result::Ok(v) => {
+                    let mut v = v.into_vec();
                     v.reserve_exact(y.len());
                     v
                 }
@@ -2930,7 +2945,8 @@ pub fn binop(op: BinOp, a: Value, b: Value, line: u32) -> Result<Value, Ctrl> {
             (List(x), List(y)) => {
                 // Made to size at once (not grown as it is filled).
                 let mut v = match Arc::try_unwrap(x) {
-                    std::result::Result::Ok(mut v) => {
+                    std::result::Result::Ok(v) => {
+                        let mut v = v.into_vec();
                         v.reserve_exact(y.len());
                         v
                     }
@@ -3162,6 +3178,8 @@ impl Interp {
             parent_rules: None,
             mount_rules: Vec::new(),
             rendered_island: false,
+            island_nonce: None,
+            load_kept: None,
             scroll_island: false,
             page_head: None,
             head_sent: None,
@@ -3308,6 +3326,8 @@ impl Interp {
             parent_rules: None,
             mount_rules: Vec::new(),
             rendered_island: false,
+            island_nonce: self.island_nonce,
+            load_kept: self.load_kept.clone(),
             scroll_island: false,
             page_head: None,
             head_sent: None,
@@ -3593,6 +3613,12 @@ impl Interp {
         // In the server: each function as a coroutine on the event loop, so
         // their waits (queries, `http.*`) overlap without threads.
         let stop = Arc::new(Stop { now: Default::default(), up: self.stop.clone() });
+        // The answer's nonce made before the functions are forked, so that islands they render carry
+        // it, where each made its own and none was taken up (the third review of slice W1;
+        // FEEDBACK51.md, Q-667; branch feedback86-89).
+        if self.current_request.is_some() || self.pending_request.is_some() {
+            self.island_nonce.get_or_insert_with(crate::server::island_nonce);
+        }
         if crate::httpd::in_task() {
             let mut results: Vec<Option<(Result<Value, Ctrl>, Back)>> = (0..fs.len()).map(|_| None).collect();
             let base = results.as_mut_ptr() as usize;
@@ -3625,6 +3651,7 @@ impl Interp {
             })
             .collect();
         let shared = self.shared.clone();
+        let loading = crate::value::loading();
         let results: Vec<(Result<Value, Ctrl>, Back)> = self.unlocked(|| {
             std::thread::scope(|s| {
                 let running: Vec<_> = tasks
@@ -3633,6 +3660,10 @@ impl Interp {
                         let shared = &shared;
                         std::thread::Builder::new().name("quillo-parallel".into()).stack_size(8 << 20).spawn_scoped(s, move || {
                             shared.gil.acquire();
+                            // Loading where the program is: an island rendered carries the load
+                            // nonce, as the program's own would (the fourth review of slice W1;
+                            // FEEDBACK51.md, Q-667; branch feedback86-89).
+                            crate::value::set_loading(loading);
                             let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| it.call(&f, Vec::new(), line)))
                                 .unwrap_or_else(|_| fail(line, "a function given to `parallel` failed unexpectedly"));
                             it.failed(&r);
@@ -3850,6 +3881,10 @@ impl Interp {
             crate::debug::leave(self);
         }
         r?;
+        // The markup it made at load with islands in it, kept, for answers to give them their nonce;
+        // this load's, in place of any before (`server::LoadKept`; the fourth review of slice W1;
+        // FEEDBACK51.md, Q-667; branch feedback86-89).
+        self.load_kept = crate::server::LoadKept::of(&self.globals, &self.island_names);
         self.build_client().map_err(|e| e.in_file(file))?;
         Ok(last)
     }
@@ -5151,7 +5186,7 @@ impl Interp {
                 let Some(Value::List(items)) = more.take() else { unreachable!("looked at above") };
                 let l = crate::value::sole(l);
                 match Arc::try_unwrap(items) {
-                    Ok(items) => l.extend(items),
+                    Ok(items) => l.extend(items.into_vec()),
                     Err(shared) => l.extend_from_slice(&shared),
                 }
                 true
@@ -5922,7 +5957,7 @@ impl Interp {
                             Some(was) if cookie => {
                                 *was = match std::mem::replace(was, Value::Nil) {
                                     Value::List(l) => {
-                                        let mut l = (*l).clone();
+                                        let mut l = l.to_vec();
                                         l.push(v);
                                         Value::list(l)
                                     }
@@ -5947,7 +5982,7 @@ impl Interp {
                 }
                 _ => {}
             },
-            Value::Err(e, _, _) if name == "error" || name == "message" => return Ok((**e).clone()),
+            Value::Err(e, _, _) if name == "error" || name == "message" => return Ok(Value::clone(e)),
             _ => {}
         }
         // `xs.len` is `len(xs)`. On maps only `len`, `keys` and `values` work
@@ -6276,9 +6311,9 @@ impl Interp {
                 e.msg = format!("{} ({})", e.msg, earlier(&g));
                 Err(Ctrl::Error(e))
             }
-            (Some(g), Ok(Value::Err(e, own, at))) if matches!(&*e, Value::Str(m) if refused_an_error(m)) => {
+            (Some(g), Ok(Value::Err(e, own, at))) if matches!(e.value(), Value::Str(m) if refused_an_error(m)) => {
                 let m = format!("{} ({})", e.display(), earlier(&g));
-                Ok(Value::Err(Arc::new(Value::str(m)), own, at))
+                Ok(Value::Err(Arc::new(Value::str(m).into()), own, at))
             }
             (_, r) => r,
         }
@@ -6477,7 +6512,7 @@ impl Interp {
     /// script's 20,000 (Q-1274, found reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch
     /// feedback72-81).
     fn run_ended(&self, line: u32) -> Value {
-        Value::Err(Arc::new(Value::str("a script's function runs only while its script does")), false, Place::new(self.cur_file.as_ref(), line))
+        Value::Err(Arc::new(Value::str("a script's function runs only while its script does").into()), false, Place::new(self.cur_file.as_ref(), line))
     }
 
     #[inline(always)]
@@ -6866,13 +6901,118 @@ impl Interp {
         r
     }
 
+    /// `render_value`, in this answer: markup the program made while it loaded with an island in it
+    /// (`server::LoadKept`) has the load nonce written as this answer's, and the render showing it
+    /// is not kept, as a view's would give the first answer's nonce to every later one (the fourth
+    /// review of slice W1; FEEDBACK51.md, Q-667; branch feedback86-89). A program with none pays a
+    /// look at one field.
+    #[must_use]
+    #[inline(always)]
+    fn render_shown(&mut self, v: &Value, out: &mut Held) -> bool {
+        if self.load_kept.is_none() {
+            return render_value(v, out);
+        }
+        self.render_kept(v, out)
+    }
+
+    #[must_use]
+    fn render_kept(&mut self, v: &Value, out: &mut Held) -> bool {
+        match v {
+            Value::Html(h) if self.load_kept.as_ref().is_some_and(|k| k.holds(h)) => {
+                self.mark_impure();
+                // Its islands need the page's loader and their components, as the page's own do.
+                self.rendered_island = true;
+                if let Some(k) = self.load_kept.clone() {
+                    for n in &k.names {
+                        if !self.island_names.contains(n) {
+                            self.island_names.push(n.clone());
+                        }
+                    }
+                }
+                let now = *self.island_nonce.get_or_insert_with(crate::server::island_nonce);
+                crate::server::push_kept(h, now, out);
+                false
+            }
+            Value::List(items) => crate::stack::maybe_grow(64 << 10, 1 << 20, || {
+                let mut left = false;
+                for i in items.iter() {
+                    left |= self.render_kept(i, out);
+                    if out.is_over() {
+                        break;
+                    }
+                }
+                left
+            }),
+            _ => render_value(v, out),
+        }
+    }
+
+    /// A route's answer that is markup the program made while it loaded (`route GET /bare = nav`),
+    /// `respond(200, nav)`, or `reply 200 nav`, with this answer's nonce, as `render_shown` writes
+    /// it in a page (the fourth review of slice W1; FEEDBACK51.md, Q-667; branch feedback86-89).
+    pub(crate) fn kept_answer(&mut self, ran: Result<Value, Ctrl>) -> Result<Value, Ctrl> {
+        let Some(kept) = self.load_kept.clone() else { return ran };
+        let nonce = &mut self.island_nonce;
+        let names = &mut self.island_names;
+        let rendered = &mut self.rendered_island;
+        let mut rewrite_html = |h: &Arc<str>| {
+            *rendered = true;
+            for n in &kept.names {
+                if !names.contains(n) {
+                    names.push(n.clone());
+                }
+            }
+            let mut out = Held::with_capacity(h.len());
+            crate::server::push_kept(h, *nonce.get_or_insert_with(crate::server::island_nonce), &mut out);
+            out.into_text().ok().map(|t| Value::Html(Arc::from(t)))
+        };
+        let mut mine = |v: &mut Value| match v {
+            Value::Html(h) if kept.holds(h) => {
+                if let Some(new_h) = rewrite_html(h) {
+                    *v = new_h;
+                }
+            }
+            Value::Response(r) => {
+                if let Body::Value(Value::Html(h)) = &r.body {
+                    if kept.holds(h) {
+                        if let Some(new_h) = rewrite_html(h) {
+                            Arc::make_mut(r).body = Body::Value(new_h);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        };
+        match ran {
+            Ok(mut v) => {
+                mine(&mut v);
+                Ok(v)
+            }
+            Err(Ctrl::Return(mut v)) => {
+                mine(&mut v);
+                Err(Ctrl::Return(v))
+            }
+            Err(Ctrl::Reply(mut r)) => {
+                if let Body::Value(Value::Html(h)) = &r.body {
+                    if kept.holds(h) {
+                        if let Some(new_h) = rewrite_html(h) {
+                            Arc::make_mut(&mut r).body = Body::Value(new_h);
+                        }
+                    }
+                }
+                Err(Ctrl::Reply(r))
+            }
+            other => other,
+        }
+    }
+
     fn render_call_into(&mut self, c: &Closure, args: Vec<Option<Value>>, line: u32, out: &mut Held) -> Result<(), Ctrl> {
         // A declared result type is checked on the value. A script's function as a tag: called as
         // it is anywhere, under its script's limits while it runs, an error after (Q-1274, found
         // reviewing the trusted CSS of FEEDBACK79.md's Q-1250; branch feedback72-81).
         if c.def.ret.is_some() || c.def.err.is_some() || c.def.run != 0 {
             let v = self.call_closure(c, args, line)?;
-            if render_value(&v, out) {
+            if self.render_shown(&v, out) {
                 self.error_shown(&v, line);
             }
             return Ok(());
@@ -6969,7 +7109,7 @@ impl Interp {
                 // `return` (or `?`) part-way: the result is that value alone.
                 Err(Ctrl::Return(v)) => {
                     out.truncate(start);
-                    if render_value(&v, out) {
+                    if this.render_shown(&v, out) {
                         this.error_shown(&v, line);
                     }
                     Ok(())
@@ -7001,7 +7141,7 @@ impl Interp {
             Expr::Binary(BinOp::And, a, b, _) => {
                 let x = self.eval(a, env)?;
                 if !x.truthy() {
-                    if render_value(&x, out) {
+                    if self.render_shown(&x, out) {
                         self.error_shown(&x, shown_line(a));
                     }
                     return Ok(());
@@ -7011,7 +7151,7 @@ impl Interp {
             Expr::Binary(BinOp::Or, a, b, _) => {
                 let x = self.eval(a, env)?;
                 if x.truthy() {
-                    if render_value(&x, out) {
+                    if self.render_shown(&x, out) {
                         self.error_shown(&x, shown_line(a));
                     }
                     return Ok(());
@@ -7084,7 +7224,7 @@ impl Interp {
                 }
                 _ => {
                     let v = self.eval_block(stmts, env, true)?;
-                    if render_value(&v, out) {
+                    if self.render_shown(&v, out) {
                         self.error_shown(&v, shown_line(e));
                     }
                     Ok(())
@@ -7092,7 +7232,7 @@ impl Interp {
             },
             _ => {
                 let v = self.eval(e, env)?;
-                if render_value(&v, out) {
+                if self.render_shown(&v, out) {
                     self.error_shown(&v, shown_line(e));
                 }
                 Ok(())
@@ -7671,13 +7811,13 @@ impl Interp {
                 let v = self.eval(e, env)?;
                 if holds_markup(&v) {
                     self.render_unseen(out, line, |this, out| {
-                        if render_value(&v, out) {
+                        if this.render_shown(&v, out) {
                             this.error_shown(&v, line());
                         }
                         Ok(())
                     })
                 } else {
-                    if render_value(&v, out) {
+                    if self.render_shown(&v, out) {
                         self.error_shown(&v, line());
                     }
                     Ok(())
@@ -8746,7 +8886,7 @@ impl Interp {
     /// state (or, inside a table or a select, its own root element carrying them, or comments
     /// around it). Whether it was marked by comments.
     #[allow(clippy::too_many_arguments)]
-    fn island_wrap(&self, tag: &str, props: Map, mut state: Map, live: Map, eager: bool, extra: &str, body: &str, svg: bool, nested: bool, out: &mut Held) -> bool {
+    fn island_wrap(&mut self, tag: &str, props: Map, mut state: Map, live: Map, eager: bool, extra: &str, body: &str, svg: bool, nested: bool, out: &mut Held) -> bool {
         // A state that still holds its very prop, as `state items = initial` does, is written as
         // a reference to it, not as a second copy of the list (FEEDBACK30.md, Q-371; branch
         // feedback27-35-fixes).
@@ -8785,6 +8925,10 @@ impl Interp {
             }
             other => other.island_text_held(),
         };
+        // A `children` given as text is the HTML the server made of the element's children (a
+        // program cannot pass one as a prop): marked so, the runtime puts in as HTML only that
+        // (FEEDBACK51.md, Q-667; branch feedback86-89).
+        let html_children = matches!(props.get("children"), Some(Value::Str(_)));
         let props_json = crate::server::for_visitor(Value::map(props)).island_text_held();
         let live_json = (!live.is_empty()).then(|| {
             let mut j = Vec::new();
@@ -8797,7 +8941,10 @@ impl Interp {
         // A component that runs by itself (timers, live data, `@mount`, the
         // page's JavaScript) is started as soon as the page is idle; others
         // when someone reaches for them (see the loader in server.rs).
-        let mut data = Held::new();
+        // Room for all of it at once, where it grew a step at a time and copied itself at each, the
+        // answer's nonce one step more on a small page (the speed review of slice W1; FEEDBACK51.md,
+        // Q-667; branch feedback86-89).
+        let mut data = Held::with_capacity(64 + tag.len() + props_json.len() + state_text.len() + live_json.as_ref().and_then(|l| l.as_ref()).map_or(0, String::len));
         data.push_str(" data-c=\"");
         escape_into(tag, &mut data);
         data.push_str("\" data-p=\"");
@@ -8814,6 +8961,19 @@ impl Interp {
             data.push_str(" data-e");
         }
         data.push_str(extra);
+        if html_children {
+            data.push_str(" data-qh");
+        }
+        // This answer's nonce, which the page's loader carries: only an island with it is taken up
+        // (FEEDBACK51.md, Q-667; branch feedback86-89).
+        // One rendered while the program loads carries the load nonce, written as the answer's where
+        // the page shows it (`server::LoadKept`; the third review of slice W1); any other, the
+        // answer's, as a waiting component's part made after the answer's head is.
+        if crate::value::loading() {
+            data.push_str(crate::server::load_nonce().attr());
+        } else {
+            data.push_str(self.island_nonce.get_or_insert_with(crate::server::island_nonce).attr());
+        }
         let Ok(data) = data.into_text() else {
             out.stop();
             return false;

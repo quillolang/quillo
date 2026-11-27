@@ -208,7 +208,9 @@ fn b64(data: &[u8]) -> String {
 
 /// The hash of each inline `<script>` of a page, as a policy names it.
 fn script_hashes(page: &str) -> Vec<String> {
-    page.split("<script>").skip(1).filter_map(|s| s.split_once("</script>")).map(|(t, _)| format!("'sha256-{}'", b64(&sha2::Sha256::digest(t.as_bytes())))).collect()
+    // The loader's tag carries the answer's nonce (changed for 0.8.12: FEEDBACK51.md, Q-667; branch
+    // feedback86-89).
+    support::no_nonce(page).split("<script>").skip(1).filter_map(|s| s.split_once("</script>")).map(|(t, _)| format!("'sha256-{}'", b64(&sha2::Sha256::digest(t.as_bytes())))).collect()
 }
 
 const COUNTER: &str = r#"component Counter() {
@@ -321,10 +323,12 @@ fn hashes_go_where_each_policy_decides_and_nowhere_else() {
 // carries the prefetch script, hashed; and under --watch the development script is too.
 #[test]
 fn streamed_parts_links_and_the_development_script_are_covered() {
+    // The swap reads its own script through `Document.prototype` (changed for 0.8.12: FEEDBACK51.md,
+    // Q-667, the second review of slice W1; branch feedback86-89).
     let d = dir("parts", &page("/p", "default-src 'self'", "<Counter/><Later/>"));
     let (_g, port, _log) = serve_logged(&d, &[]);
     let (policy, body) = fetch(port, "/p");
-    assert!(body.contains("got 42") && body.contains("swap(document.currentScript"), "{}", body);
+    assert!(body.contains("got 42") && body.contains("swap(Object.getOwnPropertyDescriptor(Document.prototype,\"currentScript\")"), "{}", body);
     for h in script_hashes(&body) {
         assert!(policy.contains(&h), "{} not in {}: {}", h, policy, body);
     }
@@ -333,7 +337,7 @@ fn streamed_parts_links_and_the_development_script_are_covered() {
     // review).
     let a = support::send(port, "GET", "/p", &[("sec-purpose", "prefetch")], "");
     assert_eq!(a.status, 200, "{}", a.body);
-    assert!(a.body.contains("got 42") && a.body.contains("swap(document.currentScript") && !a.body.contains("swap(\"0\")"), "{}", a.body);
+    assert!(a.body.contains("got 42") && a.body.contains("swap(Object.getOwnPropertyDescriptor(Document.prototype,\"currentScript\")") && !a.body.contains("swap(\"0\")"), "{}", a.body);
     let policy = a.header("content-security-policy").unwrap();
     for h in script_hashes(&a.body) {
         assert!(policy.contains(&h), "{} not in {}: {}", h, policy, a.body);

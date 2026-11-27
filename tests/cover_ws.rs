@@ -33,7 +33,8 @@ fn seq(port: u16) -> u64 {
 fn open(port: u16, since: u64) -> TcpStream {
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(s, "GET /_quillo/live?since={}&s=&t=db:rows HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", since).unwrap();
+    // Its topic signed, as the server gives it (changed for 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89).
+    write!(s, "GET /_quillo/live?since={}&s=&t={} HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", since, support::signed("db:rows")).unwrap();
     let mut head = Vec::new();
     let mut b = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {

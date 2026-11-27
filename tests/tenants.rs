@@ -75,7 +75,9 @@ fn a_change_wakes_only_the_tenants_own_live_pages() {
     let d = dir("live");
     let mut it = app(&d, APP);
     let live = |it: &mut Interp, since: u64| -> serde_json::Value {
-        let url = format!("/_quillo/live?since={}&t=acme@db:notes,beta@db:notes,db:notes", since);
+        // Signed for acme's page, as the server gives them (changed for 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89).
+        let t: Vec<String> = ["acme@db:notes", "beta@db:notes", "db:notes"].iter().map(|t| quillo::server::signed_topic("", Some("acme"), t)).collect();
+        let url = format!("/_quillo/live?since={}&t={}", since, t.join(","));
         serde_json::from_str(&send(it, "GET", "acme.example.com", &url, "").text()).unwrap()
     };
     send(&mut it, "POST", "example.com", "/signup/acme", "");

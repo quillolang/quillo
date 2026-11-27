@@ -2170,10 +2170,10 @@ impl Parser {
         if self.eat(&Tok::LBrace)? {
             let mut defaults = Vec::new();
             let fields = self.parse_shape(Some(&mut defaults))?;
-            return Ok(TypeDef { name, ty: Ty { names: vec!["map".into()], optional: false, elem: None, fields: Some(fields) }, defaults, line });
+            return Ok(TypeDef { name, ty: Ty { names: vec!["map".into()], optional: false, elem: None, fields: Some(fields) }, defaults, line, id: TypeDef::next_id() });
         }
         let ty = self.parse_type()?;
-        Ok(TypeDef { name, ty, defaults: Vec::new(), line })
+        Ok(TypeDef { name, ty, defaults: Vec::new(), line, id: TypeDef::next_id() })
     }
 
     /// The fields of a map type, after its `{`; with `defaults`, a record's,

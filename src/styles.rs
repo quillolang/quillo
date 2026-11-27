@@ -584,25 +584,103 @@ pub fn set_by_quillo(class: &str) -> bool {
 pub fn classes_in(css: &str) -> Vec<(String, u32)> {
     let src = blank_comments(css);
     let mut at = Vec::new();
-    classes_in_block(&src, 0, &mut at);
-    at.into_iter().map(|(name, k)| (name, src[..k].matches('\n').count() as u32)).collect()
+    classes_in_block(&src, &mut at);
+    // Each class's line from the newlines since the one before it, as they come in order: each
+    // was counted from the start of the sheet, so a sheet of 2 MiB took 38 s to check
+    // (FEEDBACK71.md, Q-991; branch feedback86-89). Counted as bytes, with no list of the lines,
+    // so a small sheet costs no more than before.
+    let (mut from, mut line) = (0, 0);
+    at.into_iter()
+        .map(|(name, k)| {
+            if k < from {
+                (from, line) = (0, 0);
+            }
+            line += src.as_bytes()[from..k].iter().filter(|&&b| b == b'\n').count();
+            from = k;
+            (name, line as u32)
+        })
+        .collect()
 }
 
-fn classes_in_block(src: &str, base: usize, out: &mut Vec<(String, usize)>) {
+/// Each `{`'s `}` (as `closing` finds it), or the end, by where the `{` is: one pass over the
+/// sheet, as `closing` from each `{` ends where this does.
+fn brace_pairs(src: &str) -> Vec<(usize, usize)> {
+    let (mut pairs, mut open, mut quote) = (Vec::new(), Vec::new(), None);
+    for (k, c) in src.char_indices() {
+        match (quote, c) {
+            (Some(q), _) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '{') => {
+                open.push(pairs.len());
+                pairs.push((k, src.len()));
+            }
+            (None, '}') => {
+                if let Some(p) = open.pop() {
+                    pairs[p].1 = k;
+                }
+            }
+            _ => {}
+        }
+    }
+    pairs
+}
+
+/// The classes of `src`'s rules, and of those in the at-rules that hold rules. Read with a list of
+/// the blocks it is in, each `}` found once: it called itself for each `@media` inside another and
+/// looked for each one's `}` from its `{`, so a sheet of 120,000 `@media x{` (1 MiB) overflowed
+/// the stack and ended `quillo check` and the language server, and 20,000 took 1.1 s
+/// (FEEDBACK71.md, Q-991, found testing its fix; branch feedback86-89).
+fn classes_in_block(src: &str, out: &mut Vec<(String, usize)>) {
+    const DEEP: usize = 8;
+    // Made once a sheet nests at-rules this deep: up to there each block's `}` is looked for
+    // from its `{`, within the block it is in, as before, so a sheet that nests no deeper pays
+    // for no list.
+    let mut pairs = None;
+    // Where each block being read ends: the one being read in `upto`, those it is in below it, the
+    // first `DEEP` in place and the rest in `deeper` (a list made for each sheet with an `@media`
+    // cost a sheet of 115 bytes 4% more instructions than 0.8.11).
+    let (mut near, mut deeper, mut depth) = ([0usize; DEEP], Vec::new(), 0);
+    let mut upto = src.len();
     let mut i = 0;
-    while i < src.len() {
-        let (end, found) = scan_to(src, i, &['{', ';']);
+    loop {
+        if i >= upto {
+            i = upto + 1;
+            if depth == 0 {
+                break;
+            }
+            depth -= 1;
+            upto = if depth < DEEP { near[depth] } else { deeper.pop().unwrap_or(src.len()) };
+            continue;
+        }
+        let (end, found) = scan_to(&src[..upto], i, &['{', ';']);
         if found != Some('{') {
             i = end + 1;
             continue;
         }
-        let close = closing(src, end);
+        let close = if depth + 1 < DEEP {
+            closing(&src[..upto], end)
+        } else {
+            let pairs = pairs.get_or_insert_with(|| brace_pairs(src));
+            // Always there, as the two read quotes alike; `closing` if not, rather than a panic.
+            match pairs.get(pairs.partition_point(|&(a, _)| a < end)) {
+                Some(&(a, z)) if a == end => z.min(upto),
+                _ => closing(&src[..upto], end),
+            }
+        };
         let prelude = &src[i..end];
-        let inner = &src[end + 1..close.min(src.len())];
         if let Some(at) = prelude.trim_start().strip_prefix('@') {
             let name: String = at.chars().take_while(|c| c.is_alphanumeric() || *c == '-').collect::<String>().to_ascii_lowercase();
             if matches!(name.as_str(), "media" | "supports" | "container" | "layer" | "scope" | "document") {
-                classes_in_block(inner, base + end + 1, out);
+                if depth < DEEP {
+                    near[depth] = upto;
+                } else {
+                    deeper.push(upto);
+                }
+                depth += 1;
+                upto = close;
+                i = end + 1;
+                continue;
             }
         } else {
             let mut globals: Vec<(usize, usize)> = Vec::new();
@@ -621,13 +699,15 @@ fn classes_in_block(src: &str, base: usize, out: &mut Vec<(String, usize)>) {
                     (None, '"' | '\'') => quote = Some(c),
                     (None, '[') => depth += 1,
                     (None, ']') => depth -= 1,
-                    (None, '.') if depth == 0 && !globals.iter().any(|(a, z)| k > *a && k < *z) => {
+                    // `globals` are in order and apart: the last that starts before `k` is the
+                    // only one `k` can be in (FEEDBACK71.md, Q-991; branch feedback86-89).
+                    (None, '.') if depth == 0 && !globals[..globals.partition_point(|(a, _)| *a < k)].last().map_or(false, |(_, z)| k < *z) => {
                         let name: String = prelude[k + 1..].chars().take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_').collect();
                         let starts = name.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_' || c == '-');
                         // `.sm\:p-2`: a name with escapes, which this does not read.
                         let escaped = prelude[k + 1 + name.len()..].starts_with('\\');
                         if starts && !escaped {
-                            out.push((name, base + i + k));
+                            out.push((name, i + k));
                         }
                     }
                     _ => {}
@@ -692,6 +772,31 @@ mod tests {
     fn the_classes_a_sheet_styles() {
         let css = ".a, .b:hover { x: 1 }\n/* .c */\n@media (x) {\n  .d .e[title=\".f\"] { y: 1.5em }\n}\n:global(.g) .h { }";
         assert_eq!(classes_in(css), vec![("a".into(), 0), ("b".into(), 0), ("d".into(), 3), ("e".into(), 3), ("h".into(), 5)]);
+        // With its `{ }`: a selector with no block styles nothing, so without it this gave [] (the
+        // line is new in this branch's Q-991 change, and failed as first written).
+        assert_eq!(classes_in(":global(.a) .b :global(.c .d) .e, .f:global(.g) { }"), vec![("b".into(), 0), ("e".into(), 0), ("f".into(), 0)]);
+    }
+
+    /// A sheet's classes and their lines are found in linear time: each line was counted from
+    /// the sheet's start, so 2 MiB took 38 s of `quillo check` (FEEDBACK71.md, Q-991; branch
+    /// feedback86-89); and a selector of many `:global(...)` is looked through once.
+    #[test]
+    fn a_large_sheets_classes_are_found_in_linear_time() {
+        let mut css = String::new();
+        for i in 0..60_000 {
+            css.push_str(&format!(".c{} {{ x: 1 }}\n/* a */\n", i));
+        }
+        let t = std::time::Instant::now();
+        let got = classes_in(&css);
+        assert!(t.elapsed().as_secs_f64() < 20.0, "{:?}", t.elapsed());
+        assert_eq!(got.len(), 60_000);
+        assert_eq!((got[0].1, got[1].1, got[59_999].1), (0, 2, 119_998));
+        assert_eq!(got[59_999].0, "c59999");
+        let wide: String = (0..40_000).map(|i| format!(":global(.g{}) .l{} ", i, i)).collect::<String>() + "{ }";
+        let t = std::time::Instant::now();
+        let got = classes_in(&wide);
+        assert!(t.elapsed().as_secs_f64() < 20.0, "{:?}", t.elapsed());
+        assert_eq!((got.len(), got[0].0.as_str(), got[39_999].0.as_str()), (40_000, "l0", "l39999"));
         assert_eq!(set_elsewhere("/* set elsewhere: leaflet-, .mapbox */ .x {}"), vec!["leaflet-", "mapbox"]);
         assert_eq!(set_elsewhere("/* set elsewhere: leaflet- (Leaflet's script sets them) */"), vec!["leaflet-"]);
     }

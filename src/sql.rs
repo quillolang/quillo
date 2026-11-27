@@ -173,6 +173,19 @@ pub struct Scan {
     /// MySQL: for each value (from 1), the column it is given to or compared with, in lower
     /// case (`Reader::column_at`).
     columns: Vec<Option<Box<str>>>,
+    /// PostgreSQL: it calls `lastval()`, `currval()` or `setseed()`, which read or set the
+    /// session's sequences or its random numbers.
+    last_value: bool,
+    /// PostgreSQL: it makes, changes or drops something of the catalog's (`create`, `alter` or
+    /// `drop` of anything but a temporary one, a `do` block), after which
+    /// whether the database's own code uses a session's state is asked again (FEEDBACK75.md,
+    /// Q-1060, and its reviews; branch feedback86-89).
+    catalog: bool,
+    /// PostgreSQL: it cannot run inside a transaction block (`vacuum`, `... concurrently`, `create
+    /// database`, `alter system`, ...), or controls one: on a database whose code uses a session's
+    /// state, where a shared connection's statement runs inside one with its reset, it runs apart
+    /// (FEEDBACK75.md, Q-1060, the fourth review; branch feedback86-89).
+    outside_tx: bool,
 }
 
 /// When what `set_config` sets ends.
@@ -660,7 +673,10 @@ fn split(d: Dialect, s: &str, toks: &[Tok]) -> Vec<Span> {
             // `end` closes one. MySQL's `end if`, `end loop`, `end while`, `end repeat` and
             // MariaDB's `end for` close what was not counted, and `end case` a `case`.
             Kind::Word if depth == 0 && routine == Some(true) => {
-                if is(i, "begin") {
+                // PostgreSQL's body is `begin atomic`: a `begin` of the header's (a type's name)
+                // took the statement after the routine into it, unread (the review of Q-1060's
+                // first fix; branch feedback86-89).
+                if is(i, "begin") && (d != Dialect::Postgres || is(i + 1, "atomic")) {
                     body += 1;
                 } else if is(i, "case") {
                     if body > 0 {
@@ -801,7 +817,16 @@ impl<'a> Reader<'a> {
                 let rest = if unicode { &t[3..] } else { t.strip_prefix('"')? };
                 // One never closed ends with the text.
                 let inner = rest.strip_suffix('"').unwrap_or(rest).replace("\"\"", "\"");
-                Some(if unicode { unicode_escapes(&inner) } else { inner })
+                // `UESCAPE '!'` after it names another escape character (the review of Q-1060's
+                // first fix; branch feedback86-89).
+                let esc = (unicode && self.is_word(i + 1, "uescape") && self.kind(i + 2) == Some(Kind::Str))
+                    .then(|| str_body(self.text(i + 2)))
+                    .and_then(|b| {
+                        let mut c = b.chars();
+                        c.next().filter(|_| c.next().is_none())
+                    })
+                    .unwrap_or('\\');
+                Some(if unicode { unicode_escapes(&inner, esc) } else { inner })
             }
             _ => None,
         }
@@ -1326,29 +1351,31 @@ fn writes_when_called(name: &str) -> bool {
 /// text's `set_config(..., false)` changed the session that every request shares (FEEDBACK75.md,
 /// Q-1060 and its review; branch feedback75).
 fn runs_sql(name: &str) -> bool {
-    const NAMES: &[&str] = &["ts_stat", "ts_rewrite"];
+    // And those that run a type's input, named as text, on text: a domain's check (the review of
+    // Q-1060's first fix; branch feedback86-89).
+    const NAMES: &[&str] = &["ts_stat", "ts_rewrite", "pg_input_is_valid", "pg_input_error_info"];
     const STARTS: &[&str] = &["query_to_xml", "cursor_to_xml", "table_to_xml", "schema_to_xml", "database_to_xml"];
     NAMES.contains(&name) || STARTS.iter().any(|p| name.starts_with(p))
 }
 
 /// `U&"..."`'s text decoded: `\XXXX`, `\+XXXXXX` and `\\`.
-fn unicode_escapes(t: &str) -> String {
+fn unicode_escapes(t: &str, esc: char) -> String {
     let mut out = String::with_capacity(t.len());
     let mut rest = t;
-    while let Some(at) = rest.find('\\') {
+    while let Some(at) = rest.find(esc) {
         out.push_str(&rest[..at]);
-        rest = &rest[at + 1..];
+        rest = &rest[at + esc.len_utf8()..];
         let (digits, len) = if rest.starts_with('+') { (rest.get(1..7), 7) } else { (rest.get(..4), 4) };
         match digits.and_then(|h| u32::from_str_radix(h, 16).ok()).and_then(char::from_u32) {
             Some(c) => {
                 out.push(c);
                 rest = &rest[len..];
             }
-            None if rest.starts_with('\\') => {
-                out.push('\\');
-                rest = &rest[1..];
+            None if rest.starts_with(esc) => {
+                out.push(esc);
+                rest = &rest[esc.len_utf8()..];
             }
-            None => out.push('\\'),
+            None => out.push(esc),
         }
     }
     out.push_str(rest);
@@ -1417,7 +1444,15 @@ impl Scan {
                     }
                     // MySQL's names in any case are one.
                     let name = if pg { r.name(k) } else { r.name(k).map(|n| n.to_lowercase()) };
-                    if let Some(n) = name {
+                    if let Some(mut n) = name {
+                        // PostgreSQL keeps 63 bytes of a name (the review of Q-1060's first fix).
+                        if pg && n.len() > 63 {
+                            let mut cut = 63;
+                            while !n.is_char_boundary(cut) {
+                                cut -= 1;
+                            }
+                            n.truncate(cut);
+                        }
                         // PostgreSQL's own functions that run SQL given as text or read tables and
                         // views by name: what they run is not read here, so they run isolated, as
                         // a `do` block does (FEEDBACK75.md, Q-1060; branch feedback75).
@@ -1429,8 +1464,29 @@ impl Scan {
                 }
             }
         }
+        let last_value = pg && calls.iter().any(|c| matches!(&**c, "lastval" | "currval" | "setseed"));
+        let mut catalog = false;
+        if pg {
+            // A temporary one is the session's alone, and gone with it.
+            let temp = |sp: &Span| (sp.from + 1..(sp.from + 4).min(sp.to)).any(|k| r.is_word(k, "temp") || r.is_word(k, "temporary"));
+            catalog = unseen
+                || r.spans.iter().any(|sp| match r.head_text(sp).0.to_ascii_lowercase().as_str() {
+                    "create" => !temp(sp),
+                    "alter" | "drop" => true,
+                    _ => false,
+                });
+        }
         let tx_alone = r.spans.len() == 1 && r.controls_tx(&r.spans[0]);
         let tx_any = r.spans.iter().any(|sp| r.controls_tx(sp));
+        let outside_tx = pg
+            && (tx_any
+                || r.spans.iter().any(|sp| {
+                    let head = r.head_text(sp).0.to_ascii_lowercase();
+                    let second = (sp.from + 1 < sp.to).then(|| r.name(sp.from + 1)).flatten().unwrap_or_default().to_ascii_lowercase();
+                    matches!(head.as_str(), "vacuum" | "cluster" | "reindex" | "discard" | "checkpoint")
+                        || (matches!(head.as_str(), "create" | "drop" | "alter") && matches!(second.as_str(), "database" | "tablespace" | "system" | "subscription"))
+                        || (sp.from..sp.to).any(|k| r.is_word(k, "concurrently"))
+                }));
         let prepares = r.spans.iter().any(|sp| r.head_text(sp).0.eq_ignore_ascii_case("prepare"));
         let commits = if d == Dialect::Mysql {
             r.spans.iter().find(|sp| r.commits(sp)).map(|sp| (r.toks[sp.from].start, r.toks[sp.to - 1].end))
@@ -1499,6 +1555,9 @@ impl Scan {
             assigned,
             ddl,
             columns,
+            last_value,
+            catalog,
+            outside_tx,
         }
     }
 
@@ -1628,6 +1687,23 @@ impl Scan {
     /// runs is read too, and the SQL it makes from text written out.
     pub fn changes_session(&self, params: &[Value]) -> bool {
         self.lasting || self.given.iter().any(|&m| !matches!(self.value_of(m, params), Some(Value::Bool(true))))
+    }
+
+    /// PostgreSQL: whether it reads the session's sequences (`lastval()`, `currval()`) or sets its
+    /// random numbers (`setseed()`), which on a connection requests share are any request's
+    /// (FEEDBACK75.md, Q-1060, and its second review; branch feedback86-89).
+    pub fn reads_last_value(&self) -> bool {
+        self.last_value
+    }
+
+    /// PostgreSQL: whether it cannot run inside a transaction block (see `outside_tx`).
+    pub fn outside_tx(&self) -> bool {
+        self.outside_tx
+    }
+
+    /// PostgreSQL: whether it changes the catalog (see `catalog`).
+    pub fn changes_catalog(&self) -> bool {
+        self.catalog
     }
 
     /// The first statement MySQL commits the transaction around by itself before it runs:

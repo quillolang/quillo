@@ -235,7 +235,7 @@ const READS: &[&str] = &[
 const ACTS: &[&str] = &[
     "exit", "stdin", "read_line", "notify", "random", "random_int", "uuid", "crypto.token", "crypto.hash_password", "write_file", "delete_file", "save_upload",
     "image.convert", "run_script", "publish", "redirect", "respond", "stream", "events", "listen", "set_cookie", "delete_cookie", "set_session", "end_session", "idempotent",
-    "mcp_token", "revoke_mcp_token", "http.post", "http.put", "http.patch", "http.delete", "http.request", "http.stream", "db.exec", "db.exec_many", "db.migrate", "db.open", "db.atomic", "new_tenant",
+    "mcp_token", "revoke_mcp_token", "http.post", "http.put", "http.patch", "http.delete", "http.request", "http.stream", "db.exec", "db.exec_many", "db.migrate", "db.open", "db.own_setup", "db.atomic", "new_tenant",
     "__service", "__service_later", "__site_call", "__site", "__built", "__callers", "schedule", "translations", "locale_from", "tenant_from", "allow_cross_site", "moves_in_place", "site_headers",
     "page_head", "accept_calls", "style_with", "ready", "channel.on", "channel.send", "channel.broadcast", "channel.open", "receive", "media.rtp", "media.close", "media.on", "udp.listen",
     "udp.send", "udp.reply",

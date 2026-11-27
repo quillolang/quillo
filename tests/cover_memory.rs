@@ -360,10 +360,11 @@ fn a_page_ends_where_a_value_written_in_it_passes_the_limit() {
         assert!(log.lines().any(|l| l.contains(&format!("GET {}", path)) && l.ends_with(&said)), "{}: {}", path, log);
     }
     // Under it, each as written.
+    // Without the answer's nonce (changed for 0.8.12: FEEDBACK51.md, Q-667; branch feedback86-89).
     let page = |path: &str| {
         let (status, body) = get(port, path);
         assert_eq!(status, 200, "{}: {}", path, body);
-        body
+        support::no_nonce(&body)
     };
     let shown = page("/shown?n=1");
     assert!(shown.contains(&format!("<p>{}</p>", "q".repeat(100000))), "{}", &shown[..200]);

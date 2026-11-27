@@ -181,7 +181,14 @@ pub fn run_keyed(db: &Backend, dir: &Path, judge: Judge<'_>, prefix: &str) -> Re
         }
         Backend::Postgres(pool) => {
             let mut c = pool.checkout()?;
-            let r = pg_run(&mut c, prefix, &todo);
+            // Not under a role or `search_path` a request's statement left there (FEEDBACK75.md,
+            // Q-1060, the sixth review; branch feedback86-89).
+            if let Err(e) = c.set_back_if_used(pool.uses_session()) {
+                pool.discard(c);
+                return Err(e);
+            }
+            let own = crate::db::own_tables::mode(db);
+            let r = pg_run(&mut c, prefix, &todo, own.as_deref());
             // What a migration set in the session (`set search_path`) is not the next request's
             // (FEEDBACK55.md, Q-708; branch feedback55).
             if c.batch(pg::RESET).is_ok() {
@@ -194,7 +201,8 @@ pub fn run_keyed(db: &Backend, dir: &Path, judge: Judge<'_>, prefix: &str) -> Re
         #[cfg(feature = "mysql")]
         Backend::Mysql(pool) => {
             let mut c = pool.checkout()?;
-            let r = my_run(&mut c, prefix, &todo);
+            let own = crate::db::own_tables::mode(db);
+            let r = my_run(&mut c, prefix, &todo, own.as_deref());
             pool.give_back(c);
             r
         }
@@ -415,14 +423,30 @@ fn foreign_key_check(c: &rusqlite::Connection, name: &str, before: &[(String, Op
 /// changes the schema commits at once there (MySQL's rule), so a migration
 /// that fails part way may leave what came before it done.
 #[cfg(feature = "mysql")]
-fn my_run(c: &mut crate::my::Conn, prefix: &str, todo: &[(String, String)]) -> Result<Vec<String>, String> {
+fn my_run(c: &mut crate::my::Conn, prefix: &str, todo: &[(String, String)], own: Option<&crate::db::own_tables::Own>) -> Result<Vec<String>, String> {
+    // As `pg_run`'s (`own_tables`; branch feedback86-89).
+    let record = |c: &mut crate::my::Conn, sql: &str, params: &[Value], rows: bool| -> Result<Vec<Value>, String> {
+        match own {
+            Some(o) => {
+                let (call, p) = crate::db::own_tables::call(o, sql, params, rows);
+                let got = c.query(&call, &p, None)?;
+                Ok(match crate::db::own_tables::result(o, got, rows) {
+                    Value::List(l) => l.to_vec(),
+                    _ => Vec::new(),
+                })
+            }
+            None if rows => c.query(sql, params, Some(1)),
+            None if params.is_empty() => c.batch(sql).map(|_| Vec::new()),
+            None => c.exec(sql, params).map(|_| Vec::new()),
+        }
+    };
     c.query("select get_lock('quillo_migrations', 600) as got", &[], Some(1))?;
     let r = (|| {
-        c.batch("create table if not exists _quillo_migrations (name varchar(255) primary key, sha256 char(64) not null, applied_at varchar(32) not null)")?;
+        record(c, "create table if not exists _quillo_migrations (name varchar(255) primary key, sha256 char(64) not null, applied_at varchar(32) not null)", &[], false)?;
         let mut applied = Vec::new();
         for (name, text) in todo {
             let (hash, key) = (digest(text), format!("{}{}", prefix, name));
-            let had = c.query("select sha256 from _quillo_migrations where name = ?", &[Value::str(&key)], Some(1))?;
+            let had = record(c, "select sha256 from _quillo_migrations where name = ?", &[Value::str(&key)], true)?;
             if let Some(Value::Map(row)) = had.first() {
                 if !matches!(row.get("sha256"), Some(Value::Str(s) | Value::Css(s)) if **s == *hash) {
                     eprintln!("quillo: warning: migration {} changed after it was applied; it is not run again", name);
@@ -431,10 +455,7 @@ fn my_run(c: &mut crate::my::Conn, prefix: &str, todo: &[(String, String)]) -> R
             }
             c.batch("start transaction")?;
             let done = c.batch(text).and_then(|_| {
-                c.exec(
-                    "insert into _quillo_migrations (name, sha256, applied_at) values (?, ?, cast(now() as char))",
-                    &[Value::str(&key), Value::str(&hash)],
-                )
+                record(c, "insert into _quillo_migrations (name, sha256, applied_at) values (?, ?, cast(now() as char))", &[Value::str(&key), Value::str(&hash)], false)
             });
             match done {
                 Ok(_) => {
@@ -456,15 +477,32 @@ fn my_run(c: &mut crate::my::Conn, prefix: &str, todo: &[(String, String)]) -> R
     r
 }
 
-fn pg_run(c: &mut pg::Conn, prefix: &str, todo: &[(String, String)]) -> Result<Vec<String>, String> {
+fn pg_run(c: &mut pg::Conn, prefix: &str, todo: &[(String, String)], own: Option<&crate::db::own_tables::Own>) -> Result<Vec<String>, String> {
+    // Quillo's record, as its role where one holds its tables, in the migration's own transaction
+    // (`own_tables`; the user's decision of 2026-11-26, branch feedback86-89).
+    let record = |c: &mut pg::Conn, sql: &str, params: &[Value], rows: bool| -> Result<Vec<Value>, String> {
+        match own {
+            Some(o) => {
+                let (call, p) = crate::db::own_tables::call(o, sql, params, rows);
+                let got = c.query(&call, &p, None)?;
+                Ok(match crate::db::own_tables::result(o, got, rows) {
+                    Value::List(l) => l.to_vec(),
+                    _ => Vec::new(),
+                })
+            }
+            None if rows => c.query(sql, params, Some(1)),
+            None if params.is_empty() => c.batch(sql).map(|_| Vec::new()),
+            None => c.exec(sql, params).map(|_| Vec::new()),
+        }
+    };
     // One server at a time, across every server sharing the database.
     c.batch("select pg_advisory_lock(7171717171)")?;
     let r = (|| {
-        c.batch(TABLE)?;
+        record(c, TABLE, &[], false)?;
         let mut applied = Vec::new();
         for (name, text) in todo {
             let (hash, key) = (digest(text), format!("{}{}", prefix, name));
-            let had = c.query("select sha256 from _quillo_migrations where name = $1", &[Value::str(&key)], Some(1))?;
+            let had = record(c, "select sha256 from _quillo_migrations where name = $1", &[Value::str(&key)], true)?;
             if let Some(Value::Map(row)) = had.first() {
                 if !matches!(row.get("sha256"), Some(Value::Str(s) | Value::Css(s)) if **s == *hash) {
                     eprintln!("quillo: warning: migration {} changed after it was applied; it is not run again", name);
@@ -473,10 +511,7 @@ fn pg_run(c: &mut pg::Conn, prefix: &str, todo: &[(String, String)]) -> Result<V
             }
             c.batch("begin")?;
             let done = c.batch(text).and_then(|_| {
-                c.exec(
-                    "insert into _quillo_migrations (name, sha256, applied_at) values ($1, $2, now()::text)",
-                    &[Value::str(&key), Value::str(&hash)],
-                )
+                record(c, "insert into _quillo_migrations (name, sha256, applied_at) values ($1, $2, now()::text)", &[Value::str(&key), Value::str(&hash)], false)
             });
             match done {
                 Ok(_) => {

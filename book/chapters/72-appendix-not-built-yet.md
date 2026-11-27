@@ -8,8 +8,6 @@
 - splitting a page's bundle by route, and components loaded lazily
 - a caller finding a service by name through limer's pool, and [`--join`](#options-of-quillo-run) for copies behind NAT
 - `{{ ... }}` blocks of JavaScript in a component (a design only)
-- in the browser, a map's keys that look like integers keep their order of insertion:
-  there `keys({ "10": 1, "2": 2 })` is `["2", "10"]`, as JavaScript orders them
 - Linux builds linked with musl, or static: not planned, since a static binary cannot
   load plugins. The releases from 0.7.0 on are linked against glibc 2.17 instead
 - a catalog whose entries are signed, and its plugins prebuilt for Linux (a policy's

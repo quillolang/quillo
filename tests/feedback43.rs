@@ -177,7 +177,9 @@ fn a_database_opened_again_is_announced_and_not_answered_from_the_old_one() {
     let seq = now["seq"].as_u64().unwrap();
     // Opened again and nothing written: still said, and the next live call is not given c's rows.
     assert_eq!(text(&send(&mut it, "GET", "/quiet", &[], "")), "back to a");
-    let changed = json(&send(&mut it, "GET", &format!("/_quillo/live?since={}&t=db%3Anotes,var%3Ax", seq), &[], ""));
+    // Signed, as the server gives them to a page (changed for 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89).
+    let t = format!("{},{}", quillo::server::signed_topic("", None, "db:notes"), quillo::server::signed_topic("", None, "var:x"));
+    let changed = json(&send(&mut it, "GET", &format!("/_quillo/live?since={}&t={}", seq, t), &[], ""));
     assert_eq!(changed["changed"], serde_json::json!(["db:notes"]), "{}", changed);
     assert_eq!(load(&mut it)["ok"][0]["text"], "from a");
     // A connection's own tables are not the program's database: not said.

@@ -311,7 +311,9 @@ fn boot_line(it: &Interp, c: &Compiler) -> String {
     // A prerender nobody follows must not run a page: `@mount`, live updates and `server
     // fn`s all start from here, so they wait until it is shown (FEEDBACK22.md, Q-178; branch
     // feedback22-fixes).
-    let start = "const go = () => { if (document.readyState === \"loading\") document.addEventListener(\"DOMContentLoaded\", boot); else boot(); }; if (document.prerendering) document.addEventListener(\"prerenderingchange\", go, { once: true }); else go();";
+    // The document's own, past elements of the page named for them (runtime.js's `docGet`;
+    // FEEDBACK51.md, Q-667, the review of slice W1; branch feedback86-89).
+    let start = "const go = () => { if (docGet(\"readyState\") === \"loading\") docOn(\"DOMContentLoaded\", boot); else boot(); }; if (docGet(\"prerendering\")) docOn(\"prerenderingchange\", go, { once: true }); else go();";
     let mut mods: Vec<(&String, &JsLib)> = c.globals.keys().filter_map(|k| it.js_libs.get_key_value(k)).collect();
     mods.retain(|(_, l)| l.export.is_some() && !l.refused);
     mods.sort_by_key(|(_, l)| l.order);

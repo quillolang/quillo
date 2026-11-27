@@ -101,7 +101,18 @@ fn short(v: &Value) -> String {
 /// a function over one, checked at each call, took time in its square (FEEDBACK75.md, Q-1080's
 /// review; branch feedback75). A type that names itself (`type Ab = Ab | int`) is found when the
 /// program is checked (`self_naming`), not by this walk.
+/// That walk, for a record's constructor and a pattern, goes on to the end (`FULL`): the records it
+/// makes are marked (`Map::made_as`), and a map marked as the type asked for is taken as it is, at
+/// once, so that a chain built record by record is checked one level at a time; deeper than
+/// `value::DEEPEST` of unmarked levels, the value is refused (FEEDBACK75.md, Q-1122, the user's
+/// decision; branch feedback86-89). A function's argument and answer keep the 64 levels: a value
+/// read as JSON is not marked, and a function over one would check it whole at each call.
 const PROGRAM_DEPTH: usize = 64;
+
+/// What a constructor says of a value nested deeper than `value::DEEPEST` (`FULL`).
+fn too_deep_made() -> Why {
+    Why { path: String::new(), what: format!("is nested more than {} deep", crate::value::DEEPEST) }
+}
 
 /// Deeper than this, a value from a request (`make`: a server fn's arguments, a route's patterns)
 /// is refused as nested too deep. Past 64 levels it was taken as it came, unchecked: the 33rd
@@ -359,16 +370,20 @@ impl<'a> Chain for &'a Named<'a> {
 /// lists and map shapes are checked as before (`list<int>` is any list);
 /// records are checked field by field, and everything inside them too.
 pub fn fits(types: &Types, ty: &Ty, v: &Value, deep: bool) -> Result<(), Why> {
-    fits_at(types, ty, v, deep, 0)
+    fits_at::<false>(types, ty, v, deep, 0)
 }
 
-fn fits_at(types: &Types, ty: &Ty, v: &Value, deep: bool, depth: usize) -> Result<(), Why> {
-    if (ty.optional && matches!(v, Value::Nil)) || depth > PROGRAM_DEPTH {
+/// `FULL`: to the end, as a constructor checks (see `PROGRAM_DEPTH`).
+fn fits_at<const FULL: bool>(types: &Types, ty: &Ty, v: &Value, deep: bool, depth: usize) -> Result<(), Why> {
+    if (ty.optional && matches!(v, Value::Nil)) || (!FULL && depth > PROGRAM_DEPTH) {
         return Ok(());
+    }
+    if FULL && depth >= PROGRAM_DEPTH {
+        return fits_full(types, ty, v, deep, depth);
     }
     let mut best = Why::default();
     for n in &ty.names {
-        match fits_name(types, n, ty, v, deep, depth) {
+        match fits_name::<FULL>(types, n, ty, v, deep, depth) {
             Ok(()) => return Ok(()),
             Err(w) if best.what.is_empty() && !w.what.is_empty() => best = w,
             Err(_) => {}
@@ -381,7 +396,7 @@ fn fits_at(types: &Types, ty: &Ty, v: &Value, deep: bool, depth: usize) -> Resul
 // typed argument's check 5% more (the in-process bench; FEEDBACK75.md, Q-1080's review; branch
 // feedback75).
 #[inline(always)]
-fn fits_name(types: &Types, n: &str, ty: &Ty, v: &Value, deep: bool, depth: usize) -> Result<(), Why> {
+fn fits_name<const FULL: bool>(types: &Types, n: &str, ty: &Ty, v: &Value, deep: bool, depth: usize) -> Result<(), Why> {
     if n.starts_with('"') {
         let want: String = serde_json::from_str(n).unwrap_or_default();
         return match v {
@@ -391,14 +406,19 @@ fn fits_name(types: &Types, n: &str, ty: &Ty, v: &Value, deep: bool, depth: usiz
     }
     if let Some(td) = types.get(n) {
         if !td.is_record() {
-            return fits_at(types, &td.ty, v, deep, depth + 1);
+            return fits_at::<FULL>(types, &td.ty, v, deep, depth + 1);
         }
         let Value::Map(m) = v else { return Err(Why::default()) };
+        // Made as this record, and unchanged since: it is one (FEEDBACK75.md, Q-1122; branch
+        // feedback86-89).
+        if m.made_as() == td.id {
+            return Ok(());
+        }
         for (k, fty) in td.ty.fields.as_deref().unwrap_or_default() {
             match field(m, k).filter(|x| !matches!(x, Value::Nil)) {
                 None if fty.optional => {}
                 None => return Err(Why::missing(k)),
-                Some(x) => fits_at(types, fty, x, true, depth + 1).map_err(|w| w.here(fty, x).inside(k))?,
+                Some(x) => fits_at::<FULL>(types, fty, x, true, depth + 1).map_err(|w| w.here(fty, x).inside(k))?,
             }
         }
         return Ok(());
@@ -411,7 +431,7 @@ fn fits_name(types: &Types, n: &str, ty: &Ty, v: &Value, deep: bool, depth: usiz
             ("list", Value::List(items)) => {
                 if let Some(e) = &ty.elem {
                     for (i, x) in items.iter().enumerate() {
-                        fits_at(types, e, x, true, depth + 1).map_err(|w| w.here(e, x).inside(&format!("[{}]", i)))?;
+                        fits_at::<FULL>(types, e, x, true, depth + 1).map_err(|w| w.here(e, x).inside(&format!("[{}]", i)))?;
                     }
                 }
             }
@@ -420,7 +440,7 @@ fn fits_name(types: &Types, n: &str, ty: &Ty, v: &Value, deep: bool, depth: usiz
                     match field(m, k).filter(|x| !matches!(x, Value::Nil)) {
                         None if fty.optional => {}
                         None => return Err(Why::missing(k)),
-                        Some(x) => fits_at(types, fty, x, true, depth + 1).map_err(|w| w.here(fty, x).inside(k))?,
+                        Some(x) => fits_at::<FULL>(types, fty, x, true, depth + 1).map_err(|w| w.here(fty, x).inside(k))?,
                     }
                 }
             }
@@ -428,6 +448,25 @@ fn fits_name(types: &Types, n: &str, ty: &Ty, v: &Value, deep: bool, depth: usiz
         }
     }
     Ok(())
+}
+
+/// `fits_at::<true>` past `PROGRAM_DEPTH`, out of the way of the shallow values: held to
+/// `value::DEEPEST`, on a new piece of stack where it runs low.
+#[cold]
+#[inline(never)]
+fn fits_full(types: &Types, ty: &Ty, v: &Value, deep: bool, depth: usize) -> Result<(), Why> {
+    if depth > crate::value::DEEPEST {
+        return Err(too_deep_made());
+    }
+    let mut best = Why::default();
+    for n in &ty.names {
+        match crate::value::deeper(depth, || fits_name::<true>(types, n, ty, v, deep, depth)) {
+            Ok(()) => return Ok(()),
+            Err(w) if best.what.is_empty() && !w.what.is_empty() => best = w,
+            Err(_) => {}
+        }
+    }
+    Err(best)
 }
 
 /// A record's or a map shape's field, looked up as 0.8.8's walk had `IndexMap::get` in line: with
@@ -462,16 +501,37 @@ pub fn make(it: &mut Interp, ty: &Ty, v: &Value, lenient: bool) -> Result<Result
     req_make_at::<_, Shallow>(it, ty, v, lenient, 0, Unnamed)
 }
 
-/// `make` for a value of the program's own (a record's constructor): 0.8.8's walk, held to
-/// `PROGRAM_DEPTH`.
+/// `make` for a value of the program's own (a record's constructor, a pattern): 0.8.8's walk, to
+/// the end, marked records taken at once (see `PROGRAM_DEPTH`; FEEDBACK75.md, Q-1122; branch
+/// feedback86-89).
 pub(crate) fn make_program(it: &mut Interp, ty: &Ty, v: &Value, lenient: bool) -> Result<Result<Value, Why>, Ctrl> {
     make_at(it, ty, v, lenient, 0)
 }
 
 fn make_at(it: &mut Interp, ty: &Ty, v: &Value, lenient: bool, depth: usize) -> Result<Result<Value, Why>, Ctrl> {
-    if (ty.optional && matches!(v, Value::Nil)) || depth > PROGRAM_DEPTH {
+    if ty.optional && matches!(v, Value::Nil) {
         return Ok(Ok(v.clone()));
     }
+    // To the end, held to `value::DEEPEST` and on a new piece of stack where it runs low (see
+    // `PROGRAM_DEPTH`; FEEDBACK75.md, Q-1122; branch feedback86-89).
+    if depth >= PROGRAM_DEPTH {
+        return make_deep(it, ty, v, lenient, depth);
+    }
+    make_names(it, ty, v, lenient, depth)
+}
+
+/// `make_at` past `PROGRAM_DEPTH`, out of the way of the shallow values.
+#[cold]
+#[inline(never)]
+fn make_deep(it: &mut Interp, ty: &Ty, v: &Value, lenient: bool, depth: usize) -> Result<Result<Value, Why>, Ctrl> {
+    if depth > crate::value::DEEPEST {
+        return Ok(Err(too_deep_made()));
+    }
+    crate::value::deeper(depth, || make_names(it, ty, v, lenient, depth))
+}
+
+#[inline(always)]
+fn make_names(it: &mut Interp, ty: &Ty, v: &Value, lenient: bool, depth: usize) -> Result<Result<Value, Why>, Ctrl> {
     let mut best = Why::default();
     for n in &ty.names {
         let r = make_name(it, n, ty, v, lenient, depth)?;
@@ -490,6 +550,11 @@ fn make_name(it: &mut Interp, n: &str, ty: &Ty, v: &Value, lenient: bool, depth:
             return make_at(it, &td.ty, v, lenient, depth + 1);
         }
         let Value::Map(m) = v else { return Ok(Err(Why::default())) };
+        // Made as this record, and unchanged since: taken as it is (FEEDBACK75.md, Q-1122; branch
+        // feedback86-89).
+        if m.made_as() == td.id {
+            return Ok(Ok(v.clone()));
+        }
         return make_record(it, &td, m, lenient, depth);
     }
     match (n, v) {
@@ -525,7 +590,8 @@ fn make_name(it: &mut Interp, n: &str, ty: &Ty, v: &Value, lenient: bool, depth:
         // The type's other names checked as they are, from the top as 0.8.8 checked them, by the
         // type itself: no copy of its list's or map shape's parts made for the step and dropped
         // (FEEDBACK75.md, Q-1080's review; branch feedback75), which also halves a record's making.
-        _ => Ok(fits_name(&it.types, n, ty, v, true, 0).map(|_| v.clone())),
+        // To the end (`FULL`), from where the walk is (FEEDBACK75.md, Q-1122; branch feedback86-89).
+        _ => Ok(fits_name::<true>(&it.types, n, ty, v, true, depth).map(|_| v.clone())),
     }
 }
 
@@ -552,7 +618,8 @@ fn make_record(it: &mut Interp, td: &TypeDef, m: &Map, lenient: bool, depth: usi
             Err(w) => return Ok(Err(w.here(fty, &x).inside(k))),
         }
     }
-    Ok(Ok(Value::map(out)))
+    // Marked as made by this record (FEEDBACK75.md, Q-1122; branch feedback86-89).
+    Ok(Ok(Value::map(out.made(td.id))))
 }
 
 // ---- A request's walk: `make` (FEEDBACK75.md, Q-1080 and its reviews; branch feedback75) ----
@@ -988,7 +1055,8 @@ fn req_make_record<M: Mode>(it: &mut Interp, td: &TypeDef, m: &Map, lenient: boo
             Err(w) => return Ok(Err(w.here(fty, &x).inside(k))),
         }
     }
-    Ok(Ok(Value::map(out)))
+    // Marked as made by this record (FEEDBACK75.md, Q-1122; branch feedback86-89).
+    Ok(Ok(Value::map(out.made(td.id))))
 }
 
 /// `__record(name, fields)`: what `User(fields)` calls.

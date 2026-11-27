@@ -578,7 +578,7 @@ fn children(v: &Value, start: Option<u64>, count: Option<u64>) -> Vec<(String, V
             xs.iter().enumerate().skip(start).take(count).map(|(i, x)| (i.to_string(), x.clone())).collect()
         }
         Value::Map(m) => m.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
-        Value::Err(x, _, _) => vec![("error".into(), (**x).clone())],
+        Value::Err(x, _, _) => vec![("error".into(), Value::clone(x))],
         Value::Response(r) => {
             let mut out = vec![("status".to_string(), Value::Int(r.status as i64))];
             // A header named `null` shows so (FEEDBACK55.md, Q-710; branch feedback55).

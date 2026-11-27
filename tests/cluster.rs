@@ -183,7 +183,9 @@ route GET / = <p>hello</p>
     assert_eq!(shown["ok"], 0);
     assert_eq!(shown["topics"], serde_json::json!(["db:orders"]));
     let (seq, server_b) = (shown["seq"].as_u64().unwrap(), shown["server"].as_str().unwrap().to_string());
-    let wait_url = format!("http://127.0.0.1:{}/_quillo/live?since={}&s={}&t=db%3Aorders", b, seq, server_b);
+    // The topic with the signature B gave the page (changed for 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89).
+    let t = format!("~{},db%3Aorders", shown["key"].as_str().unwrap());
+    let wait_url = format!("http://127.0.0.1:{}/_quillo/live?since={}&s={}&t={}", b, seq, server_b, t);
     let waiting = std::thread::spawn(move || {
         let t0 = Instant::now();
         (get(&wait_url), t0.elapsed())

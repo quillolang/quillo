@@ -357,6 +357,10 @@ fn navigate_takes_no_javascript_url() {
 
 // Q-666: a page named the topics it followed, and `acme@db:orders` from tenant evil's host was
 // followed: evil learned when acme's orders changed. A tenant follows its own and the shared.
+// Changed for 0.8.12 (FEEDBACK51.md, Q-666, the user's decision of 2026-11-26; branch
+// feedback86-89): a page follows only topics the server signed for its tenant, so each page sends
+// them signed, as the server gives them (acme's page's topics, copied to the other hosts); the
+// same attack, on the same topics, must still fail.
 #[test]
 fn a_page_follows_no_other_tenants_topics() {
     let d = dir("live-tenants", "tenant_from(\"example.com\")\nroute POST /change = { publish(\"orders\"); \"ok\" }\n");
@@ -367,17 +371,21 @@ fn a_page_follows_no_other_tenants_topics() {
         let b = support::send(s.port, "GET", "/_quillo/live?since=0&t=x", &[("Host", &host(t))], "").body;
         serde_json::from_str::<serde_json::Value>(&b).unwrap()["seq"].as_u64().unwrap()
     };
+    // As the server signs a topic for a tenant's page, with the tests' secret, each alone in its
+    // live state (src/server.rs, `set_sig`).
+    let signed = |tenant: &str, topic: &str| support::signed_topic("test secret for the tests", "", Some(tenant), topic);
+    let acmes = [signed("acme", "acme@orders"), signed("acme", "evil@orders"), signed("acme", "orders")].join(",");
     change("acme");
     // Each waits for a change of what it follows.
-    let follow = |h: &str, since: u64| {
+    let follow = |h: &str, since: u64, t: &str| {
         let mut c = std::net::TcpStream::connect(("127.0.0.1", s.port)).unwrap();
-        write!(c, "GET /_quillo/live?since={}&t=acme@orders,evil@orders,orders HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", since, h).unwrap();
+        write!(c, "GET /_quillo/live?since={}&t={} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", since, t, h).unwrap();
         c
     };
     let since = seq("acme");
-    let mut acme = follow(&host("acme"), since);
-    let mut evil = follow(&host("evil"), since);
-    let mut bare = follow("example.com", since);
+    let mut acme = follow(&host("acme"), since, &acmes);
+    let mut evil = follow(&host("evil"), since, &acmes);
+    let mut bare = follow("example.com", since, &acmes);
     std::thread::sleep(std::time::Duration::from_millis(200));
     change("acme");
     let read = |c: &mut std::net::TcpStream, ms: u64| {
@@ -387,32 +395,55 @@ fn a_page_follows_no_other_tenants_topics() {
         out
     };
     assert!(read(&mut acme, 10_000).contains("\"changed\":[\"acme@orders\"]"), "acme was not told");
-    assert_eq!(read(&mut evil, 1_500), "", "evil was told of acme's change");
-    assert_eq!(read(&mut bare, 500), "", "a page with no tenant was told of acme's change");
+    // Refused, as none of the topics is signed for them (changed for 0.8.12: a refusal where it
+    // waited; the coordinator's decision of 2026-11-27).
+    let e = read(&mut evil, 1_500);
+    assert!(e.starts_with("HTTP/1.1 403") && !e.contains("acme@orders"), "evil was told of acme's change: {}", e);
+    let e = read(&mut bare, 500);
+    assert!(e.starts_with("HTTP/1.1 403") && !e.contains("acme@orders"), "a page with no tenant was told of acme's change: {}", e);
     // Its own, it is told of.
+    let since = seq("evil");
+    let mut evil = follow(&host("evil"), since, &signed("evil", "evil@orders"));
+    std::thread::sleep(std::time::Duration::from_millis(200));
     change("evil");
     let b = read(&mut evil, 10_000);
     assert!(b.contains("\"changed\":[\"evil@orders\"]"), "{}", b);
-    // Without waiting, on the program's own path (a mounted program's), the same.
+    // Without waiting, on the program's own path (a mounted program's), the same, with the
+    // signature a live call of each tenant's gave its topics.
     let mut it = quillo::Interp::new(&d);
-    it.load_source("tenant_from(\"example.com\")\nroute POST /change = { publish(\"orders\"); \"ok\" }\nroute POST /pipe = { publish(\"inbox:x|evil@orders\"); \"ok\" }\n", "main.qwe").unwrap();
+    it.load_source("tenant_from(\"example.com\")\nserver fn load() {\n    watch(\"orders\")\n    watch(\"inbox:x|evil@orders\")\n    return 1\n}\nroute POST /change = { publish(\"orders\"); \"ok\" }\nroute POST /pipe = { publish(\"inbox:x|evil@orders\"); \"ok\" }\n", "main.qwe").unwrap();
     let mut ask = |method: &str, url: &str, t: &str| {
-        let r = it.handle(&quillo::server::HttpRequest { method: method.into(), url: url.into(), headers: vec![("host".into(), host(t))], body: Vec::new(), remote: "127.0.0.1".into() });
+        let live = url.starts_with("/_quillo/rpc/");
+        let mut headers = vec![("host".to_string(), host(t))];
+        if live {
+            headers.push(("x-quillo-live".into(), "1".into()));
+            headers.push(("content-type".into(), "application/json".into()));
+        }
+        let r = it.handle(&quillo::server::HttpRequest { method: method.into(), url: url.into(), headers, body: if live { b"[]".to_vec() } else { Vec::new() }, remote: "127.0.0.1".into() });
         r.text()
     };
+    let given = |j: &str| -> String {
+        let j: serde_json::Value = serde_json::from_str(j).unwrap();
+        let mut t = vec![format!("~{}", j["key"].as_str().unwrap())];
+        t.extend(j["topics"].as_array().unwrap().iter().map(|t| t.as_str().unwrap().replace('%', "%25").replace(',', "%2C").replace('|', "%7C")));
+        t.join(",")
+    };
+    let acme_t = given(&ask("POST", "/_quillo/rpc/load", "acme"));
+    let evil_t = given(&ask("POST", "/_quillo/rpc/load", "evil"));
     let since: serde_json::Value = serde_json::from_str(&ask("GET", "/_quillo/live?since=0&t=x", "acme")).unwrap();
     ask("POST", "/change", "acme");
     ask("POST", "/change", "evil");
-    let url = format!("/_quillo/live?since={}&t=acme@orders,evil@orders", since["seq"]);
-    let b = ask("GET", &url, "evil");
+    let url = |t: &str| format!("/_quillo/live?since={}&t={}", since["seq"], t);
+    let b = ask("GET", &url(&evil_t), "evil");
     assert!(b.contains("\"changed\":[\"evil@orders\"]"), "{}", b);
-    assert!(ask("GET", &url, "acme").contains("\"changed\":[\"acme@orders\"]"));
+    assert!(ask("GET", &url(&acme_t), "acme").contains("\"changed\":[\"acme@orders\"]"));
+    let b = ask("GET", &url(&acme_t), "evil");
+    assert!(b.contains("not signed for this page") && !b.contains("acme@orders"), "{}", b);
     // A topic of acme's with a `|` in it is still acme's.
     ask("POST", "/pipe", "acme");
-    let url = format!("/_quillo/live?since={}&t=acme@inbox:x|evil@orders", since["seq"]);
-    assert!(ask("GET", &url, "acme").contains("\"changed\":[\"acme@inbox:x|evil@orders\"]"));
-    let b = ask("GET", &url, "evil");
-    assert!(b.contains("\"changed\":[]"), "{}", b);
+    assert!(ask("GET", &url(&acme_t), "acme").contains("\"acme@inbox:x|evil@orders\""));
+    let b = ask("GET", &url(&acme_t), "evil");
+    assert!(b.contains("not signed for this page") && !b.contains("acme@"), "{}", b);
 }
 
 // Q-651: middleware let the route go on for any map: `{ error: "bad api key" }`, the way a

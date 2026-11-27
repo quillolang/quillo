@@ -243,6 +243,51 @@ fn all_values(pat: &crate::ast::Pattern, m: &Value, raw: &str) -> Option<Value> 
     Some(Value::map(out))
 }
 
+/// Whether a field's pattern expects a boolean (`bool`, `bool = ...`, `flag as bool`, `bool | null`).
+fn takes_bool(pat: &crate::ast::Pattern) -> bool {
+    match pat {
+        crate::ast::Pattern::Type(t) => t == "bool",
+        crate::ast::Pattern::As(p, _) => takes_bool(p),
+        crate::ast::Pattern::Alt(ps) => ps.iter().any(takes_bool),
+        _ => false,
+    }
+}
+
+/// Bare query flags (`?on`, no `=`) as `true` for fields whose route pattern wants a `bool`
+/// (FEEDBACK47.md, Q-543, W4; branch feedback86-89). `?on=` still has `=`, so it stays blank text
+/// (400 without a default, or default with one), and `request.query` keeps `""` for both.
+fn bare_bools(pat: &crate::ast::Pattern, m: &Value, raw: &str) -> Option<Value> {
+    let crate::ast::Pattern::Record(fields) = pat else { return None };
+    let Value::Map(map) = m else { return None };
+    if raw.is_empty() || !fields.iter().any(|f| f.path.len() == 1 && takes_bool(&f.pat)) {
+        return None;
+    }
+    let mut last_bare: Option<std::collections::HashMap<String, bool>> = None;
+    let mut get_last = |name: &str| -> bool {
+        let state = last_bare.get_or_insert_with(|| {
+            let mut seen = std::collections::HashMap::new();
+            for pair in raw.split('&').filter(|p| !p.is_empty()) {
+                let (k, has_eq) = match pair.split_once('=') {
+                    Some((k, _)) => (k, true),
+                    None => (pair, false),
+                };
+                seen.insert(percent_decode(k, true), !has_eq);
+            }
+            seen
+        });
+        state.get(name).copied().unwrap_or(false)
+    };
+    let mut out = None;
+    for f in fields {
+        if f.path.len() == 1 && takes_bool(&f.pat) && matches!(map.get(f.path[0].as_str()), Some(Value::Str(s)) if s.is_empty()) {
+            if get_last(&f.path[0]) {
+                out.get_or_insert_with(|| (**map).clone()).insert(f.path[0].as_str().into(), Value::Bool(true));
+            }
+        }
+    }
+    out.map(Value::map)
+}
+
 fn match_path(def: &[Seg], segs: &[String]) -> Option<Vec<(String, Value)>> {
     let mut out = Vec::new();
     for (i, seg) in def.iter().enumerate() {
@@ -1021,6 +1066,10 @@ impl Interp {
             return resp;
         }
         self.rendered_island = false;
+        // Each answer its own nonce (FEEDBACK51.md, Q-667; branch feedback86-89), made at its first
+        // island, or the first markup made at load it shows (`LoadKept`; the fourth review of slice
+        // W1).
+        self.island_nonce = None;
         self.scroll_island = false;
         // One said outside a request (at load, in a job) is no page's.
         if self.page_head.is_some() || self.head_sent.is_some() {
@@ -1228,7 +1277,8 @@ impl Interp {
                 // Quillo's own, said so on a page that moves in place, whose moves leave it as it ran
                 // (fourth review of slice H).
                 if self.site.in_place {
-                    insert_at(&mut resp.body, at, format!("<script data-quillo>{}</script>", o.register_js).as_bytes());
+                    let mark = self.own_mark();
+                    insert_at(&mut resp.body, at, format!("<script{}>{}</script>", mark, o.register_js).as_bytes());
                 } else {
                     insert_at(&mut resp.body, at, o.register.as_bytes());
                 }
@@ -1275,8 +1325,11 @@ impl Interp {
                 if refused.scripts {
                     // Made by a script of Quillo's, hashed: a policy with `'strict-dynamic'` takes
                     // what it makes, and refuses a `<script src>` in the page (found in review).
-                    let load = format!("(d=>{{const s=d.createElement(\"script\");s.src=\"{}/_quillo/media.js\";s.async=false;d.head.appendChild(s)}})(document)", self.base);
-                    insert_at(&mut resp.body, at, format!("<script{}>{}</script>", if self.site.in_place { " data-quillo" } else { "" }, load).as_bytes());
+                    // Through `Document.prototype`, past what the page names `createElement` or `head`
+                    // (the second review of slice W1; FEEDBACK51.md, Q-667; branch feedback86-89).
+                    let load = format!("(d=>{{const D=Document.prototype,s=D.createElement.call(d,\"script\");s.src=\"{}/_quillo/media.js\";s.async=false;Object.getOwnPropertyDescriptor(D,\"head\").get.call(d).appendChild(s)}})(document)", self.base);
+                    let mark = if self.site.in_place { self.own_mark() } else { String::new() };
+                    insert_at(&mut resp.body, at, format!("<script{}>{}</script>", mark, load).as_bytes());
                     own.push(load);
                 } else {
                     insert_at(&mut resp.body, at, format!("<script src=\"{}/_quillo/media.js\" defer></script>", self.base).as_bytes());
@@ -1337,7 +1390,8 @@ impl Interp {
                 // same characters to JavaScript wherever it is read (coverage of 0.8.7, Q-1116;
                 // branch coverage-087).
                 // Quillo's own, said so on a page that moves in place (third review of slice H).
-                tags.push_str(&format!("<script{}>{}.g={}</script>", if in_place { " data-quillo" } else { "" }, crate::client::HANDOFF_JS, text.replace('<', "\\u003c").replace('&', "\\u0026")));
+                let mark = if in_place { self.own_mark() } else { String::new() };
+                tags.push_str(&format!("<script{}>{}.g={}</script>", mark, crate::client::HANDOFF_JS, text.replace('<', "\\u003c").replace('&', "\\u0026")));
             }
             // Components translate in the browser too: the page carries its
             // locale's text, read when the (deferred) bundle runs.
@@ -1392,11 +1446,21 @@ impl Interp {
                         resp.headers.push(("vary".into(), "Cookie".into()));
                     }
                 }
-                tags.push_str(&format!("<script{}>{}</script>", if in_place { " data-quillo" } else { "" }, island_loader(&srcs, &self.integrities(&srcs), std::mem::take(&mut self.scroll_island), in_place.then(|| key.as_ref().map_or("", |k| k.0.as_str())))));
+                // The answer's nonce on the loader's tag, which the loader reads (FEEDBACK51.md, Q-667;
+                // branch feedback86-89): its text stays the same from answer to answer.
+                let mark = if in_place { self.own_mark() } else { String::new() };
+                tags.push_str(&format!("<script{}{}>{}</script>", mark, self.island_nonce.as_ref().map_or("", IslandNonce::attr), island_loader(&srcs, &self.integrities(&srcs), std::mem::take(&mut self.scroll_island), in_place.then(|| key.as_ref().map_or("", |k| k.0.as_str())), self.island_nonce.is_some())));
             } else {
                 bundle_styles = self.styles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ids();
                 if let Some((i18n, l)) = &i18n {
                     tags.push_str(&format!("<script>{}.i18n={}</script>", crate::client::HANDOFF_JS, i18n.browser_json(l, None)));
+                }
+                // The program loads the whole bundle itself: the answer's nonce, as the loader
+                // carries it (FEEDBACK51.md, Q-667; branch feedback86-89).
+                // On its tag, read by a text the same in every answer: its policy's hash holds for a
+                // page a 304 keeps (the review of slice W1).
+                if let Some(n) = &self.island_nonce {
+                    tags.push_str(&format!("<script{}>{}</script>", n.attr(), HANDOFF_QN));
                 }
             }
             let at = has(&resp.body, b"</body>").unwrap_or(resp.body.len());
@@ -1455,6 +1519,36 @@ impl Interp {
                     body = replace_bytes(&body, line.as_bytes(), format!("<script>{}</script>", crate::defer::ONE_SWAP).as_bytes());
                 }
                 resp.body = body;
+            }
+        }
+        // A page the program sends as written (its own `etag`, a range: nothing of Quillo's added),
+        // with components, that loads the whole bundle itself: its islands carry the answer's nonce,
+        // so the script that says it comes too, let through the page's policy, or no component of it
+        // was taken up (the review of slice W1; FEEDBACK51.md, Q-667; branch feedback86-89).
+        // A HEAD is answered with the same headers, its length and policy among them (the second
+        // review of slice W1).
+        if !html && self.rendered_island && is_html(&resp) && script_tag_for(&resp.body, b"/_quillo/quillo.js") {
+            if let Some(n) = self.island_nonce {
+                let at = rfind_tag(&resp.body, b"</body>").unwrap_or(resp.body.len());
+                insert_at(&mut resp.body, at, format!("<script{}>{}</script>", n.attr(), HANDOFF_QN).as_bytes());
+                if policy_refuses(&resp).scripts {
+                    allow_own(&mut resp, &[HANDOFF_QN.to_string()], &[], false);
+                }
+            }
+        }
+        // The answer's nonce, for the runtime's own requests (a move in place, a page fetched ahead,
+        // --watch's): what it takes islands up by there, which no markup can say, where the first
+        // loader text in a page read was the visitor's own copy in a `<noscript>` (the second review
+        // of slice W1; FEEDBACK51.md, Q-667; branch feedback86-89).
+        // Only to those requests (`x-quillo-move`, `x-quillo-prefetch`, `x-quillo-hot`): one header
+        // more on every page was some 900 instructions an answer.
+        if let Some(n) = self.island_nonce {
+            if asks_nonce(req) && is_html(&resp) {
+                resp.headers.push((NONCE_HEADER.into(), n.nonce().into()));
+                // No `Vary` on these: a page fetched ahead is private and a move's and --watch's are
+                // not stored, where one made the click unable to take what was fetched ahead, and the
+                // page was made twice; a move given a public page without the header loads it whole
+                // (the fourth review of slice W1).
             }
         }
         // The rule only where an island is, or may come in a part.
@@ -1562,9 +1656,11 @@ impl Interp {
             }
 
             let mut binds = Vec::new();
-            // A list in a pattern takes all of a name's values.
+            // A list in a pattern takes all of a name's values; a bare `?on` (no `=`) for `bool` is true.
             let query_all = r.query.as_ref().and_then(|p| all_values(p, &query_v, qs));
             let query_v = query_all.as_ref().unwrap_or(&query_v);
+            let query_bools = r.query.as_ref().and_then(|p| bare_bools(p, query_v, qs));
+            let query_v = query_bools.as_ref().unwrap_or(query_v);
             let form_all = form_lists(r.body_pat.as_ref(), &reqv, req);
             let reqv = form_all.unwrap_or(reqv);
             // The `routes` groups' patterns too, outermost first (branch route-groups).
@@ -1648,7 +1744,9 @@ impl Interp {
             if self.rendered_island && self.site.i18n.is_some() {
                 self.locale();
             }
-            let resp = finish(crate::interp::in_file(ran, &r.file));
+            // Markup made at load, with this answer's nonce (the fourth review of slice W1).
+            let ran = crate::interp::in_file(ran, &r.file);
+            let resp = finish(if self.load_kept.is_some() { self.kept_answer(ran) } else { ran });
             self.current_request = None;
             self.pending_request = None;
             // For Quillo's service worker, once the answer is made (see `handle`; FEEDBACK67.md,
@@ -2087,6 +2185,14 @@ impl Interp {
         want
     }
 
+    /// What marks a script of Quillo's own on a page that moves in place: `data-quillo` with the
+    /// answer's nonce, which the runtime has from the answer's `x-quillo-nonce` header, so that a
+    /// visitor's `<script data-quillo>` is not taken for one (the second review of slice W1;
+    /// FEEDBACK51.md, Q-667; branch feedback86-89).
+    fn own_mark(&mut self) -> String {
+        format!(" data-quillo=\"{}\"", self.island_nonce.get_or_insert_with(island_nonce).nonce())
+    }
+
     /// `rules_for_mount` for the program mounted `i`th, kept where it is the same for every path
     /// under its prefix (see `mount_rules`).
     fn mount_rules_for(&mut self, i: usize, path: &str) -> Arc<Vec<(String, Option<String>)>> {
@@ -2457,10 +2563,18 @@ impl Interp {
             // The tenant is the request's: without it set, none was found, and a tenant's own
             // topics were dropped too (FEEDBACK51.md, Q-666; branch feedback51-fixes).
             self.current_request = Some(Value::map(build_request(req, path, &Value::map(Map::new()))));
-            let tenant = self.tenant();
+            let tenant = page_tenant(self);
             self.current_request = None;
-            let topics = own_topics(topics, self.site.tenant_rule.is_some(), tenant.as_deref());
-            let (seq, changed) = self.shared.live_now(since, server.as_deref(), &topics);
+            // Only topics signed for this program's place and tenant (FEEDBACK51.md, Q-666; branch
+            // feedback86-89).
+            let (topics, unsigned) = own_topics(topics, &LivePlace { base: self.base.clone(), tenant: tenant.map(|t| t.to_string()) });
+            if none_signed(&self.shared, (&topics, &unsigned), since, server.as_deref()) {
+                return unsigned_refused();
+            }
+            let (seq, mut changed) = self.shared.live_now(since, server.as_deref(), &topics);
+            if from_elsewhere(&self.shared, since, server.as_deref()) {
+                changed.extend(unsigned);
+            }
             return json_response(200, serde_json::json!({ "seq": seq, "server": self.shared.id, "changed": changed }));
         }
         if let Some(name) = rest.strip_prefix("job/") {
@@ -2695,7 +2809,7 @@ impl Interp {
             };
             drop(parsed);
             match marked {
-                Value::List(a) => Arc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()),
+                Value::List(a) => Arc::try_unwrap(a).map_or_else(|a| a.to_vec(), crate::value::Items::into_vec),
                 _ => return bad(),
             }
         };
@@ -2840,14 +2954,18 @@ impl Interp {
         let mut resp = json_response(200, serde_json::Value::Null);
         // The server's own answer, marked (`MARKED`).
         resp.headers.push((MARKED.into(), "1".into()));
+        // The topics' signature for the page's place, which the live endpoint takes them with
+        // (FEEDBACK51.md, Q-666; branch feedback86-89): base64url, which JSON writes as it is.
+        let key = topics_key(self, &topics);
         resp.body = format!(
-            "{{\"{}\":{},\"h\":\"{}\",\"topics\":{},\"seq\":{},\"server\":{}}}",
+            "{{\"{}\":{},\"h\":\"{}\",\"topics\":{},\"seq\":{},\"server\":{},\"key\":\"{}\"}}",
             field,
             value,
             crate::livecache::hash_text(answer.h),
             serde_json::json!(topics),
             seq,
-            serde_json::json!(self.shared.id)
+            serde_json::json!(self.shared.id),
+            key.as_deref().unwrap_or("")
         )
         .into_bytes();
         // A whole answer many pages share is gzipped once.
@@ -3003,13 +3121,45 @@ fn live_query(qs: &str) -> (u64, Option<String>, Vec<String>, bool) {
 /// its page never heard of it (FEEDBACK55.md, Q-801; branch feedback55).
 /// A topic longer than any a change can be told of is dropped, as `liveKey` drops it (found in
 /// review).
+/// Each live state's topics come after its signature, `~` and 16 characters (a topic that starts
+/// with `~` has it written `%7E`), which the list holds as `\0` and the signature (`own_topics`;
+/// FEEDBACK51.md, Q-666; branch feedback86-89).
 fn topics_of(t: &str) -> Vec<String> {
-    t.split(',')
-        .filter(|s| !s.is_empty() && s.len() <= MAX_PAGE_TOPIC * 3)
-        .map(|s| if s.contains('%') { unescape_topic(s) } else { s.to_string() })
-        .filter(|s| s.len() <= MAX_PAGE_TOPIC)
-        .take(MAX_TOPICS)
-        .collect()
+    let mut items = PageItems::default();
+    for s in t.split(',') {
+        items.take(s);
+    }
+    items.list
+}
+
+/// What a page sent of its topics, an item at a time: at most `MAX_TOPICS` topics and as many
+/// signatures.
+#[derive(Default)]
+struct PageItems {
+    list: Vec<String>,
+    topics: usize,
+}
+
+impl PageItems {
+    fn take(&mut self, raw: &str) {
+        if raw.is_empty() || raw.len() > MAX_PAGE_TOPIC * 3 {
+            return;
+        }
+        if let Some(sig) = raw.strip_prefix('~').filter(|s| s.len() == TOPIC_SIG && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')) {
+            if self.list.len() - self.topics < MAX_TOPICS {
+                self.list.push(format!("\0{}", sig));
+            }
+            return;
+        }
+        if self.topics >= MAX_TOPICS {
+            return;
+        }
+        let t = if raw.contains('%') { unescape_topic(raw) } else { raw.to_string() };
+        if t.len() <= MAX_PAGE_TOPIC {
+            self.list.push(t);
+            self.topics += 1;
+        }
+    }
 }
 
 fn unescape_topic(s: &str) -> String {
@@ -3018,7 +3168,9 @@ fn unescape_topic(s: &str) -> String {
     while let Some(at) = rest.find('%') {
         out.push_str(&rest[..at]);
         let code = rest.get(at + 1..at + 3).unwrap_or("");
-        let c = if code.eq_ignore_ascii_case("2c") { Some(',') } else if code == "25" { Some('%') } else { None };
+        // `%7E`: a topic's own `~` at its start, which would read as a signature's (FEEDBACK51.md,
+        // Q-666; branch feedback86-89).
+        let c = if code.eq_ignore_ascii_case("2c") { Some(',') } else if code == "25" { Some('%') } else if code.eq_ignore_ascii_case("7e") { Some('~') } else { None };
         match c {
             Some(c) => {
                 out.push(c);
@@ -3040,15 +3192,16 @@ fn unescape_topic(s: &str) -> String {
 const MAX_PAGE_TOPIC: usize = crate::shared::MAX_TOPIC + 192;
 
 /// The most of a page's topics taken after its address (`tm=1`): 256 of the longest, each `%` and
-/// `,` in them written as three bytes, as `liveKey` sends them. One page's socket was let hold 8
-/// MiB with 4 MiB, and one visitor 2 GiB with 256 sockets (found in review).
-const MAX_TOPICS_TEXT: usize = MAX_TOPICS * (MAX_PAGE_TOPIC * 3 + 1);
+/// `,` in them written as three bytes, as `liveKey` sends them, and a signature before each
+/// (FEEDBACK51.md, Q-666; branch feedback86-89). One page's socket was let hold 8 MiB with 4 MiB,
+/// and one visitor 2 GiB with 256 sockets (found in review).
+const MAX_TOPICS_TEXT: usize = MAX_TOPICS * (MAX_PAGE_TOPIC * 3 + 1) + MAX_TOPICS * (TOPIC_SIG + 2);
 
 /// Topics read as they come, a part at a time, as `topics_of` reads them all: a topic too long to be
 /// told of is skipped as it comes, not kept (found in review).
 #[derive(Default)]
 struct TopicReader {
-    topics: Vec<String>,
+    items: PageItems,
     cur: Vec<u8>,
     skip: bool,
 }
@@ -3070,12 +3223,8 @@ impl TopicReader {
     }
 
     fn topic(&mut self) {
-        if !self.skip && !self.cur.is_empty() && self.topics.len() < MAX_TOPICS {
-            let t = String::from_utf8_lossy(&self.cur);
-            let t = if t.contains('%') { unescape_topic(&t) } else { t.into_owned() };
-            if t.len() <= MAX_PAGE_TOPIC {
-                self.topics.push(t);
-            }
+        if !self.skip && !self.cur.is_empty() {
+            self.items.take(&String::from_utf8_lossy(&self.cur));
         }
         self.cur.clear();
         self.skip = false;
@@ -3083,7 +3232,7 @@ impl TopicReader {
 
     fn end(mut self) -> Vec<String> {
         self.topic();
-        self.topics
+        self.items.list
     }
 }
 
@@ -3178,33 +3327,424 @@ fn later_topics(body: &[u8]) -> Result<Vec<String>, HttpResponse> {
 /// Most topics one page can wait on; each change looks through them all.
 const MAX_TOPICS: usize = 256;
 
-/// The topics a page may follow: not another tenant's, `acme@dm:alice:bob` from tenant `evil`,
-/// which told it when Bob wrote Alice (FEEDBACK51.md, Q-666; branch feedback51-fixes). A
-/// topic is a tenant's when it starts with a tenant's name and `@` (after a mount's `base|`).
-fn own_topics(topics: Vec<String>, tenants: bool, tenant: Option<&str>) -> Vec<String> {
-    if !tenants {
-        return topics;
-    }
-    let owner = |t: &str| {
-        // A mounted program's topics start `/prefix|`; only that is taken off, as a tenant's
-        // own topic may hold a `|` (`acme@inbox:x|evil@y` was evil's; found in review).
-        let t = if t.starts_with('/') { t.split_once('|').map_or(t, |(_, rest)| rest) } else { t };
-        t.split_once('@').map(|(who, _)| who.to_string()).filter(|who| crate::site::tenant_name_ok(who))
-    };
-    topics.into_iter().filter(|t| owner(t).is_none_or(|who| Some(who.as_str()) == tenant)).collect()
+/// The key a page's live topics are signed with and its islands' nonces made with (FEEDBACK51.md,
+/// Q-666 and Q-667; branch feedback86-89): from the program's own secret (`QUILLO_SECRET`), so
+/// servers that share it follow each other's pages and a page from before a restart or a deploy is
+/// followed still; without one, a key made at start, as sessions' is (a page from before a restart
+/// is told all its topics changed, and loads them again signed anew: see `own_topics`). `--watch`
+/// keeps a secret in `.quillo`, so its restarts keep the key.
+fn page_key() -> &'static ring::hmac::Key {
+    static K: std::sync::OnceLock<ring::hmac::Key> = std::sync::OnceLock::new();
+    K.get_or_init(|| {
+        let base = std::env::var("QUILLO_SECRET").ok().filter(|s| !s.is_empty()).map_or_else(|| crate::crypto::secret_bytes(32), String::into_bytes);
+        let k = ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &base), b"quillo page key 1");
+        ring::hmac::Key::new(ring::hmac::HMAC_SHA256, k.as_ref())
+    })
 }
 
-/// The tenant a live request comes from, and whether the program has tenants: worked out by the
-/// program, as for any request.
-fn live_tenant(app: &App, req: &HttpRequest, path: &str) -> (bool, Option<String>) {
-    let current = app.current().1;
-    let Loaded::Ready(it) = &*current else { return (false, None) };
+/// A live state's signature as a page carries it: 12 bytes of the HMAC (96 bits, checked only
+/// online), in base64url.
+const TOPIC_SIG: usize = 16;
+
+/// The part of a topic after its mount's `base|`, which says whether it is a tenant's.
+fn bare_topic<'t>(base: &str, topic: &'t str) -> &'t str {
+    if base.is_empty() {
+        return topic;
+    }
+    topic.strip_prefix(base).and_then(|r| r.strip_prefix('|')).unwrap_or(topic)
+}
+
+thread_local! {
+    /// The sets this thread signed for pages, by what was signed (`set_sig`), and its text, written
+    /// again for each.
+    static SIGNED: std::cell::RefCell<(String, std::collections::HashMap<Box<str>, Arc<str>>)> = Default::default();
+}
+
+/// A live state's topics signed for the pages of the program mounted at `base`, for `tenant`: one
+/// signature over the set (sorted, each once), the place and the tenant, not the session, so a page
+/// kept by a cache or a worker is followed as it was (FEEDBACK51.md, Q-666, the user's decisions of
+/// 2026-11-26 and 2026-11-27; branch feedback86-89). A set of global variables' topics (`var:`),
+/// which every tenant shares, is signed for none. Kept by each thread (`SIGNED`, up to 4,096 sets of
+/// up to 4 KiB, then begun again): a page's sets are signed and checked again and again, and an
+/// HMAC is some 4,700 instructions. Only a set the server signs for a page is kept (`keep`); one a
+/// request brings is looked up and, not found, worked out and let go, so anyone's requests cannot
+/// fill a thread's room nor push the pages' sets out (the review of slice W1).
+fn set_sig(base: &str, tenant: Option<&str>, topics: &[&str], keep: bool) -> Arc<str> {
+    let tenant = if topics.iter().all(|t| bare_topic(base, t).starts_with("var:")) { None } else { tenant };
+    SIGNED.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        let (said, sigs) = &mut *kept;
+        said.clear();
+        said.push_str(base);
+        said.push('\0');
+        said.push_str(tenant.unwrap_or(""));
+        said.push('\0');
+        // Each topic after its length: no two sets read the same.
+        for t in topics {
+            let (mut digits, mut n, mut at) = ([0u8; 20], t.len(), 20);
+            loop {
+                at -= 1;
+                digits[at] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            // SAFETY: ASCII digits.
+            said.push_str(unsafe { std::str::from_utf8_unchecked(&digits[at..]) });
+            said.push(':');
+            said.push_str(t);
+        }
+        if let Some(sig) = sigs.get(said.as_str()) {
+            return sig.clone();
+        }
+        let sig: Arc<str> = crate::crypto::b64url(&ring::hmac::sign(page_key(), said.as_bytes()).as_ref()[..12]).into();
+        if keep && said.len() <= 4096 {
+            if sigs.len() >= 4096 {
+                sigs.clear();
+            }
+            sigs.insert(said.as_str().into(), sig.clone());
+        }
+        sig
+    })
+}
+
+/// A live state's topics as a page of this process sends them: `~` and their signature, as the
+/// item before them (`liveKey`): for a program run in the same process (its tests, an embedding),
+/// whose key, without `QUILLO_SECRET`, no one else knows (FEEDBACK51.md, Q-666; branch
+/// feedback86-89).
+pub fn signed_topics(base: &str, tenant: Option<&str>, topics: &[&str]) -> String {
+    let mut set = topics.to_vec();
+    set.sort_unstable();
+    set.dedup();
+    format!("~{}", set_sig(base, tenant, &set, false))
+}
+
+/// `topic`, alone in its live state, as a page of this process sends it: `~` and the state's
+/// signature, then the topic as `liveKey` writes it (FEEDBACK51.md, Q-666; branch feedback86-89).
+pub fn signed_topic(base: &str, tenant: Option<&str>, topic: &str) -> String {
+    let mut t = topic.replace('%', "%25").replace(',', "%2C");
+    if t.starts_with('~') {
+        t.replace_range(..1, "%7E");
+    }
+    format!("{},{}", signed_topics(base, tenant, &[topic]), t)
+}
+
+/// The signature of the topics a live run read (sorted, each once), for the page it goes to: one
+/// HMAC a state, made once an answer (FEEDBACK51.md, Q-666; branch feedback86-89). The tenant is
+/// asked for only where a topic is a tenant's, as `scope_topic` asks for it. Over the topics the
+/// endpoint takes, as the page sends them (`liveKey`): none longer than it can be told of, and the
+/// first 256, so a state that read more is followed for those, as in 0.8.11, where it was followed
+/// for none (the review of slice W1).
+pub(crate) fn topics_key(it: &mut Interp, topics: &[String]) -> Option<Arc<str>> {
+    let mut inline = [""; 8];
+    let mut n = 0usize;
+    let mut spilled: Option<Vec<&str>> = None;
+    for t in topics.iter().map(String::as_str).filter(|t| t.len() <= MAX_PAGE_TOPIC).take(MAX_TOPICS) {
+        if let Some(v) = &mut spilled {
+            v.push(t);
+        } else if n < inline.len() {
+            inline[n] = t;
+            n += 1;
+        } else {
+            let mut v = Vec::with_capacity(topics.len().min(MAX_TOPICS));
+            v.extend_from_slice(&inline);
+            v.push(t);
+            spilled = Some(v);
+        }
+    }
+    let set: &[&str] = match &spilled {
+        Some(v) => v.as_slice(),
+        None => &inline[..n],
+    };
+    if set.is_empty() {
+        return None;
+    }
+    let tenanted = set.iter().any(|t| !bare_topic(&it.base, t).starts_with("var:"));
+    let tenant = if tenanted { page_tenant(it) } else { None };
+    Some(set_sig(&it.base, tenant.as_deref(), set, true))
+}
+
+/// The tenant a page's live topics are signed for and checked by, one rule for both: the one the
+/// program's own rule finds from the request, none without a rule, never one `with_tenant` named,
+/// which the live endpoint cannot know (`with_tenant("acme", ...)` around a page signed for acme and
+/// checked for none, and its own topics were refused; the second review of slice W1; FEEDBACK51.md,
+/// Q-666; branch feedback86-89).
+pub(crate) fn page_tenant(it: &mut Interp) -> Option<Arc<str>> {
     if it.site.tenant_rule.is_none() {
-        return (false, None);
+        return None;
+    }
+    if !it.tenant_named {
+        return it.tenant();
+    }
+    let (kept, named) = (it.tenant.take(), std::mem::replace(&mut it.tenant_named, false));
+    let t = it.tenant();
+    it.tenant = kept;
+    it.tenant_named = named;
+    t
+}
+
+/// A nonce for an answer's islands, as the attribute that carries it, ` data-qn="…"`: 9 bytes of the
+/// system's randomness in base64url, none to be told ahead, taken from 4,095 asked for at a time by
+/// each thread (FEEDBACK51.md, Q-667; branch feedback86-89). Made into the attribute once, it is
+/// written whole on each island; an HMAC of a count under the page key was 4,700 instructions an
+/// answer, a page of islands +9%.
+#[derive(Clone, Copy)]
+pub struct IslandNonce([u8; 23]);
+
+/// The header an answer's nonce comes in, for the runtime's own requests (see `own_mark`).
+pub(crate) const NONCE_HEADER: &str = "x-quillo-nonce";
+
+/// Whether a request is one of the runtime's own for a page, which reads its nonce from the answer's
+/// `x-quillo-nonce`: a move in place (`x-quillo-move`), a page asked for ahead (`x-quillo-prefetch`),
+/// --watch's page asked for again (`x-quillo-hot`).
+fn asks_nonce(req: &HttpRequest) -> bool {
+    req.headers.iter().any(|(k, _)| {
+        k.len() > 9 && k.as_bytes()[..9].eq_ignore_ascii_case(b"x-quillo-") && ["move", "prefetch", "hot"].iter().any(|w| k[9..].eq_ignore_ascii_case(w))
+    })
+}
+
+/// Where the program loads the whole bundle itself, what says the answer's nonce: a script the same
+/// in every answer, which reads it from its own tag through `Document.prototype` (runtime.js's
+/// `HANDOFF_QN`; the review of slice W1, FEEDBACK51.md, Q-667; branch feedback86-89).
+const HANDOFF_QN: &str = concat!("(window[Symbol.for(\"quillo\")]||(window[Symbol.for(\"quillo\")]={}))", ".qn=(s=>s instanceof HTMLScriptElement?s.dataset.qn:\"\")(Object.getOwnPropertyDescriptor(Document.prototype,\"currentScript\").get.call(document))");
+
+impl IslandNonce {
+    /// The nonce alone.
+    pub fn nonce(&self) -> &str {
+        &self.attr()[10..22]
+    }
+
+    /// ` data-qn="…"`.
+    pub fn attr(&self) -> &str {
+        // SAFETY: ASCII, as `island_nonce` makes it.
+        unsafe { std::str::from_utf8_unchecked(&self.0) }
+    }
+}
+
+/// The nonce of an island rendered while the program loads (`let nav = <Card/>`), before any
+/// answer: made at start, written by no answer as it is, but as the answer's own where the answer
+/// shows such markup (`LoadKept`, `push_kept`). Shown as it is only in what no page takes up (JSON,
+/// `str(nav)`) (the third and fourth reviews of slice W1; FEEDBACK51.md, Q-667; branch
+/// feedback86-89).
+static LOAD_NONCE: std::sync::OnceLock<IslandNonce> = std::sync::OnceLock::new();
+
+pub(crate) fn load_nonce() -> IslandNonce {
+    *LOAD_NONCE.get_or_init(island_nonce)
+}
+
+/// The markup the program made while it loaded with such an island in it, found from its globals
+/// through lists, maps, answers and functions' scopes however deep, each value once: only these
+/// have the load nonce written as the answer's, never markup an answer made of anything else
+/// (`raw()` of a visitor's copy of one), so the nonce is never the visitor's to give. The
+/// interpreter's own (`Interp::load_kept`), made again at each load, where a static kept every
+/// version's and a thread's nonce was another request's once a request waited (the fourth review of
+/// slice W1; FEEDBACK51.md, Q-667; branch feedback86-89).
+pub(crate) struct LoadKept {
+    /// Where each is, in order, looked up before any text is.
+    at: Vec<usize>,
+    /// Held, so that none of `at` is let go and made again as something else.
+    _held: Vec<Arc<str>>,
+    /// The components rendered at load, for the page's bundle where a page shows one of these and
+    /// renders no component itself.
+    pub(crate) names: Vec<String>,
+}
+
+impl LoadKept {
+    /// What the program loaded into `globals` holds (see above), `None` if nothing.
+    pub(crate) fn of(globals: &crate::value::Env, names: &[String]) -> Option<Arc<LoadKept>> {
+        let attr = LOAD_NONCE.get()?.attr();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut held: Vec<Arc<str>> = Vec::new();
+        let mut envs: Vec<crate::value::Env> = vec![globals.clone()];
+        seen.insert(Arc::as_ptr(globals) as *const u8 as usize);
+        let mut vals: Vec<Value> = Vec::new();
+        loop {
+            if let Some(v) = vals.pop() {
+                match &v {
+                    Value::Html(h) => {
+                        if seen.insert(Arc::as_ptr(h) as *const u8 as usize) && h.contains(attr) {
+                            held.push(h.clone());
+                        }
+                    }
+                    Value::List(l) => {
+                        if seen.insert(Arc::as_ptr(l) as *const u8 as usize) {
+                            vals.extend(l.iter().cloned());
+                        }
+                    }
+                    Value::Map(m) => {
+                        if seen.insert(Arc::as_ptr(m) as *const u8 as usize) {
+                            vals.extend(m.values().cloned());
+                        }
+                    }
+                    Value::Func(c) => {
+                        if seen.insert(Arc::as_ptr(&c.env) as *const u8 as usize) {
+                            envs.push(c.env.clone());
+                        }
+                    }
+                    Value::Response(r) => {
+                        if let (true, crate::value::Body::Value(b)) = (seen.insert(Arc::as_ptr(r) as *const u8 as usize), &r.body) {
+                            vals.push(b.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            } else if let Some(e) = envs.pop() {
+                vals.extend(crate::value::scope_vars(&e).into_iter().map(|(_, v)| v));
+                if let Some(p) = crate::value::scope_parent(&e) {
+                    if seen.insert(Arc::as_ptr(p) as *const u8 as usize) {
+                        envs.push(p.clone());
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        if held.is_empty() {
+            return None;
+        }
+        let mut at: Vec<usize> = held.iter().map(|h| Arc::as_ptr(h) as *const u8 as usize).collect();
+        at.sort_unstable();
+        Some(Arc::new(LoadKept { at, _held: held, names: names.to_vec() }))
+    }
+
+    /// Whether `h` is one of them: the same value, not a copy of its text.
+    #[inline]
+    pub(crate) fn holds(&self, h: &Arc<str>) -> bool {
+        self.at.binary_search(&(Arc::as_ptr(h) as *const u8 as usize)).is_ok()
+    }
+}
+
+/// Markup the program made while it loaded (`LoadKept`), written with the load nonce as `now`, the
+/// answer's.
+pub(crate) fn push_kept(h: &str, now: IslandNonce, out: &mut crate::value::Held) {
+    let Some(load) = LOAD_NONCE.get() else { return out.push_str(h) };
+    let mut rest: &str = h;
+    while let Some(at) = rest.find(load.attr()) {
+        out.push_str(&rest[..at]);
+        out.push_str(now.attr());
+        rest = &rest[at + load.attr().len()..];
+    }
+    out.push_str(rest)
+}
+
+pub(crate) fn island_nonce() -> IslandNonce {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    thread_local! {
+        static LEFT: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut attr = *b" data-qn=\"____________\"";
+    LEFT.with(|left| {
+        let mut left = left.borrow_mut();
+        if left.len() < 9 {
+            *left = crate::crypto::secret_bytes(4095);
+        }
+        let at = left.len() - 9;
+        for (i, c) in left[at..].chunks(3).enumerate() {
+            let n = (c[0] as u32) << 16 | (c[1] as u32) << 8 | c[2] as u32;
+            for j in 0..4 {
+                attr[10 + i * 4 + j] = A[(n >> (18 - 6 * j) & 63) as usize];
+            }
+        }
+        left.truncate(at);
+    });
+    IslandNonce(attr)
+}
+
+/// Where a live request's page is: the base of the program it was mounted at and its tenant, by
+/// that program's own rule (FEEDBACK51.md, Q-666; branch feedback86-89).
+pub(crate) struct LivePlace {
+    base: String,
+    tenant: Option<String>,
+}
+
+/// The topics a page may follow: each live state's, after the signature the server gave them for
+/// its place (`set_sig`), where it is theirs; another tenant's (`acme@dm:alice:bob` from tenant `evil`, which told it
+/// when Bob wrote Alice), one made up, or one of its own tenant the server never gave this page is
+/// not followed (FEEDBACK51.md, Q-666; branch feedback86-89; 0.8.11 only dropped another tenant's).
+/// Those not signed so come second: a page from another server or from before a restart (`since`
+/// from a server other than this one) is told they changed, as it is told of all its topics then,
+/// and loads them again, signed anew; told at once, whatever changed, so it says nothing.
+fn own_topics(items: Vec<String>, place: &LivePlace) -> (Vec<String>, Vec<String>) {
+    let mut good = Vec::with_capacity(items.len());
+    let mut bad = Vec::new();
+    let mut sig: Option<String> = None;
+    let mut group: Vec<String> = Vec::new();
+    // A state's topics, followed where its signature is theirs, for this place.
+    let mut end = |sig: Option<String>, group: &mut Vec<String>| {
+        if group.is_empty() {
+            return;
+        }
+        let mut set: Vec<&str> = group.iter().map(String::as_str).collect();
+        // As the server gives them, sorted and each once.
+        if !set.windows(2).all(|w| w[0] < w[1]) {
+            set.sort_unstable();
+            set.dedup();
+        }
+        let ok = sig.is_some_and(|s| crate::crypto::same(set_sig(&place.base, place.tenant.as_deref(), &set, false).as_bytes(), s.as_bytes()));
+        if ok { good.append(group) } else { bad.append(group) }
+    };
+    for item in items {
+        if let Some(s) = item.strip_prefix('\0') {
+            end(sig.take(), &mut group);
+            sig = Some(s.to_string());
+        } else {
+            group.push(item);
+        }
+    }
+    end(sig, &mut group);
+    (good, bad)
+}
+
+/// Whether a live request's `since` came from another server, or from before a restart: then all
+/// its topics count as changed (`Shared::live_now`).
+fn from_elsewhere(shared: &Shared, since: u64, server: Option<&str>) -> bool {
+    since > 0 && server.is_some_and(|s| s != shared.id)
+}
+
+/// Whether a live request is refused: it names topics, none signed for its page, from a page of
+/// this server's that has seen a change (`since`). A page open across the upgrade to 0.8.12 sends
+/// its topics bare: refused (403), its runtime says in the console that live updates are not
+/// reaching the page, where it would have waited for good, told nothing (FEEDBACK51.md, Q-666, the
+/// coordinator's decision of 2026-11-27; branch feedback86-89). A page from elsewhere is told they
+/// changed instead (`own_topics`); `since=0` asks only for the sequence number.
+fn none_signed(shared: &Shared, (good, unsigned): (&[String], &[String]), since: u64, server: Option<&str>) -> bool {
+    good.is_empty() && !unsigned.is_empty() && since > 0 && !from_elsewhere(shared, since, server)
+}
+
+/// The refusal `none_signed` gives.
+fn unsigned_refused() -> HttpResponse {
+    plain(403, "these live topics are not signed for this page: load the page again\n")
+}
+
+/// The place a live request comes from (`LivePlace`): the program mounted where its path is, and
+/// the tenant that program's rule finds, as for any request.
+fn live_tenant(app: &App, req: &HttpRequest, path: &str) -> LivePlace {
+    let current = app.current().1;
+    let Loaded::Ready(top) = &*current else { return LivePlace { base: String::new(), tenant: None } };
+    // The mounted program under whose prefix the path is, as `handle` finds it, and the path as it
+    // sees it.
+    let mut it: &Interp = top;
+    let mut path = path;
+    while let Some((prefix, sub)) = it.mounts.iter().find(|(p, _)| path.starts_with(p.as_str()) && path.as_bytes().get(p.len()) == Some(&b'/')) {
+        path = &path[prefix.len()..];
+        it = sub;
+    }
+    if it.site.tenant_rule.is_none() {
+        return LivePlace { base: it.base.clone(), tenant: None };
     }
     let mut it = it.fork();
+    let cut = req.url.len().min(it.base.len().saturating_sub(top.base.len()));
+    let inner;
+    let req = if cut == 0 {
+        req
+    } else {
+        inner = HttpRequest { url: req.url[cut..].to_string(), ..req.clone() };
+        &inner
+    };
     it.current_request = Some(Value::map(build_request(req, path, &Value::map(Map::new()))));
-    (true, it.tenant().map(|t| t.to_string()))
+    let tenant = page_tenant(&mut it).map(|t| t.to_string());
+    LivePlace { base: it.base.clone(), tenant }
 }
 
 /// Most pages that can wait for changes at once (live data, channels and `--watch` reloads).
@@ -3380,7 +3920,7 @@ const LIVE_GATHER: Duration = Duration::from_millis(100);
 /// on to the server's threads. Over a WebSocket, each change to the topics
 /// is sent as `{seq, server, changed}` for as long as the page stays; as a
 /// plain request, the answer is the first change, or none after a while.
-fn serve_live(shared: Arc<Shared>, req: HttpRequest, (tenants, tenant): (bool, Option<String>)) -> Answer {
+fn serve_live(shared: Arc<Shared>, req: HttpRequest, page_at: LivePlace) -> Answer {
     let qs = req.url.split_once('?').map_or("", |(_, q)| q);
     let (since, server, topics, later) = live_query(qs);
     // `tk=1`: the page asks whether its socket takes topics, and is told at once (see `live_json`).
@@ -3400,6 +3940,14 @@ fn serve_live(shared: Arc<Shared>, req: HttpRequest, (tenants, tenant): (bool, O
     // waiting page is a task on the pages' runtime, where it was a thread, 240 KB a page, most of
     // it kept after the page closed (FEEDBACK66.md, Q-954; branch q954); the handshake's answer
     // is made here, so that the task holds none of the request.
+    // Signed for the page, or not, once (FEEDBACK51.md, Q-666; branch feedback86-89); a socket's
+    // topics that come after its address are looked at as they come.
+    let split = (!(later && upgrade)).then(|| own_topics(topics, &page_at));
+    if let Some((good, unsigned)) = &split {
+        if none_signed(&shared, (good, unsigned), since, server.as_deref()) {
+            return Answer::Respond(unsigned_refused());
+        }
+    }
     let bell = crate::shared::Bell::new();
     let answer = upgrade.then(|| crate::ws::handshake(&req));
     let place = match waiting_place(&req.remote) {
@@ -3417,7 +3965,7 @@ fn serve_live(shared: Arc<Shared>, req: HttpRequest, (tenants, tenant): (bool, O
             let _place = place;
             let _page = crate::metrics::LivePage::new();
             let Ok(mut stream) = tokio::net::TcpStream::from_std(stream) else { return };
-            let own = |topics| own_topics(topics, tenants, tenant.as_deref());
+            let own = |topics| own_topics(topics, &page_at);
             let Some(answer) = answer else {
                 // A long poll: what changed within 25 s, after the answers before it on its
                 // connection, which go at once, not held for the 25 s (found by its test).
@@ -3427,9 +3975,13 @@ fn serve_live(shared: Arc<Shared>, req: HttpRequest, (tenants, tenant): (bool, O
                     }
                     before.clear();
                 }
-                let following = shared.follow(own(topics), &bell);
-                let (seq, changed) = following.wait_async(since, server.as_deref(), Duration::from_secs(25)).await;
+                let (topics, unsigned) = split.unwrap_or_default();
+                let following = shared.follow(topics, &bell);
+                let (seq, mut changed) = following.wait_async(since, server.as_deref(), Duration::from_secs(25)).await;
                 drop(following);
+                if from_elsewhere(&shared, since, server.as_deref()) {
+                    changed.extend(unsigned);
+                }
                 let mut resp = json_response(200, serde_json::from_str(&live_json(&shared, seq, &changed, false)).unwrap_or_default());
                 resp.headers.push(("cache-control".into(), "no-store".into()));
                 crate::httpd::write_response(&mut before, &resp, false, true);
@@ -3445,16 +3997,17 @@ fn serve_live(shared: Arc<Shared>, req: HttpRequest, (tenants, tenant): (bool, O
             }
             drop(before);
             let mut socket = crate::ws::LiveSocket::new(stream);
-            let topics = if later {
-                let mut read = TopicReader::default();
-                if !socket.first_text_parts(MAX_TOPICS_TEXT, Duration::from_secs(10), |part| read.take(part)).await {
-                    return;
+            let split = match split {
+                Some(s) => s,
+                None => {
+                    let mut read = TopicReader::default();
+                    if !socket.first_text_parts(MAX_TOPICS_TEXT, Duration::from_secs(10), |part| read.take(part)).await {
+                        return;
+                    }
+                    own(read.end())
                 }
-                read.end()
-            } else {
-                topics
             };
-            live_page(&shared, socket, &bell, own(topics), (since, server, tk), &own).await;
+            live_page(&shared, socket, &bell, split, (since, server, tk), &own).await;
         });
     }))
 }
@@ -3465,7 +4018,15 @@ fn serve_live(shared: Arc<Shared>, req: HttpRequest, (tenants, tenant): (bool, O
 /// page that moved opened a socket for each page and closed the last, each close answered by
 /// nothing until the next look, 5 s on (FEEDBACK61.md, Q-900; branch feedback61). Every socket is
 /// watched now, as the runtime watches it, so the page is told at once that its socket takes topics.
-async fn live_page(shared: &Arc<Shared>, mut socket: crate::ws::LiveSocket, bell: &Arc<crate::shared::Bell>, topics: Vec<String>, (mut since, mut server, tk): (u64, Option<String>, bool), own: &impl Fn(Vec<String>) -> Vec<String>) {
+async fn live_page(shared: &Arc<Shared>, mut socket: crate::ws::LiveSocket, bell: &Arc<crate::shared::Bell>, (topics, mut unsigned): (Vec<String>, Vec<String>), (mut since, mut server, tk): (u64, Option<String>, bool), own: &impl Fn(Vec<String>) -> (Vec<String>, Vec<String>)) {
+    // Topics not signed for the page are not followed; a page from elsewhere is told they changed
+    // with the rest, once (see `own_topics`); one whose topics, sent after its address or down the
+    // socket, are none of them signed is let go, and asks again by its address, refused there
+    // (`none_signed`; FEEDBACK51.md, Q-666; branch feedback86-89).
+    if none_signed(shared, (&topics, &unsigned), since, server.as_deref()) {
+        socket.refuse().await;
+        return;
+    }
     let mut following = shared.follow(topics, bell);
     // The page is yet to be told that its socket takes topics: at once if it asks (`tk=1`), in its
     // first message otherwise.
@@ -3506,7 +4067,13 @@ async fn live_page(shared: &Arc<Shared>, mut socket: crate::ws::LiveSocket, bell
                 PageSaid::Gone => return,
                 PageSaid::Nothing => {}
                 PageSaid::Topics(s, srv, topics) => {
-                    following = shared.follow(own(topics), bell);
+                    let (topics, not) = own(topics);
+                    if none_signed(shared, (&topics, &not), s, srv.as_deref()) {
+                        socket.refuse().await;
+                        return;
+                    }
+                    following = shared.follow(topics, bell);
+                    unsigned = not;
                     (since, server, asked) = (s, srv, true);
                     continue;
                 }
@@ -3531,6 +4098,9 @@ async fn live_page(shared: &Arc<Shared>, mut socket: crate::ws::LiveSocket, bell
             if !early.is_zero() {
                 tokio::time::sleep(early).await;
                 (seq, changed) = following.now(since, server.as_deref());
+            }
+            if from_elsewhere(shared, since, server.as_deref()) {
+                changed.append(&mut unsigned);
             }
             if !socket.send(&live_json(shared, seq, &changed, std::mem::take(&mut takes))).await {
                 return;
@@ -4159,11 +4729,13 @@ pub const PREFETCH_JS: &str = concat!(
     "const u=new URL(a.href,location.href);if(u.origin!==location.origin||!/^https?:$/.test(u.protocol))return null;",
     "if(u.pathname===location.pathname&&u.search===location.search)return null;u.hash=\"\";return u.href};",
     "const go=(a)=>{const u=a&&want(a);if(!u||seen.has(u))return;seen.add(u);",
-    "if(spec){const s=d.createElement(\"script\");s.type=\"speculationrules\";s.textContent=JSON.stringify({prefetch:[{source:\"list\",urls:[u]}]});d.head.appendChild(s)}",
+    // The document through `Document.prototype`, past what the page names (the second review of
+    // slice W1; FEEDBACK51.md, Q-667; branch feedback86-89).
+    "if(spec){const D=Document.prototype,s=D.createElement.call(d,\"script\");s.type=\"speculationrules\";s.textContent=JSON.stringify({prefetch:[{source:\"list\",urls:[u]}]});Object.getOwnPropertyDescriptor(D,\"head\").get.call(d).appendChild(s)}",
     "else fetch(u,{credentials:\"same-origin\",headers:{\"x-quillo-prefetch\":\"1\"}}).catch(()=>{})};",
-    "let t=0;const o={capture:true,passive:true};",
-    "d.addEventListener(\"pointerover\",(e)=>{const a=link(e);clearTimeout(t);if(a)t=setTimeout(()=>go(a),65)},o);",
-    "for(const v of[\"pointerdown\",\"touchstart\",\"focusin\"])d.addEventListener(v,(e)=>go(link(e)),o)})()"
+    "let t=0;const o={capture:true,passive:true},on=(...a)=>EventTarget.prototype.addEventListener.apply(d,a);",
+    "on(\"pointerover\",(e)=>{const a=link(e);clearTimeout(t);if(a)t=setTimeout(()=>go(a),65)},o);",
+    "for(const v of[\"pointerdown\",\"touchstart\",\"focusin\"])on(v,(e)=>go(link(e)),o)})()"
 );
 
 /// `PREFETCH_JS` that fetches the links and writes no speculation rules: for a page whose policy
@@ -5066,14 +5638,16 @@ fn page_print(body: &str) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let mut rest = body;
     loop {
-        let next = [rest.find("/_quillo/b/"), rest.find(" data-v=\""), rest.find("<quillo-island")];
+        // And the answer's islands' nonce, `data-qn="…"` and the loader's `w.qn="…"`, new with each
+        // answer (FEEDBACK51.md, Q-667; branch feedback86-89).
+        let next = [rest.find("/_quillo/b/"), rest.find(" data-v=\""), rest.find("<quillo-island"), rest.find("qn=\"")];
         let Some((which, at)) = next.iter().enumerate().filter_map(|(k, i)| i.map(|i| (k, i))).min_by_key(|(_, i)| *i) else { break };
         rest[..at].hash(&mut h);
         rest = &rest[at..];
         match which {
             0 => rest = rest["/_quillo/b/".len()..].trim_start_matches(|c: char| c.is_ascii_hexdigit()),
-            1 => {
-                let after = &rest[" data-v=\"".len()..];
+            1 | 3 => {
+                let after = &rest[if which == 1 { " data-v=\"".len() } else { "qn=\"".len() }..];
                 rest = after.find('"').map_or("", |e| &after[e + 1..]);
             }
             _ => {
@@ -5136,7 +5710,9 @@ fn dev_script(version: u64, print: &str) -> String {
     // console ({ what: "cached" }) (FEEDBACK67.md, Q-957; branch pwa). By equality, never by
     // order: a restart counts from 1 again, below the version a worker kept, which reloaded for
     // ever (found in review).
-    const SCRIPT: &str = r#"<script>/*quillo-dev*/(()=>{let v='@V@',h='@H@';const v0=v,HOT=@HOT@;let c=0,e=0,box=null;const K='quillo-reload:'+location.pathname+location.search;let stale='';try{const s=JSON.parse(sessionStorage.getItem(K)||'null');sessionStorage.removeItem(K);if(s&&s.from===v0&&navigator.serviceWorker.controller)stale=s.for}catch(_){}const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const plain=()=>{const w=window[Symbol.for('quillo')]||{};return !HOT||w.hot===false||document.documentElement.hasAttribute('data-reload')};const ids=t=>{const m=/\.ids = (\{.*?\});/.exec(t);return m?JSON.parse(m[1]):null};const tell=(what,why,ver)=>{try{document.dispatchEvent(new CustomEvent('quillo:hmr',{detail:JSON.stringify({what,why,version:ver})}))}catch(_){}};const again=(why,ver)=>{ver=String(ver);if(stale&&ver===stale){v=ver;const m="This page came from a service worker's cache (`navigator.serviceWorker.controller`), so `--watch` cannot refresh it: unregister the worker (DevTools > Application > Service workers), or have it go to the server first for pages";console.warn(m);said(m);return tell('cached',why,ver)}tell('reload',why,ver);if(why!=='off')try{const w=window[Symbol.for('quillo')];if(w&&w.keep)w.keep()}catch(_){}try{sessionStorage.setItem(K,JSON.stringify({from:v0,for:ver}))}catch(_){}location.reload()};let busy=null;const hot=t=>busy||(busy=(async()=>{if(plain())return again('off',t);try{const r=await fetch(location.href,{cache:'no-store',credentials:'same-origin',headers:{'x-quillo-hot':v}});const p=await r.text();const was=r.headers.get('x-quillo-was');const m=/\/\*quillo-dev\*\/\(\(\)=>\{let v='(\d+)',h='([0-9a-f]+)'/.exec(p)||[],v2=m[1],h2=m[2];if(!r.ok||!v2)return again('failed',t);if(v2===v)return again('cache',t);let morphed=false;if(was?was!==h2:h2!==h){const w0=window[Symbol.for('quillo')]||{};let ok=false;try{ok=!!(w0.morph&&w0.morph(p))}catch(x){console.error(x)}if(!ok)return again('html',v2);morphed=true}h=h2;const mine=(window[Symbol.for('quillo')]||{}).ids;if(mine){const b=(/\/_quillo\/b\/[0-9a-f]+\.js/.exec(p)||[])[0];const lt=b?await (await fetch(b,{cache:'no-store'})).text():'';const theirs=b?ids(lt):null;if(!theirs)return again('failed',v2);const changed=Object.keys(theirs).filter(k=>mine[k]!==theirs[k]);if(changed.length){const w=window[Symbol.for('quillo')]||{};if(!w.swap||changed.includes('quillo.js')||changed.includes('boot.js')||Object.keys(mine).some(k=>!(k in theirs)))return again('code',v2);const at=(/const at = "([^"]*)"/.exec(lt)||[])[1],list=JSON.parse('['+((/for \(const f of \[([^\]]*)\]/.exec(lt)||[])[1]||'')+']');const urls=changed.map(k=>list.find(f=>f.slice(f.indexOf('/')+1)===k)).filter(Boolean).map(f=>at+f);if(urls.length!==changed.length)return again('code',v2);try{await w.swap(urls);w.ids=theirs}catch(x){console.error(x);return again('code',v2)}v=v2;said(null);return tell('swapped',changed.join(', ')+(morphed?'; the page morphed':''),v2)}}v=v2;said(null);tell(morphed?'morphed':'kept','',v2)}catch(x){again('failed',t)}})().finally(()=>{busy=null}));const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)return hot(t)};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(async t=>{await seen(t);go()},()=>setTimeout(go,1000))};go();try{if(sessionStorage.getItem('quillo-keep:'+location.pathname+location.search)){const i=document.querySelector('quillo-island,[data-qi]');if(i)i.dispatchEvent(new Event('focusin',{bubbles:true}))}}catch(_){}})()</script>"#;
+    // The page made again (`morph`) is given its answer's nonce, from the header (the second review of
+    // slice W1; FEEDBACK51.md, Q-667; branch feedback86-89).
+    const SCRIPT: &str = r#"<script>/*quillo-dev*/(()=>{let v='@V@',h='@H@';const v0=v,HOT=@HOT@;let c=0,e=0,box=null;const K='quillo-reload:'+location.pathname+location.search;let stale='';try{const s=JSON.parse(sessionStorage.getItem(K)||'null');sessionStorage.removeItem(K);if(s&&s.from===v0&&navigator.serviceWorker.controller)stale=s.for}catch(_){}const css=j=>{const p=JSON.parse(j);for(const l of document.querySelectorAll('link[rel=stylesheet]')){const u=new URL(l.href,location.href);if(u.origin===location.origin&&p.includes(u.pathname)){u.searchParams.set('quillo',Date.now());const n=l.cloneNode();n.href=u.pathname+u.search;n.onload=()=>l.remove();l.after(n)}}};const said=m=>{if(m===null){if(box){box.remove();box=null}return}if(!box){box=document.createElement('quillo-error');const r=box.attachShadow({mode:'open'});r.innerHTML='<style>:host{all:initial;position:fixed;left:0;right:0;bottom:0;z-index:2147483647;font:13px/1.45 ui-monospace,Menlo,monospace}div{position:relative;margin:8px;padding:12px 44px 12px 14px;background:#fff1f0;color:#5c0000;border:2px solid #c62828;border-radius:6px;max-height:45vh;overflow:auto;box-shadow:0 4px 18px #0005}pre{margin:8px 0 0;white-space:pre-wrap;font:inherit}button{position:absolute;top:8px;right:10px;border:0;background:none;font-size:20px;line-height:1;cursor:pointer;color:inherit}</style><div role="alert"><b>This save did not load: the page shows the version before it.</b><pre></pre><button aria-label="Close">×</button></div>';r.querySelector('button').onclick=()=>{box.remove();box=null};document.documentElement.appendChild(box)}box.shadowRoot.querySelector('pre').textContent=m};const plain=()=>{const w=window[Symbol.for('quillo')]||{};return !HOT||w.hot===false||document.documentElement.hasAttribute('data-reload')};const ids=t=>{const m=/\.ids = (\{.*?\});/.exec(t);return m?JSON.parse(m[1]):null};const tell=(what,why,ver)=>{try{document.dispatchEvent(new CustomEvent('quillo:hmr',{detail:JSON.stringify({what,why,version:ver})}))}catch(_){}};const again=(why,ver)=>{ver=String(ver);if(stale&&ver===stale){v=ver;const m="This page came from a service worker's cache (`navigator.serviceWorker.controller`), so `--watch` cannot refresh it: unregister the worker (DevTools > Application > Service workers), or have it go to the server first for pages";console.warn(m);said(m);return tell('cached',why,ver)}tell('reload',why,ver);if(why!=='off')try{const w=window[Symbol.for('quillo')];if(w&&w.keep)w.keep()}catch(_){}try{sessionStorage.setItem(K,JSON.stringify({from:v0,for:ver}))}catch(_){}location.reload()};let busy=null;const hot=t=>busy||(busy=(async()=>{if(plain())return again('off',t);try{const r=await fetch(location.href,{cache:'no-store',credentials:'same-origin',headers:{'x-quillo-hot':v}});const p=await r.text();const was=r.headers.get('x-quillo-was');const m=/\/\*quillo-dev\*\/\(\(\)=>\{let v='(\d+)',h='([0-9a-f]+)'/.exec(p)||[],v2=m[1],h2=m[2];if(!r.ok||!v2)return again('failed',t);if(v2===v)return again('cache',t);let morphed=false;if(was?was!==h2:h2!==h){const w0=window[Symbol.for('quillo')]||{};let ok=false;try{ok=!!(w0.morph&&w0.morph(p,r.headers.get('x-quillo-nonce')))}catch(x){console.error(x)}if(!ok)return again('html',v2);morphed=true}h=h2;const mine=(window[Symbol.for('quillo')]||{}).ids;if(mine){const b=(/\/_quillo\/b\/[0-9a-f]+\.js/.exec(p)||[])[0];const lt=b?await (await fetch(b,{cache:'no-store'})).text():'';const theirs=b?ids(lt):null;if(!theirs)return again('failed',v2);const changed=Object.keys(theirs).filter(k=>mine[k]!==theirs[k]);if(changed.length){const w=window[Symbol.for('quillo')]||{};if(!w.swap||changed.includes('quillo.js')||changed.includes('boot.js')||Object.keys(mine).some(k=>!(k in theirs)))return again('code',v2);const at=(/const at = "([^"]*)"/.exec(lt)||[])[1],list=JSON.parse('['+((/for \(const f of \[([^\]]*)\]/.exec(lt)||[])[1]||'')+']');const urls=changed.map(k=>list.find(f=>f.slice(f.indexOf('/')+1)===k)).filter(Boolean).map(f=>at+f);if(urls.length!==changed.length)return again('code',v2);try{await w.swap(urls);w.ids=theirs}catch(x){console.error(x);return again('code',v2)}v=v2;said(null);return tell('swapped',changed.join(', ')+(morphed?'; the page morphed':''),v2)}}v=v2;said(null);tell(morphed?'morphed':'kept','',v2)}catch(x){again('failed',t)}})().finally(()=>{busy=null}));const seen=t=>{if(t.startsWith('css:')){const i=t.indexOf(':',4);c=+t.slice(4,i)||c;css(t.slice(i+1))}else if(t.startsWith('err:')){const i=t.indexOf(':',4);e=+t.slice(4,i)||e;said(JSON.parse(t.slice(i+1)))}else if(t!==v)return hot(t)};const u=()=>'/_quillo/events?v='+v+'&c='+c+'&e='+e,go=()=>{let o=0;const s=new WebSocket(location.origin.replace(/^http/,'ws')+u());s.onopen=()=>o=1;s.onmessage=e=>seen(e.data);s.onclose=()=>o?setTimeout(go,1000):fetch(u(),{cache:'no-store'}).then(r=>r.text()).then(async t=>{await seen(t);go()},()=>setTimeout(go,1000))};go();try{if(sessionStorage.getItem('quillo-keep:'+location.pathname+location.search)){const i=document.querySelector('quillo-island,[data-qi]');if(i)i.dispatchEvent(new Event('focusin',{bubbles:true}))}}catch(_){}})()</script>"#;
     let hot = !PLAIN_RELOAD.load(std::sync::atomic::Ordering::Relaxed);
     SCRIPT.replace("@V@", &version.to_string()).replace("@H@", print).replace("@HOT@", if hot { "1" } else { "0" })
 }
@@ -5332,14 +5908,22 @@ fn script_texts(tags: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(tags);
     let mut out = Vec::new();
     let mut rest = &*text;
-    // `<script data-quillo>` too, as a page that moves in place marks them (third review of slice H).
+    // `<script data-quillo>` too, as a page that moves in place marks them (third review of slice H),
+    // and the loader's `data-qn="…"`, the answer's nonce (FEEDBACK51.md, Q-667; branch feedback86-89).
     while let Some(i) = rest.find("<script") {
-        let open = ["<script>", "<script data-quillo>"].into_iter().find(|o| rest[i..].starts_with(o));
-        let Some(open) = open else {
+        let mut tag = &rest[i + 7..];
+        tag = tag.strip_prefix(" data-quillo").unwrap_or(tag);
+        // With the answer's nonce (`own_mark`).
+        if let Some(n) = tag.strip_prefix("=\"") {
+            tag = n.find('"').map_or("", |e| &n[e + 1..]);
+        }
+        if let Some(n) = tag.strip_prefix(" data-qn=\"") {
+            tag = n.find('"').map_or("", |e| &n[e + 1..]);
+        }
+        let Some(after) = tag.strip_prefix('>') else {
             rest = &rest[i + 7..];
             continue;
         };
-        let after = &rest[i + open.len()..];
         let Some(end) = after.find("</script>") else { break };
         out.push(after[..end].to_string());
         rest = &after[end + 9..];
@@ -6145,6 +6729,9 @@ fn not_modified(req: &HttpRequest, resp: &mut HttpResponse) {
     if crate::statics::matches(&asked.1, etag) && resp.header(crate::statics::SEND_HEADER).is_none() {
         resp.status = 304;
         resp.body.clear();
+        // The page kept is another answer's, with its own nonce: the browser keeps that one's
+        // header too (the second review of slice W1; FEEDBACK51.md, Q-667; branch feedback86-89).
+        resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(NONCE_HEADER));
     }
 }
 
@@ -6921,7 +7508,7 @@ fn ready_response(it: &mut Interp, req: &HttpRequest) -> HttpResponse {
     r
 }
 
-fn island_loader(srcs: &[String], sri: &[Option<String>], scroll: bool, in_place: Option<&str>) -> String {
+fn island_loader(srcs: &[String], sri: &[Option<String>], scroll: bool, in_place: Option<&str>, nonce: bool) -> String {
     // A script confirmed with its integrity hash is loaded with it, as `[address, hash]`
     // (FEEDBACK83.md, Q-1304; branch feedback82-85); with none, the list and the loader are as
     // they were.
@@ -6942,7 +7529,7 @@ fn island_loader(srcs: &[String], sri: &[Option<String>], scroll: bool, in_place
     // feedback72-81).
     let scroll = if scroll {
         concat!(
-            "w.sc=1;d.addEventListener(\"scroll\",(e)=>{const el=e.target;if(w.booted||!el.closest||!el.closest(\"quillo-island[data-sc],[data-qi][data-sc]\"))return;",
+            "w.sc=1;on(\"scroll\",(e)=>{const el=e.target;if(w.booted||!el.closest||!el.closest(\"quillo-island[data-sc],[data-qi][data-sc]\"))return;",
             "if(!q.some((r)=>r.t===\"scroll\"&&r.el===el))q.push({t:\"scroll\",el});load()},{capture:true,passive:true});",
             "const r0=w.redo;w.redo=(r)=>{if(r.t!==\"scroll\")return r0(r);if(r.el.isConnected)r.el.dispatchEvent(new Event(\"scroll\"))};"
         )
@@ -6952,8 +7539,13 @@ fn island_loader(srcs: &[String], sri: &[Option<String>], scroll: bool, in_place
     format!(
         concat!(
             "(()=>{{const d=document,W=window,k=Symbol.for(\"quillo\"),w=W[k]||(W[k]={{}}),q=w.q=[];let go=0;",
+            // The document's own, read through `Document.prototype`: an element of the page's named for
+            // one (`<img name="currentScript">`) is what `document` gives by that name, and gave the
+            // loader a visitor's nonce, or stopped it (FEEDBACK51.md, Q-667, the review of slice W1;
+            // branch feedback86-89).
+            "const D=Document.prototype,g=n=>Object.getOwnPropertyDescriptor(D,n).get.call(d),on=(...a)=>EventTarget.prototype.addEventListener.apply(d,a){}",
             // In order: the runtime file first, when there is one.
-            "const load=()=>{{if(go)return;go=1;for(const s of {}){{const t=d.createElement(\"script\");{}t.async=false;t.onerror=fail;d.head.appendChild(t)}}}};",
+            "const load=()=>{{if(go)return;go=1;for(const s of {}){{const t=D.createElement.call(d,\"script\");{}t.async=false;t.onerror=fail;g(\"head\").appendChild(t)}}}};",
             "const isl=(e)=>e.target&&e.target.closest&&e.target.closest(\"quillo-island,[data-qi]\");",
             // What a mouse or pointer event said, to make it again: where, with
             // which buttons and keys, how many clicks (branch early-events).
@@ -6968,14 +7560,19 @@ fn island_loader(srcs: &[String], sri: &[Option<String>], scroll: bool, in_place
             "try{{el.dispatchEvent(new(r.p?PointerEvent:MouseEvent)(r.t,Object.assign({{bubbles:true,cancelable:true,composed:true,view:W}},r.i)))}}finally{{P.setPointerCapture=sc}}}};",
             // No bundle: the clicks and forms kept are done as the page alone does them.
             "const fail=()=>{{w.booted=1;for(const r of q.splice(0))if(r.t===\"click\"||r.t===\"submit\")redo(r)}};",
-            "for(const v of[\"pointerover\",\"pointerdown\",\"touchstart\",\"focusin\",\"keydown\"])d.addEventListener(v,(e)=>{{if(isl(e)){{w.at=e.target;load()}}}},{{capture:true,passive:true}});",
+            "for(const v of[\"pointerover\",\"pointerdown\",\"touchstart\",\"focusin\",\"keydown\"])on(v,(e)=>{{if(isl(e)){{w.at=e.target;load()}}}},{{capture:true,passive:true}});",
             // Kept until the bundle runs, in order: what the page alone would do
             // for a click or a form waits too; a press, a double click or a menu
             // goes on as the browser does it.
-            "for(const v of[\"pointerdown\",\"mousedown\",\"pointerup\",\"mouseup\",\"click\",\"auxclick\",\"dblclick\",\"contextmenu\",\"submit\"])d.addEventListener(v,(e)=>{{if(w.booted||!isl(e))return;const i={{}};for(const k of K)if(k in e)i[k]=e[k];q.push({{t:v,el:e.target,i,p:typeof PointerEvent!==\"undefined\"&&e instanceof PointerEvent}});if(v===\"click\"||v===\"submit\"){{e.preventDefault();e.stopPropagation()}}load()}},true);",
-            "const idle=()=>{{if({}d.querySelector(\"quillo-island[data-e],quillo-island[data-l],[data-qi][data-e],[data-qi][data-l],body>quillo-island\"))(window.requestIdleCallback||setTimeout)(load)}};",
-            "{}d.readyState===\"loading\"?d.addEventListener(\"DOMContentLoaded\",idle):idle()}})()"
+            "for(const v of[\"pointerdown\",\"mousedown\",\"pointerup\",\"mouseup\",\"click\",\"auxclick\",\"dblclick\",\"contextmenu\",\"submit\"])on(v,(e)=>{{if(w.booted||!isl(e))return;const i={{}};for(const k of K)if(k in e)i[k]=e[k];q.push({{t:v,el:e.target,i,p:typeof PointerEvent===\"function\"&&e instanceof PointerEvent}});if(v===\"click\"||v===\"submit\"){{e.preventDefault();e.stopPropagation()}}load()}},true);",
+            // Where the browser has no `requestIdleCallback`, an element named so is not it (the second
+            // review of slice W1).
+            "const idle=()=>{{if({}D.querySelector.call(d,\"quillo-island[data-e],quillo-island[data-l],[data-qi][data-e],[data-qi][data-l],body>quillo-island\"))(typeof requestIdleCallback===\"function\"?requestIdleCallback:setTimeout)(load)}};",
+            "{}g(\"readyState\")===\"loading\"?on(\"DOMContentLoaded\",idle):idle()}})()"
         ),
+        // The answer's nonce, which its islands carry: the runtime takes up only those
+        // (FEEDBACK51.md, Q-667; branch feedback86-89).
+        if nonce { ",cs=g(\"currentScript\");w.qn=cs instanceof HTMLScriptElement?cs.dataset.qn:\"\";" } else { ";" },
         src,
         set,
         // Moves in place: the bundle on every page, for its links, which it asks for ahead where
@@ -6997,6 +7594,30 @@ fn island_loader(srcs: &[String], sri: &[Option<String>], scroll: bool, in_place
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The review of slice W1: sets that requests bring, signed or not, are not kept, where 4,096 of
+    // 4 KiB each a thread were, which pushed out the pages' own; a set signed for a page is kept,
+    // and found again when a page brings it (FEEDBACK51.md, Q-666; branch feedback86-89).
+    #[test]
+    fn only_the_sets_signed_for_pages_are_kept() {
+        let kept = || SIGNED.with(|k| k.borrow().1.len());
+        let place = LivePlace { base: String::new(), tenant: None };
+        let before = kept();
+        for i in 0..100 {
+            let (good, bad) = own_topics(vec![format!("\0{}", "A".repeat(TOPIC_SIG)), format!("t{}", i), format!("u{}", i)], &place);
+            assert!(good.is_empty() && bad.len() == 2);
+        }
+        assert_eq!(kept(), before, "sets a request brought were kept");
+        let sig = set_sig("", None, &["p:1", "p:2"], true);
+        assert_eq!(kept(), before + 1);
+        let (good, bad) = own_topics(vec![format!("\0{}", sig), "p:1".into(), "p:2".into()], &place);
+        assert_eq!((good.len(), bad.len(), kept()), (2, 0, before + 1));
+        // One longer than is kept, signed for a page: not kept, and still checked.
+        let long = "x".repeat(5000);
+        let sig = set_sig("", None, &[&long], true);
+        assert_eq!(kept(), before + 1);
+        assert_eq!(own_topics(vec![format!("\0{}", sig), long.clone()], &place).0, vec![long]);
+    }
 
     // A `Set-Cookie` that ends its cookie, for a page's key (third review of slice H).
     #[test]

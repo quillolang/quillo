@@ -283,7 +283,7 @@ pub fn run_script_for(it: &mut Interp, src: &str, vars: Option<&Map>, ms: u64) -
     // into the log with each request (FEEDBACK75.md, Q-1076, found in review; branch feedback75).
     // Quillo's own messages, not an error value the script made itself.
     Ok(match &out {
-        Value::Err(e, own, _) if matches!(&**e, Value::Str(_) | Value::Css(_)) && (!names.is_empty() || (!own && e.display().len() > 100)) => {
+        Value::Err(e, own, _) if matches!(e.value(), Value::Str(_) | Value::Css(_)) && (!names.is_empty() || (!own && e.display().len() > 100)) => {
             let msg = e.display();
             let msg = if names.is_empty() { msg } else { said_as_written(&msg, &names) };
             if !own && msg.len() > 100 {

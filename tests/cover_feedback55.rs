@@ -271,11 +271,16 @@ fn topics_after_the_address_are_read_by_the_program_too() {
         let before = seq(&mut it, 0, "")["seq"].as_u64().unwrap();
         let enc: String = topic.bytes().map(|b| format!("%{:02X}", b)).collect();
         assert_eq!(ask(&mut it, "GET", &format!("/pub/{}", enc), &[], b"").status, 200);
-        let got = seq(&mut it, before, &format!("{},other", sent));
-        assert_eq!(got["changed"], serde_json::json!([topic]), "{}", topic);
+        // As from a page of another server's: told at once of every topic it sent, by the name
+        // read, as the topics are not signed with this program's key, made at start (changed for
+        // 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89; it was the change of `topic`).
+        let r = ask(&mut it, "POST", &format!("/_quillo/live?since={}&s=elsewhere&tm=1", before.max(1)), &[("Content-Type", "text/plain")], format!("{},other", sent).as_bytes());
+        let got: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(got["changed"], serde_json::json!([topic, "other"]), "{}", topic);
     }
-    // At the limit, and one byte past it.
-    let most = 256 * (448 * 3 + 1);
+    // At the limit, and one byte past it: each topic may come after its signature and a `.`
+    // (changed for 0.8.12: FEEDBACK51.md, Q-666; branch feedback86-89).
+    let most = 256 * (448 * 3 + 1) + 256 * (16 + 2);
     let r = ask(&mut it, "POST", "/_quillo/live?since=0&tm=1", &[], "a".repeat(most).as_bytes());
     assert_eq!(r.status, 200);
     let r = ask(&mut it, "POST", "/_quillo/live?since=0&tm=1", &[], "a".repeat(most + 1).as_bytes());
@@ -966,12 +971,15 @@ fn a_live_sockets_first_message_takes_any_form_a_page_sends() {
     let changed = |ws: &mut Ws| -> serde_json::Value { serde_json::from_str::<serde_json::Value>(&ws.read().expect("closed")).unwrap()["changed"].clone() };
     // Short: one frame of fewer than 126 bytes.
     let mut ws = Ws::open(s.port, &format!("/_quillo/live?since={}&tm=1", live_seq(s.port)));
-    ws.text("x:1,y:2");
+    // Each signed, as the server gives it (changed for 0.8.12: FEEDBACK51.md, Q-666; branch
+    // feedback86-89).
+    ws.text(&format!("{},{}", support::signed("x:1"), support::signed("y:2")));
     assert_eq!(support::send(s.port, "GET", "/bump/x:1", &[], "").body, "ok");
     assert_eq!(changed(&mut ws), serde_json::json!(["x:1"]));
     // In two frames, the second its continuation.
     let mut ws = Ws::open(s.port, &format!("/_quillo/live?since={}&tm=1", live_seq(s.port)));
-    ws.frame(0x01, b"x:", true);
+    let x2 = support::signed("x:é2");
+    ws.frame(0x01, x2[..x2.len() - "é2".len()].as_bytes(), true);
     ws.frame(0x80, "é2".as_bytes(), true);
     support::send(s.port, "GET", "/bump/x:%C3%A92", &[], "");
     assert_eq!(changed(&mut ws), serde_json::json!(["x:é2"]));
@@ -979,7 +987,7 @@ fn a_live_sockets_first_message_takes_any_form_a_page_sends() {
     let mut ws = Ws::open(s.port, &format!("/_quillo/live?since={}&tm=1", live_seq(s.port)));
     let long = "a".repeat(448 * 3 + 50);
     ws.frame(0x01, long.as_bytes(), true);
-    ws.frame(0x80, b"aaaa,y:3", true);
+    ws.frame(0x80, format!("aaaa,{}", support::signed("y:3")).as_bytes(), true);
     support::send(s.port, "GET", "/bump/y:3", &[], "");
     assert_eq!(changed(&mut ws), serde_json::json!(["y:3"]));
     // Binary first, or unmasked: the socket ends, nothing told.

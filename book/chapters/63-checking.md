@@ -57,7 +57,18 @@ seconds write `sleep(200)` ``); `c.query(...)` on an untyped parameter in a `wit
 function without `db`; a service whose file is not here; a name in a pattern that takes
 any value and goes unused, or reads like a type (`intt =>`); an arm that never runs
 after one that takes any value, or with a value an arm before it has; `xs.push(2)`,
-`sort(xs)` or `i + 1` alone, which make a value and drop it; a `return` that leaves the
+`sort(xs)` or `i + 1` alone, which make a value and drop it, and `xs | map(f)` or
+`filter(xs, f)` alone whose function does nothing else (assigns nothing, calls nothing that
+acts), a chain of them (`xs | map(f) | filter(g)`) and one on a field (`m.items | map(f)`)
+*(since 0.8.12)*; a component's `state` set from a state that changes (assigned,
+`bind:`, `live`, loaded by a server fn) or from a `let` that reads one, which is set once and
+does not follow it (write `let`), unless the component assigns or binds the state itself or
+reads it beside what it was set from (a snapshot) *(since 0.8.12)*; a field read or a method
+called on what a `-> T ! E` function or a service call gives, with no `?`, `??` after it,
+`is_err`, `type_of`, `match`, or a test by the program's own function first (or a `let` that
+holds such a test) *(since 0.8.12)*; `n && <markup>`, `!n`, `if n` or `n ? a : b` on a state
+that holds a number, assigned or not, where 0 counts as true *(since 0.8.12 for an assigned
+one)*; a `return` that leaves the
 function from a value that is kept (a block, a `for` body, an `if` or `match` every way
 of which leaves); code after a `return` or a `reply`, which never runs; a function
 that returns a value on one path and gives null at its end (see [Coming from
@@ -176,8 +187,18 @@ A `"""` or `'''`, as Python and Kotlin write text over several lines, is told wh
 writes *(since 0.8.11)*: ``tq.qwe:1: error: `"""` is not a string here: text over several lines
 is a backtick string, `line one ...` (`${` interpolates)``.
 
-After a syntax error that a newer Quillo might accept (an unknown character or escape,
-an unexpected keyword, an unknown word), `quillo check`, `quillo run` and the language
+An attribute's `{` left open, as after a handler's block (`onclick={() => { n += 1 }>`), is said
+of that `{` *(since 0.8.12; it was the element's text, "unexpected character")*:
+``main.qwe:3: error: `onclick={` on line 3, column 21 is never closed: add `}` before the tag's `>`;
+without it, that `>` is read as greater than and the text of <button> as code``, with the `}`
+as a quick fix when the handler is the attribute's whole value and holds no block of its own
+(before a `/>` the same); where
+it wanted a value's `}` and found something else, it names that `{`: ``main.qwe:3: error:
+`title={` on line 3, column 14: expected `}` to close it, found `c` ``.
+
+After a syntax error that a newer Quillo might accept (an unknown ASCII character or an
+escape, an unexpected keyword, an unknown word; not a character such as `♥`, which no Quillo
+takes outside text *(since 0.8.12)*), `quillo check`, `quillo run` and the language
 server say which quillo they are (`note: this is quillo 0.6.0 (f1695a3, 2026-10-29),
 built 2026-10-27 at ...`): code written for a newer Quillo fails to parse in an older
 one, such as an old build left on the `PATH`. `quillo --version` names the commit too: `QUILLO_COMMIT` when

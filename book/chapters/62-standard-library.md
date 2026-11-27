@@ -30,9 +30,6 @@
   once from each place (`[ab]*a[ab]{900}c` on a text of `a` and `b`) can take long on a long
   text, so a search whose work would pass a quarter of a second is run step by step,
   counted, and stops after 0.1 s and 0.15 µs a byte of the text (the thread's own time),
-  within [`--max-compute`](#options-of-quillo-run), and before its own work takes 256 MiB or
-  [`--max-memory`](#concurrency-and-reloading); the call is then an error value (`` `re.test`:
-  the pattern is too costly for this text: ...; repeat less, or search a shorter text ``), in
   every `re.*` call *(since 0.8.9: one search held an instance for seconds to minutes, past
   `--max-compute`)*. Ordinary patterns, a long one on a long text too, answer as before, and
   a pattern of literals alone (`cat|dog`, `\d`, a list of 5,000 words) is searched as
@@ -1327,7 +1324,10 @@ fn withdraw(account: int, cents: int) -> map with db =
   immediate`, taking the write lock at once (another process holding it is then a
   conflict, tried again, rather than a failure half way). Without options a SQLite
   transaction is a savepoint that takes the lock when it first writes, and a busy
-  database is not tried again.
+  database is not tried again. A statement outside a transaction that meets another
+  process's write lock waits for it up to 5 s, as before, but no longer holds up the other
+  requests while it waits *(since 0.8.12)*; inside a transaction (its commit too), or with the
+  program's own `pragma busy_timeout`, it waits in place.
 - On PostgreSQL and MySQL a transaction waits up to 30 s for a free connection, then
   fails (`no PostgreSQL connection free after 30 s`).
 - `retries` (0 to 20; 0 by default) runs the whole function again after a serialization
@@ -1507,9 +1507,19 @@ reaches](#what-a-program-reaches)).
   on a connection of its own, reset after it; so do PostgreSQL's functions that run SQL
   given as text or read tables and views by name, `query_to_xml` and its kin
   (`cursor_to_xml`, `table_to_xml`, `schema_to_xml`, `database_to_xml`), `ts_stat` and
-  `ts_rewrite` *(since 0.8.9: they ran on the shared connection)*. What a view, a rule or a
-  trigger changes of the session is not seen: keep session changes (`set_config(...,
-  false)`, `set`) out of the functions they call. `prepare` is refused everywhere: pass values as
+  `ts_rewrite` *(since 0.8.9: they ran on the shared connection)*. So does, *since 0.8.12*, a
+  statement that reads a view, or writes a table with rules, triggers, domain columns, or
+  checks, defaults or indexes that call the database's own functions or `currval`, or reads a
+  table whose policies call such functions or read such views, or names a domain or a type of
+  the database's own (what those run may change the session: it reached other visitors, and
+  row-level security with it); Quillo reads the database's catalog once, and again after the
+  program's own schema statements and migrations; a schema change made by another process is
+  seen at the program's next one, its migrations or a restart. Reading a table
+  with triggers stays on the shared connection (a read runs none of them), and so does what an
+  extension adds (citext, PostGIS). On a database with operators or casts of its own every
+  statement outside a transaction runs apart. `lastval()` and `currval()` are refused outside a
+  transaction *(since 0.8.12: they read another request's value)*: write `insert ... returning
+  id`. `prepare` is refused everywhere: pass values as
   parameters (`?`), which Quillo prepares itself. Inside a SQLite transaction a PostgreSQL
   query takes a free connection at once or is an error, as waiting would hold every request. Row-level
   security's setting per request is therefore written inside the transaction, as local:
@@ -1813,6 +1823,15 @@ service answered (`_quillo_calls`) go with the jobs, and so do the devices that 
 something must be kept in it (calls made later, `db.atomic`'s decisions, a device's
 subscription in a program with no database);
 `$QUILLO_SYSTEM_DB` may be a URL.
+
+*(Since 0.8.12)* On PostgreSQL and MySQL/MariaDB, an operator can isolate Quillo's own tables from
+the program's SQL under a separate database role (one the program's role cannot `SET ROLE` into or
+read directly) by running `db.own_setup(q_url)` once with `QUILLO_SECRET` set. Quillo moves any
+existing `_quillo_*` tables into `quillo` / `quillo_<schema>` (PostgreSQL) or `<db>_quillo`
+(MySQL/MariaDB), creates `SECURITY DEFINER` routines authenticated with per-statement MACs derived
+from `QUILLO_SECRET`, and exposes restricted `_quillo_migrations` and `_quillo_later` views so
+`select name from _quillo_migrations` and `update _quillo_later set at = 0, tries = 0 where tries < 0`
+continue to work while direct reads of `_quillo_idempotency` or `_quillo_secret` are denied.
 
 ## Many tenants
 

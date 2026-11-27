@@ -19,7 +19,7 @@ const withBase = (u) => (BASE && typeof u === "string" && u[0] === "/" && u[1] !
 // carry (a body on Android, a file on WebKit, a socket anywhere) goes through the app's bridge.
 // In a browser, `fetch` and `WebSocket`.
 let WIRE = null;
-if (typeof document !== "undefined" && typeof CustomEvent === "function") document.dispatchEvent(new CustomEvent("quillo-wire", { detail: (w) => { WIRE = w; } }));
+if (typeof document !== "undefined" && typeof CustomEvent === "function") (typeof EventTarget === "function" ? EventTarget.prototype.dispatchEvent : document.dispatchEvent).call(document, new CustomEvent("quillo-wire", { detail: (w) => { WIRE = w; } }));
 const wireFetch = (u, init) => (WIRE && WIRE.fetch ? WIRE.fetch(u, init) : fetch(u, init));
 const openSocket = (path) => (WIRE && WIRE.socket ? WIRE.socket(path) : new WebSocket(location.origin.replace(/^http/, "ws") + path));
 
@@ -2291,17 +2291,17 @@ B.markdown = meta(async (s, o) => {
 // classes in a host on the page (#q-notices), laid out and styled by the
 // page's CSS: <body data-notices="..."> adds its classes to the host.
 function noticeHost() {
-  let h = document.getElementById("q-notices");
+  let h = docDo("getElementById", "q-notices");
   if (!h) {
-    h = document.createElement("div");
+    h = docEl("div");
     h.id = "q-notices";
-    h.className = "q-notices " + (document.body.dataset.notices || "dialog-center toasts-top-right");
-    document.body.appendChild(h);
+    h.className = "q-notices " + (docGet("body").dataset.notices || "dialog-center toasts-top-right");
+    docGet("body").appendChild(h);
   }
   return h;
 }
 function noticeEl(tag, cls, text) {
-  const e = document.createElement(tag);
+  const e = docEl(tag);
   if (cls) e.className = cls;
   if (text != null) e.textContent = text;
   return e;
@@ -2316,7 +2316,7 @@ const ASK_WORDS = { es: ["Aceptar", "Cancelar"], fr: ["OK", "Annuler"], de: ["OK
   ms: ["OK", "Batal"], fil: ["OK", "Kanselahin"], tl: ["OK", "Kanselahin"] };
 const askWords = () => {
   const d = i18n();
-  const loc = String((d && d.locale) || (typeof document !== "undefined" && document.documentElement.lang) || "en").toLowerCase().replace("_", "-");
+  const loc = String((d && d.locale) || (typeof document !== "undefined" && docGet("documentElement").lang) || "en").toLowerCase().replace("_", "-");
   const lang = loc.split("-")[0];
   const zhHant = lang === "zh" && /-(hant|tw|hk|mo)\b/.test(loc);
   const w = ASK_WORDS[zhHant ? "zh-hant" : lang] || ["OK", "Cancel"];
@@ -2325,7 +2325,7 @@ const askWords = () => {
 };
 B.ask = meta((message, options) => Probe !== null ? probeStop() : new Promise((resolve) => {
   const o = options == null ? {} : M(options, "ask", 2);
-  const host = noticeHost(), before = document.activeElement;
+  const host = noticeHost(), before = docGet("activeElement");
   const back = noticeEl("div", "q-backdrop");
   const box = noticeEl("div", "q-dialog" + (o.tone ? " q-" + display(o.tone) : ""));
   box.setAttribute("role", "alertdialog");
@@ -2344,7 +2344,7 @@ B.ask = meta((message, options) => Probe !== null ? probeStop() : new Promise((r
   host.appendChild(back);
   requestAnimationFrame(() => back.classList.add("q-open"));
   const done = (answer) => {
-    document.removeEventListener("keydown", keys, true);
+    docOff("keydown", keys, true);
     back.classList.remove("q-open");
     setTimeout(() => back.remove(), 160);
     if (before && before.focus) before.focus();
@@ -2352,9 +2352,9 @@ B.ask = meta((message, options) => Probe !== null ? probeStop() : new Promise((r
   };
   const keys = (e) => {
     if (e.key === "Escape") { e.preventDefault(); done(false); }
-    else if (e.key === "Tab") { e.preventDefault(); (document.activeElement === yes ? no : yes).focus(); }
+    else if (e.key === "Tab") { e.preventDefault(); (docGet("activeElement") === yes ? no : yes).focus(); }
   };
-  document.addEventListener("keydown", keys, true);
+  docOn("keydown", keys, true);
   yes.onclick = () => done(true);
   no.onclick = () => done(false);
   back.onclick = (e) => { if (e.target === back) done(false); };
@@ -2933,6 +2933,29 @@ B.js_new = meta((path, ...args) => {
 // runtime hand each other, under one key of `window` rather than a name each; `quillo` and a
 // page's `__quilloErrors` are the only names (FEEDBACK42.md, Q-486; branch feedback40-43).
 const QW = typeof window === "undefined" ? {} : window[Symbol.for("quillo")] || (window[Symbol.for("quillo")] = {});
+// The document's own properties and methods, read through `Document.prototype`: an element named for
+// one in visitor markup (`<img name="body">`, `<form name="querySelectorAll">`) is what `document`
+// gives by that name, and stopped the page as it started, or gave it another's nonce
+// (FEEDBACK51.md, Q-667, the review of slice W1; branch feedback86-89). `d` is the page's document or
+// one the runtime read (a page moved to, made again under --watch). Where there is no `Document` (a
+// test's), the document's own.
+const DOC = typeof Document === "function" ? Document.prototype : null;
+const DOC_GET = {};
+const dGet = (d, n) => {
+  if (!DOC) return d[n];
+  let g = DOC_GET[n];
+  if (g === undefined) { const p = Object.getOwnPropertyDescriptor(DOC, n); g = DOC_GET[n] = (p && p.get) || null; }
+  return g ? g.call(d) : undefined;
+};
+const dDo = (d, n, ...a) => (DOC ? DOC[n] : d[n]).apply(d, a);
+const docGet = (n) => dGet(document, n);
+const docSet = (n, v) => { if (DOC) Object.getOwnPropertyDescriptor(DOC, n).set.call(document, v); else document[n] = v; };
+const docDo = (n, ...a) => dDo(document, n, ...a);
+const ET = typeof EventTarget === "function" && DOC ? EventTarget.prototype : null;
+const docOn = (t, f, o) => (ET ? ET.addEventListener : document.addEventListener).call(document, t, f, o);
+const docOff = (t, f, o) => (ET ? ET.removeEventListener : document.removeEventListener).call(document, t, f, o);
+const docEl = DOC ? (t) => DOC.createElement.call(document, t) : (t) => document.createElement(t);
+const docText = DOC ? (t) => DOC.createTextNode.call(document, t) : (t) => document.createTextNode(t);
 const i18n = () => QW.i18n || null;
 // CLDR's operands of a number as it is written, as on the server (src/i18n.rs's `Operands`): i
 // its integer digits (the last nine, `ib` when a digit before them is not 0), v how many digits
@@ -3291,23 +3314,23 @@ let Resuming = 0;
 // The keys of `v` the head shows otherwise than `v` says, as the server wrote it.
 function headLost(v) {
   const out = new Set();
-  if (typeof document === "undefined" || !document.head) return out;
+  if (typeof document === "undefined" || !docGet("head")) return out;
   for (const k of Object.keys(v)) {
     const t = HEAD_TAGS[k][0], el = headTag(t);
-    const now = t.length === 1 ? (el ? document.title : null) : el ? el.getAttribute(headAttr(t)) : null;
+    const now = t.length === 1 ? (el ? docGet("title") : null) : el ? el.getAttribute(headAttr(t)) : null;
     if (now !== v[k]) out.add(k);
   }
   return out;
 }
 // The tag of `t` (`["meta", "property", "og:title"]`) in the head, or none.
-const headTag = (t) => (t.length === 1 ? document.querySelector("head > title") : document.head.querySelector(`${t[0]}[${t[1]}="${t[2]}"]`));
+const headTag = (t) => (t.length === 1 ? docDo("querySelector", "head > title") : docGet("head").querySelector(`${t[0]}[${t[1]}="${t[2]}"]`));
 const headAttr = (t) => (t[0] === "link" ? "href" : "content");
 function headShow() {
-  if (typeof document === "undefined" || !document.head) return;
+  if (typeof document === "undefined" || !docGet("head")) return;
   // What the page came with, for a key no call says any more.
   if (!Head.base) {
     Head.base = {};
-    for (const k of HEAD_KEYS) for (const t of HEAD_TAGS[k]) { const el = headTag(t); Head.base[t.join(" ")] = t.length === 1 ? (el ? document.title : null) : el ? el.getAttribute(headAttr(t)) : null; }
+    for (const k of HEAD_KEYS) for (const t of HEAD_TAGS[k]) { const el = headTag(t); Head.base[t.join(" ")] = t.length === 1 ? (el ? docGet("title") : null) : el ? el.getAttribute(headAttr(t)) : null; }
   }
   const win = {};
   // Every call takes part, those the server wrote too, which are only not written again: an outer
@@ -3319,10 +3342,10 @@ function headShow() {
   }
   for (const k of HEAD_KEYS) for (const t of HEAD_TAGS[k]) {
     const v = win[k] && !win[k].server ? win[k].v[k] : Head.base[t.join(" ")];
-    if (t.length === 1) { if (v !== null && document.title !== v) document.title = v; continue; }
+    if (t.length === 1) { if (v !== null && docGet("title") !== v) docSet("title", v); continue; }
     let el = headTag(t);
     if (v === null) { if (el) el.remove(); continue; }
-    if (!el) { el = document.createElement(t[0]); el.setAttribute(t[1], t[2]); document.head.appendChild(el); }
+    if (!el) { el = docEl(t[0]); el.setAttribute(t[1], t[2]); docGet("head").appendChild(el); }
     if (el.getAttribute(headAttr(t)) !== v) el.setAttribute(headAttr(t), v);
   }
 }
@@ -5860,13 +5883,15 @@ function mediaPublisher(el) {
   const st = { video: 0, audio: 0, sent: 0, bytes: 0 };
   el.mediaStats = st;
   if (!el.style.display) el.style.display = "inline-block";
-  if (typeof VideoEncoder === "undefined") {
+  // `typeof … !== "function"`: where the browser has none, an element named so is not one (the
+  // second review of slice W1).
+  if (typeof VideoEncoder !== "function") {
     el.dataset.state = "unsupported";
     el.textContent = "This browser cannot send video.";
     return { stop() {} };
   }
   el.dataset.state = "starting";
-  const preview = document.createElement("video");
+  const preview = docEl("video");
   preview.muted = true;
   preview.autoplay = true;
   preview.playsInline = true;
@@ -5942,7 +5967,7 @@ function mediaPublisher(el) {
       })().catch(() => {});
     } else {
       // Without track processors: the preview drawn on a canvas, 30 times a second.
-      const c = document.createElement("canvas");
+      const c = docEl("canvas");
       c.width = w;
       c.height = h;
       const g = c.getContext("2d"), t0 = performance.now();
@@ -5954,7 +5979,7 @@ function mediaPublisher(el) {
     }
   };
   const audio = (track) => {
-    if (typeof AudioEncoder === "undefined" || typeof MediaStreamTrackProcessor !== "function") return;
+    if (typeof AudioEncoder !== "function" || typeof MediaStreamTrackProcessor !== "function") return;
     const rd = new MediaStreamTrackProcessor({ track }).readable.getReader();
     readers.push(rd);
     (async () => {
@@ -6017,20 +6042,21 @@ function mediaPlayer(el) {
   el.mediaStats = st;
   if (!el.style.display) el.style.display = "inline-block";
   if (!el.style.position) el.style.position = "relative";
-  if (typeof VideoDecoder === "undefined") {
+  // As `VideoEncoder` is looked for.
+  if (typeof VideoDecoder !== "function") {
     el.dataset.state = "unsupported";
     el.textContent = "This browser cannot play this stream.";
     return { stop() {} };
   }
   el.dataset.state = "connecting";
-  const canvas = document.createElement("canvas");
+  const canvas = docEl("canvas");
   canvas.style.cssText = "display:block;width:100%;height:auto;background:#000";
   el.replaceChildren(canvas);
   const g = canvas.getContext("2d");
   let muted = el.hasAttribute("muted");
   let button = null;
   if (el.hasAttribute("controls")) {
-    button = document.createElement("button");
+    button = docEl("button");
     button.type = "button";
     button.style.cssText = "position:absolute;right:.5rem;bottom:.5rem;font:inherit;padding:.25rem .6rem;border:0;border-radius:6px;background:rgba(0,0,0,.6);color:#fff;cursor:pointer";
     const label = () => { button.textContent = muted ? "\u{1F507} Sound off" : "\u{1F50A} Sound on"; };
@@ -6096,7 +6122,7 @@ function mediaPlayer(el) {
     st.vd.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: micros(ts, 90000, "base"), data }));
   };
   const audio = (ts, data) => {
-    if (muted || typeof AudioDecoder === "undefined") return;
+    if (muted || typeof AudioDecoder !== "function") return;
     if (!st.ad || st.ad.state === "closed") {
       st.actx = st.actx || new AudioContext({ sampleRate: 48000 });
       st.ad = new AudioDecoder({
@@ -6209,7 +6235,7 @@ function swSession() {
   // Quillo's worker alone: one of the program's own is told nothing (FEEDBACK67.md, B.2, second
   // review; branch pwa).
   if (!c || new URL(c.scriptURL).pathname !== BASE + "/_quillo/sw.js") return;
-  const m = /(?:^|;\s*)quillo_tag=([^;]*)/.exec(document.cookie);
+  const m = /(?:^|;\s*)quillo_tag=([^;]*)/.exec(docGet("cookie"));
   c.postMessage({ quillo: "session", who: m ? m[1] : "-" });
 }
 swSession();
@@ -6258,7 +6284,7 @@ async function rpcSend(name, args, live, idem) {
   }
   // A call that fails (no connection, a server error) is an error value,
   // as with http.* on the server, so `??` and `is_err` handle it.
-  const failed = (msg) => ({ value: new Err(msg), topics: [], seq: 0, server: "", failed: true });
+  const failed = (msg) => ({ value: new Err(msg), topics: [], key: "", seq: 0, server: "", failed: true });
   for (let tries = idem ? 4 : 1; ; ) {
     try {
       r = await wireFetch(BASE + "/_quillo/rpc/" + encodeURIComponent(name), {
@@ -6309,7 +6335,9 @@ async function rpcSend(name, args, live, idem) {
     if (!had) return failed(`server fn \`${name}\`: a patch to nothing`);
     value = livePatched(base, body.patch);
   } else value = body && hasOwn(body, "err") ? new Err(body.err, true) : body && hasOwn(body, "ok") ? body.ok : null;
-  return { value, topics: (body && body.topics) || [], seq: (body && body.seq) || 0, server: (body && body.server) || "", h: (body && body.h) || "" };
+  // `key`: the topics' signature, which the live endpoint follows them by (FEEDBACK51.md, Q-666;
+  // branch feedback86-89).
+  return { value, topics: (body && body.topics) || [], key: (body && body.key) || "", seq: (body && body.seq) || 0, server: (body && body.server) || "", h: (body && body.h) || "" };
 }
 
 // A live value made from the last one and what changed (the format is in
@@ -6358,7 +6386,7 @@ async function rpc(name, args, idem) {
 // server decides; asked with another server's number, it answers that all
 // the topics changed, and the page loads them again once.
 
-const Live = { seq: 0, server: "", subs: new Set(), ctrl: null, running: false, key: "", ws: null, st: null };
+const Live = { seq: 0, server: "", subs: new Set(), ctrl: null, running: false, key: "", ws: null, st: null, sets: new Map() };
 
 // Back online, as the browser says: the socket is opened again at once, where the loop waited out
 // its backoff, up to half a minute (FEEDBACK67.md, B.2; branch pwa).
@@ -6373,20 +6401,43 @@ function liveSeen(seq, server = "") {
   Live.seq = Live.seq > 0 ? Math.min(Live.seq, seq) : seq;
 }
 
+// The topics the page's live states follow; and (`Live.sets`) each state's, by the signature the
+// server gave them (FEEDBACK51.md, Q-666; branch feedback86-89), those with none together under "".
 function liveTopics() {
-  const all = new Set();
+  const all = new Set(), sets = new Map();
   for (const s of Live.subs) {
     if (s.inst.dead) { Live.subs.delete(s); continue; }
     for (const t of s.topics) all.add(t);
+    if (s.topics.length) sets.set(s.key, s.key ? s.topics : (sets.get("") || []).concat(s.topics));
   }
+  Live.sets = sets;
   return [...all].sort();
 }
 
-// The topics as the server reads them: each one's own `%` and `,` written out, so that a comma in
-// one is no separator (FEEDBACK55.md, Q-801; branch feedback55). The 256 the server follows, and
-// none longer than it can be told of (its `MAX_PAGE_TOPIC`), which keeps what is sent within what
-// it reads.
-const liveKey = (topics) => topics.filter((t) => t.length <= 448).slice(0, 256).map((t) => t.replace(/%/g, "%25").replace(/,/g, "%2C")).join(",");
+// A topic as the server reads it: its own `%` and `,` written out, so that a comma in one is no
+// separator (FEEDBACK55.md, Q-801; branch feedback55), and a `~` it starts with, which would read as
+// a signature.
+const liveEsc = (t) => t.replace(/%/g, "%25").replace(/,/g, "%2C").replace(/^~/, "%7E");
+
+// The topics as the server reads them (`liveTopics` first): each state's after `~` and the
+// signature the server gave them, which it follows them by (FEEDBACK51.md, Q-666; branch
+// feedback86-89): those it signed, none longer than it can be told of (its `MAX_PAGE_TOPIC`, 448
+// bytes as UTF-8) and the first 256, as in 0.8.11, where a longer one, or more, lost the whole state
+// (the review of slice W1); and whole states up to the 256 topics it follows.
+const utf8Len = (t) => { let n = t.length; for (let i = 0; i < t.length; i++) { const c = t.charCodeAt(i); if (c >= 0x80) n += c >= 0x800 && (c < 0xd800 || c > 0xdfff) ? 2 : 1; } return n; };
+function liveKey() {
+  const out = [];
+  let n = 0;
+  // "" first: topics with no signature, before any.
+  for (const k of [...Live.sets.keys()].sort()) {
+    const ts = Live.sets.get(k).filter((t) => utf8Len(t) <= 448).slice(0, 256);
+    if (n + ts.length > 256) continue;
+    n += ts.length;
+    if (k) out.push("~" + k);
+    for (const t of ts) out.push(liveEsc(t));
+  }
+  return out.join(",");
+}
 
 // Starts waiting, or starts again when the set of topics changed. An open socket takes the new
 // topics instead: a page that moved closed its socket and opened another for each page, every close
@@ -6638,7 +6689,7 @@ async function liveRefresh(sub, newArgs) {
   if (newArgs) waitSig(sub.sig).set(true);
   try {
     const res = await rpcRaw(sub.fname, sub.args, sub);
-    const { value, topics, seq, server, failed, h } = res;
+    const { value, topics, key, seq, server, failed, h } = res;
     if (n !== sub.loads) return;
     sub.loading = false;
     // A load that failed for a while (no connection, 408, 429, a 5xx) keeps the last good data and
@@ -6675,6 +6726,7 @@ async function liveRefresh(sub, newArgs) {
     sub.seenOn = server;
     if (sub.wanted > seq) queueMicrotask(() => liveRefresh(sub));
     sub.topics = topics;
+    sub.key = key;
     sub.h = value instanceof Err ? "" : h;
     sub.base = value;
     sub.sig.set(value);
@@ -6714,7 +6766,7 @@ let Listener = null;
 let Owner = null;
 // A document no node of which loads anything, for a probe's (see `Tmpl`).
 let inert = null;
-const inertDoc = () => inert || (inert = document.implementation.createHTMLDocument(""));
+const inertDoc = () => inert || (inert = docGet("implementation").createHTMLDocument(""));
 // What hears the reads code makes where nothing does (`untrack`, `within`): null, but while a
 // failed draw is run once more to learn what it waits on (see `probe`; FEEDBACK88.md, Q-1380, the
 // third review of slice C; branch feedback86-89).
@@ -7264,7 +7316,7 @@ const escText = (t) => t.replace(/[&<>"'\r\0]/g, (c) => ESC[c]);
 function htmlText(h) {
   if (h.text !== undefined) return h.text;
   if (typeof document === "undefined" || !h.make) return "<html>";
-  const box = document.createDocumentFragment(), out = [], o = Owner, was = hydrating, cl = claiming;
+  const box = docDo("createDocumentFragment"), out = [], o = Owner, was = hydrating, cl = claiming;
   Owner = null;
   const sc = new Scope();
   Owner = o;
@@ -7331,7 +7383,7 @@ const attrSaid = (k, v) => (v === null ? `no ${k}` : `${k}=${JSON.stringify(v.sl
 // browser joined it with text after it; an empty one is made.
 function claimText(c, t) {
   if (t === "") {
-    const e = document.createTextNode("");
+    const e = docText("");
     c.p.insertBefore(e, c.n);
     return e;
   }
@@ -7360,7 +7412,7 @@ function put(v, c, out) {
     return;
   }
   const t = shown(v);
-  out.push(c.claim ? claimText(c, t) : document.createTextNode(t));
+  out.push(c.claim ? claimText(c, t) : docText(t));
 }
 // An error value shown in markup shows nothing, as on the server, the program's as a builtin's: the
 // page read `err("...")` there. Said in the console once a render (the code that runs at once, to
@@ -7451,12 +7503,12 @@ const imeHeard = typeof document !== "undefined" && imeHear();
 function imeHear() {
   // A start only from the browser itself: a page's own, which nothing ends, held the field. An end
   // from anywhere (Chrome's for a commit is not marked trusted, and it only lets the field go).
-  document.addEventListener("compositionstart", (e) => { if (e.isTrusted) e.target.__ime = true; }, true);
+  docOn("compositionstart", (e) => { if (e.isTrusted) e.target.__ime = true; }, true);
   // Only a write held meanwhile is made at the end (`__held`): the program's value written at every
   // end wiped what was composed in a field the program does not write as it is typed (`value={prop}`,
   // or one written on `change`), and a page's own end wiped what was typed (FEEDBACK61.md, Q-939's
   // review of 06cda99; branch feedback61).
-  document.addEventListener("compositionend", (e) => {
+  docOn("compositionend", (e) => {
     const el = e.target;
     el.__ime = false;
     if (el.__held) setTimeout(() => { if (!el.__ime && el.__held) setProp(el, "value", el.__want, undefined); }, 0);
@@ -7493,7 +7545,7 @@ function dynApply(x) {
     const got = [], made = partsMade;
     put(x, c, got);
     r.nodes = own(got, made);
-    r.end = document.createTextNode("");
+    r.end = docText("");
     r.end.__part = r;
     partsMade++;
     r.made = partsMade;
@@ -7581,7 +7633,7 @@ function morph(old, now) {
       if (!listening[t]) { listening[t] = true; old.addEventListener(t, (ev) => fire(old, t, ev)); }
     }
   } else if (old.__w) old.__w = {};
-  if (now.__click && !delegating) { delegating = true; document.addEventListener("click", delegated); }
+  if (now.__click && !delegating) { delegating = true; docOn("click", delegated); }
   const oc = old.childNodes, nc = now.childNodes;
   for (let i = 0; i < nc.length; i++) morph(oc[i], nc[i]);
   // A select given a new value shows it once its options are as the markup says too: written
@@ -7601,11 +7653,11 @@ function dynAllApply(x) {
     // Taking up the page's children, the first time.
     this.old = false;
     const c = { p: el, n: el.firstChild, claim: true, svg };
-    if (isText(x) && !el.firstChild) el.appendChild(document.createTextNode(""));
+    if (isText(x) && !el.firstChild) el.appendChild(docText(""));
     c.n = el.firstChild;
     const got = [];
     put(x, c, got);
-    if (isText(x) && got.length === 0) el.appendChild(document.createTextNode(""));
+    if (isText(x) && got.length === 0) el.appendChild(docText(""));
     rest(el, c.n);
     return;
   }
@@ -7620,7 +7672,7 @@ function dynAllApply(x) {
   }
   const got = [];
   put(x, { claim: false, svg, p: el }, got);
-  if (isText(x) && got.length === 0) got.push(document.createTextNode(""));
+  if (isText(x) && got.length === 0) got.push(docText(""));
   // The children it replaces hear nothing as they go (see `removing`; FEEDBACK61.md, Q-896; branch
   // feedback61).
   removing++;
@@ -7670,11 +7722,11 @@ function plan(tp) {
 function blockTemplate(def, svg) {
   const make = (t, inSvg, doc) => {
     const here = inSvg || t[0] === "svg";
-    const el = here ? doc.createElementNS(SVG, t[0]) : doc.createElement(t[0]);
+    const el = here ? dDo(doc, "createElementNS", SVG, t[0]) : dDo(doc, "createElement", t[0]);
     for (const [k, v] of t[1]) codeAttr(k) ? el.setAttribute(k, v === true ? "" : display(v)) : setProp(el, k, v, undefined);
     // A <template>'s children go in its content (see `wire`).
     const box = t[0] === "template" && el.content || el;
-    for (const k of t[2]) box.appendChild(typeof k === "string" ? doc.createTextNode(k) : typeof k === "number" ? doc.createTextNode("") : make(k, here && t[0] !== "foreignObject", doc));
+    for (const k of t[2]) box.appendChild(typeof k === "string" ? dDo(doc, "createTextNode", k) : typeof k === "number" ? dDo(doc, "createTextNode", "") : make(k, here && t[0] !== "foreignObject", doc));
     return el;
   };
   if (svg ? def.svg : def.html) return svg ? def.svg : def.html;
@@ -7858,7 +7910,7 @@ function hole(el, kind, name, v, svg, i) {
 let resetting = false;
 function bindReset(el, t) {
   (el.__reset || (el.__reset = [])).push(t);
-  if (!resetting) { resetting = true; document.addEventListener("reset", formReset, true); }
+  if (!resetting) { resetting = true; docOn("reset", formReset, true); }
 }
 function formReset(ev) {
   const form = ev.target;
@@ -7912,7 +7964,7 @@ function showIn(el, v, claim, svg, i) {
   }
   if (claim) {
     const c = { p: el, n: el.firstChild, claim: true, svg };
-    if (isText(v) && !el.firstChild) el.appendChild(document.createTextNode(""));
+    if (isText(v) && !el.firstChild) el.appendChild(docText(""));
     c.n = el.firstChild;
     put(v, c, []);
     rest(el, c.n);
@@ -8071,9 +8123,9 @@ function rawHtml(html) {
     if (c.claim) {
       const n = c.n;
       if (n && n.nodeType === 1 && n.localName === "quillo-raw") { c.n = n.nextSibling; out.push(n); return; }
-      const t = document.createElement("template");
+      const t = docEl("template");
       t.innerHTML = html;
-      const wrap = document.createElement("quillo-raw");
+      const wrap = docEl("quillo-raw");
       wrap.style.display = "contents";
       c.p.insertBefore(wrap, c.n);
       for (let i = 0; i < t.content.childNodes.length; i++) {
@@ -8086,7 +8138,7 @@ function rawHtml(html) {
       out.push(wrap);
       return;
     }
-    const el = document.createElement("quillo-raw");
+    const el = docEl("quillo-raw");
     el.style.display = "contents";
     // Not for a probe's node, thrown away (see `probe`).
     if (Probe === null) el.innerHTML = html;
@@ -8149,7 +8201,7 @@ function leaving(e) {
 // the wait is all data. So what is kept is that page's components' state: taken as a page
 // being resumed takes it, it needs no new way to ask for data and shows no `null` first
 // (FEEDBACK22.md, Q-180; branch feedback22-fixes).
-const Ahead = { to: "", states: null, at: 0, turn: 0, wait: null };
+const Ahead = { to: "", states: null, at: 0, turn: 0, wait: null, qn: "" };
 // As long as a browser may keep a prefetch of ours.
 const AHEAD_KEPT = 30000;
 
@@ -8184,10 +8236,11 @@ function fetchAhead(e) {
   // While it is on its way, a click waits for it rather than asking again (FEEDBACK84.md, Q-1330;
   // branch feedback82-85).
   Ahead.wait = fetch(to, { credentials: "same-origin", headers: { "x-quillo-prefetch": "1" } })
-    .then((r) => (r.ok ? r.text() : null))
-    .then((html) => {
+    .then(async (r) => (r.ok ? [await r.text(), nonceOf(r)] : [null, ""]))
+    .then(([html, qn]) => {
       if (html === null || turn !== Ahead.turn) return;
       Ahead.states = new DOMParser().parseFromString(html, "text/html");
+      Ahead.qn = qn;
       Ahead.at = Date.now();
     })
     .catch(() => {})
@@ -8201,11 +8254,14 @@ function aheadFor(u) {
   const doc = Ahead.states, fresh = u.pathname + u.search === Ahead.to && Date.now() - Ahead.at < AHEAD_KEPT;
   aheadDrop();
   if (!doc || !fresh) return null;
-  const here = new Set([...document.querySelectorAll(ISLANDS)].map((i) => i.dataset.c)), q = {};
+  const here = new Set([...docDo("querySelectorAll", ISLANDS)].map((i) => i.dataset.c)), q = {};
+  // Only the islands that page's answer wrote, by its nonce (FEEDBACK51.md, Q-667; branch
+  // feedback86-89).
+  const qn = Ahead.qn;
   // Those marked by comments too, in their place in the line (FEEDBACK61.md, Q-892; branch
   // feedback61).
-  for (const i of islandsIn(doc.documentElement, doc.querySelector("[data-qm]") !== null)) {
-    if (here.has(i.dataset.c) || i.hasAttribute("data-qd")) continue;
+  for (const i of islandsIn(dGet(doc, "documentElement"), dDo(doc, "querySelector", "[data-qm]") !== null)) {
+    if (here.has(i.dataset.c) || i.hasAttribute("data-qd") || !qn || i.getAttribute("data-qn") !== qn) continue;
     liveSeen(...(i.dataset.v || "").split(":"));
     (q[i.dataset.c] = q[i.dataset.c] || []).push({ s: islandJSON(i.dataset.s, {}), l: islandJSON(i.dataset.l, null) });
   }
@@ -8231,9 +8287,9 @@ function navStart() {
   window.addEventListener("hashchange", navChanged);
   let pointed = 0;
   const o = { capture: true, passive: true };
-  document.addEventListener("pointerover", (e) => { clearTimeout(pointed); pointed = setTimeout(() => fetchAhead(e), 65); }, o);
-  for (const v of ["pointerdown", "touchstart", "focusin"]) document.addEventListener(v, fetchAhead, o);
-  document.addEventListener("click", (e) => {
+  docOn("pointerover", (e) => { clearTimeout(pointed); pointed = setTimeout(() => fetchAhead(e), 65); }, o);
+  for (const v of ["pointerdown", "touchstart", "focusin"]) docOn(v, fetchAhead, o);
+  docOn("click", (e) => {
     // Moves in place follow every link themselves (see `W.inPlace`).
     if (QW.ip || e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     const u = followed(e.target.closest && e.target.closest("a[href]"));
@@ -8373,23 +8429,23 @@ let Said = null;
 function moved() {
   requestAnimationFrame(() => {
     // Never away from a field the person is typing in.
-    const a = document.activeElement;
+    const a = docGet("activeElement");
     if (a && (a.isContentEditable || /^(input|textarea|select)$/.test(a.localName))) return;
-    const to = document.querySelector("main") || document.querySelector("h1");
+    const to = docDo("querySelector", "main") || docDo("querySelector", "h1");
     if (to) {
       if (!to.hasAttribute("tabindex") && to.tabIndex < 0) to.setAttribute("tabindex", "-1");
       to.focus({ preventScroll: true });
-    } else if (document.activeElement && document.activeElement !== document.body && document.activeElement.blur) document.activeElement.blur();
+    } else if (docGet("activeElement") && docGet("activeElement") !== docGet("body") && docGet("activeElement").blur) docGet("activeElement").blur();
     if (!Said || !Said.isConnected) {
-      Said = Said || document.createElement("div");
+      Said = Said || docEl("div");
       Said.setAttribute("aria-live", "polite");
       Said.setAttribute("aria-atomic", "true");
       Said.setAttribute("data-quillo-said", "");
       Object.assign(Said.style, { position: "absolute", width: "1px", height: "1px", margin: "-1px", padding: "0", overflow: "hidden", clipPath: "inset(50%)", whiteSpace: "nowrap", border: "0" });
-      document.body.appendChild(Said);
+      docGet("body").appendChild(Said);
     }
     Said.textContent = "";
-    setTimeout(() => { Said.textContent = document.title; }, 50);
+    setTimeout(() => { Said.textContent = docGet("title"); }, 50);
   });
 }
 
@@ -8458,7 +8514,7 @@ function ipFetch(to, ahead) {
     .then(async (r) => {
       const page = r.ok || r.status === 404 ? /^\s*text\/html/i.test(r.headers.get("content-type") || "") : false;
       if (!page) stop.abort();
-      return { url: r.url, status: r.status, ahead, html: page ? await r.text() : null };
+      return { url: r.url, status: r.status, ahead, html: page ? await r.text() : null, qn: nonceOf(r) };
     })
     .catch(() => null);
 }
@@ -8497,7 +8553,7 @@ async function ipGo(u, o) {
   const end = got && got.html !== null ? new URL(got.url || u.href, location.href) : null;
   if (end) end.hash = u.hash;
   const doc = end && ipLink({ href: end.href, hasAttribute: () => false }) ? new DOMParser().parseFromString(got.html, "text/html") : null;
-  const plan = doc && ipPlan(doc);
+  const plan = doc && ipPlan(doc, got.qn);
   if (!plan) {
     // An entry gone back to is one this runtime made, for a GET: loaded in its place.
     if (o.pop) location.replace(location.href);
@@ -8527,39 +8583,41 @@ async function ipGo(u, o) {
 // a move does not run again; and a script that is code, not data (JSON-LD, a template).
 // Marked so by the server (`data-quillo`), not told by what they say: a script of the program's
 // that names Quillo's key is the program's (third review of slice H).
-const ipOwn = (n) => n.hasAttribute("data-quillo") || n.textContent.startsWith("/*quillo-dev*/") || (n.getAttribute("src") || "").startsWith(BASE + "/_quillo/") || n.type === "speculationrules";
+// `qn`: the answer's nonce (`nonceOf`), which Quillo's own carry as `data-quillo`; a visitor's
+// `<script data-quillo>` is none of them (the second review of slice W1).
+const ipOwn = (n, qn) => (!!qn && n.getAttribute("data-quillo") === qn) || n.textContent.startsWith("/*quillo-dev*/") || (n.getAttribute("src") || "").startsWith(BASE + "/_quillo/") || n.type === "speculationrules";
 const ipCode = (n) => /^(|module|(text|application)\/(x-)?(java|ecma)script)$/.test((n.getAttribute("type") || "").trim().toLowerCase());
 const ipOuter = (root) => [...root.querySelectorAll(ISLANDS)].filter((i) => !(i.parentElement && i.parentElement.closest(ISLANDS)));
 
 // What changes this page to `doc`, or null where it cannot be done in place: `ready` once the new
 // page's style sheets have come (or 3 s), then `swap`.
-function ipPlan(doc) {
-  if (!doc.head || !doc.body || doc.querySelector("[data-qd]")) return null;
+function ipPlan(doc, qn) {
+  if (!dGet(doc, "head") || !dGet(doc, "body") || dDo(doc, "querySelector", "[data-qd]")) return null;
   // The same program's page, of the same version, with the same policies, for the same visitor:
   // another program's (a mount's), a new version's, one that may not be framed or has another
   // policy, or one after a sign-in or a sign-out, is loaded (review of slice H).
-  const key = [...doc.querySelectorAll("script[data-quillo]:not([src])")].filter((x) => x.textContent.startsWith("(()=>{const d=document,W=window,k=Symbol.for(\"quillo\")")).map((x) => (/\bw\.ik="([0-9a-f]+)"/.exec(x.textContent) || [])[1]).find(Boolean);
+  const key = [...dDo(doc, "querySelectorAll", "script[data-quillo]:not([src])")].filter((x) => ipOwn(x, qn) && x.textContent.startsWith("(()=>{const d=document,W=window,k=Symbol.for(\"quillo\")")).map((x) => (/\bw\.ik="([0-9a-f]+)"/.exec(x.textContent) || [])[1]).find(Boolean);
   if (!IP.ik || key !== IP.ik) return null;
   // The scripts each page's head was written with are in the key, not the live head's, where a
   // library the loader adds, or an analytics script, has its own.
-  for (const x of doc.body.querySelectorAll("script")) if (!ipOwn(x) && ipCode(x)) return null;
+  for (const x of dGet(doc, "body").querySelectorAll("script")) if (!ipOwn(x, qn) && ipCode(x)) return null;
   // The head's other elements, by what they are: those of the new page's that this one lacks
   // come, those it no longer has go. The new style sheets come first, and are waited for.
-  const tags = (d) => [...d.head.children].filter((n) => n.localName !== "script" && n.localName !== "title");
+  const tags = (d) => [...dGet(d, "head").children].filter((n) => n.localName !== "script" && n.localName !== "title");
   const was = tags(document), now = tags(doc);
   const wasK = new Set(was.map((n) => n.outerHTML)), nowK = new Set(now.map((n) => n.outerHTML));
-  const added = now.filter((n) => !wasK.has(n.outerHTML)).map((n) => document.importNode(n, true));
+  const added = now.filter((n) => !wasK.has(n.outerHTML)).map((n) => docDo("importNode", n, true));
   const sheets = added.filter((n) => n.localName === "link" && /\bstylesheet\b/i.test(n.rel));
   const ready = Promise.all(sheets.map((l) => new Promise((ok) => {
     const t = setTimeout(ok, 3000);
     l.addEventListener("load", () => { clearTimeout(t); ok(); });
     l.addEventListener("error", () => { clearTimeout(t); ok(); });
-    document.head.appendChild(l);
+    docGet("head").appendChild(l);
   })));
   const swap = () => {
     for (const n of was) if (!nowK.has(n.outerHTML)) n.remove();
-    for (const n of added) if (!n.isConnected) document.head.appendChild(n);
-    document.title = doc.title;
+    for (const n of added) if (!n.isConnected) docGet("head").appendChild(n);
+    docSet("title", dGet(doc, "title"));
     // What `page_head` said in the browser, again over the new page's head, which the server
     // wrote for this page: what a kept component says that it does not show is what it lost there.
     Head.base = null;
@@ -8567,10 +8625,10 @@ function ipPlan(doc) {
     if (Head.said.length) headShow();
     // The components on both pages, kept: each the n-th of its name, with the same props.
     const olds = {}, nth = {}, kept = new Set();
-    const old = ipOuter(document.body);
+    const old = ipOuter(docGet("body"));
     for (const el of old) (olds[el.dataset.c] = olds[el.dataset.c] || []).push(el);
-    const body = document.importNode(doc.body, true);
-    for (const x of [...body.querySelectorAll("script")]) if (ipOwn(x)) x.remove();
+    const body = docDo("importNode", dGet(doc, "body"), true);
+    for (const x of [...body.querySelectorAll("script")]) if (ipOwn(x, qn)) x.remove();
     for (const n of ipOuter(body)) {
       const c = n.dataset.c, i = nth[c] = (nth[c] || 0) + 1, o = olds[c] && olds[c][i - 1];
       if (o && o.__qi && !o.__qi.dead && o.getAttribute("data-p") === n.getAttribute("data-p")) { n.replaceWith(o); kept.add(o); }
@@ -8579,17 +8637,19 @@ function ipPlan(doc) {
     removing++;
     try {
       // The new page's own on <html> (lang, dir, a theme) and <body>.
-      for (const [from, to] of [[doc.documentElement, document.documentElement], [body, document.body]]) {
+      for (const [from, to] of [[dGet(doc, "documentElement"), docGet("documentElement")], [body, docGet("body")]]) {
         for (const a of [...to.attributes]) if (!from.hasAttribute(a.name)) to.removeAttribute(a.name);
         for (const a of [...from.attributes]) if (to.getAttribute(a.name) !== a.value) to.setAttribute(a.name, a.value);
       }
-      document.body.replaceChildren(...body.childNodes);
+      docGet("body").replaceChildren(...body.childNodes);
     } finally {
       removing--;
     }
-    // The new page's own components, taken up as a page's are (see `boot`).
+    // The new page's own components, taken up as a page's are (see `boot`): by its answer's nonce
+    // (FEEDBACK51.md, Q-667; branch feedback86-89).
+    QW.qn = qn;
     const byItself = (i) => i.hasAttribute("data-e") || i.hasAttribute("data-l");
-    for (const i of ipOuter(document.body)) if (!kept.has(i) && (byItself(i) || i.parentElement === document.body || [...i.querySelectorAll(ISLANDS)].some(byItself))) resume(i);
+    for (const i of ipOuter(docGet("body"))) if (!kept.has(i) && (byItself(i) || i.parentElement === docGet("body") || [...i.querySelectorAll(ISLANDS)].some(byItself))) resume(i);
   };
   // A move another took the place of: its style sheets go again.
   const drop = () => { for (const l of sheets) l.remove(); };
@@ -8608,7 +8668,7 @@ function toHash() {
     if (location.href !== at) return;
     // The same address with a #hash: a fragment navigation, no reload and no
     // new history entry.
-    if (document.getElementById(id) || document.getElementsByName(id)[0]) location.replace(at);
+    if (docDo("getElementById", id) || docDo("getElementsByName", id)[0]) location.replace(at);
     else if (++frames < 300) requestAnimationFrame(look);
   };
   look();
@@ -8652,7 +8712,20 @@ function spreadAttrOk(k) {
 // The island's own, as the server writes them (`island_attr` in src/interp.rs), `data-qt` on what
 // is swapped in for a waiting one (src/defer.rs).
 // `data-qm`: an island holding some marked by comments (FEEDBACK61.md, Q-892; branch feedback61).
-const ISLAND_ATTRS = new Set(["data-qi", "data-qd", "data-qt", "data-c", "data-p", "data-s", "data-l", "data-v", "data-e", "data-qm"]);
+// `data-qn`: the answer's nonce; `data-qh`: a `children` that is the server's HTML (FEEDBACK51.md,
+// Q-667; branch feedback86-89).
+const ISLAND_ATTRS = new Set(["data-qi", "data-qd", "data-qt", "data-c", "data-p", "data-s", "data-l", "data-v", "data-e", "data-qm", "data-qn", "data-qh"]);
+// Whether an island is one the server wrote in this page's answer: it carries the nonce the page's
+// loader carries. Markup a program or a visitor put in with a `data-qi` (visitor HTML a sanitizer
+// that keeps `data-*` let through) is no island: its `data-p` and `data-s` were the visitor's, a
+// string `children` among them put in as HTML (FEEDBACK51.md, Q-667; branch feedback86-89).
+const ownIsland = (el) => !!QW.qn && el.getAttribute("data-qn") === QW.qn;
+// The nonce of a page the runtime asked for itself (a move in place, a page fetched ahead, --watch's
+// own fetch): the answer's `x-quillo-nonce` header, which no markup in it can say; read from the
+// page, the first loader text was a visitor's copy in a `<noscript>`, which a parser that runs no
+// scripts makes elements of (the second review of slice W1; FEEDBACK51.md, Q-667; branch
+// feedback86-89).
+const nonceOf = (r) => (r && r.headers && r.headers.get("x-quillo-nonce")) || "";
 const runtimeAttr = (n) => ISLAND_ATTRS.has(n) || n.startsWith("data-q-") || n.startsWith("data-quillo-");
 
 const sandboxed = (el) => el.hasAttribute("sandbox") && !/allow-same-origin/i.test(el.getAttribute("sandbox"));
@@ -8785,7 +8858,7 @@ function setProp(el, k, v, old) {
     // composition ends (FEEDBACK61.md, Q-939; branch feedback61).
     // A field no longer focused is not being composed in (its end got lost, or was a page's own).
     if (typed && imeHeard && el.__ime) {
-      if (el === document.activeElement) {
+      if (el === docGet("activeElement")) {
         el.__held = true;
         return;
       }
@@ -8797,7 +8870,7 @@ function setProp(el, k, v, old) {
       // program writes it in capitals, leaves a key out or groups it (see `caretIn`). A write put
       // it at the end, and the next key went there (FEEDBACK61.md, Q-891 and its review; branch
       // feedback61). At the end, where the write puts it, nothing more is done.
-      const keep = typed && el === document.activeElement && typeof el.selectionStart === "number";
+      const keep = typed && el === docGet("activeElement") && typeof el.selectionStart === "number";
       const was = el.value, at = keep ? el.selectionStart : 0, to = keep ? el.selectionEnd : 0, dir = keep ? el.selectionDirection : undefined;
       el.value = nv;
       if (keep) {
@@ -8983,7 +9056,7 @@ function listen(el, t, f) {
   if (Writer !== null && (Owner === null || Owner.comp !== Writer)) el.__by = Writer;
   if (t === "click") {
     el.__click = f;
-    if (!delegating) { delegating = true; document.addEventListener("click", delegated); }
+    if (!delegating) { delegating = true; docOn("click", delegated); }
     return;
   }
   if (claiming && el.__kept) { el.__kept = false; el.setAttribute("src", el.getAttribute("src")); }
@@ -9048,7 +9121,7 @@ function focusSoon(el) {
   if (focusSoon.q.length === 0) queueMicrotask(() => {
     let first = null;
     for (const e of focusSoon.q.splice(0)) if (e.isConnected && (!first || first.compareDocumentPosition(e) & Node.DOCUMENT_POSITION_PRECEDING)) first = e;
-    const a = document.activeElement;
+    const a = docGet("activeElement");
     if (first && !(a && a !== first && typingIn(a))) first.focus();
   });
   focusSoon.q.push(el);
@@ -9092,7 +9165,7 @@ function each(list, key, row, follows) {
       first = false;
       const at = out.length, inTable = c.claim && (c.p.localName === "table" || c.p.__qb);
       st.rows = items.map((x, i) => newRow(x, ks ? ks[i] : key ? keyOf(st, key, x) : i, row, c, out));
-      st.end = document.createTextNode("");
+      st.end = docText("");
       st.end.__part = st;
       partsMade++;
       st.made = partsMade;
@@ -9280,7 +9353,7 @@ function rowFailed(r, row, svg, e) {
   disposeKids(sc);
   // Nor its item's records of what the failed make built: they piled up at each try.
   r.item.direct = null;
-  const at = r.at || (r.at = document.createTextNode(""));
+  const at = r.at || (r.at = docText(""));
   if (!at.__part) at.__part = { nodes: [] };
   recover(2, [r, row, svg]);
 }
@@ -9487,7 +9560,7 @@ function clearRows(st, p) {
       p.textContent = "";
       p.appendChild(end);
     } else if (first && first.parentNode === p) {
-      const range = document.createRange();
+      const range = docDo("createRange");
       range.setStartBefore(first);
       range.setEndBefore(end);
       range.deleteContents();
@@ -9573,7 +9646,7 @@ function reconcile(st, items, key, ks, row, svg) {
     if (j < 0) {
       const got = [];
       r = newRow(items[i], keys[i], row, { claim: false, svg, p }, got);
-      if (!pend) pend = document.createDocumentFragment();
+      if (!pend) pend = docDo("createDocumentFragment");
       for (let k = got.length - 1; k >= 0; k--) pend.insertBefore(got[k], pend.firstChild);
     } else {
       if (pend) {
@@ -9613,11 +9686,11 @@ function reconcile(st, items, key, ks, row, svg) {
 // The focused element in `p`, and what is selected in it: what puts them back after a move, when
 // the move took the focus away.
 function focusBack(p) {
-  const a = document.activeElement;
+  const a = docGet("activeElement");
   if (!a || !p.contains(a)) return null;
   const sel = typeof a.selectionStart === "number" ? [a.selectionStart, a.selectionEnd, a.selectionDirection] : null;
   return () => {
-    if (document.activeElement === a || !a.isConnected) return;
+    if (docGet("activeElement") === a || !a.isConnected) return;
     a.focus({ preventScroll: true });
     if (sel) a.setSelectionRange(sel[0], sel[1], sel[2]);
   };
@@ -9630,7 +9703,7 @@ function focusBack(p) {
 // them (they were held, and up to 63 of them stayed alive with all they held: found in review).
 // (The listener is in this declaration's lines, so that it comes with the lists that use it.)
 const scrolled = [], scrollKnown = new WeakSet();
-if (typeof document !== "undefined" && typeof WeakRef === "function" && !Element.prototype.moveBefore) document.addEventListener("scroll", scrollSeen, { capture: true, passive: true });
+if (typeof document !== "undefined" && typeof WeakRef === "function" && !Element.prototype.moveBefore) docOn("scroll", scrollSeen, { capture: true, passive: true });
 let scrollKept = 0;
 function scrollSeen(e) {
   const t = e.target;
@@ -9845,7 +9918,7 @@ const ownRoot = (el) => el.localName !== "quillo-island";
 const TABLE_PART = /^(t[rdh]|thead|tbody|tfoot|caption|colgroup|option|optgroup)$/;
 // A <quillo-island> the page makes, which stands anywhere.
 function wrapper(name) {
-  const w = document.createElement("quillo-island");
+  const w = docDo("createElement", "quillo-island");
   w.style.display = "contents";
   w.dataset.c = name;
   w.__q = true;
@@ -9897,7 +9970,7 @@ function bareRoot(got, inst, name) {
 const isMarked = (n) => n != null && n.nodeType === 8 && n.data.charCodeAt(0) === 113 && n.data.charCodeAt(1) === 32;
 function markedData(n) {
   if (!n.__qd) {
-    const t = document.createElement("template");
+    const t = docDo("createElement", "template");
     t.innerHTML = "<i" + n.data.slice(1) + ">";
     n.__qd = t.content.firstChild;
   }
@@ -9924,7 +9997,7 @@ function islandsIn(el, marked) {
   if (!marked) return [...el.querySelectorAll(ISLANDS)];
   // One walk, in the page's order: sorted by comparing their places, taking up 3,000 of them
   // took longer than making the page again (found in review).
-  const found = [], w = document.createTreeWalker(el, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT);
+  const found = [], w = docDo("createTreeWalker", el, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT);
   for (let n = w.nextNode(); n; n = w.nextNode()) {
     if (n.nodeType === 8) { if (isMarked(n)) found.push(markedData(n)); }
     else if (n.localName === "quillo-island" || n.hasAttribute("data-qi")) found.push(n);
@@ -10118,7 +10191,7 @@ function drawView(inst, d, view, el, svg, p, hq) {
 function drawFailed(inst, d, el, svg, p, e, view, n, m, hq) {
   const first = !el && !inst.at;
   if (!sameFailure(inst, e, (inst.failedAt | 0) + 1, (d.owned ? d.owned.length : 0) - n)) report(e);
-  if (first) { inst.at = document.createTextNode(""); inst.at.__part = { nodes: [] }; }
+  if (first) { inst.at = docText(""); inst.at.__part = { nodes: [] }; }
   // Its view failed: what building it made goes (see `drawView`). Its code failed: what that made
   // and started (an `every` that fills the state it needs) stays until the code runs again.
   if (view !== null) disposeFrom(d, n, m);
@@ -10243,7 +10316,7 @@ function recLoad() {
     // Each waiter looks again at once: what it waits for may have come while the file did (`late`).
     for (let i = 0; i < h.length; i += 2) { const o = h[i + 1][0]; if (!(o.dead || o.scope && o.scope.dead)) { const w = Rec[h[i]].apply(null, h[i + 1]); if (w) { w.late = true; stale(w, DIRTY); } } }
   };
-  const s = document.createElement("script");
+  const s = docEl("script");
   s.src = RecAt;
   // Not had: a file this server does not have (404: a page from before the program changed, whose
   // runtime its new code must not run with) loads the page again, once; otherwise (offline, no
@@ -10261,7 +10334,7 @@ function recLoad() {
     };
     fetch(RecAt, { method: "HEAD" }).then((r) => { if (r.status === 404) recStale(); else again(); }, again);
   };
-  document.head.appendChild(s);
+  docGet("head").appendChild(s);
 }
 function recOnline() { if (Rec === null) { clearTimeout(RecTry); recLoad(); } }
 // The failure code's file is gone (see `recLoad`): the page again, once for each such file (the
@@ -10286,8 +10359,9 @@ function recStale() {
 // of it a form has reset, which shows what it showed untouched: a range's middle, an empty
 // `<select>`'s nothing (the seventeenth review).
 function typed(d) {
-  for (const el of d.querySelectorAll("*")) {
-    const c = el.contentDocument, f = document.createElement("form");
+  // A document (the page's, a frame's) through `Document.prototype` (the second review of slice W1).
+  for (const el of (d.nodeType === 9 && DOC ? DOC.querySelectorAll.call(d, "*") : d.querySelectorAll("*"))) {
+    const c = el.contentDocument, f = docEl("form");
     if (el.shadowRoot && typed(el.shadowRoot) || c && typed(c)) return true;
     if (el.isContentEditable ? el.textContent !== "" : /^(input|select|textarea)$/.test(el.localName) && (f.appendChild(el.cloneNode(true)), f.reset(), el.value !== f.firstChild.value || el.checked !== f.firstChild.checked || [...el.options || []].map((o) => o.selected) + "" !== [...f.firstChild.options || []].map((o) => o.selected) + "")) return true;
   }
@@ -10300,7 +10374,7 @@ function recKeep() {
   const go = () => setTimeout(fetch, 1000, RecAt);
   // The session that installs the worker has it once it takes the page (the fourteenth review).
   if (!sw.controller) sw.addEventListener("controllerchange", go, { once: true });
-  else document.readyState === "complete" ? go() : addEventListener("load", go);
+  else docGet("readyState") === "complete" ? go() : addEventListener("load", go);
 }
 
 // Island JSON (and a server fn's answer), with error values
@@ -10439,15 +10513,15 @@ let TOOLS = null;
 let VERSION = ""; // Quillo's version: src/client.rs sets it after the runtime, as BASE
 
 function toolsStart() {
-  if (document.documentElement.getAttribute("data-quillo-devtools") !== "1") return;
+  if (docGet("documentElement").getAttribute("data-quillo-devtools") !== "1") return;
   TOOLS = { ids: new WeakMap(), all: new Map(), next: 1, marked: null };
-  document.addEventListener("quillo:devtools-ask", toolsAsk);
+  docOn("quillo:devtools-ask", toolsAsk);
   toolsSay("hello", { protocol: 1, version: VERSION, dev: DEV, base: BASE });
 }
 
 // A map's keys in the order set, as `toolsWire` gives them (FEEDBACK55.md, Q-875; branch feedback55).
 function toolsSay(type, o) {
-  document.dispatchEvent(new CustomEvent("quillo:devtools", { detail: writeJSON(Object.assign({ type }, o)) }));
+  docDo("dispatchEvent", new CustomEvent("quillo:devtools", { detail: writeJSON(Object.assign({ type }, o)) }));
 }
 
 // A value as the wire writes it; what cannot be written (a page's object) as its text.
@@ -10567,26 +10641,26 @@ function kept() {
   } catch (_) { PageKept = null; }
   return PageKept;
 }
-const pathOf = (n) => { const p = []; for (; n && n !== document.body && n.parentElement; n = n.parentElement) p.unshift([...n.parentElement.children].indexOf(n)); return p; };
-const atPath = (p) => { let n = document.body; for (const i of p) { n = n && n.children[i]; } return n || null; };
+const pathOf = (n) => { const p = []; for (; n && n !== docGet("body") && n.parentElement; n = n.parentElement) p.unshift([...n.parentElement.children].indexOf(n)); return p; };
+const atPath = (p) => { let n = docGet("body"); for (const i of p) { n = n && n.children[i]; } return n || null; };
 function keepPage() {
-  const islands = [...document.querySelectorAll(ISLANDS)].map((el) => el.__qi && el.__qi.sigs
+  const islands = [...docDo("querySelectorAll", ISLANDS)].map((el) => el.__qi && el.__qi.sigs
     ? { c: el.dataset.c, s: Object.fromEntries(Object.entries(el.__qi.sigs).map(([k, sig]) => [k, toolsWire(sig._v)])) } : null);
   const fields = [];
-  for (const f of document.querySelectorAll("input,textarea,select")) {
+  for (const f of docDo("querySelectorAll", "input,textarea,select")) {
     const changed = f.type === "checkbox" || f.type === "radio" ? f.checked !== f.defaultChecked : f.tagName === "SELECT" ? [...f.options].some((o) => o.selected !== o.defaultSelected) : f.value !== f.defaultValue;
     if (changed && f.type !== "password" && f.type !== "file") fields.push({ p: pathOf(f), t: f.tagName + ":" + f.type, v: f.type === "checkbox" || f.type === "radio" ? f.checked : f.value });
   }
-  const open = [...document.querySelectorAll("details[open]")].map(pathOf);
-  const a = document.activeElement;
-  const focus = a && a !== document.body ? { p: pathOf(a), s: typeof a.selectionStart === "number" ? [a.selectionStart, a.selectionEnd] : null } : null;
+  const open = [...docDo("querySelectorAll", "details[open]")].map(pathOf);
+  const a = docGet("activeElement");
+  const focus = a && a !== docGet("body") ? { p: pathOf(a), s: typeof a.selectionStart === "number" ? [a.selectionStart, a.selectionEnd] : null } : null;
   try { sessionStorage.setItem(KEEP(), writeJSON({ islands, fields, open, focus, scroll: [scrollX, scrollY] })); } catch (_) {}
 }
 // The island `el`'s states as kept, where the server's state of that name has the same kind.
 function keptFor(el, state) {
   const k = kept();
   if (!k || !k.islands) return state;
-  const i = [...document.querySelectorAll(ISLANDS)].indexOf(el);
+  const i = [...docDo("querySelectorAll", ISLANDS)].indexOf(el);
   const was = k.islands[i];
   if (!was || was.c !== el.dataset.c) return state;
   const out = Object.assign({}, state);
@@ -10602,7 +10676,7 @@ function keptFor(el, state) {
 function keptPageBack() {
   const k = kept();
   if (!k) return;
-  const islands = [...document.querySelectorAll(ISLANDS)];
+  const islands = [...docDo("querySelectorAll", ISLANDS)];
   (k.islands || []).forEach((was, i) => { if (was && islands[i] && islands[i].dataset.c === was.c) resume(outerIsland(islands[i]) || islands[i]); });
   for (const f of k.fields || []) {
     const n = atPath(f.p);
@@ -10623,16 +10697,16 @@ function keptPageBack() {
 // A component that is a row's or a cell's own root (no element of its own) starts again.
 function loadScript(url) {
   return new Promise((ok, no) => {
-    const t = document.createElement("script");
+    const t = docEl("script");
     t.src = url;
     t.onload = () => { t.remove(); ok(); };
     t.onerror = () => { t.remove(); no(new Error("quillo: could not load " + url)); };
-    document.head.appendChild(t);
+    docGet("head").appendChild(t);
   });
 }
 async function hotSwap(urls) {
   for (const u of urls) await loadScript(u);
-  const outer = [...document.querySelectorAll(ISLANDS)].filter((i) => !(i.parentElement && i.parentElement.closest(ISLANDS)));
+  const outer = [...docDo("querySelectorAll", ISLANDS)].filter((i) => !(i.parentElement && i.parentElement.closest(ISLANDS)));
   for (const el of outer) if (el.__qi && el.isConnected) remakeIsland(el, el.__qp || el.__qi.props);
 }
 
@@ -10648,7 +10722,7 @@ const kindOf = (n) => n.tagName + ":" + (n.type || "");
 function takeDom(el) {
   const at = (n) => { const p = pathIn(el, n); return p && { p, k: kindOf(n) }; };
   const took = { win: [scrollX, scrollY], scroll: [], fields: [], open: [], media: [], focus: null };
-  const a = document.activeElement;
+  const a = docGet("activeElement");
   if (a && el.contains(a) && a !== el) took.focus = Object.assign(at(a) || {}, { s: typeof a.selectionStart === "number" ? [a.selectionStart, a.selectionEnd, a.selectionDirection] : null });
   for (const n of el.querySelectorAll("*")) {
     if (n.scrollTop || n.scrollLeft) took.scroll.push(Object.assign(at(n), { t: n.scrollTop, l: n.scrollLeft }));
@@ -10735,7 +10809,7 @@ function remakeIsland(el, props) {
 // place, a script of the program's that differs, <head>'s scripts): false, and the page reloads,
 // keeping what it holds (A.6). Quillo's own scripts (its loader, the page's states, the dev
 // script) are left as they are.
-function hotMorph(html) {
+function hotMorph(html, qn) {
   const doc = new DOMParser().parseFromString(html, "text/html");
   const own = (n) => n.nodeType === 1 && n.localName === "script" && (/Symbol\.for\(["']quillo["']\)/.test(n.textContent) || n.textContent.startsWith("/*quillo-dev*/") || /\/_quillo\//.test(n.getAttribute("src") || ""));
   const holds = (n) => n.nodeType === 1 && (n.matches(ISLANDS) || n.localName === "script" || !!n.querySelector(ISLANDS + ",script"));
@@ -10759,10 +10833,14 @@ function hotMorph(html) {
     if (old.matches(ISLANDS)) {
       if (!now.matches(ISLANDS) || old.dataset.c !== now.dataset.c) return false;
       if (old.__qi) {
+        // Made again from the new answer's props only where that answer wrote the island, by its
+        // nonce; any other reloads the page (the third review of slice W1; FEEDBACK51.md, Q-667;
+        // branch feedback86-89).
+        if (old.dataset.p !== now.dataset.p && (!qn || now.getAttribute("data-qn") !== qn)) return false;
         if (old.dataset.p !== now.dataset.p) ops.push(() => {
           old.dataset.p = now.dataset.p;
           const props = islandJSON(now.dataset.p, {});
-          if (typeof props.children === "string") props.children = rawHtml(props.children);
+          if (typeof props.children === "string" && now.hasAttribute("data-qh")) props.children = rawHtml(props.children);
           remakeIsland(old, props);
         });
       } else if (old.outerHTML !== now.outerHTML) {
@@ -10786,25 +10864,28 @@ function hotMorph(html) {
       const after = n ? oc[n - 1] : null;
       ops.push(() => {
         let ref = after ? after.nextSibling : old.firstChild;
-        for (const a of added) old.insertBefore(document.importNode(a, true), ref);
+        for (const a of added) old.insertBefore(docDo("importNode", a, true), ref);
       });
     }
     return true;
   };
   // <head>: its scripts must be as they were; its title and stylesheets follow.
-  const heads = (d) => [...d.head.querySelectorAll("script")].filter((x) => !own(x)).map((x) => (x.getAttribute("src") || "") + "\n" + x.textContent).join("\0");
+  const heads = (d) => [...dGet(d, "head").querySelectorAll("script")].filter((x) => !own(x)).map((x) => (x.getAttribute("src") || "") + "\n" + x.textContent).join("\0");
   if (heads(document) !== heads(doc)) return false;
-  if (!plan(document.body, doc.body)) return false;
-  if (document.title !== doc.title) ops.push(() => { document.title = doc.title; });
-  const sheets = (d) => [...d.head.querySelectorAll("link[rel=stylesheet]")].map((l) => l.getAttribute("href"));
+  if (!plan(docGet("body"), dGet(doc, "body"))) return false;
+  if (docGet("title") !== dGet(doc, "title")) ops.push(() => { docSet("title", dGet(doc, "title")); });
+  const sheets = (d) => [...dGet(d, "head").querySelectorAll("link[rel=stylesheet]")].map((l) => l.getAttribute("href"));
   const was = sheets(document), now = sheets(doc);
   if (was.join("\0") !== now.join("\0")) {
     ops.push(() => {
-      for (const l of [...document.head.querySelectorAll("link[rel=stylesheet]")]) if (!now.includes(l.getAttribute("href"))) l.remove();
-      for (const href of now) if (!was.includes(href)) { const l = document.createElement("link"); l.rel = "stylesheet"; l.href = href; document.head.appendChild(l); }
+      for (const l of [...docGet("head").querySelectorAll("link[rel=stylesheet]")]) if (!now.includes(l.getAttribute("href"))) l.remove();
+      for (const href of now) if (!was.includes(href)) { const l = docEl("link"); l.rel = "stylesheet"; l.href = href; docGet("head").appendChild(l); }
     });
   }
   for (const op of ops) op();
+  // Its islands not yet taken up now carry the new answer's nonce, from its header (`nonceOf`;
+  // FEEDBACK51.md, Q-667; branch feedback86-89).
+  QW.qn = qn || "";
   return true;
 }
 
@@ -10814,12 +10895,15 @@ function resume(el) {
   // Still waiting for its deferred state, which the server sends after the page
   // and swaps in (src/defer.rs; branch defer): taken up once it has come.
   if (el.__q || (el.hasAttribute && el.hasAttribute("data-qd"))) return;
+  // Only an island of this answer's, and inside it only those (FEEDBACK51.md, Q-667; branch
+  // feedback86-89).
+  if (!ownIsland(el)) return;
   el.__q = true;
   const def = C[el.dataset.c];
   if (!def) { report(`unknown component <${el.dataset.c}>`); return; }
   // Those inside it the server marked by comments too, found once (FEEDBACK61.md, Q-892; branch
   // feedback61).
-  const inside = islandsIn(el, el.hasAttribute("data-qm"));
+  const inside = islandsIn(el, el.hasAttribute("data-qm")).filter(ownIsland);
   const queue = () => {
     const q = {};
     for (const inner of inside) {
@@ -10830,8 +10914,9 @@ function resume(el) {
   for (const inner of inside) liveSeen(...(inner.dataset.v || "").split(":"));
   liveSeen(...(el.dataset.v || "").split(":"));
   const props = islandJSON(el.dataset.p, {});
-  // A top island's children come as the HTML the server made of them.
-  if (typeof props.children === "string") props.children = rawHtml(props.children);
+  // A top island's children come as the HTML the server made of them, which it marks (`data-qh`):
+  // a `children` text it did not mark stays text (FEEDBACK51.md, Q-667; branch feedback86-89).
+  if (typeof props.children === "string" && el.hasAttribute("data-qh")) props.children = rawHtml(props.children);
   const given = islandJSON(el.dataset.s, {}), liveInfo = islandJSON(el.dataset.l, null);
   const state = DEV ? keptFor(el, given) : given;
   hydrating = queue();
@@ -10905,7 +10990,7 @@ function asParsed(f) {
   }
   if (f.value === f.defaultValue) return true;
   if (f.tagName !== "INPUT") return false;
-  const p = document.createElement("input");
+  const p = docDo("createElement", "input");
   for (const a of ["type", "min", "max", "step"]) if (f.hasAttribute(a)) p.setAttribute(a, f.getAttribute(a));
   p.setAttribute("value", f.defaultValue);
   return f.value === p.value;
@@ -10922,22 +11007,24 @@ function boot() {
   QW.resume = (el) => { if (el && !el.__q) resume(el); };
   // Someone reaching for an island takes it up (before their event is
   // handled: it reaches the component).
-  for (const t of ["pointerover", "pointerdown", "touchstart", "focusin", "keydown", "click", "submit", "input"]) document.addEventListener(t, wake, true);
+  // The document's own, past elements named for them (see `docGet`).
+  for (const t of ["pointerover", "pointerdown", "touchstart", "focusin", "keydown", "click", "submit", "input"]) docOn(t, wake, true);
   // And a scroll, on a page whose loader said it has a component that listens to them: heard as it
   // goes down, so the component's handler, put in place as it is taken up, hears the same scroll
   // (FEEDBACK72.md, Q-1010; branch feedback72-81).
-  if (QW.sc) document.addEventListener("scroll", wake, { capture: true, passive: true });
-  const outer = [...document.querySelectorAll(ISLANDS)].filter((i) => !(i.parentElement && i.parentElement.closest(ISLANDS)));
+  if (QW.sc) docOn("scroll", wake, { capture: true, passive: true });
+  const body = docGet("body");
+  const outer = [...docDo("querySelectorAll", ISLANDS)].filter((i) => !(i.parentElement && i.parentElement.closest(ISLANDS)));
   // An island runs by itself when one inside it does: the inner one starts
   // with its outer one (FEEDBACK5.md, Q-046; branch stays-fixes).
   const byItself = (i) => i.hasAttribute("data-e") || i.hasAttribute("data-l");
   for (const island of outer) {
-    if (byItself(island) || island.parentElement === document.body || [...island.querySelectorAll(ISLANDS)].some(byItself)) resume(island);
+    if (byItself(island) || island.parentElement === body || [...island.querySelectorAll(ISLANDS)].some(byItself)) resume(island);
   }
   // The island someone reached for, which brought the bundle, and the one
   // that has the focus.
-  for (const n of [QW.at, document.activeElement]) {
-    const i = n && n !== document.body ? outerIsland(n) : null;
+  for (const n of [QW.at, docGet("activeElement")]) {
+    const i = n && n !== body ? outerIsland(n) : null;
     if (i) resume(i);
   }
   // What was done before the bundle came (the loader in server.rs kept it):
@@ -11209,9 +11296,9 @@ W.inPlace = () => {
   window.addEventListener("popstate", ipPop);
   let pointed = 0;
   const o = { capture: true, passive: true };
-  document.addEventListener("pointerover", (e) => { clearTimeout(pointed); pointed = setTimeout(() => ipAhead(e), 65); }, o);
-  for (const v of ["pointerdown", "touchstart", "focusin"]) document.addEventListener(v, ipAhead, o);
-  document.addEventListener("click", ipClick);
+  docOn("pointerover", (e) => { clearTimeout(pointed); pointed = setTimeout(() => ipAhead(e), 65); }, o);
+  for (const v of ["pointerdown", "touchstart", "focusin"]) docOn(v, ipAhead, o);
+  docOn("click", ipClick);
 };
 // A function's form for `<Name .../>`: its code once, with props as getters.
 W.view = (f, view) => { f.$view = view; return f; };
@@ -11241,7 +11328,7 @@ function liveSig(inst, name, fname, args, every) {
   const had = hasOwn(inst.s0, name);
   const sig = new Sig(had ? inst.s0[name] : null);
   // `fails`: loads that failed in a row; `retry`: the timer of the next try (see `liveRefresh`).
-  const sub = { inst, sig, name, fname, every: every || 0, last: 0, args: null, topics: info ? info.t : [], h: had && info && info.h || "", base: had ? inst.s0[name] : undefined, fails: 0, retry: 0, fx: null };
+  const sub = { inst, sig, name, fname, every: every || 0, last: 0, args: null, topics: info ? info.t : [], key: info && info.k || "", h: had && info && info.h || "", base: had ? inst.s0[name] : undefined, fails: 0, retry: 0, fx: null };
   Live.subs.add(sub);
   onCleanup(() => { Live.subs.delete(sub); clearTimeout(sub.retry); liveRestart(); });
   sub.fx = liveArgs(sub, args, true, had);

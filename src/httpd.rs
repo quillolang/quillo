@@ -1681,6 +1681,11 @@ impl Loop {
         c.input = Vec::new();
         c.chunked = None;
         c.full = false;
+        c.receiving = None;
+        c.body_of = None;
+        c.body_from = None;
+        c.continued = false;
+        c.continue_due = false;
         if c.writing {
             c.writing = false;
             let _ = self.poll.registry().reregister(&mut c.stream, Token(i), Interest::READABLE);

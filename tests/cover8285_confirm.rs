@@ -143,13 +143,38 @@ fn other_server() -> (u16, Arc<AtomicUsize>) {
     let seen = Arc::new(AtomicUsize::new(0));
     let s = seen.clone();
     std::thread::spawn(move || {
-        for c in l.incoming().flatten() {
+        for mut c in l.incoming().flatten() {
             s.fetch_add(1, Ordering::SeqCst);
-            let mut c = c;
             c.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            let mut req = Vec::new();
             let mut buf = [0u8; 4096];
-            let _ = c.read(&mut buf);
+            let mut body_need = None;
+            loop {
+                let Ok(n) = c.read(&mut buf) else { break };
+                if n == 0 {
+                    break;
+                }
+                req.extend_from_slice(&buf[..n]);
+                if body_need.is_none() {
+                    if let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&req[..end]);
+                        let cl = head
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                k.trim().eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        body_need = Some(end + 4 + cl);
+                    }
+                }
+                if body_need.is_some_and(|need| req.len() >= need) || req.len() > (1 << 20) {
+                    break;
+                }
+            }
             let _ = c.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok");
+            let _ = c.flush();
+            let _ = c.shutdown(std::net::Shutdown::Write);
         }
     });
     (port, seen)
@@ -734,9 +759,8 @@ fn confirm_at_a_terminal_answered_no_writes_nothing() {
 // ---- a provider's policy, and the program's own ------------------------------------------------
 
 /// Under a provider's policy, a start with an incomplete `quillo.confirmed` says how many things
-/// it leaves out and that a later release will not start so, and starts (src/confirm.rs
-/// at_start_in, provider_line; FEEDBACK83.md questions 5 and 6; coverage of feedback82-85; branch
-/// feedback82-85).
+/// it leaves out and refuses to start from 0.8.12 (`STOPS_FROM`; src/confirm.rs at_start_in,
+/// provider_line; FEEDBACK83.md questions 5 and 6; coverage of feedback82-85; branch feedback82-85).
 #[test]
 fn a_providers_policy_hears_what_a_start_leaves_out() {
     let d = dir("provider");
@@ -744,19 +768,18 @@ fn a_providers_policy_hears_what_a_start_leaves_out() {
     write(&d, "p.toml", "[http]\nhosts = [\"*\"]\n");
     write(&d, "quillo.confirmed", "[\"main.qwe\"]\nhttp = [\"api.example.com\"]\n");
     let pv = d.join("p.toml").display().to_string();
-    let (g, port, log) = serve_env(&d, &[], &[("QUILLO_POLICY_PATH", &pv)]);
-    assert_eq!(send(port, "GET", "/up", &[], "").body, "up");
-    drop(g);
-    let text = read(&log);
+    let (code, text) = quillo_env(&d, &["run", "main.qwe", "--port", "0"], 60, &[("QUILLO_POLICY_PATH", &pv)]);
+    assert_eq!(code, Some(2), "{}", text);
     assert!(text.contains("quillo: 1 thing in 1 file is not confirmed (quillo.confirmed): each is refused as it is reached"), "{}", text);
-    assert!(text.contains(&format!("quillo: the policy {} asks for a complete quillo.confirmed, and quillo.confirmed leaves 1 thing out: from Quillo 0.8.12 it will not start so (`quillo confirm` writes it)", pv)), "{}", text);
+    assert!(text.contains(&format!("quillo: the policy {} asks for a complete quillo.confirmed, and quillo.confirmed leaves 1 thing out: so it does not start (`quillo confirm` writes it)", pv)), "{}", text);
     // Two left out: said by their number.
     write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
-    let (g, _, log) = serve_env(&d, &[], &[("QUILLO_POLICY_PATH", &pv)]);
-    drop(g);
-    assert!(read(&log).contains("quillo.confirmed leaves 2 things out: from Quillo 0.8.12"), "{}", read(&log));
-    // Without the provider's layer, nothing of it said.
-    let (g, _, log) = serve(&d, &[]);
+    let (code, out) = quillo_env(&d, &["run", "main.qwe", "--port", "0"], 60, &[("QUILLO_POLICY_PATH", &pv)]);
+    assert_eq!(code, Some(2), "{}", out);
+    assert!(out.contains("quillo.confirmed leaves 2 things out: so it does not start"), "{}", out);
+    // Without the provider's layer, it starts and nothing of it is said.
+    let (g, port, log) = serve(&d, &[]);
+    assert_eq!(send(port, "GET", "/up", &[], "").body, "up");
     drop(g);
     assert!(!read(&log).contains("asks for a complete"), "{}", read(&log));
 }

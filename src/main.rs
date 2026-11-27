@@ -2043,7 +2043,7 @@ fn stop_asked() {
             with::stop_all();
             std::process::exit(130);
         }
-        eprintln!("quillo: stopping when the app stops: its requests in progress may still call this service (again to stop now)");
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"quillo: stopping when the app stops: its requests in progress may still call this service (again to stop now)\n");
         return;
     }
     // One signal waited for the app already: this is the second.
@@ -2065,9 +2065,9 @@ fn begin_stop(again: bool) {
         quillo::server::leave_private();
         std::process::exit(130);
     }
-    // A message that cannot be written no longer panics (the `eprintln!` above), so the
-    // handler goes on to stop the server (FEEDBACK37.md, Q-452; branch feedback36-39).
-    eprintln!("quillo: stopping once the requests in progress are answered (again to stop now)");
+    // A message that cannot be written never panics, so the handler goes on to stop the server
+    // (FEEDBACK37.md, Q-452; branch feedback36-39).
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"quillo: stopping once the requests in progress are answered (again to stop now)\n");
     if quillo::httpd::stopping() {
         return;
     }
@@ -2097,7 +2097,7 @@ fn begin_stop(again: bool) {
                 n => running.push(format!("{} files being sent", n)),
             }
             if limit.is_some_and(|l| began.elapsed() >= l) {
-                eprintln!("quillo: stopping with requests in progress: {}", running.join(", "));
+                let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("quillo: stopping with requests in progress: {}\n", running.join(", ")));
                 // As a stop that waited does: pages told, and each database not in a transaction
                 // whole (FEEDBACK80.md, Q-1260 and Q-1265; branch feedback72-81).
                 quillo::wt::close_all();
@@ -2107,7 +2107,7 @@ fn begin_stop(again: bool) {
                 std::process::exit(0);
             }
             if !running.is_empty() {
-                eprintln!("quillo: still waiting for {} (again to stop now)", running.join(", "));
+                let _ = std::io::Write::write_fmt(&mut std::io::stderr(), format_args!("quillo: still waiting for {} (again to stop now)\n", running.join(", ")));
             }
         }
     });

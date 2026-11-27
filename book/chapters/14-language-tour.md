@@ -299,6 +299,11 @@ match v {
   (or another service) are made as `User(v)` makes them: checked the same way, with
   defaults put in and fields the record does not have left out, so a page cannot add
   `is_admin` to the profile it saves.
+- A field the record does not have, read on a value `User(...)` makes or a function
+  declared `-> User` returns, is an error in `quillo check` *(since 0.8.12; it read null)*,
+  as it is on a parameter typed `User`; so is one read on any map whose fields are known
+  (the program's own function that gives a map or `err(...)`), except `.len`, `.keys`,
+  `.values`, `.error` and `.message`.
 - In a pattern, a record matches what `User(v)` would make, and binds that: in a route,
   `{ json: User }` takes the body as a User, and `{ form: Signup }` a form, its text
   converted to the numbers and booleans the record asks for, as query values are. A
@@ -503,6 +508,10 @@ write `x.y`.
 `! T` in a signature declares what the function's errors contain. It is checked: a
 function declared `! str` that returns `err(42)` is a runtime error, and `quillo check`
 reports it, and a `?` that would pass on the wrong kind of error, before the program runs.
+A field read or a method called on what such a function gives (or a service call), straight
+off the call or kept in a `let` or `state`, with no `?`, `is_err`, `type_of`, `match` or test of
+it first, is warned of *(since 0.8.12)*: an error has none of its fields. `inv.id ?? 0` is
+fine: `??` takes a read that failed.
 
 Mistakes in the code itself (calling a non-function, adding a map to an int, a
 failed type check, recursion more than 10,000 calls deep) are runtime errors. In a
@@ -954,13 +963,12 @@ expressions go in `{...}`, and everything is escaped unless it is already HTML:
   <script>{raw(CODE)}</script>, or put it in a file of its own``. A component's `<script>` (made
   in the browser, which runs it) takes only text written in the program. Script built
   as text outside a `<script>` element (`raw("<script>" + ... )`) is not looked at.
-- `raw(s)` marks trusted HTML. HTML a visitor wrote, even cleaned by a sanitizer, must not
-  keep the attributes Quillo's islands are made of: `data-qi`, `data-qd`, `data-qt`,
-  `data-c`, `data-p`, `data-s`, `data-l`, `data-v` and `data-e`, nor `<quillo-island>`
-  elements. The page takes such an element up
-  as one of its components, with the props and state it says, and a `children` text in its
-  `data-p` as HTML (FEEDBACK51.md, Q-667). DOMPurify keeps `data-*` unless told not to
-  (`ALLOW_DATA_ATTR: false`).
+- `raw(s)` marks trusted HTML. *(Since 0.8.12, Quillo signs each answer's components with a
+  per-answer nonce `data-qn` and marks server-rendered `children` HTML with `data-qh`, so
+  injected `<quillo-island>` or `data-*` elements without that answer's nonce are ignored by the
+  runtime.)* Still strip `data-qi`, `data-qd`, `data-qt`, `data-c`, `data-p`, `data-s`, `data-l`,
+  `data-v`, `data-e`, `data-qn`, `data-qh` and `<quillo-island>` from untrusted HTML before `raw()`:
+  DOMPurify keeps `data-*` unless told not to (`ALLOW_DATA_ATTR: false`).
 - A capitalized tag calls a view: attributes fill parameters by name, and the element's body is passed as `children`.
   A view with no `children` parameter given a body is an error *(since 0.7: the body was
   dropped)*, as an attribute it has no parameter for is; spaces alone are no body.

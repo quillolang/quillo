@@ -230,7 +230,7 @@ pub fn parse_as(boundary: &str, body: &[u8], held: bool) -> Result<(Map, Map), c
                         let v = match files.shift_remove(&key) {
                             None => f,
                             Some(Value::List(l)) => {
-                                let mut l = (*l).clone();
+                                let mut l = l.to_vec();
                                 l.push(f);
                                 Value::list(l)
                             }
