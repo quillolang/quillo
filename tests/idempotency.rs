@@ -224,7 +224,7 @@ fn answers_expire() {
 fn server_fns_called_from_pages_send_a_key_and_get_the_first_answer() {
     let (_f, s) = app("rpc");
     let bundle = send(s.port, "GET", "/_quillo/quillo.js", &[], "").body;
-    assert!(bundle.contains(r#"W.server("add", true)"#), "the page sends keys for `add`");
+    assert!(bundle.contains(r#"W.server("add",true)"#) || bundle.contains(r#"W.server("add", true)"#), "the page sends keys for `add`");
     assert!(bundle.contains("idempotency-key"));
 
     let call = |key: &str| send(s.port, "POST", "/_quillo/rpc/add", &[("Idempotency-Key", key), ("Sec-Fetch-Site", "same-origin")], "[41]");

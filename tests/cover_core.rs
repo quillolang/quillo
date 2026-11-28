@@ -127,7 +127,7 @@ fn a_service_called_in_a_helper_counts_as_the_http_effect() {
 #[test]
 fn a_component_that_returns_early_copies_its_props() {
     let js = bundle("component C(a) {\n    if a {\n        return <b>\"yes\"</b>\n    }\n    <i>\"no\"</i>\n}\nroute GET / = <C a={true}/>\n");
-    assert!(js.contains("= $p.a;"), "{}", js);
+    assert!(js.contains("=$p.a;") || js.contains("= $p.a;"), "{}", js);
 }
 
 /// A function is a global the browser has, but not one it can change.
@@ -140,7 +140,7 @@ fn a_handler_cannot_assign_a_function_of_the_server() {
 #[test]
 fn state_stays_when_a_component_returns_early() {
     let js = bundle("component C(a) {\n    state x = 1\n    if a {\n        return <b>{x}</b>\n    }\n    <i>{x}</i>\n}\nroute GET / = <C a={true}/>\n");
-    assert!(js.contains("= $p.a;"), "{}", js);
+    assert!(js.contains("=$p.a;") || js.contains("= $p.a;"), "{}", js);
 }
 
 // ---- the interpreter -------------------------------------------------------

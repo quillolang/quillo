@@ -576,7 +576,8 @@ pub(crate) fn bundle_for_states_with_chunks(
                     let sub = components_of(it, &dc);
                     if !sub.iter().any(|x| sorted_roots.contains(x)) {
                         let chunk_prog = program_text(it, &dc, false, false);
-                        if chunk_prog.len() >= 1024 {
+                        let own_bytes: usize = dc.blocks.iter().map(|s| s.len()).sum::<usize>() + dc.defs.last().map_or(0, |s| s.len());
+                        if own_bytes >= 2048 {
                             if let Some(esm) = rt_file.wrap_esm(&chunk_prog) {
                                 let hash = hash_text(&esm);
                                 lazy_map.insert(d.clone(), format!("{}/_quillo/c/{}.js", it.base, hash));
@@ -4544,7 +4545,7 @@ impl<'a> Compiler<'a> {
         fn html_ok(el: &HtmlEl, states: &HashSet<String>, it: &Interp, seen: &mut HashSet<String>) -> bool {
             if el.tag.starts_with(|c: char| c.is_uppercase())
                 || el.tag.contains('-')
-                || matches!(el.tag.as_str(), "svg" | "select" | "option" | "optgroup" | "textarea" | "script" | "style" | "foreignObject" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "colgroup" | "datalist")
+                || matches!(el.tag.as_str(), "svg" | "g" | "circle" | "ellipse" | "line" | "path" | "polygon" | "polyline" | "rect" | "text" | "tspan" | "defs" | "use" | "symbol" | "clipPath" | "mask" | "pattern" | "linearGradient" | "radialGradient" | "stop" | "image" | "select" | "option" | "optgroup" | "textarea" | "script" | "style" | "foreignObject" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "colgroup" | "datalist")
             {
                 return false;
             }
@@ -4555,7 +4556,7 @@ impl<'a> Compiler<'a> {
                 if expr_disallowed(c, it, seen) { return false; }
             }
             for (name, v) in &el.attrs {
-                if name == "key" || name == "@mount" || name.starts_with("bind:") { return false; }
+                if name == "key" || name == "@mount" || name == "autofocus" || name.starts_with("bind:") { return false; }
                 match v {
                     AttrVal::Spread(_) => return false,
                     AttrVal::Bool => if name.starts_with('@') { return false; },
@@ -4973,11 +4974,26 @@ impl<'a> Compiler<'a> {
                 }).collect();
                 emit_text_patch(w, &span, &tvar)?;
             }
+            let all_els = el.children.iter().all(|c| match c {
+                HtmlChild::El(_) => true,
+                HtmlChild::Expr(Expr::Lit(Lit::Str(s))) => s.trim().is_empty(),
+                _ => false,
+            });
             if need_me {
+                let mut len_chk = String::new();
+                if all_els {
+                    let el_count = el.children.iter().filter(|c| matches!(c, HtmlChild::El(_))).count();
+                    let _ = write!(len_chk, " if ($c && {my_var}.children.length !== {el_count}) {mis};", mis = w.mis);
+                }
                 let hdr = if parent_expr == my_var {
-                    format!("if ($c && (!{my_var} || {my_var}.localName !== {tag})) {mis};\n{body}", tag = js_str(&el.tag.to_ascii_lowercase()), mis = w.mis)
+                    format!("if ($c && (!{my_var} || {my_var}.localName !== {tag})) {mis};{len_chk}\n{body}", tag = js_str(&el.tag.to_ascii_lowercase()), mis = w.mis)
                 } else {
-                    format!("const {my_var} = {parent_expr}; if ($c && (!{my_var} || {my_var}.localName !== {tag})) {mis};\n{body}", tag = js_str(&el.tag.to_ascii_lowercase()), mis = w.mis)
+                    let root_chk = if parent_expr == "$el.firstElementChild" {
+                        format!(" if ($c && $el.children.length !== 1) {mis};", mis = w.mis)
+                    } else {
+                        String::new()
+                    };
+                    format!("const {my_var} = {parent_expr};{root_chk} if ($c && (!{my_var} || {my_var}.localName !== {tag})) {mis};{len_chk}\n{body}", tag = js_str(&el.tag.to_ascii_lowercase()), mis = w.mis)
                 };
                 w.walk.insert_str(hdr_pos, &hdr);
             }
@@ -7016,7 +7032,7 @@ impl<'a> Compiler<'a> {
         fn html_ok(el: &HtmlEl, it: &Interp, compiler: &Compiler, row_var: &str) -> bool {
             if el.tag.starts_with(|c: char| c.is_uppercase())
                 || el.tag.contains('-')
-                || matches!(el.tag.as_str(), "svg" | "select" | "option" | "optgroup" | "textarea" | "script" | "style" | "foreignObject" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "colgroup" | "datalist")
+                || matches!(el.tag.as_str(), "svg" | "g" | "circle" | "ellipse" | "line" | "path" | "polygon" | "polyline" | "rect" | "text" | "tspan" | "defs" | "use" | "symbol" | "clipPath" | "mask" | "pattern" | "linearGradient" | "radialGradient" | "stop" | "image" | "select" | "option" | "optgroup" | "textarea" | "script" | "style" | "foreignObject" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "colgroup" | "datalist")
             {
                 return false;
             }
@@ -7028,7 +7044,7 @@ impl<'a> Compiler<'a> {
             }
             for (name, v) in &el.attrs {
                 if name == "key" { continue; }
-                if name == "@mount" || name.starts_with("bind:") { return false; }
+                if name == "@mount" || name == "autofocus" || name.starts_with("bind:") { return false; }
                 match v {
                     AttrVal::Spread(_) => return false,
                     AttrVal::Bool => if name.starts_with('@') { return false; },

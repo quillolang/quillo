@@ -369,7 +369,7 @@ route GET / = <html><body><C/></body></html>
     assert_eq!(status, 200);
     let at = js.find("W.setf(").unwrap_or_else(|| panic!("no field set in the bundle: {}", js));
     let set = &js[at..js[at..].find(';').map_or(js.len(), |e| at + e)];
-    assert!(set.contains("\"title\", (\"color: \" + W.display(B.__css_value("), "{}", set);
+    assert!(set.contains("\"title\",(\"color: \"+W.display(B.__css_value(") || set.contains("\"title\", (\"color: \" + W.display(B.__css_value("), "{}", set);
 }
 
 /// A `reply` in a style's expression sends its body as written, as the same reply before the
