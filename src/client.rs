@@ -81,7 +81,12 @@ fn bundle_from(it: &Interp, c: &Compiler, boots: bool) -> String {
 /// The program compiled for the browser, from `roots` (all its components
 /// when none), and whether it has any.
 fn compiled<'a>(it: &'a Interp, roots: Option<&[String]>) -> Result<(Compiler<'a>, bool), QuilloError> {
+    compiled_with(it, roots, &HashMap::new())
+}
+
+fn compiled_with<'a>(it: &'a Interp, roots: Option<&[String]>, lazy_chunks: &HashMap<String, String>) -> Result<(Compiler<'a>, bool), QuilloError> {
     let mut c = Compiler::new(it);
+    c.lazy_chunks = lazy_chunks.clone();
     let mut names: Vec<(String, Arc<FnDef>)> = Vec::new();
     for (name, v) in scope_vars(&it.globals) {
         if let Value::Func(f) = v {
@@ -429,12 +434,63 @@ fn needs_dec_money(it: &Interp, program: &str) -> (bool, bool) {
     (dec, money)
 }
 
-fn push_feature_inits(it: &Interp, program: &mut String) {
+fn ast_has_tag(it: &Interp, tags: &[&str]) -> bool {
+    fn html_has_tag(el: &HtmlEl, tags: &[&str], found: &mut bool) {
+        if *found { return; }
+        if tags.contains(&el.tag.as_str()) { *found = true; return; }
+        for c in &el.children {
+            match c {
+                HtmlChild::El(sub) => html_has_tag(sub, tags, found),
+                HtmlChild::Expr(e) => expr_has_tag(e, tags, found),
+            }
+        }
+    }
+    fn expr_has_tag(e: &Expr, tags: &[&str], found: &mut bool) {
+        if *found { return; }
+        each_expr(e, &mut |x| {
+            if let Expr::Html(el, _) = x {
+                html_has_tag(el, tags, found);
+            }
+        });
+    }
+    let mut found = false;
+    for stmts in it.program.iter() {
+        for st in stmts.iter() {
+            match st {
+                Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) | Stmt::Return(Some(e), _) => expr_has_tag(e, tags, &mut found),
+                Stmt::SetField(o, _, _, e, _) => { expr_has_tag(o, tags, &mut found); expr_has_tag(e, tags, &mut found); }
+                Stmt::Fn(d) => expr_has_tag(&d.body, tags, &mut found),
+                Stmt::Route(r) => expr_has_tag(&r.body, tags, &mut found),
+                Stmt::Type(_) | Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None, _) => {}
+            }
+            if found { return true; }
+        }
+    }
+    found
+}
+
+fn push_feature_inits(it: &Interp, program: &mut String, uses_json_attr: bool, all_dom: bool) {
     let (dec, money) = needs_dec_money(it, program);
     if money { program.push_str("useMoney();\n"); }
     if dec { program.push_str("useDec();\n"); }
     if it.routes.iter().any(|r| r.offline) || program.contains("B.ask") || program.contains("B.notify") {
         program.push_str("useSw();\n");
+    }
+    if all_dom || program.contains("W.live") { program.push_str("useLive();\n"); }
+    if all_dom || program.contains("\"style\"") || program.contains("W.spread") || program.contains("W.csst") || program.contains("B.css") || program.contains("W.Html") || program.contains("B.html") {
+        program.push_str("useStyle();\n");
+    }
+    if all_dom || program.contains("[\"select\"") || program.contains("[\"option\"") || program.contains("[\"optgroup\"") || program.contains("W.Html") || program.contains("B.html") || ast_has_tag(it, &["select", "option", "optgroup"]) {
+        program.push_str("useSelect();\n");
+    }
+    if all_dom || program.contains("[\"table\"") || program.contains("[\"thead\"") || program.contains("[\"tbody\"") || program.contains("[\"tfoot\"") || program.contains("[\"tr\"") || program.contains("[\"colgroup\"") || program.contains("[\"select\"") || program.contains("[\"datalist\"") || program.contains("[\"optgroup\"") || ast_has_tag(it, &["table", "thead", "tbody", "tfoot", "tr", "colgroup", "select", "datalist", "optgroup"]) {
+        program.push_str("useMarked();\n");
+    }
+    if all_dom || program.contains("\"children\"") || program.contains("W.Html") || program.contains("B.html") {
+        program.push_str("useRawHtml();\n");
+    }
+    if all_dom || uses_json_attr || program.contains("W.spread") {
+        program.push_str("useJsonAttr();\n");
     }
 }
 
@@ -469,7 +525,7 @@ fn program_text(it: &Interp, c: &Compiler, boots: bool, with_base: bool) -> Stri
     if it.site.in_place {
         program.push_str(IN_PLACE_LINE);
     }
-    push_feature_inits(it, &mut program);
+    push_feature_inits(it, &mut program, c.uses_json_attr, false);
     if boots {
         program.push_str(&boot_line(it, c));
     }
@@ -492,29 +548,73 @@ pub fn bundle_for(it: &Interp, roots: &[String], rt: Option<&RuntimeFile>) -> Re
 
 /// `bundle_for`, and the page states its code reads (see `Compiler::states`; FEEDBACK75.md, Q-1058).
 pub fn bundle_for_states(it: &Interp, roots: &[String], rt: Option<&RuntimeFile>) -> Result<(PageBundle, Arc<Vec<String>>), QuilloError> {
+    bundle_for_states_with_chunks(it, roots, rt).map(|(b, s, _)| (b, s))
+}
+
+pub(crate) fn bundle_for_states_with_chunks(
+    it: &Interp,
+    roots: &[String],
+    rt: Option<&RuntimeFile>,
+) -> Result<(PageBundle, Arc<Vec<String>>, Vec<(String, Arc<String>)>), QuilloError> {
     let mut c = compiled(it, Some(roots))?;
     let set = components_of(it, &c.0);
     let mut sorted_roots = roots.to_vec();
     sorted_roots.sort();
     sorted_roots.dedup();
+    let mut chunks = Vec::new();
+    let mut lazy_map = HashMap::new();
     if set != sorted_roots {
-        c = compiled(it, Some(&set))?;
+        if let Some(rt_file) = rt.filter(|_| !c.0.dev) {
+            for d in set.iter().filter(|n| !sorted_roots.contains(n)) {
+                if let Ok((dc, _)) = compiled(it, Some(std::slice::from_ref(d))) {
+                    let sub = components_of(it, &dc);
+                    if !sub.iter().any(|x| sorted_roots.contains(x)) {
+                        let chunk_prog = program_text(it, &dc, false, false);
+                        if chunk_prog.len() >= 1024 {
+                            if let Some(esm) = rt_file.wrap_esm(&chunk_prog) {
+                                let hash = hash_text(&esm);
+                                lazy_map.insert(d.clone(), format!("{}/_quillo/c/{}.js", it.base, hash));
+                                chunks.push((hash, Arc::new(esm)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        c = compiled_with(it, Some(&set), &lazy_map)?;
     }
-    let (c, boots) = c;
+    let (full, boots) = c;
+    // Keep `<head>` styles, libs, hints, translation keys and page states from the full set even when
+    // deferred subcomponents load lazily in chunks.
+    let (meta_c, _) = if lazy_map.is_empty() { (full, boots) } else {
+        let m = compiled(it, Some(&set))?;
+        let styles = styles_of(it, &m.0);
+        let libs = libs_of(it, &m.0);
+        let hints = hint_links(it, m.0.globals.keys().filter_map(|k| it.js_libs.get(k)));
+        let t_keys = m.0.t_keys.clone().map(Arc::new);
+        let states = Arc::new(m.0.states.clone());
+        if let Some(rt) = rt {
+            if let Some(js) = rt.wrap(&program_text(it, &full, boots, false)) {
+                return Ok((PageBundle { js, set, split: true, styles, libs, hints, t_keys }, states, chunks));
+            }
+        }
+        return Ok((PageBundle { js: assemble("(function () {", &program_text(it, &full, boots, true), "})();"), set, split: false, styles, libs, hints, t_keys }, states, Vec::new()));
+    };
+    let (c, boots) = (meta_c, boots);
     let styles = styles_of(it, &c);
     let libs = libs_of(it, &c);
     let hints = hint_links(it, c.globals.keys().filter_map(|k| it.js_libs.get(k)));
     let t_keys = c.t_keys.clone().map(Arc::new);
     let states = Arc::new(c.states.clone());
     if c.dev {
-        return Ok((PageBundle { js: dev::bundle(it, &c, boots), set, split: false, styles, libs, hints, t_keys }, states));
+        return Ok((PageBundle { js: dev::bundle(it, &c, boots), set, split: false, styles, libs, hints, t_keys }, states, Vec::new()));
     }
     if let Some(rt) = rt {
         if let Some(js) = rt.wrap(&program_text(it, &c, boots, false)) {
-            return Ok((PageBundle { js, set, split: true, styles, libs, hints, t_keys }, states));
+            return Ok((PageBundle { js, set, split: true, styles, libs, hints, t_keys }, states, chunks));
         }
     }
-    Ok((PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false, styles, libs, hints, t_keys }, states))
+    Ok((PageBundle { js: assemble("(function () {", &program_text(it, &c, boots, true), "})();"), set, split: false, styles, libs, hints, t_keys }, states, Vec::new()))
 }
 
 pub struct PageBundle {
@@ -580,8 +680,10 @@ fn runtime_from(it: &Interp, c: &Compiler, boots: bool) -> RuntimeFile {
     // review of slice C; branch feedback86-89), and the developer tools bridge. Under Quillo's
     // worker (`offline` routes), the page has the failure code's file kept (`recKeep`).
     let offline = it.routes.iter().any(|r| r.offline);
-    let (keep, keep_tools, main) = shake_split(rt, &format!("{}\nQW", program), if offline { "recKeep" } else { "" });
-    let wanted: HashSet<String> = names_in(&program).into_iter().collect();
+    let multi = scope_vars(&it.globals).iter().filter(|(_, v)| matches!(v, Value::Func(f) if f.def.component)).count() >= 2;
+    let seed = format!("{}\nQW{}", program, if multi { " W.lazy" } else { "" });
+    let (keep, keep_tools, main) = shake_split(rt, &seed, if offline { "recKeep" } else { "" });
+    let wanted: HashSet<String> = names_in(&seed).into_iter().collect();
     let mut exported: Vec<String> = rt
         .by_name
         .iter()
@@ -732,6 +834,14 @@ impl RuntimeFile {
     /// or none if it needs something the file does not have (it then
     /// carries its own runtime).
     fn wrap(&self, program: &str) -> Option<String> {
+        self.wrap_with(program, false)
+    }
+
+    fn wrap_esm(&self, program: &str) -> Option<String> {
+        self.wrap_with(program, true)
+    }
+
+    fn wrap_with(&self, program: &str, esm: bool) -> Option<String> {
         let rt = runtime_units();
         let need = shake_except(rt, program, rt.by_name.get("TOOLS_MOD").copied());
         if need.iter().zip(&self.keep).any(|(n, k)| *n && !*k) {
@@ -754,9 +864,14 @@ impl RuntimeFile {
         if used.iter().any(|n| !self.exported.contains(n) || assigns(program, n)) {
             return None;
         }
-        let mut out = format!("(function ($rt) {{\n\"use strict\";\nconst {{ {} }} = $rt;\n", used.join(", "));
+        let head = if esm {
+            format!("export default function ($rt) {{\n\"use strict\";\nconst {{ {} }} = $rt;\n", used.join(", "))
+        } else {
+            format!("(function ($rt) {{\n\"use strict\";\nconst {{ {} }} = $rt;\n", used.join(", "))
+        };
+        let mut out = head;
         compact_js(program, &mut out);
-        out.push_str("})(window[Symbol.for(\"quillo\")].rt);\n");
+        out.push_str(if esm { "}\n" } else { "})(window[Symbol.for(\"quillo\")].rt);\n" });
         Some(out)
     }
 }
@@ -799,6 +914,7 @@ pub struct Bundles {
     /// The components a page rendered, sorted and joined, to its set's key.
     by_roots: HashMap<String, String>,
     by_set: HashMap<String, Made>,
+    chunks: HashMap<String, Arc<String>>,
     tick: u64,
 }
 
@@ -825,6 +941,18 @@ impl Bundles {
 
     /// `keep`, with the page states the bundle's code reads (FEEDBACK75.md, Q-1058).
     pub fn keep_with(&mut self, roots: String, b: PageBundle, states: Arc<Vec<String>>) -> PageRef {
+        self.keep_with_chunks(roots, b, states, Vec::new())
+    }
+
+    pub(crate) fn keep_with_chunks(&mut self, roots: String, b: PageBundle, states: Arc<Vec<String>>, chunks: Vec<(String, Arc<String>)>) -> PageRef {
+        if !chunks.is_empty() {
+            if self.chunks.len() > 4 * KEPT {
+                self.chunks.clear();
+            }
+            for (h, js) in chunks {
+                self.chunks.insert(h, js);
+            }
+        }
         let set = b.set.join(",");
         self.tick += 1;
         if self.by_roots.len() > 4 * KEPT {
@@ -848,6 +976,10 @@ impl Bundles {
 
     pub fn by_hash(&self, hash: &str) -> Option<Arc<String>> {
         self.by_set.values().find(|m| m.page.hash == hash).map(|m| m.js.clone())
+    }
+
+    pub fn chunk_by_hash(&self, hash: &str) -> Option<Arc<String>> {
+        self.chunks.get(hash).cloned()
     }
 
     pub fn len(&self) -> usize {
@@ -1388,7 +1520,7 @@ pub fn test_script(it: &Interp, name: &str) -> Result<String, QuilloError> {
     if !crate::value::hiding() {
         program.push_str("ERRORS_SHOWN = true;\n");
     }
-    push_feature_inits(it, &mut program);
+    push_feature_inits(it, &mut program, c.uses_json_attr, true);
     let _ = writeln!(
         program,
         "try {{ console.log(W.repr({}{}())); }} catch (e) {{ console.log(\"ERROR: \" + (e instanceof Ret ? W.repr(e.v) : e.message)); }}",
@@ -2287,6 +2419,10 @@ struct Compiler<'a> {
     types: HashSet<String>,
     /// Whether statements are marked with the line they come from (see `DEV`).
     dev: bool,
+    /// Dynamic HTML attribute outside standard scalar attributes (needs `JSON_ATTR`).
+    uses_json_attr: bool,
+    /// Component names compiled as deferred lazy ESM chunks (`hash -> url`).
+    lazy_chunks: HashMap<String, String>,
 }
 
 fn js_str(s: &str) -> String {
@@ -3620,6 +3756,8 @@ impl<'a> Compiler<'a> {
             file: None,
             types: HashSet::new(),
             dev: DEV.load(std::sync::atomic::Ordering::Relaxed),
+            uses_json_attr: false,
+            lazy_chunks: HashMap::new(),
         }
     }
 
@@ -3986,6 +4124,12 @@ impl<'a> Compiler<'a> {
                 let idem = if crate::idempotency::used_by(&self.it.globals, &f.def) { ", true" } else { "" };
                 self.defs.push(format!("{} = W.server({}{});", js, js_str(name), idem));
                 Ok(r)
+            }
+            Value::Func(f) if f.def.component && self.lazy_chunks.contains_key(name) => {
+                let url = &self.lazy_chunks[name];
+                self.globals.insert(name.to_string(), (js.clone(), false));
+                self.defs.push(format!("{} = W.lazy({}, {});", js, js_str(name), js_str(url)));
+                Ok((js, false))
             }
             Value::Func(f) => {
                 let def = f.def.clone();
@@ -6484,7 +6628,11 @@ impl<'a> Compiler<'a> {
         self.line = el.line;
         let mut fixed_attrs: Vec<String> = Vec::new();
         let mut holes: Vec<String> = Vec::new();
-        let hole = |holes: &mut Vec<String>, vals: &mut Vec<String>, kind: u8, name: &str, v: String| {
+        let mut uses_json_attr = self.uses_json_attr;
+        let mut hole = |holes: &mut Vec<String>, vals: &mut Vec<String>, kind: u8, name: &str, v: String| {
+            if kind == 0 && !matches!(name, "id" | "class" | "style" | "value" | "checked" | "selected" | "muted" | "indeterminate" | "open" | "volume" | "currentTime" | "playbackRate" | "min" | "max" | "step" | "autofocus" | "href" | "src" | "action" | "formaction" | "poster" | "placeholder" | "disabled" | "readonly" | "type" | "name") {
+                uses_json_attr = true;
+            }
             holes.push(format!("[{}, {}, {}]", kind, js_str(name), vals.len()));
             vals.push(v);
         };
@@ -6743,6 +6891,8 @@ impl<'a> Compiler<'a> {
             let v = format!("W.spread([{}], [{}], {})", spread_js.join(", "), written.join(", "), js_str(&el.tag));
             hole(&mut holes, vals, 3, "", if spread_r { format!("() => {}", v) } else { v });
         }
+        drop(hole);
+        self.uses_json_attr |= uses_json_attr;
         // Children: fixed text and elements are in the template; anything
         // else is a value shown in its place.
         let mut kids = Vec::new();

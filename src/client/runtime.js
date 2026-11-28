@@ -1523,20 +1523,20 @@ const flJSON = (f) => (Object.is(f, -0) ? "-0.0" : (f = String(f), f.includes("e
 // reached a server fn as the int 5, and `a"\0int:5` made its JSON broken (FEEDBACK55.md, Q-875's
 // review; branch feedback55).
 let rawOk = null;
-const rawNum = (t) => ((rawOk ?? (rawOk = typeof JSON.rawJSON === "function")) ? JSON.rawJSON(t) : marks().num + t);
-// The marks of a page, made once at random: a number's text (`num`), a map in order (`kept`); and
-// how JSON writes them (`numText`, `keptText`).
+const rawNum = (t) => ((rawOk ?? (rawOk = typeof JSON.rawJSON === "function")) ? JSON.rawJSON(t) : marks().mn + t);
+// The marks of a page, made once at random: a number's text (`mn`), a map in order (`mk`); and
+// how JSON writes them (`mnt`, `mkt`).
 let marksMade = null;
 function marks() {
   if (marksMade === null) {
     const r = randomTag();
-    marksMade = { num: "\u0000n" + r + ":", numText: "\"\\u0000n" + r + ":", numRe: new RegExp("\"\\\\u0000n" + r + ":(-?[\\d.e+]+)\"", "g"),
-      kept: "\u0000k" + r + ":", keptText: "\"\\u0000k" + r + ":", keptRe: new RegExp("\"\\\\u0000k" + r + ":(\\d+)\"", "g") };
+    marksMade = { mn: "\u0000n" + r + ":", mnt: "\"\\u0000n" + r + ":", mnr: new RegExp("\"\\\\u0000n" + r + ":(-?[\\d.e+]+)\"", "g"),
+      mk: "\u0000k" + r + ":", mkt: "\"\\u0000k" + r + ":", mkr: new RegExp("\"\\\\u0000k" + r + ":(\\d+)\"", "g") };
   }
   return marksMade;
 }
 // What `rawNum` marked written as it is.
-const unmark = (t) => (marksMade !== null && t.includes(marksMade.numText) ? t.replace(marksMade.numRe, "$1") : t);
+const unmark = (t) => (marksMade !== null && t.includes(marksMade.mnt) ? t.replace(marksMade.mnr, "$1") : t);
 // Letters no text holds, by chance.
 function randomTag() {
   return typeof crypto !== "undefined" && crypto.getRandomValues ? Array.from(crypto.getRandomValues(new Uint32Array(4)), (x) => x.toString(36)).join("") : String(Math.random()).slice(2);
@@ -1549,7 +1549,7 @@ class Kept {
   toJSON() {
     if (keptOut === null) return [this.ks, this.vs];
     keptOut.push(this);
-    return marks().kept + (keptOut.length - 1);
+    return marks().mk + (keptOut.length - 1);
   }
 }
 // The maps in order met while `writeJSON` writes.
@@ -1566,7 +1566,7 @@ function writeJSON(j, indent) {
   }
 }
 // Text `t` with each map in order written where its mark is.
-const keptIn = (t, out, indent) => t.replace(marksMade.keptRe, (m, n, at) => keptText(out[n], out, indent, indent ? lineIndent(t, at) : ""));
+const keptIn = (t, out, indent) => t.replace(marksMade.mkr, (m, n, at) => keptText(out[n], out, indent, indent ? lineIndent(t, at) : ""));
 function lineIndent(t, at) {
   const s = t.lastIndexOf("\n", at) + 1;
   let e = s;
@@ -1588,7 +1588,7 @@ function keptText(k, out, indent, base) {
     else if (typeof x === "number") t = String(x);
     else {
       t = JSON.stringify(x, null, indent);
-      if (typeof x === "object" && t.includes(marksMade.keptText)) t = keptIn(t, out, indent);
+      if (typeof x === "object" && t.includes(marksMade.mkt)) t = keptIn(t, out, indent);
       if (indent) t = t.replace(/\n/g, "\n" + base + gap);
     }
     parts[i] = (isIdx(key) ? "\"" + key + "\"" : JSON.stringify(key)) + colon + t;
@@ -6419,6 +6419,8 @@ function liveWake(onlyFailing) {
   else if (st.fails > 0) st.revived = true;
 }
 
+let LIVE_SEEN = null;
+function useLive() { LIVE_SEEN = liveSeen; }
 // Also takes data-v="<seq>:<server>" from a server-rendered island, split.
 function liveSeen(seq, server = "") {
   seq = +seq;
@@ -7621,7 +7623,7 @@ function dynApply(x) {
   textareaFollows(p);
   // Options shown or hidden: their select shows its value again (FEEDBACK55.md, Q-758; branch
   // feedback55).
-  selFollow(p);
+  if (SEL_FN) SEL_FN.f(p);
 }
 
 // Whether two lists of nodes are the same elements and texts, in the same order, all the way
@@ -7669,7 +7671,7 @@ function morph(old, now) {
   // A select given a new value shows it once its options are as the markup says too: written
   // before them, it named an option that was not there yet (FEEDBACK61.md, Q-890's review; branch
   // feedback61).
-  if (wrote && old.localName === "select") selectShow(old, old.__want);
+  if (SEL_FN && wrote && old.localName === "select") SEL_FN.s(old, old.__want);
 }
 
 // An element's only content, following `get`: its children, without markers.
@@ -7708,7 +7710,7 @@ function dynAllApply(x) {
   removing++;
   try { el.replaceChildren(...got); } finally { removing--; }
   textareaFollows(el);
-  selFollow(el);
+  if (SEL_FN) SEL_FN.f(el);
 }
 
 // What is left of an element's children after taking it up: empty text
@@ -7835,7 +7837,7 @@ function wire(tp, el, vals, svg) {
   }
   // Its options are in now: the value it was given before them (FEEDBACK55.md, Q-758; branch
   // feedback55).
-  if (tp[0] === "select" && el.__want !== undefined) selectShow(el, el.__want, true);
+  if (SEL_FN && tp[0] === "select" && el.__want !== undefined) SEL_FN.s(el, el.__want, true);
 }
 
 const inner = (tp, svg) => (svg || tp[0] === "svg") && tp[0] !== "foreignObject";
@@ -8293,7 +8295,7 @@ function aheadFor(u) {
   // feedback61).
   for (const i of islandsIn(dGet(doc, "documentElement"), dDo(doc, "querySelector", "[data-qm]") !== null)) {
     if (here.has(i.dataset.c) || i.hasAttribute("data-qd") || !qn || i.getAttribute("data-qn") !== qn) continue;
-    liveSeen(...(i.dataset.v || "").split(":"));
+    if (LIVE_SEEN) LIVE_SEEN(...(i.dataset.v || "").split(":"));
     (q[i.dataset.c] = q[i.dataset.c] || []).push({ s: islandJSON(i.dataset.s, {}), l: islandJSON(i.dataset.l, null) });
   }
   return q;
@@ -8823,11 +8825,11 @@ function classTokens(el, was, now) {
 // React's unitless properties, and `msFlex` is `-ms-flex`, as on the server (FEEDBACK48.md,
 // Q-565; branch main).
 const UNITLESS = new Set(("animation-iteration-count aspect-ratio border-image-outset border-image-slice border-image-width " +
-  "box-flex box-flex-group box-ordinal-group column-count columns fill-opacity flex flex-grow flex-negative flex-order " +
+  "box-flex box-flex-group box-ordinal-group column-count columns fill-opacity flex flex-grow flex-negative flex-ord" + "er " +
   "flex-positive flex-shrink flood-opacity font-weight grid-area grid-column grid-column-end grid-column-span " +
-  "grid-column-start grid-row grid-row-end grid-row-span grid-row-start line-clamp line-height opacity order orphans " +
+  "grid-column-start grid-row grid-row-end grid-row-span grid-row-start line-clamp line-height opacity ord" + "er orphans " +
   "scale stop-opacity stroke-dasharray stroke-dashoffset stroke-miterlimit stroke-opacity stroke-width tab-size widows " +
-  "z-index zoom").split(" "));
+  "z-in" + "dex zoom").split(" "));
 const styleName = (k) => (k.startsWith("--") ? k : k.replace(/_/g, "-").replace(/[A-Z]/g, (c) => "-" + c.toLowerCase()).replace(/^ms-/, "-ms-"));
 const styleNonzero = (v) => (typeof v === "number" ? v !== 0 && Number.isFinite(v) : typeof v === "bigint" ? v !== 0n : v instanceof Fl ? v.f !== 0 : v instanceof Dec && v.m !== 0n);
 const stylePx = (n, v) => styleNonzero(v) && !n.startsWith("--") && !UNITLESS.has(n.replace(/^-(webkit|moz|ms|o)-/, "")) ? "px" : "";
@@ -8852,6 +8854,13 @@ function boolText(k, v) {
   return (n.length > 5 && (n.startsWith("aria-") || n.startsWith("data-"))) || n === "draggable" || n === "spellcheck" || n === "contenteditable" ? String(v) : null;
 }
 
+let STYLE_FN = null;
+function useStyle() { STYLE_FN = { a: styleApply, t: styleText }; }
+let JSON_ATTR = null;
+function useJsonAttr() { JSON_ATTR = (v) => jsonText(visible(v)); }
+let SEL_FN = null;
+function useSelect() { SEL_FN = { s: selectShow, f: selFollow }; }
+
 function setProp(el, k, v, old) {
   // A component's own root that is its island (a table's row): the island's attributes are the
   // server's, and the markup's own neither change them nor add one (FEEDBACK55.md, Q-700; branch
@@ -8865,8 +8874,8 @@ function setProp(el, k, v, old) {
   // Nor an error, which shows nothing, as on the server (FEEDBACK81.md, Q-1272; branch
   // feedback72-81).
   else if (v instanceof Err) { errShown(v); v = null; }
-  if (k === "style" && isMap(v)) v = styleText(v);
-  if (k === "style" && isMap(old)) old = styleText(old);
+  if (k === "style" && isMap(v)) v = STYLE_FN.t(v);
+  if (k === "style" && isMap(old)) old = STYLE_FN.t(old);
   // What the attribute is only the default of, as `value` (FEEDBACK28.md, Q-338; branch
   // feedback29-fixes).
   if (k === "value") {
@@ -8877,7 +8886,7 @@ function setProp(el, k, v, old) {
     el.__want = v === undefined ? null : v;
     // Taking up the server's HTML: what the page shows (typed, ticked) stays.
     if (claiming) return;
-    if (el.localName === "select") { selectShow(el, v, first); return; }
+    if (SEL_FN && el.localName === "select") { SEL_FN.s(el, v, first); return; }
     // A number the field's text already reads as stays as typed: `1.0` on the way to `1.05` is
     // not written back as `1`; blank text reads as no number, and as null, which a number field
     // gives for it (FEEDBACK55.md, Q-757; branch feedback55).
@@ -8912,7 +8921,7 @@ function setProp(el, k, v, old) {
         }
       }
     }
-    if (el.localName === "option") selFollow(el.parentNode);
+    if (el.localName === "option") SEL_FN.f(el.parentNode);
     // Made here, its first value is its default too, as the server writes it, so that a form's
     // reset brings it back (FEEDBACK55.md, Q-768; branch feedback55).
     if (first && !isNil(v)) { if (el.localName === "input") el.setAttribute("value", nv); else if (el.localName === "textarea") el.defaultValue = nv; }
@@ -8949,7 +8958,7 @@ function setProp(el, k, v, old) {
     if (old !== undefined && truthy(old) === truthy(v)) return;
   }
   if ((k === "style" || k === "class") && typeof v === "string" && (typeof old === "string" || isNil(old) || old === false) && old !== undefined) {
-    (k === "style" ? styleApply : classTokens)(el, typeof old === "string" ? old : "", v);
+    (k === "style" ? STYLE_FN.a : classTokens)(el, typeof old === "string" ? old : "", v);
     return;
   }
   if (typeof v === "boolean") { const t = boolText(k, v); if (t !== null) v = t; }
@@ -8978,7 +8987,7 @@ function setProp(el, k, v, old) {
   // feedback86-89).
   if (Probe !== null && (URL_ATTRS.includes(k.toLowerCase()) || /srcset$/i.test(k))) return;
   if (k === "href" || k === "src" || k === "action" || k === "formaction" || k === "poster") v = withBase(v);
-  let s = v === true ? "" : (Array.isArray(v) || isMap(v)) ? jsonText(visible(v)) : noNul(display(v));
+  let s = v === true ? "" : JSON_ATTR && (Array.isArray(v) || isMap(v)) ? JSON_ATTR(v) : noNul(display(v));
   // The text the attribute will say, whatever the value's type (html too).
   if (URL_ATTRS.includes(k.toLowerCase()) && scriptURL(s) || animValueAttr(el, k) && s.split(";").some(scriptURL)) v = s = "about:blank#blocked";
   if (claiming && el.getAttribute(k) !== s) attrDiffers(el, k, s); // dev
@@ -9411,7 +9420,7 @@ function rowWaits(r, row, svg) {
     try { put(part(row(r.item)), { claim: false, svg, p }, got); } catch (e2) { rowFailed(r, row, svg, e2); return; } finally { Owner = w; Listener = l; }
     for (const n of got) p.insertBefore(n, at);
     at.__part.nodes = own(got, made);
-    selFollow(p);
+    if (SEL_FN) SEL_FN.f(p);
   });
   w.waits = true;
   Owner = o;
@@ -9711,7 +9720,7 @@ function reconcile(st, items, key, ks, row, svg) {
   st.rows = rows;
   if (back) back();
   if (scrolls) scrolls();
-  if (came) selFollow(p);
+  if (SEL_FN && came) SEL_FN.f(p);
 }
 
 // The focused element in `p`, and what is selected in it: what puts them back after a move, when
@@ -9801,7 +9810,16 @@ function inOrder(a) {
 // follows the parent's values without the parent running again. A plain
 // function returning markup is called again when its arguments change.
 
+let LAZY_MODS = null;
+function lazyMod(name, url) {
+  const s = new Sig(0);
+  let loaded = null;
+  const load = () => (LAZY_MODS || (LAZY_MODS = {}))[url] || (LAZY_MODS[url] = import(url).then((m) => { m.default(QW.rt); return C[name] || G[name]; }));
+  return { $name: name, $lazy: (props, kids, spreads) => new Html((c, out) => { dyn(() => { s.v; return loaded ? comp(loaded, props, kids, spreads) : (load().then((real) => { loaded = real; s.set(1); }, report), null); }, c, out); }) };
+}
+
 function comp(def, props, kids, spreads) {
+  if (def && def.$lazy) return def.$lazy(props, kids, spreads);
   if (typeof def !== "function") fail(`<${def}> is not a view`);
   const ps = def.$p || [];
   for (const k of Object.keys(props)) if (!ps.includes(k)) fail(`<${def.$name}> has no parameter \`${k}\``);
@@ -10024,13 +10042,16 @@ function markedEnd(open, here) {
 }
 // The islands in `el`, in the page's order, as elements: those marked by comments too when
 // `marked` (its island says it holds some: `data-qm`).
+let MARKED = null;
+function useMarked() { MARKED = { d: markedData, c: islandMarked }; }
+
 function islandsIn(el, marked) {
   if (!marked) return [...el.querySelectorAll(ISLANDS)];
   // One walk, in the page's order: sorted by comparing their places, taking up 3,000 of them
   // took longer than making the page again (found in review).
   const found = [], w = docDo("createTreeWalker", el, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT);
   for (let n = w.nextNode(); n; n = w.nextNode()) {
-    if (n.nodeType === 8) { if (isMarked(n)) found.push(markedData(n)); }
+    if (n.nodeType === 8) { if (MARKED && isMarked(n)) found.push(MARKED.d(n)); }
     else if (n.localName === "quillo-island" || n.hasAttribute("data-qi")) found.push(n);
   }
   return found;
@@ -10051,7 +10072,7 @@ function island(def, props, h, c, out) {
     outOfBody(c);
     intoBody(c, null);
   }
-  if (c.claim && isMarked(c.n)) { islandMarked(def, props, h, c, out); return; }
+  if (c.claim && MARKED && isMarked(c.n)) { MARKED.c(def, props, h, c, out); return; }
   let inst = new Inst(def, props, h && h.s, h && h.l);
   // Made again in a swap (FEEDBACK54.md, A.2): its states as they were, while their kind holds.
   if (h && h.swapped) inst.swapped = true;
@@ -10264,7 +10285,7 @@ function drawWaitsFor(inst, d, el, svg, p, view, hq) {
     let got;
     try { got = view === null ? run(inst, el, false, svg, to) : again(inst, d, view, el, svg, to, hq); } finally { hydrating = h; inst.repoint = null; }
     // Options drawn again: their select shows its value, as a place's do (see `dynApply`).
-    if (got) { for (const n of got) to.insertBefore(n, at); at.__part.nodes = own(got, made); bareRoot(got, inst, inst.def.$name); selFollow(to); }
+    if (got) { for (const n of got) to.insertBefore(n, at); at.__part.nodes = own(got, made); bareRoot(got, inst, inst.def.$name); if (SEL_FN) SEL_FN.f(to); }
     // A row or an SVG element that is its own root, made in a wrapper (taken up again, swapped
     // under --watch): its own island once drawn, as after a first draw (see `asOwnRoot`), where it
     // stayed in the wrapper, out of its table's rows, and drew nothing in <svg>.
@@ -10929,6 +10950,9 @@ function hotMorph(html, qn) {
 
 // An island taken up: its component (and those inside it) resumed from
 // the state the server wrote, on the HTML it wrote.
+let RAW_HTML = null;
+function useRawHtml() { RAW_HTML = rawHtml; }
+
 function resume(el) {
   // Still waiting for its deferred state, which the server sends after the page
   // and swaps in (src/defer.rs; branch defer): taken up once it has come.
@@ -10949,12 +10973,11 @@ function resume(el) {
     }
     return q;
   };
-  for (const inner of inside) liveSeen(...(inner.dataset.v || "").split(":"));
-  liveSeen(...(el.dataset.v || "").split(":"));
+  if (LIVE_SEEN) { for (const inner of inside) LIVE_SEEN(...(inner.dataset.v || "").split(":")); LIVE_SEEN(...(el.dataset.v || "").split(":")); }
   const props = islandJSON(el.dataset.p, {});
   // A top island's children come as the HTML the server made of them, which it marks (`data-qh`):
   // a `children` text it did not mark stays text (FEEDBACK51.md, Q-667; branch feedback86-89).
-  if (typeof props.children === "string" && el.hasAttribute("data-qh")) props.children = rawHtml(props.children);
+  if (RAW_HTML && typeof props.children === "string" && el.hasAttribute("data-qh")) props.children = RAW_HTML(props.children);
   const given = islandJSON(el.dataset.s, {}), liveInfo = islandJSON(el.dataset.l, null);
   let state = given;
   if (DEV) state = keptFor(el, state); // dev
@@ -11275,6 +11298,7 @@ W.hidden = Object.freeze({});
 W.choose = choose;
 W.keyed = keyed;
 W.c = comp;
+W.lazy = lazyMod;
 W.memo = memo;
 // The page's states (FEEDBACK68.md; branch global-state).
 W.gs = pageState;

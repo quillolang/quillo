@@ -4058,12 +4058,16 @@ impl Interp {
         };
         // With the page states its code reads, the only ones its page carries (FEEDBACK75.md,
         // Q-1058; branch feedback75).
-        let (made, states) = crate::client::bundle_for_states(self, &sorted, runtime.as_deref()).ok()?;
-        Some(self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keep_with(key, made, states))
+        let (made, states, chunks) = crate::client::bundle_for_states_with_chunks(self, &sorted, runtime.as_deref()).ok()?;
+        Some(self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keep_with_chunks(key, made, states, chunks))
     }
 
     pub fn bundle_by_hash(&self, hash: &str) -> Option<Arc<String>> {
         self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).by_hash(hash)
+    }
+
+    pub fn chunk_by_hash(&self, hash: &str) -> Option<Arc<String>> {
+        self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner).chunk_by_hash(hash)
     }
 
     /// The sheet of the styles a page shows (FEEDBACK8.md, Q-068; branch

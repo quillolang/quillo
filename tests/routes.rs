@@ -1119,3 +1119,35 @@ route GET /plain = <html><body><Plain/></body></html>
     let plain = page(&mut it, "/plain");
     assert!(!plain.contains("chart.umd.js") && !plain.contains("leaflet.js"), "{}", plain);
 }
+
+#[test]
+fn deferred_heavy_components_split_into_lazy_esm_chunks() {
+    let items: String = (0..30).map(|i| format!("<li class=\"row-item-{i}\">Row entry number {i}: deferred heavy section content</li>")).collect();
+    let src = format!(
+        r#"component Heavy() {{
+    state count = 0
+    <section id="heavy"><ul>{items}</ul><button id="hbtn" @click={{() => {{ count += 1 }}}}>{{count}}</button></section>
+}}
+component Host() {{
+    state open = false
+    <div><button id="open" @click={{() => {{ open = true }}}}>open</button>{{open ? <Heavy/> : null}}</div>
+}}
+route GET / = <html><body><Host/></body></html>
+"#
+    );
+    let mut it = app(&src);
+    let page = get(&mut it, "/").text();
+    let srcs = scripts_of(&page);
+    assert!(srcs.len() >= 2, "{:?}", srcs);
+    let bundle = get(&mut it, &srcs[1]).text();
+    assert!(!bundle.contains("Row entry number 29"), "{}", bundle);
+    let at = bundle.find("/_quillo/c/").expect("lazy chunk url");
+    let end = at + bundle[at..].find('"').expect("end quote");
+    let chunk_url = &bundle[at..end];
+    assert!(bundle.contains(&format!("W.lazy(\"Heavy\",\"{}\")", chunk_url)), "{}", bundle);
+    let r = get(&mut it, chunk_url);
+    assert_eq!(r.status, 200);
+    assert!(r.header("cache-control").unwrap_or("").contains("immutable"));
+    let esm = r.text();
+    assert!(esm.starts_with("export default function ($rt)") && esm.contains("Row entry number 29"), "{}", esm);
+}

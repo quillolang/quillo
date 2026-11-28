@@ -1673,3 +1673,48 @@ fn the_edges_of_feedback30_hold_in_the_browser() {
     assert_eq!(r["field"], serde_json::json!([true, true, "ab"]), "{}", r);
     assert_eq!(r["remade"], 0, "{}", r);
 }
+
+#[test]
+fn deferred_lazy_component_esm_chunk_loads_when_opened() {
+    let Some(chrome) = chrome().filter(|_| node_available()) else {
+        eprintln!("skipping: needs Chrome and Node 22 or later");
+        return;
+    };
+    let dir = support::temp_dir("lazy-chunk-browser");
+    let items: String = (0..30).map(|i| format!("<li class=\"row-item-{i}\">Row entry number {i}: deferred heavy section content</li>")).collect();
+    let app = dir.join("main.qwe");
+    std::fs::write(
+        &app,
+        format!(
+            r#"component Heavy() {{
+    state count = 0
+    <section id="heavy"><ul>{items}</ul><button id="hbtn" @click={{() => {{ count += 1 }}}}>{{count}}</button></section>
+}}
+component Host() {{
+    state open = false
+    <div><button id="open" @click={{() => {{ open = true }}}}>open</button>{{open ? <Heavy/> : null}}</div>
+}}
+route GET / = <html><body><Host/></body></html>
+"#
+        ),
+    ).unwrap();
+    let script = dir.join("test.js");
+    std::fs::write(
+        &script,
+        r#"(async () => {
+  const tick = (ms = 30) => new Promise((r) => setTimeout(r, ms));
+  for (let i = 0; i < 200 && !(window[Symbol.for("quillo")] || {}).booted; i++) await tick(20);
+  const before = performance.getEntriesByType("resource").some((r) => r.name.includes("/_quillo/c/"));
+  document.getElementById("open").click();
+  for (let i = 0; i < 200 && !document.getElementById("hbtn"); i++) await tick(20);
+  const afterOpen = performance.getEntriesByType("resource").some((r) => r.name.includes("/_quillo/c/"));
+  document.getElementById("hbtn").click();
+  await tick(40);
+  const out = { before, afterOpen, count: document.getElementById("hbtn") && document.getElementById("hbtn").textContent, errors: window.__quilloErrors || [] };
+  document.body.setAttribute("data-result", JSON.stringify(out));
+})();"#,
+    ).unwrap();
+    let r = run_page_with(&chrome, &app, 0, Some(&script));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(r, serde_json::json!({ "before": false, "afterOpen": true, "count": "1", "errors": [] }), "{}", r);
+}

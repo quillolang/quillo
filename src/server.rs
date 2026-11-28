@@ -2457,6 +2457,16 @@ impl Interp {
                 body: js.as_bytes().to_vec(),
             };
         }
+        if let Some(hash) = rest.strip_prefix("c/").and_then(|r| r.strip_suffix(".js")) {
+            return match self.chunk_by_hash(hash) {
+                Some(js) => HttpResponse {
+                    status: 200,
+                    headers: vec![("content-type".into(), "text/javascript; charset=utf-8".into()), ("cache-control".into(), "public, max-age=31536000, immutable".into())],
+                    body: js.as_bytes().to_vec(),
+                },
+                None => HttpResponse { status: 404, headers: vec![("cache-control".into(), "no-cache".into())], body: Vec::new() },
+            };
+        }
         // A page's own bundle: its address names its content, so it is kept.
         // One this program did not make (a page from before a reload) gets
         // the whole bundle, which has every component.

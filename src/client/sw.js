@@ -23,7 +23,7 @@
 const BASE = @BASE@, V = @V@, PAGES = @PAGES@, OFFLINE = @OFFLINE@, GATE = @GATE@, GATE_HASH = @GATE_HASH@;
 const MINE = "quillo:" + BASE + ":", NAME = MINE + V, AWAY = NAME + ":", GONE = MINE + "gone", TAG = "quillo_tag";
 const STATE = location.origin + BASE + "/_quillo/sw-state", DROPPED = location.origin + BASE + "/_quillo/sw-dropped";
-const NAMED = BASE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/_quillo/[brsti]/[0-9a-f]+\\.(?:js|css|png)";
+const NAMED = BASE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "/_quillo/[bcrsti]/[0-9a-f]+\\.(?:js|css|png)";
 const ONE = new RegExp("^" + NAMED + "$"), ALL = new RegExp(NAMED, "g");
 const lasting = (res) => res.ok && /immutable/.test(res.headers.get("cache-control") || "");
 const offline = () => new Response(OFFLINE, { status: 503, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
