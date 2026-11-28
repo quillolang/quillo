@@ -59,13 +59,20 @@ impl T {
 /// What compiled code shares with its caller: whether it gave up, and how
 /// deep its calls may go.
 #[repr(C)]
-struct Ctx {
-    bail: u64,
-    depth: u64,
-    max: u64,
+pub(crate) struct Ctx {
+    pub(crate) bail: u64,
+    pub(crate) depth: u64,
+    pub(crate) max: u64,
 }
 
-type Entry = unsafe extern "C" fn(*const u64, *mut Ctx) -> u64;
+impl Ctx {
+    #[inline(always)]
+    pub(crate) fn new(max: u64) -> Self {
+        Self { bail: 0, depth: 0, max }
+    }
+}
+
+pub(crate) type Entry = unsafe extern "C" fn(*const u64, *mut Ctx) -> u64;
 
 /// A function compiled for some argument types.
 struct Compiled {
@@ -608,6 +615,79 @@ pub fn call<A: Arg>(c: &Closure, args: &[A], depth: usize) -> Ran {
         }
     }
     run(compiled.entry, compiled.ret, &raw, depth, compiled.per, compiled.reserve, Some(&compiled.deep))
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FastUnary {
+    pub(crate) entry: Entry,
+    pub(crate) arg: T,
+    pub(crate) ret: T,
+    pub(crate) frame: usize,
+    pub(crate) reserve: usize,
+}
+
+impl FastUnary {
+    #[inline(always)]
+    pub(crate) fn max_depth(&self, depth: usize) -> Option<u64> {
+        let left = crate::stack::remaining().unwrap_or(64 << 10).checked_sub(self.reserve)?;
+        let limit = MAX_DEPTH.saturating_sub(depth);
+        Some(limit.min(left / self.frame) as u64)
+    }
+
+    #[inline(always)]
+    pub(crate) unsafe fn call_bits(&self, bits: u64, ctx: &mut Ctx) -> Option<u64> {
+        ctx.bail = 0;
+        ctx.depth = 0;
+        // SAFETY: `entry` was compiled for 1 argument of type `self.arg`; `ctx` outlives the call.
+        let r = unsafe { (self.entry)(&bits as *const u64, ctx) };
+        (ctx.bail == 0).then_some(r)
+    }
+}
+
+/// Compiles or looks up a 1-argument function for repeated direct calls in `map`/`filter`/`count`/pipes.
+pub(crate) fn fast_unary(c: &Closure, sample: &Value, depth: usize) -> Option<FastUnary> {
+    let gate = FLOORS.load(Relaxed);
+    if gate != 0 && (gate & OFF != 0 || under_floor(depth)) {
+        return None;
+    }
+    let def = &c.def;
+    if def.params.len() != 1 || def.hot.load(Relaxed) == NEVER {
+        return None;
+    }
+    let arg_t = T::of(sample)?;
+    if def.hot.load(Relaxed) < 1 {
+        if !shape_ok(def) {
+            def.hot.store(NEVER, Relaxed);
+            return None;
+        }
+        def.hot.store(1, Relaxed);
+    }
+    let at = Arc::as_ptr(def) as usize;
+    let compiled = JIT.with(|j| {
+        let mut j = j.borrow_mut();
+        if j.is_none() {
+            *j = new_jit();
+        }
+        let jit = j.as_mut()?;
+        let sig = vec![arg_t];
+        let key = (at, sig.clone());
+        if let Some(done) = jit.done.get(&key) {
+            return done.clone();
+        }
+        let made = compile(jit, c, &sig).map(Arc::new);
+        if made.is_none() && !shape_ok(def) {
+            def.hot.store(NEVER, Relaxed);
+        }
+        jit.done.insert(key, made.clone());
+        made
+    })?;
+    for (name, at) in &compiled.deps {
+        match lookup(&c.env, name) {
+            Some(Value::Func(f)) if Arc::as_ptr(&f.def) as usize == *at => {}
+            _ => return None,
+        }
+    }
+    Some(FastUnary { entry: compiled.entry, arg: arg_t, ret: compiled.ret, frame: compiled.per, reserve: compiled.reserve })
 }
 
 /// Made where it is called: with the second quick call (`OVER`) its own function, a call of it
@@ -1235,8 +1315,9 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
                     ids: &ids,
                     done: &jit.done,
                     ctx: V::from_u32(0),
-                    depth0: V::from_u32(0),
+                    left: V::from_u32(0),
                     bail: Block::from_u32(0),
+                    bail_depth: Block::from_u32(0),
                     sc: Scopes { stack: vec![Vec::new()] },
                     ret: types[&key],
                     ended: false,
@@ -1313,10 +1394,24 @@ fn compile(jit: &mut Jit, c: &Closure, sig: &[T]) -> Option<Compiled> {
                 T::B => b.ins().ireduce(types::I8, raw),
             });
         }
+        let d = b.ins().load(types::I64, MemFlagsData::trusted(), cx, DEPTH);
+        let max = b.ins().load(types::I64, MemFlagsData::trusted(), cx, MAX);
+        let left = b.ins().isub(max, d);
+        vals.push(left);
         vals.push(cx);
         let f = jit.module.declare_func_in_func(target, b.func);
         let call = b.ins().call(f, &vals);
         let r = b.inst_results(call)[0];
+        let bailed = b.inst_results(call)[1];
+        let go = b.create_block();
+        let bad = b.create_block();
+        b.ins().brif(bailed, bad, &[], go, &[]);
+        b.switch_to_block(bad);
+        let one = b.ins().iconst(types::I64, 1);
+        b.ins().store(MemFlagsData::trusted(), one, cx, BAIL);
+        let zero64 = b.ins().iconst(types::I64, 0);
+        b.ins().return_(&[zero64]);
+        b.switch_to_block(go);
         let bits = match ret {
             T::I => r,
             T::F => b.ins().bitcast(types::I64, MemFlagsData::new(), r),
@@ -1382,15 +1477,13 @@ fn give_up(m: &mut JITModule, id: FuncId, args: &[T], ret: T) {
     let blk = b.create_block();
     b.append_block_params_for_function_params(blk);
     b.switch_to_block(blk);
-    let cx = b.block_params(blk)[args.len()];
-    let one = b.ins().iconst(types::I64, 1);
-    b.ins().store(MemFlagsData::trusted(), one, cx, BAIL);
     let zero = match ret {
         T::I => b.ins().iconst(types::I64, 0),
         T::F => b.ins().f64const(0.0),
         T::B => b.ins().iconst(types::I8, 0),
     };
-    b.ins().return_(&[zero]);
+    let one = b.ins().iconst(types::I8, 1);
+    b.ins().return_(&[zero, one]);
     b.seal_all_blocks();
     b.finalize(m.target_config());
     let _ = m.define_function(id, &mut ctx);
@@ -1401,8 +1494,10 @@ fn signature(m: &JITModule, args: &[T], ret: T) -> cranelift_codegen::ir::Signat
     for t in args {
         s.params.push(AbiParam::new(t.ir()));
     }
+    s.params.push(AbiParam::new(types::I64));
     s.params.push(AbiParam::new(m.target_config().pointer_type()));
     s.returns.push(AbiParam::new(ret.ir()));
+    s.returns.push(AbiParam::new(types::I8));
     s
 }
 
@@ -1414,11 +1509,12 @@ struct Gen<'a, 'f> {
     types: &'a HashMap<Key, T>,
     ids: &'a HashMap<Key, FuncId>,
     done: &'a HashMap<Key, Option<Arc<Compiled>>>,
-    /// The `Ctx` pointer, and the call depth on entry.
+    /// The `Ctx` pointer, and the calls remaining before the depth limit.
     ctx: V,
-    depth0: V,
-    /// Where code goes to give up.
+    left: V,
+    /// Where code goes to give up, and when depth runs out.
     bail: Block,
+    bail_depth: Block,
     sc: Scopes<(Variable, T)>,
     ret: T,
     /// The current block has ended (a `return`): code after it is unreachable.
@@ -1439,7 +1535,8 @@ impl Gen<'_, '_> {
         self.b.append_block_params_for_function_params(entry);
         self.b.switch_to_block(entry);
         let params = self.b.block_params(entry).to_vec();
-        self.ctx = params[args.len()];
+        self.left = params[args.len()];
+        self.ctx = params[args.len() + 1];
         for (i, (p, t)) in def.params.iter().zip(args).enumerate() {
             let var = self.b.declare_var(t.ir());
             self.b.try_def_var(var, params[i]).ok()?;
@@ -1447,25 +1544,27 @@ impl Gen<'_, '_> {
         }
         // The bail-out: tell the caller, return anything.
         self.bail = self.b.create_block();
+        self.bail_depth = self.b.create_block();
         // Deeper by one, within the limit.
-        let d = self.b.ins().load(types::I64, MemFlagsData::trusted(), self.ctx, DEPTH);
-        self.depth0 = d;
-        let d1 = self.b.ins().iadd_imm_s(d, 1);
-        let max = self.b.ins().load(types::I64, MemFlagsData::trusted(), self.ctx, MAX);
-        let over = self.b.ins().icmp(IntCC::UnsignedGreaterThan, d1, max);
-        self.check(over);
-        self.b.ins().store(MemFlagsData::trusted(), d1, self.ctx, DEPTH);
+        let over = self.b.ins().icmp_imm_s(IntCC::SignedLessThanOrEqual, self.left, 0);
+        let go = self.b.create_block();
+        self.b.ins().brif(over, self.bail_depth, &[], go, &[]);
+        self.b.switch_to_block(go);
         let mut ret = None;
         let v = self.value(&def.body, &mut ret)?;
         if !self.ended {
             self.leave(v);
         }
+        // Out of depth: tell `gave_up` via `depth == max`.
+        self.b.switch_to_block(self.bail_depth);
+        let max = self.b.ins().load(types::I64, MemFlagsData::trusted(), self.ctx, MAX);
+        self.b.ins().store(MemFlagsData::trusted(), max, self.ctx, DEPTH);
+        self.b.ins().jump(self.bail, &[]);
         // Giving up.
         self.b.switch_to_block(self.bail);
-        let one = self.b.ins().iconst(types::I64, 1);
-        self.b.ins().store(MemFlagsData::trusted(), one, self.ctx, BAIL);
+        let one = self.b.ins().iconst(types::I8, 1);
         let zero = self.zero(self.ret);
-        self.b.ins().return_(&[zero]);
+        self.b.ins().return_(&[zero, one]);
         Some(())
     }
 
@@ -1477,10 +1576,10 @@ impl Gen<'_, '_> {
         }
     }
 
-    /// Returns `v`, the call depth as it was.
+    /// Returns `v`.
     fn leave(&mut self, v: V) {
-        self.b.ins().store(MemFlagsData::trusted(), self.depth0, self.ctx, DEPTH);
-        self.b.ins().return_(&[v]);
+        let ok = self.b.ins().iconst(types::I8, 0);
+        self.b.ins().return_(&[v, ok]);
         self.ended = true;
     }
 
@@ -1602,12 +1701,14 @@ impl Gen<'_, '_> {
                     }
                 };
                 let _ = self.types;
+                let next_left = self.b.ins().iadd_imm_s(self.left, -1);
+                vs.push(next_left);
                 vs.push(self.ctx);
                 let fr = self.module.declare_func_in_func(id, self.b.func);
                 let call = self.b.ins().call(fr, &vs);
                 let r = self.b.inst_results(call)[0];
                 // Gave up inside: give up here too.
-                let bailed = self.b.ins().load(types::I64, MemFlagsData::trusted(), self.ctx, BAIL);
+                let bailed = self.b.inst_results(call)[1];
                 self.check(bailed);
                 r
             }

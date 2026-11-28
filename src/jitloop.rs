@@ -96,6 +96,9 @@ struct Cx {
     /// The run's texts, in the order of their places (FEEDBACK55.md, string speed; branch
     /// feedback55).
     texts: *mut Text,
+    /// For `for x in xs`, the list being iterated and a 256-element batch buffer.
+    iter_list: *const Value,
+    chunk: [u64; 256],
     err: Option<Ctrl>,
 }
 
@@ -104,6 +107,8 @@ const END: i32 = 8;
 const STEP: i32 = 16;
 const MISS: i32 = 24;
 const TEXTS: i32 = 32;
+const ITER_LIST: i32 = std::mem::offset_of!(Cx, iter_list) as i32;
+const CHUNK: i32 = std::mem::offset_of!(Cx, chunk) as i32;
 
 /// A text a loop reads or adds to, as its code takes it: the numbers first, at fixed places
 /// (FEEDBACK55.md, string speed; branch feedback55).
@@ -185,7 +190,7 @@ struct Code {
 }
 
 type ShapeKey = (u64, usize);
-type CodeKey = (u64, usize, Vec<Kind>);
+type CodeKey = (u64, usize, Vec<Kind>, Option<T>);
 
 thread_local! {
     static SHAPES: RefCell<HashMap<ShapeKey, Option<Arc<Shape>>>> = RefCell::new(HashMap::new());
@@ -200,9 +205,21 @@ pub fn compiled() -> usize {
 /// Runs `node`, a `for` over a range at round `range.0` or a `while`, in machine code from
 /// here, if it can be: None to go on in the interpreter.
 pub(crate) fn run(it: &mut Interp, node: &Expr, env: &Env, range: Option<(i64, i64, i64)>) -> Option<Ran> {
+    run_with(it, node, env, range.unwrap_or((0, 0, 1)), None)
+}
+
+/// Runs `for x in xs` over a numeric/bool list from index `at` (`xs` length `len`).
+pub(crate) fn run_list(it: &mut Interp, node: &Expr, env: &Env, list: &Value, at: i64, len: i64) -> Option<Ran> {
+    let Value::List(l) = list else { return None };
+    let item_t = l.first().and_then(T::of)?;
+    run_with(it, node, env, (at, len, 1), Some((list as *const Value, item_t)))
+}
+
+fn run_with(it: &mut Interp, node: &Expr, env: &Env, (k, end, step): (i64, i64, i64), iter: Option<(*const Value, T)>) -> Option<Ran> {
     let id = it.code_id;
     let skey = (id, node as *const Expr as usize);
-    let shape = SHAPES.with(|s| s.borrow_mut().entry(skey).or_insert_with(|| shape_of(node).map(Arc::new)).clone())?;
+    let list_loop = iter.is_some();
+    let shape = SHAPES.with(|s| s.borrow_mut().entry(skey).or_insert_with(|| shape_of_as(node, list_loop).map(Arc::new)).clone())?;
     for b in &shape.builtins {
         if !matches!(value::builtin_named(env, *b), Some((n, _)) if n == b.as_str()) {
             return None;
@@ -217,11 +234,12 @@ pub(crate) fn run(it: &mut Interp, node: &Expr, env: &Env, range: Option<(i64, i
         }
         kinds.push(k);
     }
-    let ckey = (id, skey.1, kinds.clone());
+    let iter_item = iter.map(|(_, t)| t);
+    let ckey = (id, skey.1, kinds.clone(), iter_item);
     let code = match CODE.with(|c| c.borrow().get(&ckey).cloned()) {
         Some(c) => c?,
         None => {
-            let made = compile(node, &shape, &kinds).map(Arc::new);
+            let made = compile(node, &shape, &kinds, iter_item).map(Arc::new);
             CODE.with(|c| c.borrow_mut().insert(ckey, made.clone()));
             made?
         }
@@ -249,8 +267,8 @@ pub(crate) fn run(it: &mut Interp, node: &Expr, env: &Env, range: Option<(i64, i
             }
         }
     }
-    let (k, end, step) = range.unwrap_or((0, 0, 1));
-    let mut cx = Cx { k, end, step, miss: 0, texts: texts.as_mut_ptr(), err: None };
+    let iter_list = iter.map_or(std::ptr::null(), |(p, _)| p);
+    let mut cx = Cx { k, end, step, miss: 0, texts: texts.as_mut_ptr(), iter_list, chunk: [0u64; 256], err: None };
     // SAFETY: the code was made for exactly these kinds: a number for each in `scalars`, a
     // list for each in `lists`, a text for each in `texts`, in order, which outlive the call,
     // as `cx` does.
@@ -349,6 +367,26 @@ fn update<'a>(name: Sym, op: &AssignOp, e: &'a Expr) -> Option<Update<'a>> {
         }
         _ => None,
     }
+}
+
+/// `for j in range(a, b, s) { xs = xs | set(j, val) }` where `val` is loop-invariant.
+fn stride_set<'a>(pat: &Pattern, body: &'a Expr) -> Option<(Sym, &'a Expr, u32)> {
+    let Pattern::Bind(j_sym) = pat else { return None };
+    let Expr::Block(ss) = body else { return None };
+    let [Stmt::Assign(list_sym, op, e, _)] = ss.as_slice() else { return None };
+    if list_sym == j_sym {
+        return None;
+    }
+    let Some(Update::Set1 { i: Expr::Ident(idx, _), v, line }) = update(*list_sym, op, e) else {
+        return None;
+    };
+    if idx != j_sym || !matches!(v, Expr::Lit(..) | Expr::Ident(..)) {
+        return None;
+    }
+    if matches!(v, Expr::Ident(n, _) if n == j_sym || n == list_sym) {
+        return None;
+    }
+    Some((*list_sym, v, line))
 }
 
 /// `m = set(m, k, get(m, k, d) + e)` (or `-`, `*`, and `m | set(...)`), a count kept in a
@@ -550,16 +588,21 @@ impl Walk {
 }
 
 /// What a loop takes from around it, if it is made only of what compiled code does.
-fn shape_of(node: &Expr) -> Option<Shape> {
+fn shape_of_as(node: &Expr, list_loop: bool) -> Option<Shape> {
     let mut w = Walk { bound: vec![Vec::new()], free: Vec::new(), builtins: Vec::new() };
     match node {
         Expr::For(pat, iter, body, _) => {
-            range_parts(iter)?;
+            if !list_loop {
+                range_parts(iter)?;
+            }
             w.bound.push(Vec::new());
             w.bind(pat)?;
             w.expr(body)?;
         }
         Expr::While(c, body, _) => {
+            if list_loop {
+                return None;
+            }
             w.expr(c)?;
             w.bound.push(Vec::new());
             w.expr(body)?;
@@ -640,6 +683,124 @@ fn failed(cx: *mut Cx, e: Ctrl) -> u64 {
     // SAFETY: as `miss`.
     unsafe { (*cx).err = Some(e) };
     2
+}
+
+/// Reads up to 256 items of type `t` from `list[at..]` into `out`, stopping at any type mismatch.
+unsafe extern "C" fn list_chunk(list: *const Value, at: i64, out: *mut u64, t: u64) -> i64 {
+    // SAFETY: `list` lives across `run_with`; `out` points to `cx.chunk` (`[u64; 256]`).
+    let Value::List(l) = (unsafe { &*list }) else { return 0 };
+    let at = at.max(0) as usize;
+    if at >= l.len() {
+        return 0;
+    }
+    let n = (l.len() - at).min(256);
+    let slice = &l[at..at + n];
+    let out = unsafe { std::slice::from_raw_parts_mut(out, 256) };
+    let mut got = 0usize;
+    match t {
+        0 => {
+            for x in slice {
+                if let Value::Int(v) = x {
+                    out[got] = *v as u64;
+                    got += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        1 => {
+            for x in slice {
+                if let Value::Float(v) = x {
+                    out[got] = v.to_bits();
+                    got += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        _ => {
+            for x in slice {
+                if let Value::Bool(v) = x {
+                    out[got] = *v as u64;
+                    got += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    got as i64
+}
+
+/// `for j in range(start, end, step) { xs = xs | set(j, val) }` in one call (`sole` once).
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn set_stride(list: *mut Value, start: i64, end: i64, step: i64, t: u64, bits: u64, line: u64, cx: *mut Cx) -> u64 {
+    let count = crate::builtins::range_count(start, end, step);
+    if count == 0 {
+        return 0;
+    }
+    let v = value_of(of_tag(t), bits);
+    // SAFETY: `list` is one of the run's lists, written by nothing else while it runs.
+    let slot = unsafe { &mut *list };
+    if let Value::List(l) = slot {
+        let last = start as i128 + (count as i128 - 1) * step as i128;
+        let len = l.len() as i128;
+        if start >= 0 && last >= 0 && i128::from(start) < len && last < len {
+            let dst = value::sole(l);
+            let mut idx = start as usize;
+            let end_u = last as usize;
+            let step_u = if step > 0 { step as usize } else { (-step as i128) as usize };
+            let asc = step > 0;
+            macro_rules! fill_stride {
+                ($same:expr, $val:expr) => {
+                    loop {
+                        if !($same)(&dst[idx]) {
+                            dst[idx] = $val;
+                        }
+                        if asc {
+                            match idx.checked_add(step_u) {
+                                Some(next) if next <= end_u => idx = next,
+                                _ => break,
+                            }
+                        } else {
+                            if idx < step_u || idx - step_u < end_u {
+                                break;
+                            }
+                            idx -= step_u;
+                        }
+                    }
+                };
+            }
+            match &v {
+                Value::Bool(b) => {
+                    let b = *b;
+                    fill_stride!(|cur: &Value| matches!(cur, Value::Bool(x) if *x == b), Value::Bool(b));
+                }
+                Value::Int(n) => {
+                    let n = *n;
+                    fill_stride!(|cur: &Value| matches!(cur, Value::Int(x) if *x == n), Value::Int(n));
+                }
+                Value::Float(f) => {
+                    let bits = f.to_bits();
+                    fill_stride!(|cur: &Value| matches!(cur, Value::Float(x) if x.to_bits() == bits), Value::Float(f64::from_bits(bits)));
+                }
+                _ => {
+                    fill_stride!(|_: &Value| false, v.clone());
+                }
+            }
+            return 0;
+        }
+    }
+    let mut cur = start;
+    for _ in 0..count {
+        match crate::builtins::set_of(vec![slot.clone(), Value::Int(cur), v.clone()], line as u32) {
+            Ok(now) => *slot = now,
+            Err(e) => return failed(cx, e),
+        }
+        let Some(next) = cur.checked_add(step) else { break };
+        cur = next;
+    }
+    0
 }
 
 /// `xs = set(xs, i, v)`: where it is, or the error `set` gives.
@@ -946,7 +1107,7 @@ struct Gen<'f> {
     fail: Block,
 }
 
-fn compile(node: &Expr, shape: &Shape, kinds: &[Kind]) -> Option<Code> {
+fn compile(node: &Expr, shape: &Shape, kinds: &[Kind], iter_item: Option<T>) -> Option<Code> {
     with_module(|module| {
         let ptr = module.target_config().pointer_type();
         let cc = module.target_config().default_call_conv;
@@ -964,7 +1125,7 @@ fn compile(node: &Expr, shape: &Shape, kinds: &[Kind]) -> Option<Code> {
         {
             let b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
             let mut g = Gen { b, cc, ptr, lists: V::from_u32(0), cx: V::from_u32(0), texts: V::from_u32(0), text_written: Vec::new(), text_counted: Vec::new(), lits: Vec::new(), sc: vec![Vec::new()], items: Vec::new(), written: false, bail: Block::from_u32(0), fail: Block::from_u32(0) };
-            g.function(node, shape, kinds)?;
+            g.function(node, shape, kinds, iter_item)?;
             g.b.seal_all_blocks();
             g.b.finalize(module.target_config());
             (lits, counted) = (g.lits, g.text_counted);
@@ -979,7 +1140,7 @@ fn compile(node: &Expr, shape: &Shape, kinds: &[Kind]) -> Option<Code> {
 }
 
 impl Gen<'_> {
-    fn function(&mut self, node: &Expr, shape: &Shape, kinds: &[Kind]) -> Option<()> {
+    fn function(&mut self, node: &Expr, shape: &Shape, kinds: &[Kind], iter_item: Option<T>) -> Option<()> {
         let entry = self.b.create_block();
         self.b.append_block_params_for_function_params(entry);
         self.b.switch_to_block(entry);
@@ -1032,6 +1193,68 @@ impl Gen<'_> {
         };
         let k = self.b.declare_var(types::I64);
         match node {
+            Expr::For(pat, _, inner, _) if iter_item.is_some() => {
+                let item_t = iter_item.unwrap();
+                let start = self.b.ins().load(types::I64, MemFlagsData::trusted(), cx, K);
+                let end = self.b.ins().load(types::I64, MemFlagsData::trusted(), cx, END);
+                let list_ptr = self.b.ins().load(self.ptr, MemFlagsData::trusted(), cx, ITER_LIST);
+                let chunk_ptr = self.b.ins().iadd_imm_s(cx, CHUNK as i64);
+                let item_tag = self.b.ins().iconst(types::I64, tag(item_t));
+                let fetch = self.b.create_block();
+                let inner_head = self.b.create_block();
+                let chunk_done = self.b.create_block();
+                let j = self.b.declare_var(types::I64);
+                let at = self.b.declare_var(types::I64);
+                let chunk_n = self.b.declare_var(types::I64);
+                self.b.def_var(at, start);
+                self.b.def_var(k, start);
+                self.b.ins().jump(head, &[]);
+                self.b.switch_to_block(head);
+                let at_v = self.b.use_var(at);
+                let more = self.b.ins().icmp(IntCC::SignedLessThan, at_v, end);
+                self.b.ins().brif(more, fetch, &[], done, &[]);
+                self.b.switch_to_block(fetch);
+                snapshot(self);
+                self.b.def_var(k, at_v);
+                let n = self.helper(list_chunk as *const () as usize, &[list_ptr, at_v, chunk_ptr, item_tag], true)?;
+                let zero = self.b.ins().icmp_imm_s(IntCC::Equal, n, 0);
+                let go = self.b.create_block();
+                self.b.ins().brif(zero, self.bail, &[], go, &[]);
+                self.b.switch_to_block(go);
+                self.b.def_var(chunk_n, n);
+                let z0 = self.b.ins().iconst(types::I64, 0);
+                self.b.def_var(j, z0);
+                self.b.ins().jump(inner_head, &[]);
+                self.b.switch_to_block(inner_head);
+                let jv = self.b.use_var(j);
+                let nv = self.b.use_var(chunk_n);
+                let jmore = self.b.ins().icmp(IntCC::SignedLessThan, jv, nv);
+                self.b.ins().brif(jmore, body, &[], chunk_done, &[]);
+                self.b.switch_to_block(body);
+                let cur_k = self.b.ins().iadd(at_v, jv);
+                self.b.def_var(k, cur_k);
+                snapshot(self);
+                self.written = false;
+                let off = self.b.ins().ishl_imm_u(jv, 3);
+                let eaddr = self.b.ins().iadd(chunk_ptr, off);
+                let raw = self.b.ins().load(types::I64, MemFlagsData::trusted(), eaddr, 0);
+                let elem = self.from_bits(item_t, raw);
+                self.sc.push(Vec::new());
+                if let Pattern::Bind(n) = pat {
+                    let var = self.b.declare_var(item_t.ir());
+                    self.b.def_var(var, elem);
+                    self.sc.last_mut()?.push((*n, Var::Num(var, item_t)));
+                }
+                self.stmt_expr(inner)?;
+                self.sc.pop();
+                let j1 = self.b.ins().iadd_imm_s(jv, 1);
+                self.b.def_var(j, j1);
+                self.b.ins().jump(inner_head, &[]);
+                self.b.switch_to_block(chunk_done);
+                let next_at = self.b.ins().iadd(at_v, nv);
+                self.b.def_var(at, next_at);
+                self.b.ins().jump(head, &[]);
+            }
             Expr::For(pat, _, inner, _) => {
                 let start = self.b.ins().load(types::I64, MemFlagsData::trusted(), cx, K);
                 let end = self.b.ins().load(types::I64, MemFlagsData::trusted(), cx, END);
@@ -1888,6 +2111,18 @@ impl Gen<'_> {
                     }
                     None => self.b.ins().iconst(types::I64, 1),
                 };
+                if let Some((list_sym, v_expr, set_line)) = stride_set(pat, body) {
+                    if let Some(Var::List(slot)) = self.lookup(list_sym) {
+                        let (vv, tv) = self.value(v_expr)?;
+                        let addr = self.list_addr(slot);
+                        let bits = self.to_bits(tv, vv);
+                        let args = [addr, start, end, step, self.b.ins().iconst(types::I64, tag(tv)), bits, self.b.ins().iconst(types::I64, set_line as i64), self.cx];
+                        let r = self.helper(set_stride as *const () as usize, &args, true)?;
+                        self.leave_if(r, self.fail);
+                        self.written = true;
+                        return Some(());
+                    }
+                }
                 // A body that writes is run again after its writes.
                 let after = self.written || self.writes(body);
                 self.written = after;

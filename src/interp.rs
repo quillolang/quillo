@@ -275,7 +275,7 @@ pub struct Interp {
     /// one (FEEDBACK89.md, Q-1394; branch feedback86-89).
     pub(crate) chain: Option<Arc<crate::service::ChainCell>>,
     /// Calls in progress on this thread, to stop runaway recursion cleanly.
-    depth: usize,
+    pub(crate) depth: usize,
     /// The quotient of two ints a pipe is passing on, for `floor` to make in ints (`eval_pipe`):
     /// for the pipe's own call to take as it begins (`pipe_div`), then for the call itself, set
     /// just before it and taken by it (`exact_div`), so that no argument, inner or later call
@@ -468,6 +468,11 @@ pub struct Interp {
     pub pg_tx: std::sync::Mutex<Vec<crate::db::TxConn>>,
     /// This program's database (SQLite or a Postgres pool), opened on first use.
     pub db: Arc<std::sync::Mutex<Option<crate::db::DbSlot>>>,
+    /// Bumped whenever `db` changes, so `backend(it)` avoids locking `db` on every SQL call.
+    pub(crate) db_gen: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) db_fast: (u64, Option<Arc<crate::db::Backend>>),
+    pub(crate) scan_fast: Option<(crate::sql::Dialect, Arc<str>, Arc<crate::sql::Scan>)>,
+    db_default_ptr: usize,
     /// Databases besides `db` (`db.connect`): each with its label for live
     /// updates, shared by the program's forks.
     pub(crate) db_conns: Arc<std::sync::Mutex<Vec<(String, crate::db::DbSlot)>>>,
@@ -520,6 +525,8 @@ pub struct Interp {
     printing: bool,
     /// What `in_place_call` gave back is already where it goes.
     stored: bool,
+    /// Statement position `db.exec(...)` whose `{ changes, last_id }` result is discarded.
+    pub(crate) exec_discard: bool,
     /// This program's, for compiled loops (src/jitloop.rs): new for each one loaded, the
     /// same in a fork, so code made for one program's loop is never another's.
     pub(crate) code_id: u64,
@@ -2677,6 +2684,21 @@ fn constant(e: &Expr) -> bool {
     }
 }
 
+fn const_value(e: &Expr) -> Option<Value> {
+    Some(match e {
+        Expr::Lit(l) => lit_value(l),
+        Expr::List(xs) => Value::list(xs.iter().map(const_value).collect::<Option<Vec<_>>>()?),
+        Expr::Map(xs) => {
+            let mut m = Map::with_capacity(xs.len());
+            for (k, x) in xs {
+                m.insert(k.into(), const_value(x)?);
+            }
+            Value::map(m)
+        }
+        _ => return None,
+    })
+}
+
 /// An int's text, as `str` and a map's key have it, written into `buf` with nothing made
 /// (FEEDBACK55.md, string speed; branch feedback55).
 pub(crate) fn int_text(i: i64, buf: &mut [u8; 20]) -> &str {
@@ -3051,6 +3073,10 @@ impl Interp {
     pub fn with_shared(base_dir: impl Into<PathBuf>, shared: Arc<Shared>) -> Self {
         let globals = Scope::root();
         crate::builtins::install(&globals);
+        let db_default_ptr = match lookup(&globals, Sym::new("db")) {
+            Some(Value::Map(m)) => Arc::as_ptr(&m) as usize,
+            _ => 0,
+        };
         Interp {
             globals,
             routes: Arc::new(Vec::new()),
@@ -3135,6 +3161,10 @@ impl Interp {
             catching_drops: 0,
             dropped: None,
             db: Arc::new(std::sync::Mutex::new(None)),
+            db_gen: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+            db_fast: (0, None),
+            scan_fast: None,
+            db_default_ptr,
             db_conns: Arc::new(std::sync::Mutex::new(Vec::new())),
             db_on: None,
             wrote_req: None,
@@ -3152,6 +3182,7 @@ impl Interp {
             own_seqs: Vec::new(),
             printing: false,
             stored: false,
+            exec_discard: false,
             keep_last: true,
             code_id: NEXT_CODE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             text: None,
@@ -3283,6 +3314,10 @@ impl Interp {
             catching_drops: 0,
             dropped: None,
             db: self.db.clone(),
+            db_gen: self.db_gen.clone(),
+            db_fast: (0, None),
+            scan_fast: None,
+            db_default_ptr: self.db_default_ptr,
             db_conns: self.db_conns.clone(),
             db_on: None,
             wrote_req: None,
@@ -3300,6 +3335,7 @@ impl Interp {
             own_seqs: Vec::new(),
             printing: false,
             stored: false,
+            exec_discard: false,
             keep_last: true,
             code_id: self.code_id,
             text: None,
@@ -3396,6 +3432,37 @@ impl Interp {
             }
             self.note_published(raw);
         }
+    }
+
+    /// As `publish`, for database table writes (`db:t` or `db@label:t`): inside a transaction where
+    /// the table is already pending, avoids allocating topic strings on every statement.
+    pub(crate) fn publish_db_writes(&mut self, label: Option<&str>, writes: &[String]) {
+        self.mark_impure();
+        if self.tx_depth > 0 && self.base.is_empty() && self.site.tenant_rule.is_none() && self.tenant.is_none() {
+            for w in writes {
+                let seen = self.pending.iter().rev().take(64).any(|p| match label {
+                    None => p.strip_prefix("db:") == Some(w.as_str()),
+                    Some(l) => p.strip_prefix("db@").and_then(|rest| rest.strip_prefix(l)).and_then(|rest| rest.strip_prefix(':')) == Some(w.as_str()),
+                });
+                if !seen {
+                    let s = match label {
+                        None => format!("db:{}", w),
+                        Some(l) => format!("db@{}:{}", l, w),
+                    };
+                    self.pending.push(s.clone());
+                    self.pending_raw.push(s);
+                }
+            }
+            return;
+        }
+        let topics: Vec<String> = writes
+            .iter()
+            .map(|w| match label {
+                None => format!("db:{}", w),
+                Some(l) => format!("db@{}:{}", l, w),
+            })
+            .collect();
+        self.publish(topics);
     }
 
     /// While answering a service call, keeps the topics just announced
@@ -4767,6 +4834,12 @@ impl Interp {
         // reached (`m.floor`, `[floor][0]`, `floor()`): the quotient goes on as the float it is,
         // and `floor` given that float alone, here, makes it from the ints (FEEDBACK55.md,
         // Q-788; found in review).
+        let discard = std::mem::take(&mut self.exec_discard);
+        if crate::httpd::value_most() == u64::MAX && self.can_fast_call() {
+            if let Some(r) = self.try_fused_range_pipe(lhs, rhs, env, line) {
+                return r;
+            }
+        }
         let v = match lhs {
             Expr::Binary(BinOp::Div, a, b, at) => {
                 let x = self.eval(a, env)?;
@@ -4782,10 +4855,12 @@ impl Interp {
                     (Some((p, q)), Value::Float(f)) => Some(Box::new(ExactDiv { bits: f.to_bits(), a: p, b: q, line: *at })),
                     _ => None,
                 };
+                self.exec_discard = discard;
                 return self.pipe_into(v, rhs, env, line, pending);
             }
             _ => self.eval(lhs, env)?,
         };
+        self.exec_discard = discard;
         self.pipe_into(v, rhs, env, line, None)
     }
 
@@ -4803,20 +4878,32 @@ impl Interp {
             }
             // `sql | analytics.one`: on that connection.
             Expr::Field(obj, name, l) => {
+                let discard = std::mem::take(&mut self.exec_discard);
                 // `x | read_file.curry` hands `read_file` on, to `curry` (`get_field`).
                 let recv = if let Expr::Ident(..) = &**obj { self.eval_receiver(obj, name, env)? } else { self.eval(obj, env)? };
-                let db_on = crate::db::conn_of(&recv, name);
+                let db_on = if let Value::Map(m) = &recv {
+                    crate::db::conn_of_method(m, m.get(name.as_str()))
+                } else {
+                    None
+                };
                 let f = self.get_field(recv, name, env, *l)?;
                 self.db_on = db_on;
                 self.exact_div = pending;
                 self.piped_site(rhs);
-                self.call(&f, vec![v], line)
+                self.exec_discard = discard && matches!(f, Value::Builtin("db.exec", _));
+                let r = self.call(&f, vec![v], line);
+                self.exec_discard = false;
+                r
             }
             other => {
+                let discard = std::mem::take(&mut self.exec_discard);
                 let f = self.eval_called(other, env)?;
                 self.exact_div = pending;
                 self.piped_site(rhs);
-                self.call(&f, vec![v], line)
+                self.exec_discard = discard && matches!(f, Value::Builtin("db.exec", _));
+                let r = self.call(&f, vec![v], line);
+                self.exec_discard = false;
+                r
             }
         }
     }
@@ -4874,7 +4961,11 @@ impl Interp {
             }
             Expr::Block(stmts) => self.eval_block(stmts, env, false),
             e => {
-                let v = self.eval(e, env)?;
+                let prev = self.exec_discard;
+                self.exec_discard = matches!(e, Expr::Call(..) | Expr::Pipe(..));
+                let v = self.eval(e, env);
+                self.exec_discard = prev;
+                let v = v?;
                 if let Value::Err(err, ..) = &v {
                     // A `db.open` that failed as the program starts, its error taken by nothing
                     // (alone on a line, or given back by a function called so): the program
@@ -4958,6 +5049,79 @@ impl Interp {
 
     #[inline(never)]
     fn eval_template(&mut self, parts: &[TPart], env: &Env) -> Result<Value, Ctrl> {
+        // Short templates without `--max-memory` limits format on the stack so `Value::str` makes
+        // one `Arc<str>` allocation instead of allocating and freeing a `String` first.
+        if !self.printing && self.fuel == u64::MAX && parts.len() <= 4 && crate::httpd::most_bytes() >= 96 {
+            let mut buf = [0u8; 96];
+            let mut len = 0usize;
+            let mut fast = true;
+            for p in parts {
+                match p {
+                    TPart::Lit(t) => {
+                        let b = t.as_bytes();
+                        if len + b.len() <= buf.len() {
+                            buf[len..len + b.len()].copy_from_slice(b);
+                            len += b.len();
+                        } else {
+                            fast = false;
+                            break;
+                        }
+                    }
+                    TPart::Expr(x) => {
+                        if parts.len() > 2 || !matches!(x, Expr::Ident(..) | Expr::Lit(..)) {
+                            fast = false;
+                            break;
+                        }
+                        match self.eval(x, env)? {
+                            Value::Int(n) => {
+                                let mut nbuf = [0u8; 21];
+                                let mut i = nbuf.len();
+                                let mut m = n.unsigned_abs();
+                                loop {
+                                    i -= 1;
+                                    nbuf[i] = b'0' + (m % 10) as u8;
+                                    m /= 10;
+                                    if m == 0 {
+                                        break;
+                                    }
+                                }
+                                if n < 0 {
+                                    i -= 1;
+                                    nbuf[i] = b'-';
+                                }
+                                let s = &nbuf[i..];
+                                if len + s.len() <= buf.len() {
+                                    buf[len..len + s.len()].copy_from_slice(s);
+                                    len += s.len();
+                                } else {
+                                    fast = false;
+                                    break;
+                                }
+                            }
+                            Value::Str(t) | Value::Css(t) => {
+                                let b = t.as_bytes();
+                                if len + b.len() <= buf.len() {
+                                    buf[len..len + b.len()].copy_from_slice(b);
+                                    len += b.len();
+                                } else {
+                                    fast = false;
+                                    break;
+                                }
+                            }
+                            _ => {
+                                fast = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if fast {
+                // SAFETY: all slices pushed are valid UTF-8 (`&str` literals, `Str`/`Css`, ASCII digits).
+                let s = unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
+                return Ok(Value::str(s));
+            }
+        }
         let mut s = Held::new();
         self.template_into(parts, env, &mut s)?;
         // Stopped, `template_into` said so: none is left.
@@ -4990,12 +5154,311 @@ impl Interp {
         self.fuel == u64::MAX && self.reads.is_none() && self.tracks.is_empty() && !crate::debug::on() && !crate::httpd::compute_limited() && crate::jit::enabled()
     }
 
+    /// Whether a pure builtin batch (`map`, `filter`, `count`, fused pipelines) can bypass per-call
+    /// interpreter checks and invoke compiled unary functions directly.
+    #[inline]
+    pub(crate) fn can_fast_call(&self) -> bool {
+        let ok = self.fuel == u64::MAX
+            && self.reads.is_none()
+            && self.tracks.is_empty()
+            && !crate::debug::on()
+            && !crate::httpd::compute_limited()
+            && !self.writes_noted()
+            && self.allowed == ALL_EFFECTS
+            && self.chain.is_none()
+            && self.stop.is_none()
+            && self.asking.is_none()
+            && !self.in_run
+            && self.exact_div.is_none();
+        #[cfg(feature = "jit")]
+        return ok && crate::jit::enabled();
+        #[cfg(not(feature = "jit"))]
+        return ok;
+    }
+
+    /// Fuses `range(a, b[, step]) | (filter/map)* | (sum/count/list)` without allocating intermediate lists.
+    #[inline(never)]
+    fn try_fused_range_pipe(&mut self, lhs: &Expr, rhs: &Expr, env: &Env, _line: u32) -> Option<Result<Value, Ctrl>> {
+        enum Step<'a> {
+            Filter(&'a Expr),
+            Map(&'a Expr),
+        }
+        enum Reduce<'a> {
+            List,
+            Sum,
+            Count(Option<&'a Expr>),
+        }
+        let mut chain_exprs = vec![rhs];
+        let mut cur = lhs;
+        while let Expr::Pipe(a, b, _) = cur {
+            chain_exprs.push(b);
+            cur = a;
+        }
+        chain_exprs.reverse();
+        let (range_args, range_is_op, range_line) = match cur {
+            Expr::Binary(BinOp::Range, _, _, l) => (None, true, *l),
+            Expr::Call(f, args, l) => {
+                let Expr::Ident(n, _) = &**f else { return None };
+                if n != "range" || !(1..=3).contains(&args.len()) || !matches!(lookup(env, *n), Some(Value::Builtin("range", _))) {
+                    return None;
+                }
+                (Some(args.as_slice()), false, *l)
+            }
+            _ => return None,
+        };
+        let mut steps = Vec::new();
+        let mut reducer = Reduce::List;
+        for (idx, expr) in chain_exprs.iter().enumerate() {
+            let last = idx + 1 == chain_exprs.len();
+            let (name, args, _sline) = match expr {
+                Expr::Call(f, args, l) => {
+                    let Expr::Ident(n, _) = &**f else { return None };
+                    if !matches!(lookup(env, *n), Some(Value::Builtin(b, _)) if b == n.as_str()) {
+                        return None;
+                    }
+                    (n.as_str(), args.as_slice(), *l)
+                }
+                Expr::Ident(n, l) => {
+                    if !matches!(lookup(env, *n), Some(Value::Builtin(b, _)) if b == n.as_str()) {
+                        return None;
+                    }
+                    (n.as_str(), &[][..], *l)
+                }
+                _ => return None,
+            };
+            match (name, args, last) {
+                ("filter", [arg], _) => steps.push(Step::Filter(arg)),
+                ("map", [arg], _) => steps.push(Step::Map(arg)),
+                ("sum", [], true) => reducer = Reduce::Sum,
+                ("count", [], true) => reducer = Reduce::Count(None),
+                ("count", [arg], true) => reducer = Reduce::Count(Some(arg)),
+                _ => return None,
+            }
+        }
+        // Check that all closures are already literal lambdas (or function idents) that take 1 arg
+        // before evaluating anything side-effecting.
+        let (a, b, step) = if range_is_op {
+            let Expr::Binary(BinOp::Range, ea, eb, _) = cur else { unreachable!() };
+            let va = match self.eval(ea, env) { Ok(v) => v, Err(e) => return Some(Err(e)) };
+            let vb = match self.eval(eb, env) { Ok(v) => v, Err(e) => return Some(Err(e)) };
+            let (Value::Int(a), Value::Int(b)) = (va, vb) else { return None };
+            (a, b, 1i64)
+        } else {
+            let rargs = range_args?;
+            let mut iv = [0i64; 3];
+            for (k, e) in rargs.iter().enumerate() {
+                match self.eval(e, env) {
+                    Ok(Value::Int(n)) => iv[k] = n,
+                    Ok(_) => return None,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            match rargs.len() {
+                1 => (0, iv[0], 1),
+                2 => (iv[0], iv[1], 1),
+                3 => {
+                    if iv[2] == 0 {
+                        return Some(fail(range_line, "`range`: a step of 0 never gets anywhere"));
+                    }
+                    (iv[0], iv[1], iv[2])
+                }
+                _ => return None,
+            }
+        };
+        let count = crate::builtins::range_count(a, b, step);
+        if count > 10_000_000 {
+            return Some(fail(range_line, "range is too large"));
+        }
+        // O(1) arithmetic series sum for `range(...) | sum()`.
+        if steps.is_empty() {
+            if let Reduce::Sum = reducer {
+                if count == 0 {
+                    return Some(Ok(Value::Int(0)));
+                }
+                let n = count as i128;
+                let last = a as i128 + (n - 1) * step as i128;
+                let total = n.checked_mul(a as i128 + last).map(|x| x / 2);
+                if let Some(Ok(ans)) = total.map(i64::try_from) {
+                    return Some(Ok(Value::Int(ans)));
+                }
+                return None;
+            }
+        }
+        // Fast constant-literal `range(...) | map((_i) => lit)`.
+        if steps.len() == 1 {
+            if let (Step::Map(arg), Reduce::List) = (&steps[0], &reducer) {
+                if matches!(arg, Expr::Lambda(_) | Expr::Ident(..)) {
+                    if let Ok(Value::Func(c)) = self.eval(arg, env) {
+                        if c.def.params.len() == 1 && c.def.params[0].default.is_none() && c.def.params[0].ty.is_none() && c.def.ret.is_none() && c.def.err.is_none() {
+                            if let Some(lit) = crate::builtins::const_lit_expr(&c.def.body) {
+                                return Some(Ok(Value::list(vec![lit; count as usize])));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "jit")]
+        {
+            use crate::jit::{self, Ctx, FastUnary, T};
+            enum PipeOp {
+                Filter(FastUnary, bool),
+                Map(FastUnary),
+            }
+            let mut cur_t = T::I;
+            let mut ops = Vec::with_capacity(steps.len());
+            let mut closures = Vec::new();
+            for s in &steps {
+                let (expr, is_filter) = match s {
+                    Step::Filter(e) => (*e, true),
+                    Step::Map(e) => (*e, false),
+                };
+                let v = match self.eval(expr, env) {
+                    Ok(v) => v,
+                    Err(e) => return Some(Err(e)),
+                };
+                let Value::Func(c) = v else { return None };
+                let sample = match cur_t {
+                    T::I => Value::Int(a),
+                    T::F => Value::Float(0.0),
+                    T::B => Value::Bool(false),
+                };
+                let u = jit::fast_unary(&c, &sample, self.depth)?;
+                if is_filter {
+                    if !matches!(u.ret, T::B | T::I) {
+                        return None;
+                    }
+                    ops.push(PipeOp::Filter(u, matches!(u.ret, T::B)));
+                } else {
+                    cur_t = u.ret;
+                    ops.push(PipeOp::Map(u));
+                }
+                closures.push(c);
+            }
+            let count_pred = match reducer {
+                Reduce::Count(Some(expr)) => {
+                    let v = match self.eval(expr, env) {
+                        Ok(v) => v,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    let Value::Func(c) = v else { return None };
+                    let sample = match cur_t {
+                        T::I => Value::Int(a),
+                        T::F => Value::Float(0.0),
+                        T::B => Value::Bool(false),
+                    };
+                    let u = jit::fast_unary(&c, &sample, self.depth)?;
+                    if !matches!(u.ret, T::B | T::I) {
+                        return None;
+                    }
+                    closures.push(c);
+                    Some((u, matches!(u.ret, T::B)))
+                }
+                _ => None,
+            };
+            let _keep_closures = closures;
+            if matches!(reducer, Reduce::Sum) && !matches!(cur_t, T::I | T::F) {
+                return None;
+            }
+            let mut max = MAX_DEPTH.saturating_sub(self.depth) as u64;
+            for op in &ops {
+                let u = match op { PipeOp::Filter(u, _) | PipeOp::Map(u) => u };
+                max = max.min(u.max_depth(self.depth)?);
+            }
+            if let Some((u, _)) = &count_pred {
+                max = max.min(u.max_depth(self.depth)?);
+            }
+            let mut ctx = Ctx::new(max);
+            let mut i_acc = 0i64;
+            let mut f_acc = 0.0f64;
+            let mut had_any = false;
+            let mut cnt = 0i64;
+            let mut out = if matches!(reducer, Reduce::List) {
+                Vec::with_capacity(if ops.iter().all(|o| matches!(o, PipeOp::Map(_))) { count as usize } else { 0 })
+            } else {
+                Vec::new()
+            };
+            let mut cur_val = a;
+            for iter_idx in 0..count {
+                if (iter_idx & 4095) == 0 {
+                    if let Err(e) = self.within_limit(range_line) {
+                        return Some(Err(e));
+                    }
+                }
+                let mut val_bits = cur_val as u64;
+                let mut keep = true;
+                for op in &ops {
+                    match op {
+                        PipeOp::Filter(u, check_nz) => {
+                            // SAFETY: `u` compiled for 1 arg of `cur_t`.
+                            let Some(r) = (unsafe { u.call_bits(val_bits, &mut ctx) }) else {
+                                return None;
+                            };
+                            if *check_nz && r == 0 {
+                                keep = false;
+                                break;
+                            }
+                        }
+                        PipeOp::Map(u) => {
+                            // SAFETY: `u` compiled for 1 arg of `cur_t`.
+                            let Some(r) = (unsafe { u.call_bits(val_bits, &mut ctx) }) else {
+                                return None;
+                            };
+                            val_bits = r;
+                        }
+                    }
+                }
+                if keep {
+                    had_any = true;
+                    match reducer {
+                        Reduce::Sum => match cur_t {
+                            T::I => match i_acc.checked_add(val_bits as i64) {
+                                Some(s) => i_acc = s,
+                                None => return None,
+                            },
+                            T::F => f_acc += f64::from_bits(val_bits),
+                            T::B => unreachable!(),
+                        },
+                        Reduce::Count(None) => cnt += 1,
+                        Reduce::Count(Some(_)) => {
+                            let (u, check_nz) = count_pred.as_ref().unwrap();
+                            // SAFETY: `u` compiled for 1 arg of `cur_t`.
+                            let Some(r) = (unsafe { u.call_bits(val_bits, &mut ctx) }) else {
+                                return None;
+                            };
+                            if !*check_nz || r != 0 {
+                                cnt += 1;
+                            }
+                        }
+                        Reduce::List => out.push(match cur_t {
+                            T::I => Value::Int(val_bits as i64),
+                            T::F => Value::Float(f64::from_bits(val_bits)),
+                            T::B => Value::Bool(val_bits != 0),
+                        }),
+                    }
+                }
+                cur_val = cur_val.wrapping_add(step);
+            }
+            return Some(Ok(match reducer {
+                Reduce::Sum => match cur_t {
+                    T::I => Value::Int(i_acc),
+                    T::F => if had_any { Value::Float(f_acc) } else { Value::Int(0) },
+                    T::B => unreachable!(),
+                },
+                Reduce::Count(..) => Value::Int(cnt),
+                Reduce::List => Value::list(out),
+            }));
+        }
+        #[cfg(not(feature = "jit"))]
+        None
+    }
+
     /// A step of a loop or a call: `--max-compute` ends a request here, between statements,
     /// so nothing is left half done (FEEDBACK20.md, Q-163; branch feedback20-fixes). Always in
     /// place: with the stop's branch it was no longer inlined, and calls took 4% longer (found
     /// in review of FEEDBACK55.md, Q-804; branch feedback55).
     #[inline(always)]
-    fn within_limit(&mut self, line: u32) -> Result<(), Ctrl> {
+    pub(crate) fn within_limit(&mut self, line: u32) -> Result<(), Ctrl> {
         if crate::httpd::OVER_TIME.load(std::sync::atomic::Ordering::Relaxed) && crate::httpd::over_time() {
             // Naming the policy file when its limit is the one (FEEDBACK55.md, Q-849; branch
             // feedback55).
@@ -5272,7 +5735,7 @@ impl Interp {
                 if let Some(v) = self.in_place_counted(name, key, *bop, read, more, *line, env, stored)? {
                     return Ok(Some(v));
                 }
-            } else if let Some(v) = self.in_place_nested(name, args, env)? {
+            } else if let Some(v) = self.in_place_nested(name, args, env, stored)? {
                 return Ok(Some(v));
             }
         }
@@ -5327,7 +5790,7 @@ impl Interp {
     /// it is. The value, or None to do it the long way: anything that could fail or
     /// surprise is left to that, which is why all that is worked out here has no effect
     /// and may be worked out again.
-    fn in_place_nested(&mut self, name: Sym, args: &[Expr], env: &Env) -> Result<Option<Value>, Ctrl> {
+    fn in_place_nested(&mut self, name: Sym, args: &[Expr], env: &Env, stored: bool) -> Result<Option<Value>, Ctrl> {
         let [key, inner] = args else { return Ok(None) };
         let Some((op, recv, rest, _)) = call_on(inner) else { return Ok(None) };
         let fits = match (op.as_str(), rest.len()) {
@@ -5354,16 +5817,17 @@ impl Interp {
             return Ok(None);
         }
         let key = self.eval(key, env)?;
-        let start = match start {
-            Some(d) => Some(self.eval(d, env)?),
-            None => None,
-        };
-        let mut vals = Vec::with_capacity(2);
-        for a in rest {
-            vals.push(self.eval(a, env)?);
+        let mut vals = [Value::Nil, Value::Nil];
+        for (i, a) in rest.iter().enumerate() {
+            vals[i] = self.eval(a, env)?;
         }
-        let done = crate::value::with_slot(env, name, |whole| crate::value::update_inside(whole, &key, start, vals));
-        Ok(if done == Some(true) { take_local(env, name) } else { None })
+        let slice = &mut vals[..rest.len()];
+        let done = crate::value::with_slot(env, name, |whole| crate::value::update_inside_lazy(whole, &key, || start.and_then(const_value), slice));
+        if done == Some(true) {
+            self.stored = stored;
+            return Ok(if stored { Some(Value::Nil) } else { take_local(env, name) });
+        }
+        Ok(None)
     }
 
     /// `m = set(m, k, get(m, k, d) + e)` (or `-`, `*`), a count kept in a map, as word
@@ -5608,7 +6072,24 @@ impl Interp {
             if keep {
                 out.reserve(items.len());
             }
-            for item in items {
+            let mut idx = 0usize;
+            while idx < items.len() {
+                #[cfg(feature = "jit")]
+                if !keep && idx as u64 == crate::jitloop::WARM && matches!(it, Value::List(_)) && self.loops_compile() {
+                    if let Some(s) = scope.take() {
+                        Scope::done(s);
+                    }
+                    match crate::jitloop::run_list(self, node, env, &it, idx as i64, items.len() as i64) {
+                        Some(crate::jitloop::Ran::Done) => break,
+                        Some(crate::jitloop::Ran::Resume(k)) => {
+                            idx = k as usize;
+                            continue;
+                        }
+                        Some(crate::jitloop::Ran::Failed(e)) => return Err(e),
+                        None => {}
+                    }
+                }
+                let item = &items[idx];
                 let v = match self.for_step(pat, item.clone(), body, env, &mut scope, &mut outside, line, keep) {
                     Ok(v) => v,
                     Err(x) => return Err(ended(scope, x)),
@@ -5616,6 +6097,7 @@ impl Interp {
                 if keep {
                     out.push(v);
                 }
+                idx += 1;
             }
         }
         if let Some(s) = scope {
@@ -5780,6 +6262,64 @@ impl Interp {
         env: &Env,
         line: u32,
     ) -> Result<Value, Ctrl> {
+        let discard = std::mem::take(&mut self.exec_discard);
+        if let (Expr::Ident(n, _), [arg], None) = (callee, args, &pre) {
+            if n == "str" && self.can_fast_call() {
+                if let Some(f @ Value::Builtin("str", _)) = lookup(env, *n) {
+                    let v = self.eval(arg, env)?;
+                    if let Value::Int(x) = v {
+                        if let Some(s) = crate::builtins::small_int_str(x) {
+                            return Ok(s);
+                        }
+                        return Ok(Value::str(x.to_string()));
+                    }
+                    return self.call(&f, vec![v], line);
+                }
+            }
+        }
+        // Fast stack path for positional `db.exec(...)` calls (up to 5 args total): skips heap
+        // `Vec<Value>` allocation and `remove(0)`.
+        if let (Expr::Field(obj, name, _), None) = (callee, &pre) {
+            if name == "exec" && (1..=5).contains(&args.len()) && !crate::confirm::held() && self.can_fast_call() {
+                // Ultra-fast check for unshadowed `db.exec(...)`: borrow `db` map from `env`
+                // directly when it matches the default `db` module map, skipping clones/lookups.
+                let direct_db = if let Expr::Ident(m, _) = &**obj {
+                    if m == "db" {
+                        crate::value::with_var(env, *m, |v| matches!(v, Value::Map(map) if Arc::as_ptr(map) as usize == self.db_default_ptr)) == Some(true)
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if direct_db {
+                    let mut stack = [Value::Nil, Value::Nil, Value::Nil, Value::Nil, Value::Nil];
+                    for (i, a) in args.iter().enumerate() {
+                        let v = self.eval(a, env)?;
+                        if matches!(v, Value::Err(..) | Value::Css(_)) {
+                            let mut argv = Vec::with_capacity(args.len());
+                            for slot in &mut stack[..i] {
+                                argv.push(std::mem::replace(slot, Value::Nil));
+                            }
+                            argv.push(v);
+                            for rem in &args[i + 1..] {
+                                argv.push(self.eval(rem, env)?);
+                            }
+                            let f = Value::Builtin("db.exec", crate::db::exec_fn());
+                            self.exec_discard = discard;
+                            let r = self.call(&f, argv, line);
+                            self.exec_discard = false;
+                            return r;
+                        }
+                        stack[i] = v;
+                    }
+                    return match crate::db::exec_fast(self, &stack[..args.len()], line, discard) {
+                        Ok(Value::Err(e, own, Place::NONE)) => Ok(Value::Err(e, own, Place::new(self.cur_file.as_ref(), line))),
+                        r => r,
+                    };
+                }
+            }
+        }
         let mut argv = Vec::with_capacity(args.len() + 2);
         // `analytics.query(...)` on a connection from `db.connect`: which one.
         let mut db_on = None;
@@ -5814,8 +6354,9 @@ impl Interp {
             }
             let method = match &recv {
                 Value::Map(m) => {
-                    db_on = crate::db::conn_of(&recv, name);
-                    m.get(name.as_str()).cloned()
+                    let found = m.get(name.as_str()).cloned();
+                    db_on = crate::db::conn_of_method(m, found.as_ref());
+                    found
                 }
                 _ => None,
             };
@@ -5895,7 +6436,10 @@ impl Interp {
         if let Some(a) = self.asking.as_mut() {
             a.site = callee as *const Expr as usize;
         }
-        self.call(&f, argv, line)
+        self.exec_discard = discard && matches!(f, Value::Builtin("db.exec", _));
+        let r = self.call(&f, argv, line);
+        self.exec_discard = false;
+        r
     }
 
     /// The pipe's quotient of two ints given alone to `name`, one of `floor`'s kind: in ints.

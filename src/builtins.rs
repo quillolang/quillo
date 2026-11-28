@@ -1,5 +1,6 @@
 //! The standard library: functions every program can call.
 
+use crate::ast::Expr;
 use crate::interp::{fail, Ctrl, Interp};
 use crate::value::*;
 use indexmap::IndexMap;
@@ -422,7 +423,22 @@ fn print(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     Ok(Value::Nil)
 }
 
+#[inline(always)]
+pub(crate) fn small_int_str(n: i64) -> Option<Value> {
+    if (0..=1024).contains(&n) {
+        static SMALL: std::sync::OnceLock<[Arc<str>; 1025]> = std::sync::OnceLock::new();
+        let pool = SMALL.get_or_init(|| std::array::from_fn(|i| Arc::from(i.to_string())));
+        return Some(Value::Str(Arc::clone(&pool[n as usize])));
+    }
+    None
+}
+
 fn to_str(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
+    if let Some(Value::Int(n)) = args.first() {
+        if let Some(v) = small_int_str(*n) {
+            return Ok(v);
+        }
+    }
     // A list's or map's text written through a `Held` text, which stops at `--max-memory`
     // (FEEDBACK71.md, Q-977; branch security).
     Ok(Value::str(arg(&args, 0).display_held().map_err(|o| o.at(line))?))
@@ -706,9 +722,108 @@ fn slice(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 // ---- lists -------------------------------------------------------------
 
+pub(crate) fn const_lit_expr(e: &Expr) -> Option<Value> {
+    use crate::ast::{Lit, Stmt, UnOp};
+    match e {
+        Expr::Lit(Lit::Int(n)) => Some(Value::Int(*n)),
+        Expr::Lit(Lit::Float(f)) => Some(Value::Float(*f)),
+        Expr::Lit(Lit::Bool(b)) => Some(Value::Bool(*b)),
+        Expr::Lit(Lit::Nil) => Some(Value::Nil),
+        Expr::Lit(Lit::Str(s)) => Some(Value::Str(s.clone())),
+        Expr::Unary(UnOp::Neg, x, _) => match const_lit_expr(x)? {
+            Value::Int(n) => n.checked_neg().map(Value::Int),
+            Value::Float(f) => Some(Value::Float(-f)),
+            _ => None,
+        },
+        Expr::Block(ss) if ss.len() == 1 => match &ss[0] {
+            Stmt::Expr(x) | Stmt::Return(Some(x), _) => const_lit_expr(x),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn identity_lambda(c: &Closure) -> bool {
+    use crate::ast::Stmt;
+    if c.def.params.len() != 1 || c.def.params[0].default.is_some() || c.def.params[0].ty.is_some() || c.def.ret.is_some() || c.def.err.is_some() {
+        return false;
+    }
+    let name = &c.def.params[0].name;
+    let is_id = |e: &Expr| matches!(e, Expr::Ident(n, _) if n.as_str() == name);
+    match &c.def.body {
+        e if is_id(e) => true,
+        Expr::Block(ss) if ss.len() == 1 => matches!(&ss[0], Stmt::Expr(e) | Stmt::Return(Some(e), _) if is_id(e)),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "jit")]
+#[inline(always)]
+fn jit_bits_of(v: &Value, t: crate::jit::T) -> Option<u64> {
+    use crate::jit::T;
+    match (v, t) {
+        (Value::Int(n), T::I) => Some(*n as u64),
+        (Value::Float(f), T::F) => Some(f.to_bits()),
+        (Value::Bool(b), T::B) => Some(*b as u64),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "jit")]
+#[inline(always)]
+fn jit_value_of(t: crate::jit::T, bits: u64) -> Value {
+    use crate::jit::T;
+    match t {
+        T::I => Value::Int(bits as i64),
+        T::F => Value::Float(f64::from_bits(bits)),
+        T::B => Value::Bool(bits != 0),
+    }
+}
+
 fn map(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "map", line)?;
     let f = f_arg(&args, 1, "map", line)?;
+    if let Value::Func(c) = &f {
+        if c.def.params.len() == 1 && c.def.params[0].default.is_none() && it.can_fast_call() {
+            if c.def.params[0].ty.is_none() && c.def.ret.is_none() && c.def.err.is_none() {
+                if let Some(lit) = const_lit_expr(&c.def.body) {
+                    return Ok(Value::list(vec![lit; l.len()]));
+                }
+            }
+            #[cfg(feature = "jit")]
+            if l.len() >= 16 {
+                if let Some(u) = crate::jit::fast_unary(c, &l[0], it.depth) {
+                    if let Some(max) = u.max_depth(it.depth) {
+                        let mut ctx = crate::jit::Ctx::new(max);
+                        let mut out = Vec::with_capacity(l.len());
+                        let mut idx = 0;
+                        while idx < l.len() {
+                            if (idx & 4095) == 0 {
+                                it.within_limit(line)?;
+                            }
+                            if let Some(bits) = jit_bits_of(&l[idx], u.arg) {
+                                // SAFETY: `u` was compiled for 1 argument of type `u.arg`.
+                                if let Some(r) = unsafe { u.call_bits(bits, &mut ctx) } {
+                                    out.push(jit_value_of(u.ret, r));
+                                    idx += 1;
+                                    continue;
+                                }
+                            }
+                            out.push(it.call1(&f, l[idx].clone(), line)?);
+                            idx += 1;
+                            if ctx.bail != 0 {
+                                break;
+                            }
+                        }
+                        for x in &l[idx..] {
+                            out.push(it.call1(&f, x.clone(), line)?);
+                        }
+                        return Ok(Value::list(out));
+                    }
+                }
+            }
+        }
+    }
     let mut out = Vec::with_capacity(l.len());
     for x in l.iter() {
         out.push(it.call1(&f, x.clone(), line)?);
@@ -719,6 +834,52 @@ fn map(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn filter(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "filter", line)?;
     let f = f_arg(&args, 1, "filter", line)?;
+    #[cfg(feature = "jit")]
+    if let Value::Func(c) = &f {
+        if l.len() >= 16 && it.can_fast_call() {
+            if let Some(u) = crate::jit::fast_unary(c, &l[0], it.depth) {
+                if matches!(u.ret, crate::jit::T::B | crate::jit::T::I) {
+                    if let Some(max) = u.max_depth(it.depth) {
+                        let mut ctx = crate::jit::Ctx::new(max);
+                        let mut out = Vec::new();
+                        let mut idx = 0;
+                        while idx < l.len() {
+                            if (idx & 4095) == 0 {
+                                it.within_limit(line)?;
+                            }
+                            if let Some(bits) = jit_bits_of(&l[idx], u.arg) {
+                                // SAFETY: `u` was compiled for 1 argument of type `u.arg`.
+                                if let Some(r) = unsafe { u.call_bits(bits, &mut ctx) } {
+                                    if matches!(u.ret, crate::jit::T::I) || r != 0 {
+                                        out.push(l[idx].clone());
+                                    }
+                                    idx += 1;
+                                    continue;
+                                }
+                            }
+                            match it.call1(&f, l[idx].clone(), line)? {
+                                e @ Value::Err(..) => return Ok(e),
+                                r if r.truthy() => out.push(l[idx].clone()),
+                                _ => {}
+                            }
+                            idx += 1;
+                            if ctx.bail != 0 {
+                                break;
+                            }
+                        }
+                        for x in &l[idx..] {
+                            match it.call1(&f, x.clone(), line)? {
+                                e @ Value::Err(..) => return Ok(e),
+                                r if r.truthy() => out.push(x.clone()),
+                                _ => {}
+                            }
+                        }
+                        return Ok(Value::list(out));
+                    }
+                }
+            }
+        }
+    }
     let mut out = Vec::new();
     for x in l.iter() {
         // A predicate that failed has said neither yes nor no: as a no, a failed
@@ -784,8 +945,24 @@ fn reduce(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn sum(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let l = l_arg(&args, 0, "sum", line)?;
-    let mut acc = Value::Int(0);
-    for (i, x) in l.iter().enumerate() {
+    let mut i_acc = 0i64;
+    let mut idx = 0;
+    while idx < l.len() {
+        match &l[idx] {
+            Value::Int(b) => match i_acc.checked_add(*b) {
+                Some(s) => i_acc = s,
+                None => break,
+            },
+            _ => break,
+        }
+        idx += 1;
+    }
+    if idx == l.len() {
+        return Ok(Value::Int(i_acc));
+    }
+    let mut acc = Value::Int(i_acc);
+    for (i, x) in l[idx..].iter().enumerate() {
+        let i = idx + i;
         // Numbers as `+` adds them, without its general case for each.
         let next = match (&acc, x) {
             (Value::Float(a), Value::Float(b)) => Some(Value::Float(a + b)),
@@ -5028,6 +5205,68 @@ fn count(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         return Ok(Value::Int(l.len() as i64));
     }
     let f = f_arg(&args, 1, "count", line)?;
+    if let Value::Func(c) = &f {
+        if it.can_fast_call() {
+            if identity_lambda(c) {
+                let mut n = 0i64;
+                for (i, x) in l.iter().enumerate() {
+                    if (i & 4095) == 0 {
+                        it.within_limit(line)?;
+                    }
+                    match x {
+                        e @ Value::Err(..) => return Ok(e.clone()),
+                        r if r.truthy() => n += 1,
+                        _ => {}
+                    }
+                }
+                return Ok(Value::Int(n));
+            }
+            #[cfg(feature = "jit")]
+            if l.len() >= 16 {
+                if let Some(u) = crate::jit::fast_unary(c, &l[0], it.depth) {
+                    if matches!(u.ret, crate::jit::T::B | crate::jit::T::I) {
+                        if let Some(max) = u.max_depth(it.depth) {
+                            let mut ctx = crate::jit::Ctx::new(max);
+                            let mut n = 0i64;
+                            let mut idx = 0;
+                            while idx < l.len() {
+                                if (idx & 4095) == 0 {
+                                    it.within_limit(line)?;
+                                }
+                                if let Some(bits) = jit_bits_of(&l[idx], u.arg) {
+                                    // SAFETY: `u` was compiled for 1 argument of type `u.arg`.
+                                    if let Some(r) = unsafe { u.call_bits(bits, &mut ctx) } {
+                                        if matches!(u.ret, crate::jit::T::I) || r != 0 {
+                                            n += 1;
+                                        }
+                                        idx += 1;
+                                        continue;
+                                    }
+                                }
+                                match it.call1(&f, l[idx].clone(), line)? {
+                                    e @ Value::Err(..) => return Ok(e),
+                                    r if r.truthy() => n += 1,
+                                    _ => {}
+                                }
+                                idx += 1;
+                                if ctx.bail != 0 {
+                                    break;
+                                }
+                            }
+                            for x in &l[idx..] {
+                                match it.call1(&f, x.clone(), line)? {
+                                    e @ Value::Err(..) => return Ok(e),
+                                    r if r.truthy() => n += 1,
+                                    _ => {}
+                                }
+                            }
+                            return Ok(Value::Int(n));
+                        }
+                    }
+                }
+            }
+        }
+    }
     let mut n = 0;
     for x in l.iter() {
         match it.call1(&f, x.clone(), line)? {

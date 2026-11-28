@@ -359,33 +359,21 @@ impl TenantDbs {
 /// The key of a connection's number in the map `db.connect` gives.
 pub const CONN_KEY: &str = "$db";
 
-/// The connection `recv.name(...)` is a `db` function of, if it is one.
-pub(crate) fn conn_of(recv: &Value, name: &str) -> Option<usize> {
-    let Value::Map(m) = recv else { return None };
-    // The connection's number looked for first: a map that has none, as `db` and every map that is
-    // no connection, is told so by one look of its keys, where the name called was looked for too.
-    // Each look hashes its key, some 200 instructions of every method called on a map: `db.exec`
-    // and `db.one` took 98 and 104 more a call than 0.8.10, their maps' look-ups in a unit of their
-    // own since this file grew (the speed round 2 of 0.8.11; FEEDBACK83.md, Q-1300; branch
-    // feedback82-85).
-    let Some(Value::Int(id)) = m.get(CONN_KEY) else { return None };
-    match m.get(name) {
-        Some(Value::Builtin(b, f)) if b.starts_with("db.") => {
-            // Under a hold a stand-in runs on the connection it was made for, none for `db.query`
-            // as a file names it, whatever number the map it is in says (`interp::stand_in_conn`):
-            // a kit's `{ "$db": 0, query: q }`, `q` the main file's `db.query` handed to it, ran as
-            // the main file on its `db.connect("data/secret.db")` (FEEDBACK83.md, Q-1300, found by
-            // review 6 of aebe60e; branch feedback82-85). A builtin that is no stand-in runs on the
-            // map's number, judged for the file that runs it (`conn_ok`).
-            if crate::confirm::held() {
-                if let Some(bound) = crate::interp::stand_in_conn(*f) {
-                    return bound;
-                }
-            }
-            Some(*id as usize)
-        }
-        _ => None,
+/// The connection `m.name(...)` is a `db` function of, if `m` is one (`CONN_KEY`), given the
+/// already looked-up method (`db.*`).
+#[inline]
+pub(crate) fn conn_of_method(m: &Map, method: Option<&Value>) -> Option<usize> {
+    let Some(Value::Builtin(b, f)) = method else { return None };
+    if !b.starts_with("db.") {
+        return None;
     }
+    let Some(Value::Int(id)) = m.get(CONN_KEY) else { return None };
+    if crate::confirm::held() {
+        if let Some(bound) = crate::interp::stand_in_conn(*f) {
+            return bound;
+        }
+    }
+    Some(*id as usize)
 }
 
 /// Tenant databases kept open at once: SQLite files, and Postgres
@@ -683,10 +671,14 @@ fn commits_by_itself(f: &str, stmt: &str) -> String {
 /// a function refused, where it was stored as its text (FEEDBACK55.md, Q-727); one map where
 /// the SQL has no placeholder is no value (Q-747); and placeholders with no values are refused
 /// where SQLite stored nulls (Q-729; branch feedback55).
-fn given_values(scan: &crate::sql::Scan, params: Vec<Value>) -> Result<Vec<Value>, String> {
+fn given_values(scan: &crate::sql::Scan, mut params: Vec<Value>) -> Result<Vec<Value>, String> {
     // Trusted CSS, however deep in a value, is stored as the text it is, and read back as text
     // (FEEDBACK79.md, Q-1250; branch feedback72-81).
-    let params: Vec<Value> = params.into_iter().map(|v| Value::plain_deep(&v).unwrap_or(v)).collect();
+    for v in &mut params {
+        if let Some(p) = Value::plain_deep(v) {
+            *v = p;
+        }
+    }
     // `@name` with a map that has `name`, on MySQL: a variable of the session, null unless set,
     // where SQLite takes the map's value; the map was silently left out (FEEDBACK55.md, Q-752;
     // branch feedback55).
@@ -725,6 +717,7 @@ fn given_values(scan: &crate::sql::Scan, params: Vec<Value>) -> Result<Vec<Value
 /// NaN and the infinities are refused, naming them, on every database: SQLite stored NaN as
 /// null, and MySQL and MariaDB refuse both as "out of range", while PostgreSQL keeps them
 /// (FEEDBACK55.md, Q-735; branch feedback55).
+#[inline(always)]
 fn storable(v: &Value, given: bool, inside: bool) -> Result<(), String> {
     match v {
         Value::Float(f) if !f.is_finite() => Err(format!(
@@ -3625,8 +3618,18 @@ fn slot_on(it: &Interp, on: Option<usize>) -> Option<DbSlot> {
 /// default one if needed.
 fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
     statements_of(it);
+    let g = it.db_gen.load(std::sync::atomic::Ordering::Acquire);
+    if it.db_fast.0 == g {
+        if let Some(b) = &it.db_fast.1 {
+            return Ok(b.clone());
+        }
+    }
     let slot = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     if let Some(slot) = slot {
+        if let DbSlot::One(ref b) = slot {
+            it.db_fast = (g, Some(b.clone()));
+            return Ok(b.clone());
+        }
         return backend_in(it, slot);
     }
     let target = std::env::var("QUILLO_DB").unwrap_or_else(|_| ":memory:".into());
@@ -3634,6 +3637,8 @@ fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
         tenant_template(&it.base_dir, &target);
         let t = Arc::new(TenantDbs::new(Target::Text(target)));
         *it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(DbSlot::PerTenant(t.clone()));
+        it.db_gen.fetch_add(1, std::sync::atomic::Ordering::Release);
+        it.db_fast = (0, None);
         return tenant_backend(it, &t);
     }
     let b = open_backend(it, &target)?;
@@ -3641,6 +3646,8 @@ fn backend(it: &mut Interp) -> Result<Arc<Backend>, String> {
     // first, with a database per tenant: that is the program's, and this one is let go
     // (FEEDBACK19.md, Q-159; branch feedback20-fixes).
     let slot = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert(DbSlot::One(b)).clone();
+    it.db_gen.fetch_add(1, std::sync::atomic::Ordering::Release);
+    it.db_fast = (0, None);
     backend_in(it, slot)
 }
 
@@ -4325,20 +4332,21 @@ fn awaited<T>(r: Option<Result<Result<T, String>, String>>) -> Result<T, String>
     }
 }
 
-fn to_sql(v: &Value) -> Sql {
+fn to_sql(v: &Value) -> rusqlite::types::ToSqlOutput<'_> {
+    use rusqlite::types::ToSqlOutput;
     match v {
-        Value::Nil => Sql::Null,
-        Value::Bool(b) => Sql::Integer(*b as i64),
-        Value::Int(n) => Sql::Integer(*n),
+        Value::Nil => ToSqlOutput::Borrowed(ValueRef::Null),
+        Value::Bool(b) => ToSqlOutput::Owned(Sql::Integer(*b as i64)),
+        Value::Int(n) => ToSqlOutput::Owned(Sql::Integer(*n)),
         // -0.0 as 0.0: SQLite keeps a whole real as an integer, and MariaDB reads 0, so -0.0
         // came back 0.0 there and -0 from PostgreSQL; every database is given 0.0
         // (FEEDBACK55.md, Q-735; branch feedback55).
-        Value::Float(f) => Sql::Real(*f + 0.0),
+        Value::Float(f) => ToSqlOutput::Owned(Sql::Real(*f + 0.0)),
         // SQLite has no decimals: the text, exactly (see `Col::Dec`).
-        Value::Dec(d) => Sql::Text(d.to_string()),
-        Value::Str(s) | Value::Css(s) => Sql::Text(s.to_string()),
-        Value::Html(h) => Sql::Text(h.to_string()),
-        other => Sql::Text(json_text(other)),
+        Value::Dec(d) => ToSqlOutput::Owned(Sql::Text(d.to_string())),
+        Value::Str(s) | Value::Css(s) => ToSqlOutput::Borrowed(ValueRef::Text(s.as_bytes())),
+        Value::Html(h) => ToSqlOutput::Borrowed(ValueRef::Text(h.as_bytes())),
+        other => ToSqlOutput::Owned(Sql::Text(json_text(other))),
     }
 }
 
@@ -4512,18 +4520,23 @@ pub(crate) fn announce(it: &mut Interp, scan: &crate::sql::Scan, on: Option<usiz
 /// statement's database reads them (src/sql.rs; FEEDBACK55.md; branch feedback55).
 fn announce_as(it: &mut Interp, scan: &crate::sql::Scan, on: Option<usize>, wrote: bool) {
     let t = &scan.tables;
+    let watch = it.reads.is_some() && !t.reads.is_empty();
+    let emit = wrote && !t.writes.is_empty();
+    if !watch && !emit {
+        return;
+    }
     let label = on.and_then(|i| it.db_conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(i).map(|(l, _)| l.split('#').next().unwrap_or(l).to_string()));
-    let prefix = match label {
-        Some(label) => format!("db@{}:", label),
-        None => "db:".to_string(),
-    };
-    if it.reads.is_some() {
+    if watch {
+        let prefix = match &label {
+            Some(label) => format!("db@{}:", label),
+            None => "db:".to_string(),
+        };
         for r in &t.reads {
             it.watch(format!("{}{}", prefix, r));
         }
     }
-    if wrote && !t.writes.is_empty() {
-        it.publish(t.writes.iter().map(|w| format!("{}{}", prefix, w)).collect());
+    if emit {
+        it.publish_db_writes(label.as_deref(), &t.writes);
     }
 }
 
@@ -4586,6 +4599,13 @@ fn no_tx_control(scan: &crate::sql::Scan, f: &str, line: u32) -> Result<(), Ctrl
 fn sql_arg(args: &[Value], name: &str, line: u32) -> Result<String, Ctrl> {
     match args.first() {
         Some(Value::Str(s) | Value::Css(s)) => Ok(s.to_string()),
+        other => fail(line, format!("`{}` expects SQL text as its first argument, got {}", name, other.map_or("nothing", |v| v.type_name()))),
+    }
+}
+
+fn sql_arg_arc(args: &[Value], name: &str, line: u32) -> Result<Arc<str>, Ctrl> {
+    match args.first() {
+        Some(Value::Str(s) | Value::Css(s)) => Ok(s.clone()),
         other => fail(line, format!("`{}` expects SQL text as its first argument, got {}", name, other.map_or("nothing", |v| v.type_name()))),
     }
 }
@@ -4807,6 +4827,10 @@ fn open(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match slot? {
         Ok(slot) => {
             let before = it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).replace(slot);
+            it.db_gen.fetch_add(1, std::sync::atomic::Ordering::Release);
+            it.db_fast = (0, None);
+            it.db_gen.fetch_add(1, std::sync::atomic::Ordering::Release);
+            it.db_fast = (0, None);
             // Another database: pages showing the old one's rows ask again, and what was shared
             // from it is not given out (FEEDBACK43.md, Q-490; branch feedback40-43).
             if before.is_some() {
@@ -5283,6 +5307,11 @@ fn exec(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     exec_as(it, args, line, false)
 }
 
+#[inline(always)]
+pub(crate) fn exec_fn() -> BuiltinFn {
+    exec
+}
+
 /// SQL with no statement in it, refused on every database: SQLite gave the statement before's
 /// `changes`, and `db.one` an error saying "not an error", PostgreSQL null (FEEDBACK55.md, Q-753;
 /// branch feedback55).
@@ -5300,27 +5329,25 @@ const NO_STATEMENT: &str = "the SQL has no statement in it (it is empty, or only
 /// own SQL may read `last_insert_rowid()` (setting it aside stored i64::MIN as a child's parent
 /// id; found in review). An insert of one row gives that row's id; an upsert's, only when the id
 /// moved, as its update leaves the id of the insert before it.
-fn sqlite_exec(c: &Connection, scan: &crate::sql::Scan, sql: &str, params: &[Value]) -> Result<Value, String> {
-    let head = scan.heads().last().map_or("", |(a, _)| a);
-    let inserts = head.eq_ignore_ascii_case("insert") || head.eq_ignore_ascii_case("replace");
-    let upsert = inserts && {
-        let text = scan.stmts.last().map_or("", |st| scan.stmt_text(st));
-        let mut words = text.split_ascii_whitespace();
-        let mut before = "";
-        words.any(|w| {
-            let found = before.eq_ignore_ascii_case("do") && w.eq_ignore_ascii_case("update");
-            before = w;
-            found
-        })
-    };
+fn sqlite_exec(c: &Connection, scan: &crate::sql::Scan, sql: &str, params: &[Value], discard: bool) -> Result<(Value, bool), String> {
+    let inserts = scan.sqlite_insert != 0;
+    let upsert = scan.sqlite_insert == 2;
     let (mut changed, mut id) = (0, None);
     let mut run = |stmt: &mut rusqlite::Statement| -> Result<(), String> {
-        let (before, was) = (c.total_changes(), c.last_insert_rowid());
-        // Its first step does all it changes, rows it returns or not; they are not wanted.
-        stmt.raw_query().next().map_err(|e| e.to_string())?;
+        let (before, was) = (c.total_changes(), if upsert && !discard { c.last_insert_rowid() } else { 0 });
+        if stmt.column_count() == 0 {
+            stmt.raw_execute().map_err(|e| e.to_string())?;
+        } else {
+            // Its first step does all it changes, rows it returns or not; they are not wanted.
+            stmt.raw_query().next().map_err(|e| e.to_string())?;
+        }
         changed = if c.total_changes() == before { 0 } else { c.changes() };
-        let now = c.last_insert_rowid();
-        id = (changed == 1 && inserts && (!upsert || now != was)).then_some(now);
+        id = if !discard && changed == 1 && inserts {
+            let now = c.last_insert_rowid();
+            (!upsert || now != was).then_some(now)
+        } else {
+            None
+        };
         Ok(())
     };
     if params.is_empty() {
@@ -5346,17 +5373,76 @@ fn sqlite_exec(c: &Connection, scan: &crate::sql::Scan, sql: &str, params: &[Val
         bind(&mut stmt, params)?;
         run(&mut stmt)?;
     }
-    let mut m = Map::new();
+    if discard {
+        return Ok((Value::Nil, changed == 0));
+    }
+    let mut m = Map::with_capacity(2);
     m.insert("changes".into(), Value::Int(changed as i64));
     m.insert("last_id".into(), id.map_or(Value::Nil, Value::Int));
-    Ok(Value::map(m))
+    Ok((Value::map(m), changed == 0))
+}
+
+#[inline]
+fn scan_cached(it: &mut Interp, d: crate::sql::Dialect, sql: &Arc<str>) -> Arc<crate::sql::Scan> {
+    if let Some((ld, ls, sc)) = &it.scan_fast {
+        if *ld == d && (Arc::ptr_eq(sql, ls) || **ls == **sql) {
+            return sc.clone();
+        }
+    }
+    let sc = crate::sql::scan(d, sql);
+    it.scan_fast = Some((d, sql.clone(), sc.clone()));
+    sc
+}
+
+fn sql_arg_ref<'a>(args: &'a [Value], name: &str, line: u32) -> Result<&'a Arc<str>, Ctrl> {
+    match args.first() {
+        Some(Value::Str(s) | Value::Css(s)) => Ok(s),
+        other => fail(line, format!("`{}` expects SQL text as its first argument, got {}", name, other.map_or("nothing", |v| v.type_name()))),
+    }
+}
+
+/// Zero-allocation fast path for `db.exec(sql, ...params)` called from `eval_call_as`.
+pub(crate) fn exec_fast(it: &mut Interp, args: &[Value], line: u32, discard: bool) -> R {
+    let on = it.db_on.take();
+    let sql = sql_arg_ref(args, "db.exec", line)?;
+    let b = match backend_on(it, on) {
+        Ok(b) => b,
+        Err(e) => {
+            it.wrote_req = Some(crate::httpd::request_number());
+            return Ok(db_err(e));
+        }
+    };
+    if let Some(e) = own_tables_refused(it, on, &b, sql) {
+        return Ok(db_err(e));
+    }
+    let scan = scan_cached(it, b.dialect(), sql);
+    if scan.is_empty() {
+        return Ok(db_err(NO_STATEMENT));
+    }
+    no_tx_control(&scan, "db.exec", line)?;
+    it.wrote_req = Some(crate::httpd::request_number());
+    let rest = &args[1..];
+    let can_borrow = matches!(&*b, Backend::Sqlite(_))
+        && !scan.named
+        && scan.vars.is_empty()
+        && !(rest.is_empty() && scan.count > 0)
+        && rest.iter().all(|v| matches!(v, Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Str(_) | Value::Html(_) | Value::Dec(_)));
+    if can_borrow {
+        return exec_inner(it, on, b, &scan, sql, rest, None, line, false, discard);
+    }
+    let params = match given_values(&scan, rest.to_vec()) {
+        Ok(p) => p,
+        Err(e) => return Ok(db_err(e)),
+    };
+    exec_inner(it, on, b, &scan, sql, &[], Some(params), line, false, discard)
 }
 
 /// `db.exec`, or Quillo's own statement (`own`), which may make its table inside the program's
 /// transaction.
 fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
+    let discard = std::mem::take(&mut it.exec_discard);
     let on = it.db_on.take();
-    let sql = sql_arg(&args, "db.exec", line)?;
+    let sql = sql_arg_arc(&args, "db.exec", line)?;
     let b = match backend_on(it, on) {
         Ok(b) => b,
         Err(e) => {
@@ -5386,12 +5472,31 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
     }
     no_tx_control(&scan, "db.exec", line)?;
     it.wrote_req = Some(crate::httpd::request_number());
-    let params = match given_values(&scan, args[1..].to_vec()) {
+    let mut rest = args;
+    rest.remove(0);
+    let params = match given_values(&scan, rest) {
         Ok(p) => p,
         Err(e) => return Ok(db_err(e)),
     };
+    exec_inner(it, on, b, &scan, &sql, &[], Some(params), line, own, discard)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exec_inner(
+    it: &mut Interp,
+    on: Option<usize>,
+    b: Arc<Backend>,
+    scan: &crate::sql::Scan,
+    sql: &Arc<str>,
+    borrowed: &[Value],
+    owned: Option<Vec<Value>>,
+    line: u32,
+    own: bool,
+    discard: bool,
+) -> R {
+    let params = owned.as_deref().unwrap_or(borrowed);
     // A change to the session, noted or refused (FEEDBACK44.md, Q-581).
-    if let Err(e) = session_change(it, &b, &scan, &params) {
+    if let Err(e) = session_change(it, &b, scan, params) {
         return Ok(db_err(e));
     }
     // On a server's shared connection, a script's `begin` anywhere (found in review).
@@ -5399,12 +5504,13 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
         return fail(line, "`db.exec`: this SQL begins or ends a transaction, which on a shared connection would hold every later request in it: write `db.transaction(() => ...)`, which commits, rolls back when something fails, and keeps other requests out of it");
     }
     if !own {
-        no_commit_inside(it, &b, &scan, "db.exec", line)?;
+        no_commit_inside(it, &b, scan, "db.exec", line)?;
     }
-    let alone = isolated(it, &b, &scan);
+    let alone = isolated(it, &b, scan);
     // Timed for /_quillo/health/queries (branch query-stats).
-    let started = std::time::Instant::now();
-    let change = catalog_changing(it, &b, &scan);
+    let started = crate::querystats::ENABLED.load(std::sync::atomic::Ordering::Relaxed).then(std::time::Instant::now);
+    let change = catalog_changing(it, &b, scan);
+    let mut zero_changes = false;
     let res = match &*b {
         Backend::Sqlite(m) => {
             // SQLite takes no parameters in a `create table`.
@@ -5415,26 +5521,32 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
             // Q-603; branch feedback86-89).
             sqlite_released(it, m, |c| {
                 tx_gone(&b, c)?;
-                let before = c.is_autocommit();
-                let r = sqlite_exec(c, &scan, &sql, &params);
+                let check_batch = params.is_empty() && c.is_autocommit();
+                let r = sqlite_exec(c, scan, &sql, params, discard);
                 // A script run whole (`sqlite3 .dump`'s `BEGIN TRANSACTION; ... COMMIT;`) may
                 // hold its own transaction, but must end it: one left open took every
                 // later request's writes into it (FEEDBACK44.md, Q-580).
-                if params.is_empty() && before && !c.is_autocommit() {
+                if check_batch && !c.is_autocommit() {
                     let _ = c.execute_batch("rollback");
                     r?;
                     return Err("this SQL left a transaction open, so it was rolled back: write `db.transaction(() => ...)`, which commits, rolls back when something fails, and keeps other requests out of it".to_string());
                 }
                 r
             })
+            .map(|(v, z)| {
+                zero_changes = z;
+                v
+            })
         }
         Backend::Postgres(_) if alone => {
-            let sql = sql.clone();
+            let sql = sql.to_string();
+            let params = owned.unwrap_or_else(|| borrowed.to_vec());
             isolated_run(it, &b, move |c| c.exec(&sql, &params))
         }
         Backend::Postgres(pool) => match shared_lanes(it, &b, pool) {
             Some(lanes) => {
-                let sql = sql.clone();
+                let sql = sql.to_string();
+                let params = owned.unwrap_or_else(|| borrowed.to_vec());
                 let reset = session_reset(it, &b);
                 if reset && scan.outside_tx() {
                     // On a lane it would run inside its reset's transaction (`pg::after_reset`).
@@ -5445,17 +5557,21 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
                 }
             }
             None => {
-                let sql = sql.clone();
+                let sql = sql.to_string();
+                let params = owned.unwrap_or_else(|| borrowed.to_vec());
                 pooled_run(it, &b, move |c| c.exec(&sql, &params))
             }
         },
         #[cfg(feature = "mysql")]
         Backend::Mysql(_) => {
-            let sql = sql.clone();
+            let sql = sql.to_string();
+            let params = owned.unwrap_or_else(|| borrowed.to_vec());
             pooled_run(it, &b, move |c| c.exec(&sql, &params))
         }
     };
-    crate::querystats::record(&sql, started.elapsed().as_secs_f64() * 1000.0, res.is_ok());
+    if let Some(started) = started {
+        crate::querystats::record(&sql, started.elapsed().as_secs_f64() * 1000.0, res.is_ok());
+    }
     // A schema's statement, by this path too (the review of Q-1060's first fix; branch
     // feedback86-89).
     drop(change);
@@ -5467,7 +5583,7 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
         _ => {}
     }
     if !own {
-        committed_inside(&res, &scan, "db.exec", line)?;
+        committed_inside(&res, scan, "db.exec", line)?;
     }
     // An update that changed no row (`set seen = 1 where seen = 0`, once all
     // are seen) is not announced: a loader marking what it shows as read
@@ -5476,8 +5592,10 @@ fn exec_as(it: &mut Interp, args: Vec<Value>, line: u32, own: bool) -> R {
     match &res {
         // A schema statement changes no row and still counts (FEEDBACK13.md, Q-090; branch
         // feedback13-fixes).
-        Ok(Value::Map(m)) if matches!(m.get("changes"), Some(Value::Int(0))) && scan.changes_rows() => announce_as(it, &scan, on, false),
-        Ok(_) => announce(it, &scan, on),
+        Ok(v) if (zero_changes || matches!(v, Value::Map(m) if matches!(m.get("changes"), Some(Value::Int(0))))) && scan.changes_rows() => {
+            announce_as(it, scan, on, false)
+        }
+        Ok(_) => announce(it, scan, on),
         Err(_) => {}
     }
     Ok(res.unwrap_or_else(db_err))
@@ -6369,7 +6487,7 @@ fn one(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
 fn query_as(it: &mut Interp, args: Vec<Value>, line: u32, limit: Option<usize>, own: bool) -> R {
     let on = it.db_on.take();
     let f = if limit.is_some() { "db.one" } else { "db.query" };
-    let sql = sql_arg(&args, f, line)?;
+    let sql = sql_arg_arc(&args, f, line)?;
     let b = match backend_on(it, on) {
         Ok(b) => b,
         Err(e) => return Ok(db_err(e)),
@@ -6388,7 +6506,7 @@ fn query_as(it: &mut Interp, args: Vec<Value>, line: u32, limit: Option<usize>, 
     if let Some(e) = (!own).then(|| own_tables_refused(it, on, &b, &sql)).flatten() {
         return Ok(db_err(e));
     }
-    let scan = crate::sql::scan(b.dialect(), &sql);
+    let scan = scan_cached(it, b.dialect(), &sql);
     if scan.is_empty() {
         return Ok(db_err(NO_STATEMENT));
     }
@@ -6396,7 +6514,7 @@ fn query_as(it: &mut Interp, args: Vec<Value>, line: u32, limit: Option<usize>, 
     if !own {
         no_commit_inside(it, &b, &scan, f, line)?;
     }
-    let rows = select_in(it, on, b, &scan, sql, args[1..].to_vec(), limit);
+    let rows = select_in(it, on, b, &scan, sql.to_string(), args[1..].to_vec(), limit);
     // Stopped at `--max-memory` as its rows were read: the request's stop (FEEDBACK71.md, Q-977;
     // branch security).
     if matches!(&rows, Err(e) if e == ROWS_OVER) {

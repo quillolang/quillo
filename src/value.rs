@@ -902,7 +902,11 @@ impl Value {
     /// script's world (`run_script`). None where it holds none: shared, not copied (FEEDBACK79.md,
     /// Q-1250; branch feedback72-81). Deep values on a new piece of stack (`deeper`), as
     /// `marks_in` reads them.
+    #[inline(always)]
     pub fn plain_deep(v: &Value) -> Option<Value> {
+        if matches!(v, Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_) | Value::Dec(_) | Value::Str(_) | Value::Html(_)) {
+            return None;
+        }
         plain_at(v, 0)
     }
 
@@ -5442,12 +5446,19 @@ fn lossy_into_held(b: &[u8]) -> Result<String, crate::httpd::OverMemory> {
 /// false, with nothing changed, if that is not how it goes. A map without the key takes
 /// `start` for it. See `Interp::in_place_nested`.
 pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut vals: Vec<Value>) -> bool {
+    let mut one = start;
+    update_inside_lazy(whole, key, || one.take(), &mut vals)
+}
+
+/// Same as `update_inside`, taking a slice on the stack and computing `start` lazily only on map-key miss.
+pub(crate) fn update_inside_lazy(whole: &mut Value, key: &Value, start: impl FnOnce() -> Option<Value>, vals: &mut [Value]) -> bool {
     fn at(l: &[Value], i: i64) -> Option<usize> {
         let n = l.len() as i64;
         let i = if i < 0 { n + i } else { i };
         (i >= 0 && i < n).then_some(i as usize)
     }
-    let last = vals.pop().unwrap_or(Value::Nil);
+    let Some((last_slot, rest)) = vals.split_last_mut() else { return false };
+    let last = std::mem::replace(last_slot, Value::Nil);
     let change = |x: &mut Value, last: Value, inner: Option<&Value>| -> bool {
         match (x, inner) {
             (Value::List(l), None) => {
@@ -5479,7 +5490,7 @@ pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut v
         }
         true
     };
-    let inner = vals.first();
+    let inner = rest.first();
     match (whole, key) {
         (Value::List(l), Value::Int(i)) => {
             let Some(i) = at(l, *i) else { return false };
@@ -5503,7 +5514,7 @@ pub fn update_inside(whole: &mut Value, key: &Value, start: Option<Value>, mut v
             if m.len() == m.capacity() && !map_may_grow_to(m, k) {
                 return false;
             }
-            let Some(mut x) = start else { return false };
+            let Some(mut x) = start() else { return false };
             let done = change(&mut x, last, inner);
             if done {
                 m.insert(k.into(), x);

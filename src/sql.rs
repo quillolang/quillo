@@ -154,7 +154,7 @@ pub struct Scan {
     /// It only reads, wherever it runs: see `reads_only`.
     reads_only: bool,
     /// MySQL's `@name` variables, as ranges of `sql` without the `@`.
-    vars: Vec<(usize, usize)>,
+    pub vars: Vec<(usize, usize)>,
     /// `insert ... values (?, ...)` and nothing after: where `values` starts, and how many `?`.
     tuple: Option<(usize, usize)>,
     /// SQLite: the columns a `create table` or `alter table` gives a type kept as a float
@@ -163,6 +163,8 @@ pub struct Scan {
     /// MySQL: one `replace` or `insert ... on duplicate key update`, whose rows MySQL counts
     /// twice when it replaces or updates them.
     twice: bool,
+    /// SQLite `db.exec`: 1 for `insert`/`replace`, 2 when it also has `do update`, 0 otherwise.
+    pub sqlite_insert: u8,
     /// MySQL: it has `||`, which MariaDB reads as `or` unless the session says otherwise.
     bars: bool,
     /// PostgreSQL: for each value (from 1), whether a placeholder of it is a column's value as
@@ -1522,6 +1524,17 @@ impl Scan {
             && r.spans.len() == 1
             && (r.is_word(r.spans[0].from, "replace")
                 || (r.is_word(r.spans[0].from, "insert") && (r.spans[0].from..r.spans[0].to).any(|k| r.is_word(k, "duplicate") && r.is_word(k + 1, "key") && r.is_word(k + 2, "update"))));
+        let sqlite_insert = if d == Dialect::Sqlite {
+            r.spans.last().map_or(0, |sp| {
+                if r.is_word(sp.from, "insert") || r.is_word(sp.from, "replace") {
+                    if (sp.from + 1..sp.to.saturating_sub(1)).any(|k| r.is_word(k, "do") && r.is_word(k + 1, "update")) { 2 } else { 1 }
+                } else {
+                    0
+                }
+            })
+        } else {
+            0
+        };
         let lossy = if d == Dialect::Sqlite && r.spans.iter().any(|sp| r.is_word(sp.from, "create") || r.is_word(sp.from, "alter")) { r.lossy() } else { Vec::new() };
         let stmts = r.spans.iter().map(|sp| Stmt { start: r.toks[sp.from].start, end: r.toks[sp.to - 1].end, routine: sp.routine, head: r.head(sp) }).collect();
         let marks = marks.iter().map(|&(i, slot)| (r.toks[i].start, r.toks[i].end, slot)).collect();
@@ -1551,6 +1564,7 @@ impl Scan {
             tuple,
             lossy,
             twice,
+            sqlite_insert,
             bars,
             assigned,
             ddl,
@@ -2002,7 +2016,21 @@ pub fn scan(d: Dialect, sql: &str) -> Arc<Scan> {
     if sql.len() > LARGEST_KEPT {
         return Arc::new(Scan::new(d, sql));
     }
-    if let Some(s) = RECENTLY.with(|r| r.borrow()[d as usize].iter().find(|s| &*s.sql == sql).cloned()) {
+    if let Some(s) = RECENTLY.with(|r| {
+        let r = r.borrow();
+        let v = &r[d as usize];
+        v.first().filter(|s| &*s.sql == sql).cloned()
+    }) {
+        return s;
+    }
+    let found = RECENTLY.with(|r| {
+        let mut r = r.borrow_mut();
+        let v = &mut r[d as usize];
+        let pos = v.iter().position(|s| &*s.sql == sql)?;
+        v[..=pos].rotate_right(1);
+        Some(v[0].clone())
+    });
+    if let Some(s) = found {
         return s;
     }
     let kept = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|m| m[d as usize].0.get(sql).cloned());

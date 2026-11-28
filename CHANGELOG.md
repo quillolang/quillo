@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.8.13 (2026-11-28)
+
+Performance release across the JIT compiler, interpreter hot paths, list/range pipelines,
+and SQLite execution.
+
+### Performance
+
+- **JIT register ABI & native loop forms**:
+  - Pass recursion depth in a register and return `(value, bail)` in registers instead of loading
+    and storing per-call state on the JIT context.
+  - Execute `for x in xs` list iterations (`run_list`) and indexed in-place list-update loops
+    (`for j in range(...) { xs = xs | set(j, val) }` via `set_stride`) directly in native JIT loops.
+- **Interpreter, string & collection fast paths**:
+  - Fuse `range(...)` pipe chains (`map` / `filter` / `count` / `sum`) without allocating intermediate lists, add fast unary lambda evaluation for `map` / `filter` / `count`, add tight integer summation in `sum`, cache small integer strings (`0..=1024`), format templates into a stack buffer, and take a direct fast call path for non-escaping functions.
+  - Bypass deep conversion allocations for scalar values in `Value::plain_deep`.
+- **SQLite execution & statement reuse**:
+  - Cache the active backend and SQLite connection handle per generation, hit index-0 cached SQL parses in `sql::scan` with move-to-front rotation, bind parameters directly from borrowed values/`Arc` without temporary vector copies, execute non-returning statements via `raw_execute()`, skip row/map allocation on discarded writes, and guard query-stats collection when inactive.
+
 ## 0.8.12 (2026-11-28)
 
 Found by the sessions making videos 208, 210, 212, 222 and 224 and the Single-Page Apps course
