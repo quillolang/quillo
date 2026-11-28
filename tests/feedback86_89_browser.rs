@@ -5039,7 +5039,7 @@ fn a_prop_handed_on_is_drawn_with_and_a_named_handler_is_not() {
             r##"
   const [w, d] = await open("/");
   const texts = await Promise.all([...d.scripts].filter((s) => s.src).map(async (s) => (await fetch(s.src)).text()));
-  const m = /W\.component\("P",[\s\S]*?\{ r: (\[[^\]]*\]), w: ([01]) \}\)/.exec(texts.join("\n") + d.documentElement.outerHTML);
+  const m = /W\.component\("P",[\s\S]*?\{\s*r:\s*(\[[^\]]*\]),\s*w:\s*([01])\s*\}\)/.exec(texts.join("\n") + d.documentElement.outerHTML);
   d.getElementById("on").click(); await tick(800);
   const h1 = +d.getElementById("h").textContent;
   d.getElementById("set").click(); await tick(800);
@@ -5219,8 +5219,8 @@ fn components_that_read_the_same_long_list_share_it() {
         r##"
   const [w, d] = await open("/");
   const texts = (await Promise.all([...d.scripts].filter((s) => s.src).map(async (s) => (await fetch(s.src)).text()))).join("\n");
-  const refs = (texts.match(/\{ r: G\["[AP]"\]\.\$f\.r, w: 0 \}/g) || []).length;
-  const lists = (texts.match(/\{ r: \[[^\]]*"s9"\], w: 0 \}/g) || []).length;
+  const refs = (texts.match(/\{\s*r:\s*G\["[AP]"\]\.\$f\.r,\s*w:\s*0\s*\}/g) || []).length;
+  const lists = (texts.match(/\{\s*r:\s*\[[^\]]*"s9"\],\s*w:\s*0\s*\}/g) || []).length;
   d.getElementById("on").click(); await tick(800);
   const h1 = +d.getElementById("h").textContent;
   d.getElementById("set").click(); await tick(800);

@@ -1782,10 +1782,10 @@ fn errors_hidden_for_one_test_stay_shown_for_the_others() {
         (call(&mut it), quillo::client::test_script(&it, "__t").unwrap(), other)
     });
     assert_eq!((hidden.as_str(), elsewhere), ("err(\"internal error\")", quillo::value::HIDING.load(std::sync::atomic::Ordering::Relaxed)));
-    assert!(!script.contains("ERRORS_SHOWN = true"));
+    assert!(!script.contains("ERRORS_SHOWN=true"));
     let (shown, script) = quillo::value::hiding_here(false, || (call(&mut it), quillo::client::test_script(&it, "__t").unwrap()));
     assert_eq!(shown, "err(\"not an int: \\\"x\\\"\")");
-    assert!(script.contains("ERRORS_SHOWN = true"));
+    assert!(script.contains("ERRORS_SHOWN=true"));
 }
 
 // Review of Q-775 and Q-776: a browser whose JSON.parse gives no text of the numbers (Safari before
@@ -13507,7 +13507,7 @@ fn a_name_like_a_temp_leaves_a_function_as_it_was() {
     let at = page.find("/_quillo/b/").expect("the page names its bundle");
     let path = page[at..].split('"').next().unwrap();
     let js = support::send(s.port, "GET", path, &[], "").body;
-    let (default, temps) = (js.find("=== undefined").expect("a default"), js.find("let $t0").expect("a temp"));
+    let (default, temps) = (js.find("===undefined").expect("a default"), js.find("let $t0").expect("a temp"));
     assert!(default < temps, "{}", js);
 }
 

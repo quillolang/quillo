@@ -245,7 +245,7 @@ fn a_pattern_default_cannot_wait() {
 fn a_handler_with_no_function_is_true() {
     // `quillo check` refuses it; the compiler does not go wrong on it.
     let js = bundle("component C() {\n  <button @click>x</button>\n}");
-    assert!(js.rfind("\"click\", 0]").is_some(), "no handler");
+    assert!(js.rfind("\"click\",0]").or_else(|| js.rfind("\"click\", 0]")).is_some(), "no handler");
     assert!(js.contains("[true]"), "its value is not `true`");
 }
 

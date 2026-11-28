@@ -327,6 +327,117 @@ fn boot_line(it: &Interp, c: &Compiler) -> String {
     format!("W.imports([{}]).then(() => {{ {} }});\n", list.join(", "), start)
 }
 
+fn ty_needs_dm(ty: &Ty, dec: &mut bool, money: &mut bool) {
+    for n in &ty.names {
+        if n == "dec" { *dec = true; }
+        if n == "money" { *dec = true; *money = true; }
+    }
+    if let Some(e) = &ty.elem { ty_needs_dm(e, dec, money); }
+    if let Some(fs) = &ty.fields {
+        for (_, t) in fs { ty_needs_dm(t, dec, money); }
+    }
+}
+
+fn pat_needs_dm(p: &Pattern, dec: &mut bool, money: &mut bool) {
+    match p {
+        Pattern::Lit(Lit::Dec(_)) => *dec = true,
+        Pattern::Type(n) => {
+            if n == "dec" { *dec = true; }
+            if n == "money" { *dec = true; *money = true; }
+        }
+        Pattern::Alt(ps) | Pattern::List(ps, _) => ps.iter().for_each(|q| pat_needs_dm(q, dec, money)),
+        Pattern::As(q, _) => pat_needs_dm(q, dec, money),
+        Pattern::Record(fs) => {
+            let has = |k: &str| fs.iter().any(|f| f.path.len() == 1 && f.path[0] == k);
+            if has("amount") && has("currency") {
+                *dec = true;
+                *money = true;
+            }
+            fs.iter().for_each(|f| pat_needs_dm(&f.pat, dec, money));
+        }
+        _ => {}
+    }
+}
+
+fn val_has_dec(v: &Value) -> bool {
+    match v {
+        Value::Dec(..) => true,
+        Value::List(xs) => xs.iter().any(val_has_dec),
+        Value::Map(m) => m.values().any(val_has_dec),
+        Value::Err(e, _, _) => val_has_dec(e),
+        _ => false,
+    }
+}
+
+fn db_slot_non_sqlite(slot: &crate::db::DbSlot) -> bool {
+    match slot {
+        crate::db::DbSlot::One(b) => !matches!(**b, crate::db::Backend::Sqlite(_)),
+        crate::db::DbSlot::PerTenant(_) | crate::db::DbSlot::Shards(_) => true,
+    }
+}
+
+fn fn_needs_dm(d: &FnDef, dec: &mut bool, money: &mut bool) {
+    for p in &d.params {
+        if let Some(ty) = &p.ty { ty_needs_dm(ty, dec, money); }
+    }
+    if let Some(ty) = &d.ret { ty_needs_dm(ty, dec, money); }
+}
+
+fn expr_needs_dm(e: &Expr, dec: &mut bool, money: &mut bool) {
+    each_expr(e, &mut |x| match x {
+        Expr::Lit(Lit::Dec(_)) => *dec = true,
+        Expr::Ident(n, _) => {
+            if n == "dec" { *dec = true; }
+            if n == "money" { *dec = true; *money = true; }
+        }
+        Expr::Map(es) => {
+            if es.iter().any(|(k, _)| k == "amount") && es.iter().any(|(k, _)| k == "currency") {
+                *dec = true;
+                *money = true;
+            }
+        }
+        Expr::Lambda(d) => fn_needs_dm(d, dec, money),
+        Expr::Match(_, arms, _) => {
+            for a in arms { pat_needs_dm(&a.pat, dec, money); }
+        }
+        _ => {}
+    });
+}
+
+fn needs_dec_money(it: &Interp, program: &str) -> (bool, bool) {
+    let mut money = program.contains("B.money") || program.contains("\"money\"") || program.contains("useMoney");
+    let mut dec = money || program.contains("B.dec") || program.contains("W.Dec") || program.contains("B.format_number") || program.contains("\"dec\"") || program.contains("useDec");
+    for stmts in it.program.iter() {
+        for st in stmts.iter() {
+            match st {
+                Stmt::Let(_, e, _) | Stmt::Assign(_, _, e, _) | Stmt::Expr(e) | Stmt::State(_, e, _) | Stmt::Return(Some(e), _) => expr_needs_dm(e, &mut dec, &mut money),
+                Stmt::SetField(o, _, _, e, _) => { expr_needs_dm(o, &mut dec, &mut money); expr_needs_dm(e, &mut dec, &mut money); }
+                Stmt::Fn(d) => { fn_needs_dm(d, &mut dec, &mut money); expr_needs_dm(&d.body, &mut dec, &mut money); }
+                Stmt::Route(r) => expr_needs_dm(&r.body, &mut dec, &mut money),
+                Stmt::Type(td) => ty_needs_dm(&td.ty, &mut dec, &mut money),
+                Stmt::Use(..) | Stmt::Mount(..) | Stmt::Service(..) | Stmt::Return(None, _) => {}
+            }
+        }
+    }
+    if !dec && it.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().is_some_and(db_slot_non_sqlite) {
+        dec = true;
+    }
+    if !dec && scope_vars(&it.globals).into_iter().any(|(_, v)| val_has_dec(&v)) {
+        dec = true;
+    }
+    if money { dec = true; }
+    (dec, money)
+}
+
+fn push_feature_inits(it: &Interp, program: &mut String) {
+    let (dec, money) = needs_dec_money(it, program);
+    if money { program.push_str("useMoney();\n"); }
+    if dec { program.push_str("useDec();\n"); }
+    if it.routes.iter().any(|r| r.offline) || program.contains("B.ask") || program.contains("B.notify") {
+        program.push_str("useSw();\n");
+    }
+}
+
 /// The compiled program as one script: `BASE` (when `with_base`), the
 /// markup blocks, the definitions, the `server fn` stubs, and the boot.
 fn program_text(it: &Interp, c: &Compiler, boots: bool, with_base: bool) -> String {
@@ -358,6 +469,7 @@ fn program_text(it: &Interp, c: &Compiler, boots: bool, with_base: bool) -> Stri
     if it.site.in_place {
         program.push_str(IN_PLACE_LINE);
     }
+    push_feature_inits(it, &mut program);
     if boots {
         program.push_str(&boot_line(it, c));
     }
@@ -447,6 +559,8 @@ pub struct RuntimeFile {
     /// The code only a failure runs, a file of its own fetched the first time a draw fails: its
     /// hash and its code (see `recovery_file`).
     pub rec: Option<(String, Arc<String>)>,
+    /// The developer tools bridge, fetched only when `<html data-quillo-devtools="1">` is set.
+    pub tools: Option<(String, Arc<String>)>,
     keep: Vec<bool>,
     exported: HashSet<String>,
 }
@@ -463,10 +577,10 @@ fn runtime_from(it: &Interp, c: &Compiler, boots: bool) -> RuntimeFile {
     let rt = runtime_units();
     // `QW`, which the file hands the bundles the runtime by. What the file holds (`main`): all but
     // the code only a failure runs (FEEDBACK88.md, Q-1380, the user's decision in the thirteenth
-    // review of slice C; branch feedback86-89). Under Quillo's worker (`offline` routes), the page
-    // has that code's file kept (`recKeep`).
+    // review of slice C; branch feedback86-89), and the developer tools bridge. Under Quillo's
+    // worker (`offline` routes), the page has the failure code's file kept (`recKeep`).
     let offline = it.routes.iter().any(|r| r.offline);
-    let (keep, main) = shake_split(rt, &format!("{}\nQW", program), if offline { "recKeep" } else { "" });
+    let (keep, keep_tools, main) = shake_split(rt, &format!("{}\nQW", program), if offline { "recKeep" } else { "" });
     let wanted: HashSet<String> = names_in(&program).into_iter().collect();
     let mut exported: Vec<String> = rt
         .by_name
@@ -487,41 +601,26 @@ fn runtime_from(it: &Interp, c: &Compiler, boots: bool) -> RuntimeFile {
     if let Some((hash, _, with)) = &rec {
         let _ = writeln!(js, "RecAt = {}; RecWith = () => ({{ {} }});{}", js_str(&format!("{}/_quillo/r/{}.js", it.base, hash)), with, if offline { " recKeep();" } else { "" });
     }
+    let tools = devtools_file(rt, &keep_tools, &main);
+    if let Some((hash, _, with)) = &tools {
+        let _ = writeln!(js, "ToolsAt = {}; ToolsWith = () => ({{ {} }});", js_str(&format!("{}/_quillo/d/{}.js", it.base, hash)), with);
+    }
     let _ = writeln!(js, "QW.rt = {{ {} }};", exported.join(", "));
     js.push_str("})();\n");
     let hash = hash_text(&js);
-    RuntimeFile { hash, js: Arc::new(js), rec: rec.map(|(h, js, _)| (h, Arc::new(js))), keep, exported: exported.into_iter().collect() }
+    RuntimeFile {
+        hash,
+        js: Arc::new(js),
+        rec: rec.map(|(h, js, _)| (h, Arc::new(js))),
+        tools: tools.map(|(h, js, _)| (h, Arc::new(js))),
+        keep,
+        exported: exported.into_iter().collect(),
+    }
 }
 
-/// `shake`'s two sets for a runtime file in one walk, each unit's names read once: `main`, all but
-/// what only `LAZY` reaches (the code only a failure runs), and `keep`, that too; `extra`, a name the
-/// file's own line uses when there is such code. Two shakes made a program's first page 39% dearer
-/// (the fourteenth review of slice C).
-fn shake_split(rt: &Runtime, program: &str, extra: &str) -> (Vec<bool>, Vec<bool>) {
-    let mut main = vec![false; rt.units.len()];
-    let lazy = rt.by_name.get("LAZY").copied();
-    let mut todo: Vec<String> = names_in(program);
-    let (mut reached, mut added) = (false, false);
-    loop {
-        while let Some(n) = todo.pop() {
-            if let Some(&i) = rt.by_name.get(n.as_str()) {
-                if Some(i) == lazy {
-                    reached = true;
-                } else if !main[i] {
-                    main[i] = true;
-                    todo.extend(names_in(&rt.units[i].1));
-                }
-            }
-        }
-        if reached && !added && !extra.is_empty() {
-            added = true;
-            todo.push(extra.to_string());
-            continue;
-        }
-        break;
-    }
-    let mut keep = main.clone();
-    if let (true, Some(l)) = (reached, lazy) {
+fn expand_lazy(rt: &Runtime, main: &[bool], root: Option<usize>) -> Vec<bool> {
+    let mut keep = main.to_vec();
+    if let Some(l) = root {
         keep[l] = true;
         let mut todo = names_in(&rt.units[l].1);
         while let Some(n) = todo.pop() {
@@ -533,22 +632,60 @@ fn shake_split(rt: &Runtime, program: &str, extra: &str) -> (Vec<bool>, Vec<bool
             }
         }
     }
-    (keep, main)
+    keep
 }
 
-/// The code only a failure runs, what the program needs (`keep`) but the runtime file (`main`) does
-/// not: a file of its own, fetched the first time a draw fails (see `recover` in runtime.js). Its
-/// code runs in the runtime file's names, which it reaches through what `RecWith` makes: each it
-/// reads, and a getter and a setter for each `let` (FEEDBACK88.md, Q-1380, the user's decision in
-/// the thirteenth review of slice C; branch feedback86-89). Its hash, its code, and that object's
-/// text; none when the program has no such code.
+/// `shake`'s split sets for a runtime file in one walk, each unit's names read once: `main`, all
+/// but what only `LAZY` (failure recovery) or `TOOLS_MOD` (devtools bridge) reaches; `extra`, a
+/// name the file's own line uses when there is failure code.
+fn shake_split(rt: &Runtime, program: &str, extra: &str) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
+    let mut main = vec![false; rt.units.len()];
+    let lazy = rt.by_name.get("LAZY").copied();
+    let tools = rt.by_name.get("TOOLS_MOD").copied();
+    let mut todo: Vec<String> = names_in(program);
+    let (mut reached_lazy, mut reached_tools, mut added) = (false, false, false);
+    loop {
+        while let Some(n) = todo.pop() {
+            if let Some(&i) = rt.by_name.get(n.as_str()) {
+                if Some(i) == lazy {
+                    reached_lazy = true;
+                } else if Some(i) == tools {
+                    reached_tools = true;
+                } else if !main[i] {
+                    main[i] = true;
+                    todo.extend(names_in(&rt.units[i].1));
+                }
+            }
+        }
+        if reached_lazy && !added && !extra.is_empty() {
+            added = true;
+            todo.push(extra.to_string());
+            continue;
+        }
+        break;
+    }
+    let keep = expand_lazy(rt, &main, reached_lazy.then_some(lazy).flatten());
+    let keep_tools = expand_lazy(rt, &main, reached_tools.then_some(tools).flatten());
+    (keep, keep_tools, main)
+}
+
 fn recovery_file(rt: &Runtime, keep: &[bool], main: &[bool]) -> Option<(String, String, String)> {
+    lazy_module(rt, keep, main, 'f', "recover", "LAZY")
+}
+
+fn devtools_file(rt: &Runtime, keep: &[bool], main: &[bool]) -> Option<(String, String, String)> {
+    lazy_module(rt, keep, main, 'd', "tools", "TOOLS_MOD")
+}
+
+/// Code loaded on demand (`recover` on first draw failure, `tools` for devtools): what the program
+/// needs (`keep`) that the runtime file (`main`) does not hold, bound via `with`.
+fn lazy_module(rt: &Runtime, keep: &[bool], main: &[bool], prefix: char, hook: &str, ret: &str) -> Option<(String, String, String)> {
     let lazy: Vec<usize> = (0..rt.units.len()).filter(|&i| keep[i] && !main[i]).collect();
     if lazy.is_empty() {
         return None;
     }
     // Not strict: its code reads the runtime's names through `with`.
-    let mut js = String::from("(function () {\nwindow[Symbol.for(\"quillo\")].recover(function (R) {\nwith (R) return (function () {\n");
+    let mut js = format!("(function () {{\nwindow[Symbol.for(\"quillo\")].{}(function (R) {{\nwith (R) return (function () {{\n", hook);
     let cover = covering();
     let mut used: Vec<String> = Vec::new();
     for &i in &lazy {
@@ -556,14 +693,17 @@ fn recovery_file(rt: &Runtime, keep: &[bool], main: &[bool]) -> Option<(String, 
         if cover {
             let _ = write!(js, "//@rt {}\n{}", rt.starts[i], text);
         } else {
-            minify_into(text, &mut js);
+            compact_js(text, &mut js);
         }
         used.extend(names_in(text));
     }
     if cover {
         js.push_str("//@rt end\n");
     }
-    js.push_str("return LAZY;\n})();\n});\n})();\n");
+    if hook == "tools" {
+        js.push_str(&version_line());
+    }
+    let _ = writeln!(js, "return {};\n}})();\n}});\n}})();", ret);
     used.sort();
     used.dedup();
     let mut with = Vec::new();
@@ -584,7 +724,7 @@ fn recovery_file(rt: &Runtime, keep: &[bool], main: &[bool]) -> Option<(String, 
         }
     }
     // Seventeen digits, where a runtime file's have sixteen: one from before a reload is told apart.
-    Some((format!("f{}", hash_text(&js)), js, with.join(", ")))
+    Some((format!("{}{}", prefix, hash_text(&js)), js, with.join(", ")))
 }
 
 impl RuntimeFile {
@@ -593,7 +733,7 @@ impl RuntimeFile {
     /// carries its own runtime).
     fn wrap(&self, program: &str) -> Option<String> {
         let rt = runtime_units();
-        let need = shake(rt, program);
+        let need = shake_except(rt, program, rt.by_name.get("TOOLS_MOD").copied());
         if need.iter().zip(&self.keep).any(|(n, k)| *n && !*k) {
             return None;
         }
@@ -615,7 +755,7 @@ impl RuntimeFile {
             return None;
         }
         let mut out = format!("(function ($rt) {{\n\"use strict\";\nconst {{ {} }} = $rt;\n", used.join(", "));
-        minify_into(program, &mut out);
+        compact_js(program, &mut out);
         out.push_str("})(window[Symbol.for(\"quillo\")].rt);\n");
         Some(out)
     }
@@ -1248,6 +1388,7 @@ pub fn test_script(it: &Interp, name: &str) -> Result<String, QuilloError> {
     if !crate::value::hiding() {
         program.push_str("ERRORS_SHOWN = true;\n");
     }
+    push_feature_inits(it, &mut program);
     let _ = writeln!(
         program,
         "try {{ console.log(W.repr({}{}())); }} catch (e) {{ console.log(\"ERROR: \" + (e instanceof Ret ? W.repr(e.v) : e.message)); }}",
@@ -1317,7 +1458,7 @@ fn assemble(open: &str, program: &str, close: &str) -> String {
     out.push_str(open);
     out.push('\n');
     runtime_into(rt, &keep, &mut out);
-    minify_into(program, &mut out);
+    compact_js(program, &mut out);
     out.push_str(close);
     out.push('\n');
     out
@@ -1336,10 +1477,10 @@ fn covering() -> bool {
 /// (tests/browser/rtcover.js).
 fn runtime_into(rt: &Runtime, keep: &[bool], out: &mut String) {
     if !covering() {
-        minify_into(&rt.preamble, out);
+        compact_js(&rt.preamble, out);
         for (i, (_, text)) in rt.units.iter().enumerate() {
             if keep[i] {
-                minify_into(text, out);
+                compact_js(text, out);
             }
         }
         return;
@@ -1355,11 +1496,15 @@ fn runtime_into(rt: &Runtime, keep: &[bool], out: &mut String) {
 
 /// Which of the runtime's declarations `program` needs, with what they need.
 fn shake(rt: &Runtime, program: &str) -> Vec<bool> {
+    shake_except(rt, program, None)
+}
+
+fn shake_except(rt: &Runtime, program: &str, skip: Option<usize>) -> Vec<bool> {
     let mut keep = vec![false; rt.units.len()];
     let mut todo: Vec<String> = names_in(program);
     while let Some(n) = todo.pop() {
         if let Some(&i) = rt.by_name.get(n.as_str()) {
-            if !keep[i] {
+            if Some(i) != skip && !keep[i] {
                 keep[i] = true;
                 todo.extend(names_in(&rt.units[i].1));
             }
@@ -1604,7 +1749,208 @@ fn event_name(ev: &str) -> &str {
     }
 }
 
+/// Strips comments and unnecessary horizontal whitespace from JavaScript while preserving ASI
+/// newlines, strings, regexes, and template literals.
+fn compact_js(js: &str, out: &mut String) {
+    let b = js.as_bytes();
+    let len = b.len();
+    let mut i = 0;
+    let mut templates: Vec<Option<u32>> = Vec::new();
+    let mut prev = b'\n';
+    let mut space = false;
+    let mut line_nonws = false;
+    let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let emit_sep = |out: &mut String, prev: u8, next: u8, space: bool, is_word: &dyn Fn(u8) -> bool| {
+        if space
+            && ((is_word(prev) && is_word(next))
+                || (prev == b'+' && next == b'+')
+                || (prev == b'-' && next == b'-')
+                || (prev == b'/' && matches!(next, b'/' | b'*'))
+                || (prev.is_ascii_digit() && next == b'.'))
+        {
+            out.push(' ');
+        }
+    };
+    while i < len {
+        match templates.last_mut() {
+            Some(None) => {
+                let c = b[i];
+                if c == b'\\' && i + 1 < len {
+                    let next = i + if b[i + 1] < 0x80 { 2 } else { 1 + js[i + 1..].chars().next().map_or(1, char::len_utf8) };
+                    out.push_str(&js[i..next]);
+                    i = next;
+                    prev = b'x';
+                    continue;
+                }
+                if c == b'`' {
+                    out.push('`');
+                    templates.pop();
+                    prev = b'`';
+                    space = false;
+                    line_nonws = true;
+                    i += 1;
+                    continue;
+                }
+                if c == b'$' && i + 1 < len && b[i + 1] == b'{' {
+                    out.push_str("${");
+                    *templates.last_mut().unwrap() = Some(0);
+                    prev = b'{';
+                    space = false;
+                    line_nonws = true;
+                    i += 2;
+                    continue;
+                }
+                let ch_len = if c < 0x80 { 1 } else { js[i..].chars().next().map_or(1, char::len_utf8) };
+                out.push_str(&js[i..i + ch_len]);
+                if c == b'\n' {
+                    line_nonws = false;
+                    prev = b'\n';
+                } else {
+                    line_nonws = true;
+                    prev = c;
+                }
+                i += ch_len;
+                continue;
+            }
+            Some(Some(depth)) if b[i] == b'}' => {
+                out.push('}');
+                if *depth == 0 {
+                    *templates.last_mut().unwrap() = None;
+                    prev = b'}';
+                } else {
+                    *depth -= 1;
+                    prev = b'}';
+                }
+                space = false;
+                line_nonws = true;
+                i += 1;
+                continue;
+            }
+            Some(Some(depth)) if b[i] == b'{' => {
+                out.push('{');
+                *depth += 1;
+                prev = b'{';
+                space = false;
+                line_nonws = true;
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let c = b[i];
+        match c {
+            b'\r' => {
+                i += 1;
+            }
+            b'\n' => {
+                if line_nonws && !matches!(prev, b';' | b'{' | b',') {
+                    out.push('\n');
+                    prev = b'\n';
+                }
+                space = false;
+                line_nonws = false;
+                i += 1;
+            }
+            b' ' | b'\t' => {
+                if line_nonws {
+                    space = true;
+                }
+                i += 1;
+            }
+            b'/' if i + 1 < len && b[i + 1] == b'/' => {
+                i += 2;
+                while i < len && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && b[i + 1] == b'*' => {
+                let mut nl = false;
+                i += 2;
+                while i + 1 < len && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    if b[i] == b'\n' {
+                        nl = true;
+                    }
+                    i += 1;
+                }
+                i = (i + 2).min(len);
+                if nl && line_nonws && !matches!(prev, b';' | b'{' | b',') {
+                    out.push('\n');
+                    prev = b'\n';
+                    space = false;
+                    line_nonws = false;
+                } else if line_nonws {
+                    space = true;
+                }
+            }
+            b'"' | b'\'' => {
+                emit_sep(out, prev, c, space, &is_word);
+                let start = i;
+                i += 1;
+                while i < len && b[i] != c {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                if i < len {
+                    i += 1;
+                }
+                out.push_str(&js[start..i]);
+                prev = c;
+                space = false;
+                line_nonws = true;
+            }
+            b'`' => {
+                emit_sep(out, prev, b'`', space, &is_word);
+                out.push('`');
+                templates.push(None);
+                prev = b'`';
+                space = false;
+                line_nonws = true;
+                i += 1;
+            }
+            b'/' if matches!(prev, b'(' | b',' | b'=' | b':' | b'[' | b'!' | b'&' | b'|' | b'?' | b'{' | b'}' | b';' | b'+' | b'-' | b'*' | b'%' | b'<' | b'>' | b'~' | b'^' | b'\n')
+                || after_keyword(out.as_bytes()) =>
+            {
+                emit_sep(out, prev, b'/', space, &is_word);
+                let start = i;
+                i += 1;
+                let mut class = false;
+                while i < len && (class || b[i] != b'/') {
+                    if b[i] == b'\\' && i + 1 < len {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'[' {
+                        class = true;
+                    } else if b[i] == b']' {
+                        class = false;
+                    }
+                    i += 1;
+                }
+                if i < len {
+                    i += 1;
+                }
+                out.push_str(&js[start..i]);
+                prev = b'/';
+                space = false;
+                line_nonws = true;
+            }
+            _ => {
+                emit_sep(out, prev, c, space, &is_word);
+                let ch_len = if c < 0x80 { 1 } else { js[i..].chars().next().map_or(1, char::len_utf8) };
+                out.push_str(&js[i..i + ch_len]);
+                prev = if ch_len == 1 { c } else { b'x' };
+                space = false;
+                line_nonws = true;
+                i += ch_len;
+            }
+        }
+    }
+    if !out.is_empty() && !out.ends_with('\n') && !matches!(prev, b';' | b'}') {
+        out.push('\n');
+    }
+}
+
 /// Drops comment lines, blank lines and indentation.
+#[cfg(test)]
 fn minify_into(js: &str, out: &mut String) {
     let mut scan = Scan::default();
     for line in js.lines() {
@@ -1631,6 +1977,7 @@ fn after_keyword(code: &[u8]) -> bool {
 
 /// Where a scan of JavaScript is at the end of a line: in code (and how
 /// many `${` of templates deep), or inside a template that goes on.
+#[cfg(test)]
 #[derive(Default)]
 struct Scan {
     /// Template literals open, innermost last: the brace depth inside each
@@ -1638,6 +1985,7 @@ struct Scan {
     templates: Vec<Option<u32>>,
 }
 
+#[cfg(test)]
 impl Scan {
     fn code(&self) -> bool {
         self.templates.is_empty()
@@ -3353,8 +3701,8 @@ impl<'a> Compiler<'a> {
 
     /// The shapes of the types an annotation names.
     fn need_types_in(&mut self, t: &Ty) -> Result<(), QuilloError> {
-        if t.names.iter().any(|n| self.it.types.contains_key(n)) || t.elem.is_some() || t.fields.is_some() {
-            self.ty_shape(t)?;
+        for n in &t.names {
+            self.need_type(n)?;
         }
         Ok(())
     }
@@ -6736,6 +7084,25 @@ mod minify_tests {
         }
         assert!(!js.contains("// dev"));
         let f = std::env::temp_dir().join(format!("quillo-runtime-{}.js", std::process::id()));
+        std::fs::write(&f, &js).unwrap();
+        let out = std::process::Command::new("node").arg("--check").arg(&f).output().unwrap();
+        let _ = std::fs::remove_file(&f);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn the_compacted_runtime_is_still_javascript() {
+        if std::process::Command::new("node").arg("--version").output().is_err() {
+            return;
+        }
+        let rt = super::runtime_units();
+        let mut js = String::new();
+        super::compact_js(&rt.preamble, &mut js);
+        for (_, text) in &rt.units {
+            super::compact_js(text, &mut js);
+        }
+        assert!(!js.contains("// dev"));
+        let f = std::env::temp_dir().join(format!("quillo-compact-{}.js", std::process::id()));
         std::fs::write(&f, &js).unwrap();
         let out = std::process::Command::new("node").arg("--check").arg(&f).output().unwrap();
         let _ = std::fs::remove_file(&f);

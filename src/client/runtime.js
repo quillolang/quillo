@@ -169,6 +169,8 @@ const isNumber = (v) => typeof v === "number" || typeof v === "bigint" || v inst
 // the usual arithmetic never meets either.
 
 class Dec { constructor(m, s) { this.m = m; this.s = s; } }
+let DEC = null;
+let MONEY = null;
 const DEC_MAX = (1n << 96n) - 1n;
 const DEC_SCALE = 28;
 const P10 = [1n];
@@ -336,6 +338,12 @@ function decArith(a, b, op, verb) {
   }
   return decRem(x, y);
 }
+function decCmpVal(a, b) {
+  const x = a instanceof Dec ? a : isInt(a) || typeof a === "bigint" ? new Dec(BigInt(a), 0) : null;
+  const y = b instanceof Dec ? b : isInt(b) || typeof b === "bigint" ? new Dec(BigInt(b), 0) : null;
+  return x === null || y === null ? null : decCmp(x, y);
+}
+function useDec() { DEC = { parse: decParse, fromFloat: decFromFloat, eq: decEq, arith: decArith, cmp: decCmp, cmpVal: decCmpVal, key: decKey, text: decText, as: asDec, round: decRound, mul: decMul, div: decDiv, p10: p10, babs: babs, scale: DEC_SCALE }; }
 
 // An int as the page keeps it: a number while it is whole as one.
 const I64_MIN = -(1n << 63n), I64_MAX = (1n << 63n) - 1n;
@@ -666,7 +674,7 @@ function typeIs(t, v) {
     // Text that is a date (FEEDBACK13.md, Q-093; branch open-fixes).
     case "date": return isDay(v);
     // Money every money function takes (FEEDBACK50.md, Q-621; branch feedback50-fixes).
-    case "money": return moneyIs(v);
+    case "money": return MONEY ? MONEY.is(v) : false;
     case "bool": return typeof v === "boolean";
     case "list": return Array.isArray(v);
     case "map": return isMap(v) || isEvent(v);
@@ -725,7 +733,7 @@ function ownFitsName(n, t, v, deep, depth) {
     if (td.a) return ownFits(td.a, v, deep, depth + 1);
     return isMap(v) ? ownFieldsFit(td.r, v, depth) : OWN_PLAIN;
   }
-  if (n === "dec") return asDec(v) === null ? OWN_PLAIN : null;
+  if (n === "dec") return DEC && DEC.as(v) !== null ? null : OWN_PLAIN;
   if (/^[A-Z]/.test(n) || !typeIs(n, v)) return OWN_PLAIN;
   if (deep && n === "list" && t.e) {
     for (let i = 0; i < v.length; i++) {
@@ -786,9 +794,9 @@ function ownMakeName(n, t, v, depth) {
   // float here either now (FEEDBACK55.md, Q-775; branch feedback55).
   if (n === "float" && (isInt(v) || typeof v === "bigint") && !t.n.includes("int")) return { ok: true, v: fl(Number(v)) };
   // A decimal field takes an int, numeric text or a JSON number.
-  if (n === "dec") { const d = asDec(v); return d === null ? { ok: false, w: OWN_PLAIN } : { ok: true, v: d }; }
+  if (n === "dec") { const d = DEC ? DEC.as(v) : null; return d === null ? { ok: false, w: OWN_PLAIN } : { ok: true, v: d }; }
   // Money, held to money.of's rules, with what is wrong (FEEDBACK50.md, Q-621).
-  if (n === "money") { const r = moneyFromData(v); return r.why ? { ok: false, w: { path: "", what: r.why } } : { ok: true, v: r.v }; }
+  if (n === "money") { const r = MONEY ? MONEY.from(v) : { why: "must be money, { amount, currency }" }; return r.why ? { ok: false, w: { path: "", what: r.why } } : { ok: true, v: r.v }; }
   const w = ownFits({ n: [n], o: false, e: t.e, f: t.f, t: t.t }, v, true, depth);
   return w ? { ok: false, w } : { ok: true, v };
 }
@@ -823,7 +831,7 @@ function repr(v) {
   if (typeof v === "boolean") return String(v);
   if (typeof v === "bigint") return String(v);
   if (v instanceof Fl) return numText(v.f);
-  if (v instanceof Dec) return decText(v) + "m";
+  if (v instanceof Dec) return DEC.text(v) + "m";
   if (typeof v === "function") return "<fn " + (v.$name || "<fn>") + ">";
   if (Array.isArray(v)) return "[" + v.map(repr).join(", ") + "]";
   // A builtin's error says `internal error` as the server writes it, unless the server shows
@@ -839,9 +847,9 @@ function repr(v) {
   return ks.length ? "{ " + ks.map((k) => fmtKey(k) + ": " + repr(v[k])).join(", ") + " }" : "{}";
 }
 
-const display = (v) => typeof v === "string" ? v : typeof v === "number" ? numText(v) : v instanceof Fl ? numText(v.f) : v instanceof Dec ? decText(v) : v instanceof Css ? v.valueOf() : repr(v);
+const display = (v) => typeof v === "string" ? v : typeof v === "number" ? numText(v) : v instanceof Fl ? numText(v.f) : v instanceof Dec ? DEC.text(v) : v instanceof Css ? v.valueOf() : repr(v);
 // A value as a map key (`set`, `get`, `group_by`): 12.5 and 12.50 are one.
-const keyText = (v) => (v instanceof Dec ? decKey(v) : display(v));
+const keyText = (v) => (v instanceof Dec ? DEC.key(v) : display(v));
 const short = (v) => { const r = repr(v); return r.length > 40 ? r.slice(0, 40) + "…" : r; };
 const truthy = (v) => !(isNil(v) || v === false || v instanceof Err);
 
@@ -852,10 +860,10 @@ function eq(a, b) {
     // Two numbers (the usual case) test only their types here; an int past 2^53 (a BigInt) or a
     // whole float (an Fl) and a number, by their values, exactly (FEEDBACK55.md, Q-776; branch
     // feedback55).
-    if (typeof a === "object" || typeof b === "object") return a instanceof Dec || b instanceof Dec ? decEq(a, b) : a instanceof Fl || b instanceof Fl ? numEq(a, b) : a instanceof Css || b instanceof Css ? cssEq(a, b) : isNil(a) && isNil(b);
+    if (typeof a === "object" || typeof b === "object") return a instanceof Dec || b instanceof Dec ? DEC.eq(a, b) : a instanceof Fl || b instanceof Fl ? numEq(a, b) : a instanceof Css || b instanceof Css ? cssEq(a, b) : isNil(a) && isNil(b);
     return typeof a === "bigint" || typeof b === "bigint" ? numEq(a, b) : isNil(a) && isNil(b);
   }
-  if (a instanceof Dec || b instanceof Dec) return decEq(a, b);
+  if (a instanceof Dec || b instanceof Dec) return DEC.eq(a, b);
   if (a instanceof Fl || b instanceof Fl) return numEq(a, b);
   if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((x, i) => eq(x, b[i]));
   if (a instanceof Err && b instanceof Err) return eq(a.error, b.error);
@@ -914,11 +922,7 @@ function cmp(a, b) {
   if (typeof a === "string" && typeof b === "string") return a === b ? 0 : strCmp(a, b);
   if (a instanceof Css || b instanceof Css) return cmp(a instanceof Css ? a.valueOf() : a, b instanceof Css ? b.valueOf() : b);
   // A decimal with a decimal or an int; not with a float.
-  if (a instanceof Dec || b instanceof Dec) {
-    const x = a instanceof Dec ? a : isInt(a) || typeof a === "bigint" ? new Dec(BigInt(a), 0) : null;
-    const y = b instanceof Dec ? b : isInt(b) || typeof b === "bigint" ? new Dec(BigInt(b), 0) : null;
-    return x === null || y === null ? null : decCmp(x, y);
-  }
+  if (a instanceof Dec || b instanceof Dec) return DEC.cmpVal(a, b);
   // Ints past 2^53 and whole floats too, exactly (FEEDBACK55.md, Q-776; branch feedback55).
   if (isNumber(a) && isNumber(b)) return numCmp(a, b);
   // Item by item, as on the server (FEEDBACK25.md, Q-320; branch feedback26-fixes).
@@ -957,12 +961,12 @@ function add(a, b) {
   if (typeof b === "string") return display(a) + b;
   // Plain text, as on the server (FEEDBACK79.md, Q-1250; branch feedback72-81).
   if (a instanceof Css || b instanceof Css) return display(a) + display(b);
-  if (a instanceof Dec || b instanceof Dec) return decArith(a, b, "+", "add");
+  if (a instanceof Dec || b instanceof Dec) return DEC.arith(a, b, "+", "add");
   if (a instanceof Fl || b instanceof Fl) return flArith(a, b, "+", "add");
   if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, "+", "add");
   if (a instanceof Html && b instanceof Html) return frag([a, b]);
   if (Array.isArray(a) && Array.isArray(b)) return a.concat(b);
-  if (isMap(a) && isMap(b)) return moneyOp(a, b, false) ?? mmerge(a, b);
+  if (isMap(a) && isMap(b)) return (MONEY && MONEY.op(a, b, false)) ?? mmerge(a, b);
   fail(`cannot add ${typeName(a)} and ${typeName(b)}`);
 }
 
@@ -970,7 +974,7 @@ function add(a, b) {
 // with an error: a float on a side gives inf or NaN, as on the server (FEEDBACK55.md, Q-775;
 // branch feedback55).
 function arith(a, b, op, verb) {
-  if (a instanceof Dec || b instanceof Dec) return decArith(a, b, op, verb);
+  if (a instanceof Dec || b instanceof Dec) return DEC.arith(a, b, op, verb);
   if (a instanceof Fl || b instanceof Fl) return flArith(a, b, op, verb);
   if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, op, verb);
   if (typeof a !== "number" || typeof b !== "number") fail(`cannot ${verb} ${typeName(a)} and ${typeName(b)}`);
@@ -985,7 +989,7 @@ function sub(a, b) {
     if (typeof b === "number") return fl(a.f - b);
     if (b instanceof Fl) return fl(a.f - b.f);
   }
-  return (isMap(a) && isMap(b) && moneyOp(a, b, true)) || arith(a, b, "-", "subtract");
+  return (MONEY && isMap(a) && isMap(b) && MONEY.op(a, b, true)) || arith(a, b, "-", "subtract");
 }
 function mul(a, b) {
   if (typeof a === "number") {
@@ -1329,9 +1333,9 @@ function matchInto(p, v, b) {
     case "t": {
       madeLast = undefined;
       // A decimal from an int, numeric text or a JSON number.
-      if (p.t === "dec") { const d = asDec(v); if (d === null) return false; madeLast = d; return true; }
+      if (p.t === "dec") { const d = DEC ? DEC.as(v) : null; if (d === null) return false; madeLast = d; return true; }
       // Money from data (FEEDBACK50.md, Q-621; branch feedback50-fixes).
-      if (p.t === "money") { const r = moneyFromData(v); if (r.why) return false; madeLast = r.v; return true; }
+      if (p.t === "money") { if (!MONEY) return false; const r = MONEY.from(v); if (r.why) return false; madeLast = r.v; return true; }
       // A record: the value made as `User(v)` makes it.
       const r = ownTypes && ownTypes.make(p.t, v);
       if (r) {
@@ -1461,7 +1465,6 @@ function coerce(t, s) {
     // JavaScript's Number() took (FEEDBACK55.md, Q-775 and Q-782; branch feedback55).
     return /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(s) ? fl(Number(s)) : null;
   }
-  if (t === "dec") return decParse(s, false);
   if (t === "date") return isDay(s) ? s : null;
   return null;
 }
@@ -1492,7 +1495,7 @@ function toJSON(v, wire) {
   // Q-1250; branch feedback72-81).
   if (v instanceof Css) return v.valueOf();
   if (typeof v === "function") return repr(v);
-  if (v instanceof Dec) return wire ? { $dec: decText(v) } : decText(v);
+  if (v instanceof Dec) return wire ? { $dec: DEC.text(v) } : DEC.text(v);
   if (typeof v === "bigint") return wire ? { $int: String(v) } : rawNum(String(v));
   if (v instanceof Fl) return wire === "tools" ? v.f : rawNum(flJSON(v.f));
   if (isMap(v) && gettersOnly(v)) return toJSON(ownJSON(v), wire);
@@ -2691,8 +2694,8 @@ function roundLeft(x, d) {
   if (!Number.isFinite(r)) fail("`round`: the rounded value is past the largest float");
   return (x < 0 ? -r : r) + 0;
 }
-B.floor = divides(meta((x) => x instanceof Dec ? decRound(x, 0, "floor") : isWhole(x) ? x : intOrFloat(Math.floor(N(x, "floor"))), "floor", null), "floor");
-B.ceil = divides(meta((x) => x instanceof Dec ? decRound(x, 0, "ceiling") : isWhole(x) ? x : intOrFloat(Math.ceil(N(x, "ceil"))), "ceil", null), "ceil");
+B.floor = divides(meta((x) => x instanceof Dec ? DEC.round(x, 0, "floor") : isWhole(x) ? x : intOrFloat(Math.floor(N(x, "floor"))), "floor", null), "floor");
+B.ceil = divides(meta((x) => x instanceof Dec ? DEC.round(x, 0, "ceiling") : isWhole(x) ? x : intOrFloat(Math.ceil(N(x, "ceil"))), "ceil", null), "ceil");
 B.sqrt = meta((x) => fl(Math.sqrt(N(x, "sqrt"))), "sqrt", null);
 B.pow = meta((x, y) => {
   // A decimal to an int's power, by squaring as src/decimal.rs's powi (FEEDBACK50.md, Q-632;
@@ -2703,19 +2706,19 @@ B.pow = meta((x, y) => {
     const powU = (b) => {
       let base = b, acc = one, k = e;
       while (k > 0n) {
-        if (k & 1n) acc = decMul(acc, base);
+        if (k & 1n) acc = DEC.mul(acc, base);
         k >>= 1n;
-        if (k > 0n) base = decMul(base, base);
+        if (k > 0n) base = DEC.mul(base, base);
       }
       return acc;
     };
     if (n >= 0n) return powU(x);
     // Below one, one over it first; above one, a power past what fits is 0 at 28 decimals,
     // as src/decimal.rs's powi (found in review).
-    if (decCmp(new Dec(babs(x.m), x.s), one) < 0) return powU(decDiv(one, x));
+    if (DEC.cmp(new Dec(DEC.babs(x.m), x.s), one) < 0) return powU(DEC.div(one, x));
     let p;
-    try { p = powU(x); } catch (err) { if (err instanceof QuilloError && err.message === "decimal overflow") return new Dec(0n, DEC_SCALE); throw err; }
-    return decDiv(one, p);
+    try { p = powU(x); } catch (err) { if (err instanceof QuilloError && err.message === "decimal overflow") return new Dec(0n, DEC.scale); throw err; }
+    return DEC.div(one, p);
   }
   // As `*` does, exactly (FEEDBACK29.md, Q-351; branch feedback29-fixes); a power past 2^53 too,
   // the int it is for -1, 0 and 1 and the overflow for any other base, as on the server: it was
@@ -2780,13 +2783,13 @@ const TWO53 = 2 ** 53;
 // A decimal's token: by its value, or past 2^53 by its nearest float.
 function decTok(d) {
   const a = d.m < 0n ? -d.m : d.m;
-  return a >= (1n << 53n) * p10(d.s) ? "N" + Number(decText(d)) : "V" + decKey(d);
+  return a >= (1n << 53n) * DEC.p10(d.s) ? "N" + Number(DEC.text(d)) : "V" + DEC.key(d);
 }
 // `|d| < 1e-10`: a decimal a float its text does not give back may be equal to.
 function smallDec(d) {
   let m = d.m < 0n ? -d.m : d.m, s = d.s;
   while (s > 0 && m % 10n === 0n) { m /= 10n; s--; }
-  return m === 0n || (s > 10 && m < p10(s - 10));
+  return m === 0n || (s > 10 && m < DEC.p10(s - 10));
 }
 // `unique`'s keys for `v`, as the server's: its own, the one with each float made its decimal, and
 // the kinds of its small numbers that may meet, with how many there are.
@@ -2814,8 +2817,8 @@ function uniqueKeys(v, decs) {
       if (Math.abs(n) >= TWO53 || !Number.isFinite(n)) { put("N" + n); continue; }
       if (int) { put("V" + f); continue; }
       // Finite, below 2^53: a decimal holds it.
-      const d = decFromFloat(n);
-      if (Math.abs(n) >= 1e-10 || Number(decText(d)) === n) { put(decTok(d)); continue; }
+      const d = DEC.fromFloat(n);
+      if (Math.abs(n) >= 1e-10 || Number(DEC.text(d)) === n) { put(decTok(d)); continue; }
       k.small++; k.pattern += "F";
       put("X" + n, decTok(d));
       continue;
@@ -3185,7 +3188,7 @@ function looseSpans(t, spans) {
   const out = [];
   let s = 0, end = 0;
   for (let i = 0; i < t.length; i++) {
-    if (i >= end && t[i] === "<" && /[A-Za-z/!?]/.test(t[i + 1] || "")) end = found(t, />/g, i + 1, 1);
+    if (i >= end && t[i] === "<" && /[A-Za-z/!?]/.test(t[i + 1] || "")) end = rxFound(t, />/g, i + 1, 1);
     const e = t[i] === "{" ? placeholderEnd(t, i) : -1;
     if (e < 0) continue;
     while (s < spans.length && spans[s].end <= i) s++;
@@ -3195,7 +3198,7 @@ function looseSpans(t, spans) {
   return out;
 }
 // Where the first match of `re` (global) in `t` from `k` starts, or with `end` ends; t.length if none.
-function found(t, re, k, end) {
+function rxFound(t, re, k, end) {
   re.lastIndex = k;
   const m = re.exec(t);
   return m ? m.index + (end ? m[0].length : 0) : t.length;
@@ -3220,8 +3223,8 @@ function readAttrSpans(t) {
     const c = t[i + 1];
     if (!/[A-Za-z]/.test(c || "")) {
       if (c !== "/" && c !== "!" && c !== "?") {
-        if (gt <= i) gt = found(t, />/g, i + 1);
-        if (ph <= i) ph = found(t, /\{\w+\}/g, i + 1);
+        if (gt <= i) gt = rxFound(t, />/g, i + 1);
+        if (ph <= i) ph = rxFound(t, /\{\w+\}/g, i + 1);
         if (ph < gt) out.push({ start: i, end: i + 1, quoted: true, kind: 7 });
       }
       i++; continue;
@@ -4192,6 +4195,7 @@ function moneyOp(x, y, sub) {
   if (a.code !== b.code) return new Err(`cannot ${sub ? "subtract" : "add"} ${a.code} and ${b.code}: convert one currency to the other first`);
   return moneyIn(decAdd(a.amount, sub ? new Dec(-b.amount.m, b.amount.s) : b.amount), a.code);
 }
+function useMoney() { MONEY = { op: moneyOp, is: moneyIs, from: moneyFromData }; }
 function moneyMode(m, f, i = f === "money.round" ? 2 : 3) {
   m = un(m);
   if (isNil(m)) return "half_even";
@@ -5605,7 +5609,7 @@ function chanSend(name, v, o) {
   // slice C; branch feedback86-89).
   if (Probe !== null) return null;
   const text = jsonText(["m", name, v]);
-  if (TOOLS) toolsSay("channel", { dir: "out", channel: name, value: toolsWire(v) });
+  if (TOOLS) TOOLS.say("channel", { dir: "out", channel: name, value: TOOLS.wire(v) });
   const reliable = isMap(o) && truthy(o.reliable);
   if (Chan.conn && Chan.joined.has(name)) {
     Chan.conn.put(text, reliable);
@@ -5810,7 +5814,7 @@ function chanGot(text) {
   let m;
   try { m = readJSON(text); } catch (e) { return; }
   const [k, name, v] = m, subs = Chan.subs.get(name);
-  if (TOOLS) toolsSay("channel", k === "j" ? { dir: "in", channel: name, joined: !!v } : { dir: "in", channel: name, value: v });
+  if (TOOLS) TOOLS.say("channel", k === "j" ? { dir: "in", channel: name, joined: !!v } : { dir: "in", channel: name, value: v });
   if (!subs) return;
   if (k === "j") {
     if (!v) {
@@ -6222,7 +6226,7 @@ function idemKey() {
 async function rpcRaw(name, args, live, idem) {
   if (!TOOLS) return rpcSend(name, args, live, idem);
   const t0 = performance.now(), r = await rpcSend(name, args, live, idem);
-  toolsSay("call", { name, args: args.map(toolsWire), ms: Math.round(performance.now() - t0), ok: !r.failed && !(r.value instanceof Err), failed: !!r.failed, value: toolsWire(r.value), live: !!live, idempotent: !!idem });
+  TOOLS.say("call", { name, args: args.map(TOOLS.wire), ms: Math.round(performance.now() - t0), ok: !r.failed && !(r.value instanceof Err), failed: !!r.failed, value: TOOLS.wire(r.value), live: !!live, idempotent: !!idem });
   return r;
 }
 
@@ -6230,6 +6234,7 @@ async function rpcRaw(name, args, live, idem) {
 // worker where one controls the page, which drops the visitor's pages it kept in any other: on each
 // page load, and after a server fn's answer that set or ended it. A sign-out the worker did not see
 // (a redirect, another tab, the cookie's end) is caught so (FEEDBACK67.md, B.2, review; branch pwa).
+let SW_PING = null;
 function swSession() {
   const c = typeof navigator !== "undefined" && navigator.serviceWorker && navigator.serviceWorker.controller;
   // Quillo's worker alone: one of the program's own is told nothing (FEEDBACK67.md, B.2, second
@@ -6238,12 +6243,14 @@ function swSession() {
   const m = /(?:^|;\s*)quillo_tag=([^;]*)/.exec(docGet("cookie"));
   c.postMessage({ quillo: "session", who: m ? m[1] : "-" });
 }
-swSession();
+function useSw() { SW_PING = swSession; swSession(); }
+
+let AHEAD_DROP = null;
 
 async function rpcSend(name, args, live, idem) {
   let r;
   // It may change what was kept for a link (see `Ahead`).
-  if (!live) aheadDrop();
+  if (!live && AHEAD_DROP) AHEAD_DROP();
   const headers = { "content-type": "application/json" };
   const had = live && live.h, base = live && live.base;
   if (live) headers["x-quillo-live"] = "1";
@@ -6301,7 +6308,7 @@ async function rpcSend(name, args, live, idem) {
     await new Promise((ok) => setTimeout(ok, 250 * 2 ** (3 - tries) * (0.75 + Math.random() / 2)));
   }
   // It set or ended the session (FEEDBACK67.md, B.2; branch pwa).
-  if (r.headers && r.headers.get("x-quillo-session") !== null) swSession();
+  if (SW_PING && r.headers && r.headers.get("x-quillo-session") !== null) SW_PING();
   let body = null, text = "", cut = false;
   try { text = await r.text(); } catch (_) { cut = true; }
   // Trusted CSS's mark only in what the server wrote of its own answer (`x-quillo-marked`), never
@@ -6680,7 +6687,7 @@ function liveChanged(j) {
   Live.server = j.server || "";
   const changed = new Set(j.changed || []);
   if (!changed.size) return;
-  if (TOOLS) toolsSay("live", { seq: j.seq, topics: [...changed], loads: [...Live.subs].filter((s) => s.topics.some((t) => changed.has(t))).map((s) => ({ id: TOOLS.ids.get(s.inst) || null, name: s.inst.def.$name })) });
+  if (TOOLS) TOOLS.say("live", { seq: j.seq, topics: [...changed], loads: [...Live.subs].filter((s) => s.topics.some((t) => changed.has(t))).map((s) => ({ id: TOOLS.ids.get(s.inst) || null, name: s.inst.def.$name })) });
   for (const s of [...Live.subs]) {
     if (!s.topics.some((t) => changed.has(t))) continue;
     if (s.seen >= j.seq && s.seenOn === Live.server) continue;
@@ -6895,7 +6902,7 @@ function disposeKids(s) {
 function dispose(s) {
   if (s.dead) return;
   s.dead = true;
-  if (TOOLS && s instanceof Inst) toolsGone(s);
+  if (TOOLS && s instanceof Inst) TOOLS.gone(s);
   const up = s.up;
   if (up && up.owned) {
     const i = up.owned.indexOf(s), last = up.owned.pop();
@@ -6937,7 +6944,7 @@ function pageState(name) {
   const init = PageInits.get(name);
   s = new Sig(Object.prototype.hasOwnProperty.call(PageGiven, name) ? PageGiven[name] : init ? init() : null);
   PageStates.set(name, s);
-  if (TOOLS) toolsPage(name, s);
+  if (TOOLS) TOOLS.page(name, s);
   return s;
 }
 
@@ -8247,6 +8254,7 @@ function followed(a) {
 }
 
 function fetchAhead(e) {
+  AHEAD_DROP = aheadDrop;
   const a = e.target.closest && e.target.closest("a[href]");
   const u = a && !a.closest("[data-no-prefetch]") ? followed(a) : null;
   const c = navigator.connection;
@@ -8840,7 +8848,7 @@ const styleText = (m) => mkeys(m).filter((k) => !isNil(m[k]) && m[k] !== false &
 // (FEEDBACK48.md, Q-564; branch main).
 function boolText(k, v) {
   const n = k.toLowerCase();
-  if (n === "translate") return v ? "yes" : "no";
+  if (n === "tra" + "nslate") return v ? "yes" : "no";
   return (n.length > 5 && (n.startsWith("aria-") || n.startsWith("data-"))) || n === "draggable" || n === "spellcheck" || n === "contenteditable" ? String(v) : null;
 }
 
@@ -9875,14 +9883,14 @@ class Inst extends Scope {
     const had = this.sigs || (this.sigs = {});
     if (had[name]) return had[name];
     const s = this.made(name, init, page);
-    return (had[name] = TOOLS ? toolsSig(this, name, s) : s);
+    return (had[name] = TOOLS ? TOOLS.sig(this, name, s) : s);
   }
 
   made(name, init, page) {
     // Swapped in place under --watch (FEEDBACK54.md, A.2): a state keeps its value while the new
     // code's starts as the same kind of value (a null there, or one not known yet, takes any; the
     // user's rule of 2026-11-04); else it starts again, and the console says so.
-    if (this.swapped && hasOwn(this.s0, name) && !page) {
+    if (DEV && this.swapped && hasOwn(this.s0, name) && !page) {
       let fresh;
       try { fresh = within(this, init); } catch (_) { fresh = null; }
       const was = this.s0[name];
@@ -10034,7 +10042,7 @@ function islandsIn(el, marked) {
 function remade(name) {
   QW.remade = (QW.remade || 0) + 1;
   if (DEV && wanted) console.warn(`quillo: <${name}> was made again, not taken up from the server's HTML: where it wrote ${onPage(wanted[0])}, the browser makes ${wanted[1]}`); // dev
-  if (TOOLS) toolsSay("remade", Object.assign({ name }, toolsWanted()));
+  if (TOOLS) TOOLS.say("remade", Object.assign({ name }, TOOLS.wanted()));
 }
 
 // A component in its <quillo-island>: made, or taking up the page's; its nodes into `out`.
@@ -10050,7 +10058,7 @@ function island(def, props, h, c, out) {
   if (!c.claim && bareIn(c)) {
     const got = run(inst, null, false, c.svg, c.p) || [];
     bareRoot(got, inst, def.$name);
-    if (TOOLS) toolsMade(inst);
+    if (TOOLS) TOOLS.made(inst);
     for (const n of got) out.push(n);
     return;
   }
@@ -10070,7 +10078,7 @@ function island(def, props, h, c, out) {
   if (DEV) el.__qi = inst;
   if (!c.claim) {
     run(inst, el, false, c.svg);
-    if (TOOLS) toolsMade(inst);
+    if (TOOLS) TOOLS.made(inst);
     out.push(asOwnRoot(el, inst, c.svg));
     return;
   }
@@ -10093,7 +10101,7 @@ function island(def, props, h, c, out) {
     inst.el = el;
     run(inst, el, false);
   }
-  if (TOOLS) toolsMade(inst);
+  if (TOOLS) TOOLS.made(inst);
   if (got) for (const n of got) out.push(n);
   else out.push(el);
 }
@@ -10123,7 +10131,7 @@ function islandMarked(def, props, h, c, out) {
     inst.el = w;
     got = [w];
   }
-  if (TOOLS) toolsMade(inst);
+  if (TOOLS) TOOLS.made(inst);
   for (const n of got) out.push(n);
 }
 
@@ -10420,7 +10428,7 @@ function untag(v) {
   // The server's mark for a state that is a prop's own value (see `made`).
   if (ks[0] === "$quillo_prop" && typeof v.$quillo_prop === "string") return new PropOf(v.$quillo_prop);
   if (ks[0] === "$quillo_err") return new Err(v.$quillo_err, true);
-  if (ks[0] === "$dec" && typeof v.$dec === "string") return decParse(v.$dec, false) ?? v.$dec;
+  if (ks[0] === "$dec" && typeof v.$dec === "string") return DEC ? (DEC.parse(v.$dec, false) ?? v.$dec) : v.$dec;
   if (ks[0] === "$int" && typeof v.$int === "string" && /^-?\d{1,19}$/.test(v.$int)) return intOf(BigInt(v.$int));
   // The server's trusted CSS: an island's props and state, a server fn's or a `live` answer
   // (FEEDBACK79.md, Q-1250; branch feedback72-81).
@@ -10504,7 +10512,7 @@ function report(e) {
   if (DEV && e instanceof Error) said.splice(1, 1, placed(e), e); // dev
   console.error(...said);
   if (typeof window !== "undefined" && window.__quilloErrors) window.__quilloErrors.push(String(e && e.message || e));
-  if (TOOLS) toolsSay("error", { message: String(e && e.message || e), place: DEV && e instanceof Error ? toolsPlace(e) : null, id: toolsOwner() });
+  if (TOOLS) TOOLS.say("error", { message: String(e && e.message || e), place: DEV && e instanceof Error ? TOOLS.place(e) : null, id: TOOLS.owner() });
 }
 
 // ---- resuming: the server's HTML, taken up as it is ----------------------
@@ -10532,12 +10540,19 @@ function outerIsland(node) {
 // `$quillo_err`); a tool asks with `quillo:devtools-ask` (`{ id, op, ... }`) and is
 // answered `{ type: "answer", id, ok }`. No name goes on `window`. With no tool, each hook
 // is one test of `TOOLS`, or is not put in place at all (a state's `set`).
-let TOOLS = null;
+let TOOLS = null, ToolsAt = null, ToolsWith = null, ToolsTried = false;
 let VERSION = ""; // Quillo's version: src/client.rs sets it after the runtime, as BASE
+const TOOLS_MOD = () => toolsStart();
+function toolsLoad(done) {
+  QW.tools = (f) => { const s0 = f(ToolsWith()); ToolsAt = null; s0(); done(); };
+  const s = docEl("script");
+  s.src = ToolsAt; s.onerror = () => { ToolsAt = null; done(); };
+  docGet("head").appendChild(s);
+}
 
 function toolsStart() {
   if (docGet("documentElement").getAttribute("data-quillo-devtools") !== "1") return;
-  TOOLS = { ids: new WeakMap(), all: new Map(), next: 1, marked: null };
+  TOOLS = { ids: new WeakMap(), all: new Map(), next: 1, marked: null, say: toolsSay, wire: toolsWire, owner: toolsOwner, place: toolsPlace, wanted: toolsWanted, made: toolsMade, gone: toolsGone, sig: toolsSig, page: toolsPage };
   docOn("quillo:devtools-ask", toolsAsk);
   toolsSay("hello", { protocol: 1, version: VERSION, dev: DEV, base: BASE });
 }
@@ -10941,7 +10956,8 @@ function resume(el) {
   // a `children` text it did not mark stays text (FEEDBACK51.md, Q-667; branch feedback86-89).
   if (typeof props.children === "string" && el.hasAttribute("data-qh")) props.children = rawHtml(props.children);
   const given = islandJSON(el.dataset.s, {}), liveInfo = islandJSON(el.dataset.l, null);
-  const state = DEV ? keptFor(el, given) : given;
+  let state = given;
+  if (DEV) state = keptFor(el, state); // dev
   hydrating = queue();
   let inst = new Inst(def, props, state, liveInfo);
   inst.el = el;
@@ -10989,7 +11005,7 @@ function resume(el) {
     if (DEV || QW.ip) { el.__qi = inst; el.__qp = props; }
   }
   hydrating = null;
-  if (TOOLS) toolsMade(inst);
+  if (TOOLS) TOOLS.made(inst);
   // What was typed before it was taken up: the component hears it now.
   for (const f of el.querySelectorAll("input, textarea, select")) {
     if (!asParsed(f)) {
@@ -11025,7 +11041,11 @@ function wake(e) {
 }
 
 function boot() {
-  toolsStart();
+  if (!ToolsTried) {
+    ToolsTried = true;
+    if (ToolsAt !== null && docGet("documentElement").getAttribute("data-quillo-devtools") === "1") { toolsLoad(boot); return; }
+    if (ToolsAt === null) TOOLS_MOD();
+  }
   // A deferred island swapped in after the runtime came: taken up if it runs by itself.
   QW.resume = (el) => { if (el && !el.__q) resume(el); };
   // Someone reaching for an island takes it up (before their event is
@@ -11056,7 +11076,7 @@ function boot() {
   // keys it had (branch early-events).
   const held = QW.q || [];
   const redo = QW.redo;
-  if (DEV) { QW.keep = keepPage; QW.swap = hotSwap; QW.morph = hotMorph; keptPageBack(); }
+  if (DEV) { QW.keep = keepPage; QW.swap = hotSwap; QW.morph = hotMorph; keptPageBack(); } // dev
   QW.booted = true;
   for (const r of held.splice(0)) {
     const i = outerIsland(r.el);

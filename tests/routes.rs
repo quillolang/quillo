@@ -653,7 +653,7 @@ route GET / = <List p="> "/>
     assert!(page.contains(r#"data-l="{&quot;xs&quot;:{&quot;f&quot;:&quot;load&quot;,&quot;a&quot;:[&quot;&gt; &quot;],&quot;t&quot;:[&quot;var:items&quot;],&quot;h&quot;:&quot;"#), "{}", page);
     assert!(page.contains("<li>&gt; a</li>"), "{}", page);
     let js = get(&mut it, "/_quillo/quillo.js").text();
-    assert!(js.contains(r#"W.live($i, "xs", "load", () => [$p.p])"#), "{}", js);
+    assert!(js.contains(r#"W.live($i,"xs","load",()=>[$p.p])"#), "{}", js);
 }
 
 #[test]
@@ -704,7 +704,7 @@ route GET /where = url().path
     let srcs = scripts_of(&page);
     assert!(srcs[0].starts_with("/shop/_quillo/r/") && srcs[1].starts_with("/shop/_quillo/b/"), "{:?}", srcs);
     assert!(get(&mut it, &srcs[0]).text().contains("BASE = \"/shop\""));
-    assert!(get(&mut it, "/shop/_quillo/quillo.js").text().contains("BASE = \"/shop\""));
+    assert!(get(&mut it, "/shop/_quillo/quillo.js").text().contains("BASE=\"/shop\""));
     assert_eq!(get(&mut it, "/shop/where").text(), "/where");
     let r = send(&mut it, "POST", "/shop/buy", None, "");
     assert_eq!((r.status, r.header("location")), (303, Some("/shop/thanks")));
@@ -1078,9 +1078,9 @@ route GET /plain = <html><head><title>p</title></head><body><Plain/></body></htm
     let at = sales.find("/_quillo/b/").expect("the bundle");
     let end = at + sales[at..].find('"').expect("its end");
     let bundle = String::from_utf8_lossy(&get(&mut it, &sales[at..end]).body).to_string();
-    assert!(bundle.contains(r#"["Chart", "Chart", "https://cdn.example/chart.js"]"#), "{}", bundle);
-    assert!(bundle.contains(r#"["dayjs", "default", "https://day.example/dayjs.js"]"#), "{}", bundle);
-    assert!(bundle.contains(r#"["Own", "Own", "/assets/own.mjs"]"#), "{}", bundle);
+    assert!(bundle.contains(r#"["Chart","Chart","https://cdn.example/chart.js"]"#), "{}", bundle);
+    assert!(bundle.contains(r#"["dayjs","default","https://day.example/dayjs.js"]"#), "{}", bundle);
+    assert!(bundle.contains(r#"["Own","Own","/assets/own.mjs"]"#), "{}", bundle);
     let plain = page(&mut it, "/plain");
     assert!(!plain.contains("modulepreload") && !plain.contains("crossorigin"), "{}", plain);
 }

@@ -872,7 +872,7 @@ fn rows_of_a_block_with_no_element_are_keyed_by_place() {
     let js = String::from_utf8(ask(&mut it, "GET", url, &[], b"").body).unwrap();
     let rows: Vec<&str> = js.match_indices("W.each(").map(|(i, _)| &js[i..(i + 80).min(js.len())]).collect();
     assert_eq!(rows.len(), 2, "{}", js);
-    assert!(rows.iter().filter(|r| r.contains(".v), null, ")).count() == 1, "{:?}", rows);
+    assert!(rows.iter().filter(|r| r.contains(".v),null,")).count() == 1, "{:?}", rows);
 }
 
 // ---- a server's sockets: live topics after the address, and a page that reads late -------

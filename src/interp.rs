@@ -4094,6 +4094,11 @@ impl Interp {
         b.runtime.as_ref().and_then(|r| r.rec.as_ref()).filter(|(h, _)| h == hash).map(|(_, js)| js.clone())
     }
 
+    pub fn devtools_file(&self, hash: &str) -> Option<Arc<String>> {
+        let b = self.bundles.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        b.runtime.as_ref().and_then(|r| r.tools.as_ref()).filter(|(h, _)| h == hash).map(|(_, js)| js.clone())
+    }
+
     pub fn load_file(&mut self, path: &Path) -> Result<Value, QuilloError> {
         let src = crate::error::read_source(path)
             .map_err(|e| QuilloError::new(format!("cannot read {}: {}", path.display(), e), 0))?;

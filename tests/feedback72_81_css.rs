@@ -493,7 +493,7 @@ route GET / = <html><body><C v="red; background: blue"/></body></html>
     assert!(page.body.contains(&format!("<p id=\"p\" style=\"color: {}\">a</p>", ONE)), "{}", page.body);
     let bundle = page.body.split('"').find(|p| p.starts_with("/_quillo/b/")).expect("a bundle").to_string();
     let js = s.get(&bundle, &[]).body;
-    assert!(js.contains("W.csst(B.css((\"color: \" + W.display(B.__css_value($p.v)))))"), "{}", js);
+    assert!(js.contains("W.csst(B.css((\"color: \"+W.display(B.__css_value($p.v)))))"), "{}", js);
     let _ = &s.dir;
 }
 

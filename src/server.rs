@@ -2420,6 +2420,16 @@ impl Interp {
         // The runtime file pages' bundles share; another than this program's
         // (a page from before a reload) gets this one, which does no harm:
         // its bundle is not kept either, so it is sent the whole bundle.
+        if let Some(hash) = rest.strip_prefix("d/").and_then(|r| r.strip_suffix(".js")) {
+            return match self.devtools_file(hash) {
+                Some(js) => HttpResponse {
+                    status: 200,
+                    headers: vec![("content-type".into(), "text/javascript; charset=utf-8".into()), ("cache-control".into(), "public, max-age=31536000, immutable".into())],
+                    body: js.as_bytes().to_vec(),
+                },
+                None => HttpResponse { status: 404, headers: vec![("cache-control".into(), "no-cache".into())], body: Vec::new() },
+            };
+        }
         if let Some(hash) = rest.strip_prefix("r/").and_then(|r| r.strip_suffix(".js")) {
             // Or its code only a failure runs, fetched the first time a draw fails (FEEDBACK88.md,
             // Q-1380, the user's decision in the thirteenth review of slice C; branch feedback86-89).

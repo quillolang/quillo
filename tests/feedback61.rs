@@ -4481,7 +4481,7 @@ route GET /h = <html><head><title>t</title></head><body><Pick/></body></html>
     for (const id of ids) for (const i of $(id).querySelectorAll("input")) i.value = "t" + i.parentNode.textContent;
     const rows = (id) => [...$(id).children].map((li) => li.textContent + "=" + li.querySelector("input").value).join(",");
     await click("sel", "rev");
-    const out = { follows: calls.map((c) => c.endsWith(", true)")) };
+    const out = { follows: calls.map((c) => c.endsWith(",true)")) };
     for (const id of ids.slice(0, 3)) out[id] = rows(id);
     return out;"##;
     let Some(rs) = in_pages("m1-one-key", src, &["/h"], body) else { return };
@@ -4917,7 +4917,7 @@ fn lists_of(name: &str, src: &str) -> Vec<(String, bool)> {
     it.load_source(src, file.to_str().unwrap()).unwrap_or_else(|e| panic!("{}", e));
     let js = quillo::client::bundle(&it).unwrap_or_else(|e| panic!("{}", e));
     let mut out = Vec::new();
-    for (at, _) in js.match_indices("W.each(() =>") {
+    for (at, _) in js.match_indices("W.each(()=>") {
         let args = js_args(&js[at + "W.each(".len()..]);
         assert!(args.len() == 3 || args.len() == 4, "{:?}", args);
         out.push((args[1].to_string(), args.get(3) == Some(&"true")));
@@ -4962,7 +4962,7 @@ route GET /b = <html><head><title>t</title></head><body><Host now={false}/></bod
 #[test]
 fn rows_shown_by_and_with_a_match_or_a_block_are_keyed_and_rows_of_nothing_are_not() {
     let lists = lists_of("and-row-keys-js", AND_ROWS);
-    let keyed = |k: &str, hidden: bool, block: bool| k.starts_with("($x) =>") && k.contains("W.hidden") == hidden && k.contains("$n_") == block;
+    let keyed = |k: &str, hidden: bool, block: bool| k.starts_with("($x)=>") && k.contains("W.hidden") == hidden && k.contains("$n_") == block;
     let (am, ab, el, ai) = (&lists[0].0, &lists[1].0, &lists[2].0, &lists[8].0);
     assert!(keyed(am, true, false), "{}", am);
     assert!(keyed(ab, true, true), "{}", ab);
