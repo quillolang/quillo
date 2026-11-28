@@ -11130,9 +11130,7 @@ function slotIsland(def, props, h, c, out) {
   out.push(el);
 }
 function slotResume(el, def) {
-  const props = islandJSON(el.dataset.p, {}), given = islandJSON(el.dataset.s, {});
-  let state = given;
-  if (DEV) state = keptFor(el, state); // dev
+  const props = islandJSON(el.dataset.p, {}), state = islandJSON(el.dataset.s, {});
   const inst = { def, el, props, s0: state, dead: false, up: null };
   if (TOOLS) TOOLS.ids.set(inst, TOOLS.next++);
   if (DEV || QW.ip) { el.__qi = inst; el.__qp = props; }
