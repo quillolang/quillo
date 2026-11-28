@@ -4070,10 +4070,13 @@ fn a_parts_writer_is_the_component_whose_code_wrote_its_markup() {
     window.clearInterval = (id) => { mine.delete(id); return ci(id); };
     const real = window.fetch.bind(window); let open = 0;
     window.fetch = (u, init) => { if (String(u).includes("/ticks/")) { open++; if (init && init.signal) init.signal.addEventListener("abort", () => open--); } return real(u, init); };
+    const until = async (f, ms) => { const t0 = performance.now(); while (!f() && performance.now() - t0 < ms) await tick(10); };
     const out = {};
     // Rows through a function prop, through one with a Box in it, one whose `@mount` starts its
     // `every` in a timer's callback and after a wait, and one that listens: made again eight times.
     for (let k = 0; k < 8; k++) { await click("regen"); await tick(30); }
+    // The five `slow(30)` RPCs share the HTTP/1.1 pool with five `/ticks/` streams, so under CI load they can finish after 200 ms.
+    await until(() => mine.size >= 20 && open === 5, 2000);
     await tick(200); out.rows = mine.size; out.streams = open;
     // Markup a handler made and put in state, eight times.
     for (let k = 0; k < 8; k++) { await click("made"); await tick(30); }
