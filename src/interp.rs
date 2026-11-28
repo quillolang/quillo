@@ -5289,7 +5289,7 @@ impl Interp {
             if let (Step::Map(arg), Reduce::List) = (&steps[0], &reducer) {
                 if matches!(arg, Expr::Lambda(_) | Expr::Ident(..)) {
                     if let Ok(Value::Func(c)) = self.eval(arg, env) {
-                        if c.def.params.len() == 1 && c.def.params[0].default.is_none() && c.def.params[0].ty.is_none() && c.def.ret.is_none() && c.def.err.is_none() {
+                        if crate::builtins::plain_untyped_unary(&c) {
                             if let Some(lit) = crate::builtins::const_lit_expr(&c.def.body) {
                                 return Some(Ok(Value::list(vec![lit; count as usize])));
                             }

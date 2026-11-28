@@ -651,7 +651,7 @@ pub(crate) fn fast_unary(c: &Closure, sample: &Value, depth: usize) -> Option<Fa
         return None;
     }
     let def = &c.def;
-    if def.params.len() != 1 || def.hot.load(Relaxed) == NEVER {
+    if def.params.len() != 1 || def.run != 0 || def.hot.load(Relaxed) == NEVER {
         return None;
     }
     let arg_t = T::of(sample)?;
@@ -784,7 +784,7 @@ fn shape_ok(def: &FnDef) -> bool {
             _ => false,
         }
     }
-    !def.server && !def.component && def.effects.is_none() && def.err.is_none() && def.params.iter().all(|p| p.default.is_none()) && expr(&def.body)
+    !def.server && !def.component && def.run == 0 && def.effects.is_none() && def.err.is_none() && def.params.iter().all(|p| p.default.is_none()) && expr(&def.body)
 }
 
 /// Variables in scope while a function is looked at: name and type (and,

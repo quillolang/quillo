@@ -743,9 +743,22 @@ pub(crate) fn const_lit_expr(e: &Expr) -> Option<Value> {
     }
 }
 
+#[inline]
+pub(crate) fn plain_untyped_unary(c: &Closure) -> bool {
+    c.def.run == 0
+        && !c.def.component
+        && c.def.effects.is_none()
+        && !c.def.server
+        && c.def.params.len() == 1
+        && c.def.params[0].default.is_none()
+        && c.def.params[0].ty.is_none()
+        && c.def.ret.is_none()
+        && c.def.err.is_none()
+}
+
 fn identity_lambda(c: &Closure) -> bool {
     use crate::ast::Stmt;
-    if c.def.params.len() != 1 || c.def.params[0].default.is_some() || c.def.params[0].ty.is_some() || c.def.ret.is_some() || c.def.err.is_some() {
+    if !plain_untyped_unary(c) {
         return false;
     }
     let name = &c.def.params[0].name;
@@ -785,7 +798,7 @@ fn map(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
     let f = f_arg(&args, 1, "map", line)?;
     if let Value::Func(c) = &f {
         if c.def.params.len() == 1 && c.def.params[0].default.is_none() && it.can_fast_call() {
-            if c.def.params[0].ty.is_none() && c.def.ret.is_none() && c.def.err.is_none() {
+            if plain_untyped_unary(c) {
                 if let Some(lit) = const_lit_expr(&c.def.body) {
                     return Ok(Value::list(vec![lit; l.len()]));
                 }
