@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.14 (2026-11-29)
+
+Lean browser client: smaller shaken runtimes, lazy-loaded chunks and DevTools, direct slot-diff components, and compiled keyed row templates (`app/lean-demo/main.qwe`).
+
+### Performance & Client Bundle Size
+
+- **Smaller shaken runtime and compacted browser JS**:
+  - Decouple tree-shaker edges across `src/client/runtime.js`, lazy-load browser DevTools from `/_quillo/d/<hash>.js`, and compact emitted client bundles/runtimes in pure Rust (`compact_js`).
+  - Feature-gate runtime DOM hooks (`STYLE_FN`, `JSON_ATTR`, `SEL_FN`, `LIVE_SEEN`, `MARKED`, `RAW_HTML`) and split heavy deferred component subtrees (`>= 2048 B` own compiled JS) into on-demand ESM chunks served under `/_quillo/c/<hash>.js` (`W.lazy`).
+- **Direct slot-diff components and compiled keyed row templates**:
+  - Compile simple reactive components directly to static HTML shells plus text/attribute/event slot patchers (`W.slot`, `W.slotText`, `W.slotOn`, `W.slotMis`) without constructing the full `Sig`/`Inst` graph, with SVG/attribute/structural mismatch guards.
+  - Compile eligible keyed `{for ... in ...}` lists into single cached `<template>` clones with direct slot patching (`W.klist`) and LIS reconciliation.
+
 ## 0.8.13 (2026-11-28)
 
 Performance release across the JIT compiler, interpreter hot paths, list/range pipelines,

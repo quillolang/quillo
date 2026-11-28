@@ -1,0 +1,174 @@
+// Interactive showcase of Quillo's Phase 1-4 lean-client behaviors:
+// 1. <SlotCounter/>  -> direct slot-diff compiler (W.slot, zero Sig/Inst graph)
+// 2. <TaskBoard/>    -> compiled keyed row template (W.klist with blank.cloneNode)
+// 3. <CatalogHost/>  -> deferred heavy component split into a lazy ESM chunk (W.lazy -> /_quillo/c/)
+// 4. <NetLog/>       -> inspect loaded /_quillo/r/, /_quillo/b/, and /_quillo/c/ scripts in the browser
+
+component SlotCounter() {
+    state count = 0
+    state step = 1
+    <section.card id="slot-card">
+        <div.card-head>
+            <h2>1. Direct Slot-Diff — W.slot</h2>
+            <span.pill>No Sig / Inst</span>
+        </div>
+        <p.muted>Static HTML shell + direct text/class slot patching with O(1) state updates.</p>
+        <div.row>
+            <button id="dec" type="button" @click={() => { count -= step }}>-</button>
+            <strong id="slot-count" class={count > 0 ? "val pos" : count < 0 ? "val neg" : "val"}>{count}</strong>
+            <button id="inc" type="button" @click={() => { count += step }}>+</button>
+            <button id="step" type="button" @click={() => { step = step == 1 ? 5 : 1 }}>step: {step}</button>
+            <button id="reset" type="button" @click={() => { count = 0 }}>reset</button>
+        </div>
+    </section>
+}
+
+component TaskBoard() {
+    state rows = [
+        { id: 1, title: "Strip devtools from /_quillo/r/", done: true },
+        { id: 2, title: "Feature-gate DOM hooks & split /_quillo/c/", done: true },
+        { id: 3, title: "Compile W.slot & W.klist templates", done: false },
+    ]
+    state next_id = 4
+    <section.card id="klist-card">
+        <div.card-head>
+            <h2>2. Keyed Row Templates (<code>W.klist</code>)</h2>
+            <span.pill>cloneNode + LIS moves</span>
+        </div>
+        <p.muted>Rows clone from a single cached &lt;template&gt; and keep DOM identity on reorder.</p>
+        <div.row>
+            <button id="k-add" type="button" @click={() => {
+                rows = rows + [{ id: next_id, title: `Keyed item #${next_id}`, done: false }]
+                next_id += 1
+            }}>+ Add row</button>
+            <button id="k-rev" type="button" @click={() => { rows = reverse(rows) }}>Reverse order</button>
+            <button id="k-drop" type="button" @click={() => { rows = len(rows) > 1 ? slice(rows, 1) : [] }}>Drop first</button>
+        </div>
+        <ul id="klist-ul">
+            {for r in rows =>
+                <li key={r.id} class={r.done ? "todo done" : "todo"}>
+                    <span.todo-title>#{r.id} {r.title}</span>
+                    <button type="button" class="toggle-btn" @click={() => {
+                        rows = rows | map((it) => it.id == r.id ? { id: it.id, title: it.title, done: !it.done } : it)
+                    }}>{r.done ? "Done" : "Mark done"}</button>
+                </li>
+            }
+        </ul>
+    </section>
+}
+
+component HeavyCatalog() {
+    state picked = "none"
+    <div id="heavy-catalog" class="catalog-box">
+        <p.ok>Lazy ESM chunk loaded and hydrated on click (<code>/_quillo/c/&lt;hash&gt;.js</code>). Selected: <strong id="cat-picked">{picked}</strong></p>
+        <div.grid>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 01 - Core Runtime" }}>01 Core Runtime</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 02 - Tree Shaker" }}>02 Tree Shaker</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 03 - JS Compactor" }}>03 JS Compactor</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 04 - Lazy DevTools" }}>04 Lazy DevTools</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 05 - Feature Style Hook" }}>05 Feature Style Hook</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 06 - Feature Select Hook" }}>06 Feature Select Hook</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 07 - Feature Marked Hook" }}>07 Feature Marked Hook</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 08 - Feature RawHtml Hook" }}>08 Feature RawHtml Hook</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 09 - Feature JsonAttr Hook" }}>09 Feature JsonAttr Hook</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 10 - Lazy ESM Chunks" }}>10 Lazy ESM Chunks</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 11 - Direct Slot Diff" }}>11 Direct Slot Diff</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 12 - Slot Mismatch Recovery" }}>12 Slot Mismatch Recovery</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 13 - Keyed Row Clone" }}>13 Keyed Row Clone</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 14 - LIS Reconciliation" }}>14 LIS Reconciliation</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 15 - Strict CSP Safe" }}>15 Strict CSP Safe</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 16 - Service Worker Precache" }}>16 Service Worker Precache</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 17 - Scroll Back Guard" }}>17 Scroll Back Guard</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 18 - Focus Back Guard" }}>18 Focus Back Guard</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 19 - Decimal Decoupling" }}>19 Decimal Decoupling</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 20 - Money Decoupling" }}>20 Money Decoupling</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 21 - V8 Coverage Verified" }}>21 V8 Coverage Verified</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 22 - Mixed Child Slots" }}>22 Mixed Child Slots</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 23 - SSR Claim Fast Path" }}>23 SSR Claim Fast Path</button>
+            <button type="button" class="cat-item" @click={() => { picked = "Module 24 - Benchmarks 1.12x Vanilla" }}>24 Benchmarks 1.12x Vanilla</button>
+        </div>
+    </div>
+}
+
+component CatalogHost() {
+    state open = false
+    <section.card id="lazy-card">
+        <div.card-head>
+            <h2>3. Lazy ESM Component Chunk (<code>W.lazy</code>)</h2>
+            <span.pill>On-demand /_quillo/c/</span>
+        </div>
+        <p.muted>Heavy deferred panel stays out of the initial bundle until opened.</p>
+        <div.row>
+            <button id="toggle-lazy" type="button" @click={() => { open = !open }}>{open ? "Hide lazy catalog" : "Load & open heavy catalog"}</button>
+        </div>
+        {open ? <HeavyCatalog/> : null}
+    </section>
+}
+
+component NetLog() {
+    state entries = []
+    let read = () => {
+        entries = js("leanNet")
+    }
+    <section.card id="net-card" @mount={() => read()}>
+        <div.card-head>
+            <h2>4. Loaded Client Assets</h2>
+            <button id="refresh-net" type="button" @click={() => read()}>Refresh resource log</button>
+        </div>
+        <ul id="net-list">
+            {for e in entries =>
+                <li key={e.path}><code>{e.path}</code> — <span>{e.bytes} B encoded</span></li>
+            }
+        </ul>
+    </section>
+}
+
+let DEMO_CSS = `
+  :root { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; }
+  body { margin: 0; padding: 32px 20px; }
+  main { max-width: 820px; margin: 0 auto; display: grid; gap: 18px; }
+  h1 { margin: 0 0 4px; font-size: 1.75rem; color: #f8fafc; }
+  h2 { margin: 0; font-size: 1.1rem; color: #f8fafc; }
+  .lead { margin: 0 0 8px; color: #94a3b8; }
+  .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 18px 20px; }
+  .card-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 8px; }
+  .pill { font-size: 0.78rem; padding: 3px 9px; border-radius: 999px; background: #0ea5e922; color: #38bdf8; border: 1px solid #0ea5e955; }
+  .muted { color: #94a3b8; margin: 0 0 12px; font-size: 0.92rem; }
+  .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  button { background: #3b82f6; color: white; border: 0; border-radius: 8px; padding: 7px 13px; font-weight: 600; cursor: pointer; }
+  button:hover { background: #2563eb; }
+  .val { font-size: 1.25rem; min-width: 44px; text-align: center; }
+  .val.pos { color: #4ade80; }
+  .val.neg { color: #f87171; }
+  ul { list-style: none; padding: 0; margin: 12px 0 0; display: grid; gap: 8px; }
+  .todo { display: flex; justify-content: space-between; align-items: center; padding: 8px 12px; border-radius: 8px; background: #0f172a; border: 1px solid #334155; }
+  .todo.done .todo-title { text-decoration: line-through; color: #64748b; }
+  .toggle-btn { background: #334155; font-size: 0.85rem; padding: 5px 10px; }
+  .catalog-box { margin-top: 12px; padding: 12px; border-radius: 8px; background: #0f172a; border: 1px solid #334155; }
+  .ok { margin: 0 0 10px; color: #4ade80; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 6px; }
+  .cat-item { background: #1e293b; border: 1px solid #475569; text-align: left; font-weight: 500; font-size: 0.85rem; }
+  code { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 0.88em; color: #93c5fd; }
+`
+
+route GET / =
+    <html>
+        <head>
+            <meta charset="utf-8"/>
+            <title>Quillo Lean Client Demo</title>
+            <style>{DEMO_CSS}</style>
+            <script>window.leanNet = () => performance.getEntriesByType('resource').filter((r) => r.name.includes('/_quillo/')).map((r) => Object.fromEntries([['path', new URL(r.name).pathname], ['bytes', r.encodedBodySize || r.transferSize || 0]]));</script>
+        </head>
+        <body>
+            <main>
+                <header>
+                    <h1>Quillo Lean Client Demo</h1>
+                    <p.lead>Showcasing Phase 1-4 runtime optimizations: W.slot, W.klist, compacted JS, and lazy ESM chunks.</p>
+                </header>
+                <SlotCounter/>
+                <TaskBoard/>
+                <CatalogHost/>
+                <NetLog/>
+            </main>
+        </body>
+    </html>
