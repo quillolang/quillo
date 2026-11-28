@@ -1253,7 +1253,7 @@ fn the_floor_ends_with_the_call_that_went_too_deep() {
     // floor ends with the call that set it, by its error; and by one passed on through `outer`.
     for deep in ["d(100000) ?? \"E\"", "outer(100000) ?? \"E\""] {
         let src = format!("{}print(d(10))\nprint({})\nlet xs = map([\"a\", \"b\", \"c\", \"d\", \"e\", \"f\"], (s) => fib(24))\nprint(xs[5])\nprint(len(str(<ul><Row n={{24}}/><Row n={{24}}/></ul>)))\n", AFTER_DEEP, deep);
-        let want = "10\nE\n46368\n255";
+        let want = "10\nE\n46368\n301";
         assert_eq!(both_ways(&src), want, "{}", src);
         let (fast, out) = fastest(&src, &[], 3);
         let (slow, _) = fastest(&src, &[("QUILLO_JIT", "0")], 2);

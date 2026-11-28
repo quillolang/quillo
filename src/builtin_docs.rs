@@ -197,6 +197,7 @@ pub const DOCS: &[(&str, &str, &str)] = &[
     ("db.one", "sql, params", "The first row as a map, or null, or an error value."),
     ("db.transaction", "options, f", "Runs `f` all or nothing; an error value rolls it back. `options` may be left out."),
     ("db.sql_name", "name", "A name quoted for this database: on a connection (`shop.sql_name(col)`), for that one, as MySQL reads \"x\" as text."),
+    ("db.own_setup", "url", "Sets up Quillo's own tables under a database role of its own, run once as that role."),
     ("db.error_kind", "e", "What failed: `unique`, `foreign_key`, `not_null`, `check`, `conflict`, `connection` or `read_only`, else null."),
     ("db.migrate", "dir", "Runs the `.sql` files of `dir` (`migrations` unless given) not yet run, in name order; gives their names."),
     ("db.tenants", "", "The names of the tenants that have a database; it needs a `{tenant}` target, not a function."),

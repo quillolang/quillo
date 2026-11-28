@@ -1289,10 +1289,10 @@ fn csp_hash(text: &[u8]) -> String {
 /// Whether the page's policy names the hash of each of its inline scripts, and of each of its
 /// `<style>` elements, and how many scripts there were.
 fn policy_lets_through(policy: &str, page: &[u8]) -> (bool, usize) {
-    let text = String::from_utf8_lossy(page);
+    let text = support::no_nonce(&String::from_utf8_lossy(page));
     let inline = |open: &str, close: &str| -> Vec<String> {
         let mut out = Vec::new();
-        let mut rest = &*text;
+        let mut rest = text.as_str();
         while let Some(i) = rest.find(open) {
             let after = &rest[i + open.len()..];
             let Some(end) = after.find(close) else { break };

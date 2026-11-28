@@ -6393,6 +6393,13 @@ const LIVE_MAX_WAIT = 8000;
 
 const Live = { seq: 0, server: "", subs: new Set(), ctrl: null, running: false, key: "", ws: null, st: null, sets: new Map() };
 
+// Listeners live inside `Live`'s tree-shaken unit so `shake()` includes them and `liveWake` whenever `Live` is used.
+if (typeof addEventListener === "function") {
+  addEventListener("online", () => liveWake(false));
+  addEventListener("focus", () => liveWake(true));
+  if (typeof docGet === "function") addEventListener("visibilitychange", () => { if (!docGet("hidden")) liveWake(true); });
+}
+
 // Wakes sleeping live reconnect waits when the network returns (`online`) or a tab regains focus/
 // visibility while failing (`focus`/`visibilitychange`), without cutting a healthy close delay
 // or an explicit `Retry-After` from the server (FEEDBACK67.md B.2; FEEDBACK91.md Q-1410).
@@ -6403,12 +6410,6 @@ function liveWake(onlyFailing) {
   if (st.carrier && !st.carrier.after && st.carrier.wake) st.carrier.wake();
   if (st.back) st.back();
   else if (st.fails > 0) st.revived = true;
-}
-
-if (typeof addEventListener === "function") {
-  addEventListener("online", () => liveWake(false));
-  addEventListener("focus", () => liveWake(true));
-  if (typeof docGet === "function") addEventListener("visibilitychange", () => { if (!docGet("hidden")) liveWake(true); });
 }
 
 // Also takes data-v="<seq>:<server>" from a server-rendered island, split.

@@ -141,7 +141,7 @@ route GET /plain = <html><body>{t("hi", { name: "</script>" })}</body></html>
     it.load_source(r#"translations({ en: { x: "</script><script>alert(1)</script>" } })
 component C() { <p>{t("x")}</p> }
 route GET / = <html><body><C/></body></html>"#, "app.qwe").unwrap();
-    let page = get(&mut it, "/", &[]).text();
+    let page = support::no_nonce(&get(&mut it, "/", &[]).text());
     // Each script ends where it was made to: the text closes none.
     assert_eq!(page.matches("</script>").count(), page.matches("<script>").count(), "{}", page);
 }
