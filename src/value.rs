@@ -1184,11 +1184,14 @@ impl Value {
         }
         // Scalars are written where they stand, and the size is looked at once a container
         // ends: what makes JSON grow past its limit is containers, shared or nested.
-        fn go<const ASK: bool>(v: &Value, out: &mut Vec<u8>, max: usize, left: usize, depth: usize) -> Result<(), String> {
-            let inner = |x: &Value, out: &mut Vec<u8>| -> Result<(), String> {
+        fn go<const ASK: bool>(v: &Value, out: &mut Vec<u8>, max: usize, left: usize, depth: usize, budget: &mut crate::httpd::ComputeBudget) -> Result<(), String> {
+            if !budget.tick() {
+                return Err(crate::httpd::over_compute());
+            }
+            let mut inner = |x: &Value, out: &mut Vec<u8>| -> Result<(), String> {
                 match x {
                     // Past 256 levels on a new piece of stack when this one runs low (`deeper`).
-                    Value::List(_) | Value::Map(_) | Value::Err(..) => deeper(depth + 1 - left, || go::<ASK>(x, out, max, left - 1, depth)),
+                    Value::List(_) | Value::Map(_) | Value::Err(..) => deeper(depth + 1 - left, || go::<ASK>(x, out, max, left - 1, depth, budget)),
                     Value::Func(_) | Value::Builtin(..) => Err(FUNCTION_IN_JSON.into()),
                     scalar if ASK => {
                         scalar_held(scalar, out)?;
@@ -1268,7 +1271,8 @@ impl Value {
         // A function has no JSON: it was written as its text, `"<fn f>"`, where JavaScript leaves
         // it out and Python refuses it; said, and where it is (FEEDBACK55.md, Q-792; branch
         // feedback55).
-        let r = go::<ASK>(self, out, max, depth + 1, depth);
+        let mut budget = crate::httpd::ComputeBudget::start();
+        let r = go::<ASK>(self, out, max, depth + 1, depth, &mut budget);
         *over = ASK && matches!(&r, Err(e) if e == OVER_IN_JSON);
         r.map_err(|e| match e.strip_prefix(FUNCTION_IN_JSON) {
             Some("") => "a function cannot be written as JSON".into(),

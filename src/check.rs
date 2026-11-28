@@ -2758,19 +2758,35 @@ impl Sig {
     }
 
     fn of_def(def: &Arc<FnDef>) -> Sig {
+        Self::of_def_in(def, false)
+    }
+
+    /// Signature of a `service` `server fn`, whose parameters arrive over HTTP and construct
+    /// records via `req_make`, so defaulted record fields may be omitted on input maps while the
+    /// return type keeps its constructed shape.
+    fn of_service_def(def: &Arc<FnDef>) -> Sig {
+        Self::of_def_in(def, true)
+    }
+
+    fn of_def_in(def: &Arc<FnDef>, service_input: bool) -> Sig {
+        let was = if service_input { Some(RECORD_INPUT.with(|c| c.replace(true))) } else { None };
+        let params = def
+            .params
+            .iter()
+            .map(|p| PSig {
+                name: p.name.to_string(),
+                ty: p.ty.as_ref().map_or(ANY, ty_bits),
+                full: p.ty.as_ref().map_or(T::ANY, ty_t),
+                optional: p.default.is_some(),
+                annotated: p.ty.is_some(),
+            })
+            .collect();
+        if let Some(was) = was {
+            RECORD_INPUT.with(|c| c.set(was));
+        }
         Sig {
             name: def.name.clone(),
-            params: def
-                .params
-                .iter()
-                .map(|p| PSig {
-                    name: p.name.to_string(),
-                    ty: p.ty.as_ref().map_or(ANY, ty_bits),
-                    full: p.ty.as_ref().map_or(T::ANY, ty_t),
-                    optional: p.default.is_some(),
-                    annotated: p.ty.is_some(),
-                })
-                .collect(),
+            params,
             variadic: false,
             ret: def.ret.as_ref().map(ty_t),
             err: def.err.as_ref().map(ty_bits),
@@ -4944,7 +4960,7 @@ impl Checker {
             let sigs = defs
                 .iter()
                 .map(|d| {
-                    let mut sig = Sig::of_def(d);
+                    let mut sig = Sig::of_service_def(d);
                     sig.def = None;
                     sig.server = false;
                     sig.effects = Some(crate::ast::effect_bit("http"));

@@ -16,6 +16,11 @@ fn quillo(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (Option<i32>, Stri
     quillo_without(dir, args, env, &[])
 }
 
+fn confirm(dir: &Path, file: &str) {
+    let (code, out) = quillo(dir, &["confirm", "--yes", file], &[]);
+    assert_eq!(code, Some(0), "{}", out);
+}
+
 /// `quillo`, with the variables `unset` not in its environment.
 fn quillo_without(dir: &Path, args: &[&str], env: &[(&str, &str)], unset: &[&str]) -> (Option<i32>, String) {
     let log = dir.join("run.log");
@@ -337,6 +342,7 @@ fn allow_path_and_env_set_under_a_policy() {
     std::fs::create_dir_all(&app).unwrap();
     let main = format!("print(read_file(\"{}\") ?? \"refused\")\nprint(env(\"F82_APP_ENV\") ?? \"none\")\n", shared.join("x.txt").display());
     std::fs::write(app.join("main.qwe"), main).unwrap();
+    confirm(&d, "app/main.qwe");
     std::fs::write(app.join(".env"), "F82_APP_ENV=from-dotenv\n").unwrap();
     std::fs::write(d.join("p.toml"), format!("[fs]\npaths = [\"{}\"]\n", shared.display())).unwrap();
     std::fs::write(d.join("host.toml"), "[env]\nset = { F82_APP_ENV = \"production\" }\n").unwrap();
@@ -436,6 +442,7 @@ fn require_path_and_the_variable() {
 #[test]
 fn quillo_policy_path_is_read_by_run_and_check() {
     let d = provider("f82-path-var", "[limits]\nworkers = 3\n", "print(\"ran\")\n");
+    confirm(&d, "main.qwe");
     std::fs::write(d.join("q.toml"), "[limits]\nmax_body = \"1KB\"\n").unwrap();
     let both = std::env::join_paths([d.join("p.toml"), d.join("q.toml")]).unwrap().into_string().unwrap();
     let (code, out) = quillo(&d, &["run", "main.qwe"], &[(policy::PATH_VAR, &both)]);
@@ -750,6 +757,7 @@ fn a_dotenv_never_names_the_policy() {
 #[test]
 fn under_a_hosts_policy_a_dotenv_steers_nothing() {
     let d = provider("f82-dotenv-steer", "[limits]\nworkers = 4\n", "print(\"ran\")\n");
+    confirm(&d, "main.qwe");
     let host = d.join("p.toml").display().to_string();
     for name in ["LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "CARGO", "RUSTC_WRAPPER", "RUSTFLAGS", "QUILLO_NATIVE_CACHE", "XDG_CACHE_HOME", "QUILLO_STOP_WITH_APP", "QUILLO_HOST_X", "RUSTUP_DIST_SERVER", "QUILLO_ENV_FROM_FILE"] {
         std::fs::write(d.join(".env"), format!("{}=/tmp/x\n", name)).unwrap();

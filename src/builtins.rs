@@ -840,12 +840,21 @@ fn max(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
 
 fn sort_values(mut items: Vec<(Value, Value)>, name: &str, line: u32) -> R {
     let mut bad = None;
+    let mut budget = crate::httpd::ComputeBudget::start();
+    let mut over = false;
     items.sort_by(|a, b| {
+        if over || !budget.tick() {
+            over = true;
+            return std::cmp::Ordering::Equal;
+        }
         compare(&a.0, &b.0).unwrap_or_else(|| {
             bad = Some((a.0.type_name(), b.0.type_name(), crate::interp::dec_hint(&a.0, &b.0)));
             std::cmp::Ordering::Equal
         })
     });
+    if over {
+        return fail(line, crate::httpd::over_compute());
+    }
     if let Some((x, y, hint)) = bad {
         return fail(line, format!("`{}` cannot compare {} with {}{}", name, x, y, hint));
     }
@@ -2922,6 +2931,7 @@ fn json_stringify(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
     match v.json_into_held(&mut out, JSON_MOST, JSON_DEEPEST) {
         Ok(()) => {}
         Err(None) => return Err(crate::httpd::OverMemory.at(line)),
+        Err(Some(why)) if crate::httpd::is_compute_stop(&why) => return fail(line, why),
         Err(Some(why)) => return Ok(Value::err(Value::str(format!("json.stringify: {}", why)))),
     }
     // SAFETY: only JSON text, which is UTF-8, was written.
@@ -2930,17 +2940,18 @@ fn json_stringify(_: &mut Interp, args: Vec<Value>, line: u32) -> R {
         // Indented, it is longer, and its indent grows with its depth: written through a `Held`
         // text, which stops at `--max-memory` as it grows (FEEDBACK71.md, Q-977, found in review:
         // a list nested 9,000 deep made 458 MB before it was compared; branch security).
-        return Ok(Value::str(indented(&text).map_err(|o| o.at(line))?));
+        return indented(&text, line).map(Value::str);
     }
     Ok(Value::str(text))
 }
 
 /// Compact JSON text indented by two spaces, as serde_json's pretty writer has it: `[]` and
 /// `{}` stay as they are, and a string's own brackets and commas are text.
-fn indented(json: &str) -> Result<String, crate::httpd::OverMemory> {
+fn indented(json: &str, line: u32) -> Result<String, Ctrl> {
     let b = json.as_bytes();
     let mut out = Held::with_capacity(json.len() * 2);
     let mut level = 0usize;
+    let mut budget = crate::httpd::ComputeBudget::start();
     let newline = |out: &mut Held, level: usize| {
         out.push('\n');
         for _ in 0..level {
@@ -2952,6 +2963,9 @@ fn indented(json: &str) -> Result<String, crate::httpd::OverMemory> {
     };
     let mut i = 0;
     while i < b.len() {
+        if !budget.tick() {
+            return fail(line, crate::httpd::over_compute());
+        }
         let c = b[i];
         match c {
             b'"' => {
@@ -2999,7 +3013,7 @@ fn indented(json: &str) -> Result<String, crate::httpd::OverMemory> {
         }
         i += 1;
     }
-    out.into_text()
+    out.into_text().map_err(|o| o.at(line))
 }
 
 // ---- files -------------------------------------------------------------
@@ -5682,6 +5696,9 @@ fn page_head(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
         };
         let text = if i >= 2 { whole_address(it, &text, "page_head", line)? } else { text };
         said.push((i, text));
+    }
+    if !site_wide(it, || "page_head".into()) {
+        return Ok(Value::Nil);
     }
     let (depth, comps) = (it.head_depth, it.islands_open());
     let head = it.page_head.get_or_insert_with(Default::default);

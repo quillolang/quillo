@@ -6386,11 +6386,30 @@ async function rpc(name, args, idem) {
 // server decides; asked with another server's number, it answers that all
 // the topics changed, and the page loads them again once.
 
+// Most a live socket, plain request, or failed live loader waits between tries after failures
+// (FEEDBACK91.md, Q-1410): 8 s spread (4–12 s) instead of 30 s keeps post-outage catch-up under
+// ~2–6 s when both socket and carrier retry independently, while still backing off smoothly.
+const LIVE_MAX_WAIT = 8000;
+
 const Live = { seq: 0, server: "", subs: new Set(), ctrl: null, running: false, key: "", ws: null, st: null, sets: new Map() };
 
-// Back online, as the browser says: the socket is opened again at once, where the loop waited out
-// its backoff, up to half a minute (FEEDBACK67.md, B.2; branch pwa).
-if (typeof addEventListener === "function") addEventListener("online", () => { if (Live.st && Live.st.back) Live.st.back(); });
+// Wakes sleeping live reconnect waits when the network returns (`online`) or a tab regains focus/
+// visibility while failing (`focus`/`visibilitychange`), without cutting a healthy close delay
+// or an explicit `Retry-After` from the server (FEEDBACK67.md B.2; FEEDBACK91.md Q-1410).
+function liveWake(onlyFailing) {
+  const st = Live.st;
+  if (!st) return;
+  if (onlyFailing && st.fails <= 0) return;
+  if (st.carrier && !st.carrier.after && st.carrier.wake) st.carrier.wake();
+  if (st.back) st.back();
+  else if (st.fails > 0) st.revived = true;
+}
+
+if (typeof addEventListener === "function") {
+  addEventListener("online", () => liveWake(false));
+  addEventListener("focus", () => liveWake(true));
+  if (typeof docGet === "function") addEventListener("visibilitychange", () => { if (!docGet("hidden")) liveWake(true); });
+}
 
 // Also takes data-v="<seq>:<server>" from a server-rendered island, split.
 function liveSeen(seq, server = "") {
@@ -6473,7 +6492,7 @@ function liveTell(key) {
 
 async function liveLoop() {
   // Tries in a row that came to nothing, and whether the page was told (see `liveFailed`).
-  const st = (Live.st = { fails: 0, said: false, back: null, revived: false });
+  const st = (Live.st = { fails: 0, said: false, back: null, revived: false, carrier: null });
   // The plain requests carrying the changes while there is no socket (`liveCarrier`), and the sockets
   // in a row that did not open meanwhile.
   let carrier = null, socks = 0;
@@ -6483,7 +6502,7 @@ async function liveLoop() {
     // body, where the server refused the address and the page never heard of a change
     // (FEEDBACK55.md, Q-801; branch feedback55).
     Live.key = liveKey(topics);
-    if (carrier && carrier.key !== Live.key) { carrier.stop(); carrier = null; }
+    if (carrier && carrier.key !== Live.key) { carrier.stop(); carrier = st.carrier = null; }
     if (!topics.length) { Live.running = false; return; }
     const ctrl = (Live.ctrl = new AbortController());
     const t = encodeURIComponent(Live.key), later = t.length > LIVE_IN_URL, key = Live.key;
@@ -6492,7 +6511,7 @@ async function liveLoop() {
     // the last told it.
     const url = () => BASE + "/_quillo/live?since=" + Live.seq + "&s=" + Live.server + "&tk=1" + (later ? "&tm=1" : "&t=" + t);
     const plain = (signal) => wireFetch(url(), later ? { method: "POST", body: key, signal, cache: "no-store" } : { signal, cache: "no-store" });
-    const carry = { start: () => { if (!carrier || carrier.stopped) carrier = liveCarrier(key, plain, st); }, stop: () => { if (carrier) carrier.stop(); carrier = null; } };
+    const carry = { start: () => { if (!carrier || carrier.stopped) carrier = st.carrier = liveCarrier(key, plain, st); }, stop: () => { if (carrier) carrier.stop(); carrier = st.carrier = null; } };
     let wait;
     try {
       if (await liveSocket(url(), ctrl.signal, later ? key : null, carry)) {
@@ -6505,7 +6524,7 @@ async function liveLoop() {
       } else {
         if (ctrl.signal.aborted) continue;
         // It did not open. The plain requests carry the changes, and go on while the next socket
-        // is made, later each time, up to half a minute: they wait by their own rules, a refusal's
+        // is made, later each time, up to LIVE_MAX_WAIT: they wait by their own rules, a refusal's
         // Retry-After and longer after each failure, and say once that the page is behind. A socket
         // that failed after 3 s or more was made again at once, and an outage whose requests failed
         // slowly (a proxy's 504 after its connect timeout) was asked again every 5 s for good,
@@ -6513,11 +6532,11 @@ async function liveLoop() {
         // changes with it (found in review of FEEDBACK61.md, Q-900; branch feedback61).
         carry.start();
         socks++;
-        wait = Math.min(1000 * 2 ** socks, 30000);
+        wait = Math.min(1000 * 2 ** socks, LIVE_MAX_WAIT);
       }
     } catch (e) {
       liveFailed(st, false);
-      wait = Math.min(1000 * 2 ** st.fails, 30000);
+      wait = Math.min(1000 * 2 ** st.fails, LIVE_MAX_WAIT);
     }
     // A plain request that is answered again after failures ends the wait: the server is back.
     if (await liveWait(Math.max(carrier ? carrier.after : 0, wait * (0.5 + Math.random())), ctrl.signal, st)) socks = 0;
@@ -6558,8 +6577,10 @@ function liveWait(ms, signal, st) {
 // page), is said at once and not asked again: what carries the changes then is the next socket. They end when a socket opens, when
 // the topics change, or with `stop` (FEEDBACK61.md, Q-900; branch feedback61).
 function liveCarrier(key, plain, st) {
-  const c = { key, stopped: false, after: 0, ctrl: null };
-  c.stop = () => { c.stopped = true; if (c.ctrl) c.ctrl.abort(); };
+  const waitSt = { back: null, revived: false };
+  const wake = () => { if (waitSt.back) waitSt.back(); };
+  const c = { key, stopped: false, after: 0, ctrl: null, wake, stop: null };
+  c.stop = () => { c.stopped = true; if (c.ctrl) c.ctrl.abort(); wake(); };
   (async () => {
     for (let fails = 0; !c.stopped; ) {
       c.ctrl = new AbortController();
@@ -6592,7 +6613,8 @@ function liveCarrier(key, plain, st) {
       fails++;
       liveFailed(st, c.after > 0 || refused);
       if (refused) { c.stopped = true; return; }
-      await liveWait(Math.max(c.after, Math.min(1000 * 2 ** fails, 30000) * (0.5 + Math.random())), null);
+      await liveWait(Math.max(c.after, Math.min(1000 * 2 ** fails, LIVE_MAX_WAIT) * (0.5 + Math.random())), null, waitSt);
+      if (c.stopped) return;
     }
   })();
   return c;
@@ -6715,7 +6737,7 @@ async function liveRefresh(sub, newArgs) {
         return;
       }
       sub.fails++;
-      const wait = Math.max(Math.min(500 * 2 ** sub.fails, 30000) * (0.5 + Math.random()), Math.min(retryAfter(res.after), 300000));
+      const wait = Math.max(Math.min(500 * 2 ** sub.fails, LIVE_MAX_WAIT) * (0.5 + Math.random()), Math.min(retryAfter(res.after), 300000));
       sub.retry = setTimeout(() => { if (!sub.inst.dead) liveRefresh(sub, newArgs); }, wait);
       return;
     }

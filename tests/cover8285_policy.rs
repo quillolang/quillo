@@ -63,6 +63,11 @@ fn quillo(dir: &Path, args: &[&str], vars: &[(&str, &str)]) -> (Option<i32>, Str
     (code, read(&log))
 }
 
+fn confirm(dir: &Path, file: &str) {
+    let (code, out) = quillo(dir, &["confirm", "--yes", file], &[]);
+    assert_eq!(code, Some(0), "{}", out);
+}
+
 /// The command, with none of the variables of `cargo test` or of a host's layer but `vars`.
 fn command(dir: &Path, args: &[&str], vars: &[(&str, &str)]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"));
@@ -352,6 +357,7 @@ fn quillo_policy_takes_the_option_with_its_file_after_equals() {
 fn the_ceilings_and_the_log_a_provider_sets_are_held() {
     let d = Tmp::new("ceilings");
     write(&d, "main.qwe", HOME);
+    confirm(&d, "main.qwe");
     write(&d, "host/instances.toml", "[run]\ninstances = 2\nlog = \"text\"\n");
     let host = d.join("host/instances.toml").display().to_string();
     let mut g = start(&d, &["run", "main.qwe", "--port", "0", "--instances", "3"], &[(policy::PATH_VAR, &host)], "i.log");
@@ -523,6 +529,7 @@ fn the_sockets_mode_is_held_to_the_policys() {
 fn a_proxy_inside_the_policys_is_taken_and_believed() {
     let d = Tmp::new("proxy");
     write(&d, "main.qwe", HOME);
+    confirm(&d, "main.qwe");
     write(&d, "host.toml", "[run]\ntrust_proxy = [\"127.0.0.0/8\"]\n");
     let host = d.join("host.toml").display().to_string();
     for (given, seen) in [("127.0.0.1", "203.0.113.9"), ("127.0.0.2", "127.0.0.1"), ("::ffff:127.0.0.1", "203.0.113.9"), ("127.0.0.0/8", "203.0.113.9")] {
@@ -546,6 +553,7 @@ fn a_proxy_inside_the_policys_is_taken_and_believed() {
 fn a_service_its_app_started_checks_again_under_check_true() {
     let d = Tmp::new("checked");
     write(&d, "main.qwe", "route GET / = \"home\"\nroute GET /x = nope()\n");
+    confirm(&d, "main.qwe");
     write(&d, "host.toml", "[run]\ncheck = true\n");
     let host = d.join("host.toml").display().to_string();
     let mut g = start(&d, &["run", "main.qwe", "--port", "0", "--checked"], &[(policy::PATH_VAR, &host), ("QUILLO_STOP_WITH_APP", "1")], "a.log");
@@ -897,6 +905,7 @@ fn a_marker_in_the_environment_drops_no_layer_of_the_providers() {
     let d = Tmp::new("forged-marker");
     write(&d, "host/p.toml", "[effects]\nallow = [\"db\"]\n");
     write(&d, "main.qwe", "print(env(\"APP_X\") ?? \"none\")\n");
+    confirm(&d, "main.qwe");
     let host = d.join("host/p.toml").display().to_string();
     let refused = format!("main.qwe:1: error: `env` needs the env effect, which {} does not allow", host);
     for marker in ["QUILLO_POLICY_PATH", "quillo_policy_path", "Quillo_Policy_Path", "APP_X,QUILLO_POLICY_PATH", ",QUILLO_POLICY_PATH,", "QUILLO_POLICY_PATH,QUILLO_POLICY", ""] {
@@ -960,6 +969,7 @@ fn a_name_the_hosts_env_set_forces_is_never_a_dotenvs() {
     write(&d, "host/p.toml", "[env]\nset = { APP_ENV = \"production\" }\n");
     write(&d, ".env", "APP_ENV=dev\nOTHER=x\napp_env=lower\n");
     write(&d, "p.qwe", "print(env(\"APP_ENV\") ?? \"none\")\nprint(env(\"OTHER\") ?? \"none\")\nprint(env(\"app_env\") ?? \"none\")\n");
+    confirm(&d, "p.qwe");
     let host = d.join("host/p.toml").display().to_string();
     let want = if cfg!(windows) { "production\nx\nproduction\n" } else { "production\nx\nlower\n" };
     for marker in ["", "APP_ENV", "APP_ENV,OTHER", "app_env,APP_ENV"] {
@@ -976,6 +986,7 @@ fn a_name_the_hosts_env_set_forces_is_never_a_dotenvs() {
     write(&d, "svc/.env", "APP_ENV=svcdev\nOTHER=svc\nREAL_X=svcfile\n");
     write(&d, "svc/s.qwe", "server fn e() -> str = env(\"APP_ENV\") ?? \"none\"\nserver fn o() -> str = env(\"OTHER\") ?? \"none\"\nserver fn r() -> str = env(\"REAL_X\") ?? \"none\"\n");
     write(&d, "main.qwe", "service s = \"svc/s.qwe\"\nroute GET /e = s.e()\nroute GET /o = s.o()\nroute GET /r = s.r()\n");
+    confirm(&d, "main.qwe");
     let vars = [(policy::PATH_VAR, host.as_str()), ("QUILLO_ENV_FROM_FILE", "APP_ENV,REAL_X"), ("REAL_X", "real"), ("QUILLO_SERVICE_SECRET", "another secret for the tests, 32 bytes or more")];
     for split in [false, true] {
         let mut args = vec!["run", "main.qwe", "--port", "0"];

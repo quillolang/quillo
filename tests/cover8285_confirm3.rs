@@ -1299,6 +1299,7 @@ fn a_library_pinned_by_its_hash_that_loads_another_by_its_install_name_does_not_
     let d = dir("fix8-libpin");
     write(&d, "main.qwe", "use \"hi.qwer\"\nprint(hi())\n");
     write(&d, "hi.qwer", &plugin("pub fn hi() -> String { \"hi\".into() }"));
+    assert_eq!(quillo(&d, &["confirm", "--yes", "main.qwe"]).0, Some(0));
     write(&d, "rt/e.c", "int evil_f(void) { return 31337; }\n");
     write(&d, "rt/x.c", "extern int evil_f(void);\nint quillo_native_abi(void) { return evil_f(); }\n");
     let rt = d.join("rt/libE.dylib");

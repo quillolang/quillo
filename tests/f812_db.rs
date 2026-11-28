@@ -1541,10 +1541,17 @@ fn q1060_r5_requests_never_wait_for_the_check() {
         return;
     };
     let url = pg.database("f812_r5_hang");
-    let mut locker = Command::new(pg.bin.join("psql")).args([url.as_str(), "-X", "-q"]).stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+    struct KillLocker(std::process::Child);
+    impl Drop for KillLocker {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut locker = KillLocker(Command::new(pg.bin.join("psql")).args([url.as_str(), "-X", "-q"]).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
     {
         use std::io::Write;
-        let stdin = locker.stdin.as_mut().unwrap();
+        let mut stdin = locker.0.stdin.take().unwrap();
         writeln!(stdin, "begin; lock table pg_catalog.pg_aggregate in access exclusive mode; select pg_sleep(60);").unwrap();
     }
     // The lock is held before the program starts (asked with no aggregate, which would wait).
@@ -1555,6 +1562,7 @@ fn q1060_r5_requests_never_wait_for_the_check() {
             held = true;
             break;
         }
+        std::thread::sleep(Duration::from_millis(25));
     }
     assert!(held);
     let (s, _d) = served("q1060-r5-hang", &url, "");
@@ -1563,8 +1571,7 @@ fn q1060_r5_requests_never_wait_for_the_check() {
         assert_eq!(get(&s, "GET", "/ping").body, "1");
         assert!(at.elapsed() < Duration::from_secs(20), "waited {:?}", at.elapsed());
     }
-    let _ = locker.kill();
-    let _ = locker.wait();
+    drop(locker);
 }
 
 /// Another process makes the database's code use a session's state while the program serves: its

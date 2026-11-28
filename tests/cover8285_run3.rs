@@ -1334,6 +1334,8 @@ fn a_library_pinned_by_its_hash_is_opened_as_the_bytes_whose_hash_is_pinned() {
     }
     std::fs::write(app.join("hi.qwer"), "//! version: 1.0.0\n//! effects: none\npub fn hi() -> String { \"hi from A\".into() }\n").unwrap();
     std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let (code, out) = quillo_at(&app, &["confirm", "--yes", "main.qwe"], &[], &d.0.join("c.log"), 60);
+    assert_eq!(code, Some(0), "{}", out);
     let (cache, t) = (r10_cache("libswap"), tmp.display().to_string());
     let (code, out) = quillo_at(&app, &["build", "main.qwe"], &[("QUILLO_NATIVE_CACHE", &cache)], &d.0.join("build.log"), 600);
     assert_eq!(code, Some(0), "{}", out);
@@ -1775,6 +1777,8 @@ fn a_held_plugin_is_loaded_once_a_process_by_each_instance_and_reload() {
     let (t, record, cache) = (tmp.display().to_string(), d.0.join("record").display().to_string(), r10_cache("once"));
     let (code, out) = quillo_at(&confirmed, &["confirm", "--yes"], &[("QUILLO_BUILT_RECORD_DIR", &record)], &d.0.join("c.log"), 120);
     assert_eq!(code, Some(0), "{}", out);
+    let (code, out) = quillo_at(&pinned, &["confirm", "--yes"], &[], &d.0.join("cp.log"), 120);
+    assert_eq!(code, Some(0), "{}", out);
     let (code, out) = quillo_at(&pinned, &["build", "main.qwe"], &[("QUILLO_NATIVE_CACHE", &cache)], &d.0.join("b.log"), 600);
     assert_eq!(code, Some(0), "{}", out);
     let lib = quillo::native::library_path(&pinned.join("cnt.qwer")).unwrap();
@@ -1827,6 +1831,8 @@ fn a_library_pinned_by_its_hash_loads_where_the_temporary_folder_is_the_programs
     }
     std::fs::write(app.join("hi.qwer"), "//! version: 1.0.0\n//! effects: none\npub fn hi() -> String { \"hi from the pinned library\".into() }\n").unwrap();
     std::fs::write(app.join("main.qwe"), "use \"hi.qwer\"\nprint(hi())\n").unwrap();
+    let (code, out) = quillo_at(&app, &["confirm", "--yes", "main.qwe"], &[], &d.0.join("c.log"), 60);
+    assert_eq!(code, Some(0), "{}", out);
     let cache = r10_cache("copydir");
     let (code, out) = quillo_at(&app, &["build", "main.qwe"], &[("QUILLO_NATIVE_CACHE", &cache)], &d.0.join("b.log"), 600);
     assert_eq!(code, Some(0), "{}", out);
@@ -1918,14 +1924,20 @@ fn marker_crate(d: &Path) -> PathBuf {
 #[test]
 fn a_plugin_pinned_by_its_library_is_never_built() {
     use sha2::Digest;
+    use std::os::unix::fs::PermissionsExt;
     let d = Dir(support::temp_dir("cov8285r3-never").canonicalize().unwrap());
-    let (app, tmp) = (d.0.join("app"), d.0.join("tmp"));
-    for f in [&app, &tmp] {
+    let (app, tmp, bin) = (d.0.join("app"), d.0.join("tmp"), d.0.join("bin"));
+    for f in [&app, &tmp, &bin] {
         std::fs::create_dir_all(f).unwrap();
     }
-    let dep = marker_crate(&d.0);
-    std::fs::write(app.join("qr.qwer"), format!("//! version: 1.0.0\n//! effects: none\n//! [dependencies]\n//! evil2 = {{ path = {:?} }}\npub fn hi() -> i64 {{ evil2::x() }}\n", dep.display().to_string())).unwrap();
+    let cargo = bin.join("cargo");
+    std::fs::write(&cargo, format!("#!/bin/sh\n: > {:?}\nexit 1\n", d.0.join("MARKER").display().to_string())).unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(app.join("qr.qwer"), "//! version: 1.0.0\n//! effects: none\npub fn hi() -> i64 { 4242 }\n").unwrap();
     std::fs::write(app.join("main.qwe"), "use \"qr.qwer\"\nprint(hi())\n").unwrap();
+    let (code, out) = quillo_at(&app, &["confirm", "--yes", "main.qwe"], &[], &d.0.join("c.log"), 60);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(!d.0.join("MARKER").exists(), "confirm ran cargo: {}", out);
     let lib = quillo::native::library_path(&app.join("qr.qwer")).unwrap();
     std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
     let fake = b"not the library built from qr.qwer";
@@ -1934,11 +1946,13 @@ fn a_plugin_pinned_by_its_library_is_never_built() {
     let hash: String = sha2::Sha256::digest(fake).iter().map(|b| format!("{:02x}", b)).collect();
     let host = d.0.join("host.toml");
     std::fs::write(&host, format!("[plugins]\nallow = [\"qr@sha256:{}\"]\n", hash)).unwrap();
+    let path = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{}:{}", bin.display(), path);
     let (h, t, cache) = (host.display().to_string(), tmp.display().to_string(), r10_cache("never"));
-    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check"], &[("QUILLO_POLICY_PATH", &h), ("TMPDIR", &t), ("QUILLO_NATIVE_CACHE", &cache)], &d.0.join("run.log"), 600);
+    let (code, out) = quillo_at(&app, &["run", "main.qwe", "--no-check"], &[("QUILLO_POLICY_PATH", &h), ("TMPDIR", &t), ("QUILLO_NATIVE_CACHE", &cache), ("PATH", &path)], &d.0.join("run.log"), 600);
     assert_eq!(code, Some(1), "{}", out);
     assert!(out.contains("is not a library this system loads: it does not load") && !out.contains("building"), "{}", out);
-    assert!(!d.0.join("MARKER").exists(), "the repository's dependency was built: {}", out);
+    assert!(!d.0.join("MARKER").exists(), "cargo ran during start: {}", out);
 }
 
 /// A plugin that starts with a byte order mark, held to its source's SHA-256, builds no dependency

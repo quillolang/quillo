@@ -1112,7 +1112,8 @@ route GET / = <html><head><script src="/assets/chart.js"></script></head>
 ## Single-page apps
 
 `url()` gives `{ path, query, hash }`: of the request on the server, and of the address
-bar in the browser, where what reads it follows it when it changes. A browser never
+bar in the browser, where what reads it follows it when it changes. (`hash` has no leading `#`,
+so `#b` gives `"b"`.) A browser never
 sends the hash, so on the server it is `""`, and a component that shows something by
 the hash is made again in the browser. A query key given twice keeps the last. Once a
 component has called it, clicks on same-site links inside components change the page
@@ -1418,7 +1419,7 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   (FEEDBACK61.md, Q-899):
   - for want of a connection, or with a 408, a 429 or any 5xx (the program's own `reply
     500 {...}`, a proxy's 502, 503 or 504), it is tried again after a second, then two,
-    doubling up to 30 s and spread out, and never before the server's `Retry-After` (up to
+    doubling up to 8 s and spread out (4 to 12 s), and never before the server's `Retry-After` (up to
     5 minutes), until one comes back; a change heard meanwhile is not lost. A newer load,
     or the component leaving the page, ends the tries. They leave `waiting()` false, so a
     page written `waiting(r) ? spinner : list` keeps its list through a server's restart;
@@ -1507,11 +1508,12 @@ grows on each. A note added from anywhere else (another tab, another visitor, a
   URL as plain requests, each answered at the first change or after 25 s; when the socket
   opens it takes over, no change missed or shown twice. Where no socket can be had, the
   plain requests carry the changes and a socket is tried again later each time, after 1
-  to 3 s, doubling up to half a minute. A connection
+  to 3 s, doubling up to 8 s (4 to 12 s spread). A connection
   that drops is opened again after a second or so, spread out, and at once when the browser
-  says it is back online (its `online` event), without waiting out its backoff; after a restart pages
+  says it is back online (`online`), or regains focus or visibility (`focus`, `visibilitychange`)
+  while disconnected, without waiting out its backoff; after a restart pages
   ask for their data over a second, so that they do not all come at once; when the
-  server cannot be reached, the page waits longer each time, up to half a minute, and
+  server cannot be reached, the page waits longer each time, up to 8 s (4 to 12 s spread), and
   never before a `Retry-After` it was given. A page that falls behind says so once in the
   console (`live updates are not reaching this page`): at the third failure in a row, or
   at once when it is told to wait or refused (a 4xx other than 408 and 429, or an answer

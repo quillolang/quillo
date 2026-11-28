@@ -510,6 +510,7 @@ pub const SITE_CALLS: &[(&str, &str, bool, &str)] = &[
     ("site_headers", "site_headers", true, "site"),
     ("tenant_from", "tenant_from", false, "site"),
     ("moves_in_place", "moves_in_place", false, "site"),
+    ("page_head", "page_head", false, "site"),
     ("accept_calls", "accept_calls", false, "site"),
     ("translations", "translations", false, "site"),
     ("locale_from", "locale_from", false, "site"),

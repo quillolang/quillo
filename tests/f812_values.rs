@@ -518,3 +518,24 @@ fn a_constructor_checks_to_the_end_and_takes_its_own_records_at_once() {
         out
     );
 }
+
+// Q-606 leftover: a single `json.stringify` call over shared exponential parts respects
+// `--max-compute` without stalling the request past the budget.
+#[test]
+fn long_json_stringify_stops_within_max_compute() {
+    let src = r#"route GET /exp {
+    let xs = [1]
+    for i in range(0, 24) { xs = [xs, xs] }
+    str(len(json.stringify(xs)))
+}
+route GET /ping = "pong"
+"#;
+    let d = dir("compute-json", src);
+    let s = support::serve_with(&d.join("main.qwe"), &["--max-compute", "150ms"]);
+    let started = std::time::Instant::now();
+    let r = support::send(s.port, "GET", "/exp", &[], "");
+    let took = started.elapsed();
+    assert_eq!(r.status, 500, "{}", r.body);
+    assert!(took < std::time::Duration::from_secs(3), "took {:?}", took);
+    assert_eq!(support::send(s.port, "GET", "/ping", &[], "").body, "pong");
+}

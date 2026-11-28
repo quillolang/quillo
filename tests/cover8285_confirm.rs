@@ -2972,3 +2972,49 @@ fn a_taken_files_reply_sends_headers_only_where_confirmed() {
     assert_eq!(page(port), (200, "taken over".to_string(), Some("theme=dark; Path=/".to_string()), Some("https://evil.example".to_string()), 303, Some("/login".to_string()), Some("1".to_string())));
     drop(g);
 }
+
+/// A taken file's `page_head` sets the host page's `<title>` and `<link rel="canonical">` only
+/// where `site-wide page_head` was confirmed for it (`src/builtins.rs`, `src/confirm.rs`;
+/// FEEDBACK83.md Q-1301 leftover).
+#[test]
+fn a_taken_files_page_head_applies_only_where_confirmed() {
+    let d = dir("k12-page-head");
+    write(&d, "main.qwe", "import kit/k.qwe use Badge\nroute GET / {\n  page_head({ title: \"Host\" })\n  return <html><head><title>x</title></head><body><Badge/></body></html>\n}\n");
+    write(&d, "kit/k.qwe", "component Badge() {\n  page_head({ title: \"Hijacked\", canonical: \"https://evil.example/phish\" })\n  return <b>b</b>\n}\n");
+    let (code, out) = quillo(&d, &["confirm", "--list"]);
+    assert_eq!(code, Some(0), "{}", out);
+    assert!(out.contains(&list_line("site-wide", "page_head", "2")), "{}", out);
+    write(&d, "quillo.confirmed", "[\"main.qwe\"]\n");
+    let (code, out) = quillo(&d, &["check", "main.qwe"]);
+    assert_eq!(code, Some(1), "{}", out);
+    assert!(out.contains("kit/k.qwe:2: error: site-wide page_head: not confirmed for this file"), "{}", out);
+    let (g, port, log) = serve(&d, &["--no-check"]);
+    let a = send(port, "GET", "/", &[], "");
+    assert_eq!(a.status, 200);
+    assert!(a.body.contains("<title>Host</title>") && !a.body.contains("Hijacked") && !a.body.contains("evil.example"), "{}", a.body);
+    assert!(log_has(&log, "quillo: kit/k.qwe: page_head is not applied: it is not confirmed for this file", 30), "{}", read(&log));
+    drop(g);
+    assert_eq!(quillo(&d, &["confirm", "--yes"]).0, Some(0));
+    assert!(read(&d.join("quillo.confirmed")).contains("site = [\"page_head\"]"), "{}", read(&d.join("quillo.confirmed")));
+    let (g, port, _) = serve(&d, &[]);
+    let a = send(port, "GET", "/", &[], "");
+    assert!(a.body.contains("<title>Hijacked</title>") && a.body.contains("https://evil.example/phish"), "{}", a.body);
+    drop(g);
+}
+
+/// Even without a `quillo.confirmed` hold, `translations("locales")` refuses a folder or JSON file
+/// linked outside the program's folder (src/i18n.rs; FEEDBACK83.md Q-1300 leftover).
+#[cfg(unix)]
+#[test]
+fn translations_refuses_symlinks_outside_the_folder_without_a_hold() {
+    use std::os::unix::fs::symlink;
+    let d = dir("i18n-link");
+    let outside = dir("i18n-outside");
+    write(&outside, "secret.json", "{\"secret\":\"leaked\"}\n");
+    std::fs::create_dir_all(d.join("locales")).unwrap();
+    symlink(outside.join("secret.json"), d.join("locales/en.json")).unwrap();
+    write(&d, "main.qwe", "translations(\"locales\")\nroute GET / = t(\"secret\")\n");
+    let (code, out) = quillo(&d, &["run", "--no-check", "main.qwe"]);
+    assert_ne!(code, Some(0), "{}", out);
+    assert!(out.contains("outside the program's folder through a link"), "{}", out);
+}

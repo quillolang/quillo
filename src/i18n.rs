@@ -72,7 +72,7 @@ fn locale_name_ok(name: &str) -> bool {
         && parts.all(|p| (2..=8).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_alphanumeric()))
 }
 
-fn load_dir(dir: &std::path::Path, judge: &dyn Fn(&str) -> Result<(), String>) -> Result<Vec<(String, Map)>, String> {
+fn load_dir(dir: &std::path::Path, judge: &dyn Fn(&std::path::Path, &str) -> Result<(), String>) -> Result<Vec<(String, Map)>, String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {}", dir.display(), e))?;
     let mut out = Vec::new();
     for e in entries.flatten() {
@@ -81,7 +81,7 @@ fn load_dir(dir: &std::path::Path, judge: &dyn Fn(&str) -> Result<(), String>) -
             continue;
         }
         // Each file as the hold judges a read of it, a link in the folder where it leads.
-        judge(&e.file_name().to_string_lossy())?;
+        judge(&path, &e.file_name().to_string_lossy())?;
         let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
         let text = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
         // A byte-order mark, as Windows' editors write one, is no part of the JSON: it was
@@ -111,17 +111,29 @@ fn translations(it: &mut Interp, args: Vec<Value>, line: u32) -> R {
             if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir)) {
                 return fail(line, format!("`translations` needs a folder inside the program's, got {:?}", &**p));
             }
+            // Even without a `quillo.confirmed` hold, refuse symlinks that lead outside the
+            // program's folder (unless under `--allow-path`), matching `read_file` and `files()`.
+            let dir_path = it.base_dir.join(rel);
+            let Some(safe_dir) = crate::builtins::inside(it, dir_path) else {
+                return fail(line, format!("`translations`: {:?} leads outside the program's folder through a link", &**p));
+            };
             // The folder and each file read as the file builtins are held, to what the calling
             // file was confirmed to read: read unheld, a kit confirmed for nothing loaded any folder
             // of the program as every page's words (FEEDBACK83.md, Q-1300, found by the review of
             // 4bc1ac9; branch feedback82-85).
             let folder = format!("{}/", p.trim_end_matches('/'));
             let (file, base) = (it.cur_file.clone(), it.base_dir.clone());
-            let judge = |name: &str| crate::confirm::path_ok(file.as_deref(), &base, &format!("{}{}", folder, name), false);
-            if let Err(why) = judge("") {
+            let path_ok = |name: &str| crate::confirm::path_ok(file.as_deref(), &base, &format!("{}{}", folder, name), false);
+            if let Err(why) = path_ok("") {
                 return fail(line, format!("`translations`: {}", why));
             }
-            match load_dir(&it.base_dir.join(rel), &judge) {
+            let judge = |entry_path: &std::path::Path, name: &str| {
+                if crate::builtins::inside(it, entry_path.to_path_buf()).is_none() {
+                    return Err(format!("{} leads outside the program's folder through a link", name));
+                }
+                path_ok(name)
+            };
+            match load_dir(&safe_dir, &judge) {
                 Ok(s) => s,
                 Err(e) => return fail(line, format!("`translations`: {}", e)),
             }

@@ -219,6 +219,29 @@ pub fn compute_left() -> Option<Duration> {
     })
 }
 
+/// Checks the remaining `--max-compute` budget inside long-running builtins (`Q-606`),
+/// sampling the clock every 1,024 steps with zero overhead when no compute limit is active.
+pub struct ComputeBudget {
+    until: Option<std::time::Instant>,
+    steps: u32,
+}
+
+impl ComputeBudget {
+    pub fn start() -> Self {
+        Self { until: compute_left().map(|d| std::time::Instant::now() + d), steps: 0 }
+    }
+
+    #[inline(always)]
+    pub fn tick(&mut self) -> bool {
+        let Some(u) = self.until else { return true };
+        self.steps = self.steps.wrapping_add(1);
+        if (self.steps & 1023) != 0 {
+            return true;
+        }
+        std::time::Instant::now() < u && !(OVER_TIME.load(SeqCst) && over_time())
+    }
+}
+
 /// `--max-memory`: the most bytes one value a request makes may take; 0 for no limit. A failed
 /// allocation ends the whole process, every visitor's request with it, and nothing held memory as
 /// `--max-compute` holds time. Where a builtin is about to make a value (a text, a list, a map, a

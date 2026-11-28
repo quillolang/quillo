@@ -691,17 +691,20 @@ fn q1171_tools_and_services_make_the_record_in_a_map_shape() {
     let main = r#"service acct = "acct.qwe"
 print(acct.shaped({ owner: { name: "Zoë", is_admin: true } }))
 print(acct.far([{ name: "ada", role: "member", is_admin: true }, { name: "bo" }]))
+"#;
+    let bad = r#"service acct = "acct.qwe"
 print(error(acct.shaped({ owner: { role: "member" } })))
 "#;
-    let d = dir("q1171-service", &[("main.qwe", main), ("acct.qwe", &service)]);
+    let d = dir("q1171-service", &[("main.qwe", main), ("bad.qwe", bad), ("acct.qwe", &service)]);
     checked(&d, "main.qwe");
+    let (ok_bad, check_bad) = check(&d, "bad.qwe");
+    assert!(!ok_bad && check_bad.contains("has no field `name`"), "{}", check_bad);
     let (out, err) = run_script(&d, "main.qwe", 120);
-    assert_eq!(
-        out,
-        "{ owner: { name: \"Zoë\", role: \"viewer\" } }\n[{ name: \"ada\", role: \"member\" }, { name: \"bo\", role: \"viewer\" }]\nservice acct: argument `x` of `shaped` must be { owner: Account }, got map (`owner.name` is missing)\n",
-        "{}",
-        err
-    );
+    assert_eq!(out, "{ owner: { name: \"Zoë\", role: \"viewer\" } }\n[{ name: \"ada\", role: \"member\" }, { name: \"bo\", role: \"viewer\" }]\n", "{}", err);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_quillo"));
+    c.args(["run", "bad.qwe", "--no-check"]).current_dir(&*d).env("QUILLO_SECRET", "test secret for the cov089 data tests");
+    let (_, bad_out, bad_err) = within(c, 120);
+    assert_eq!(bad_out, "service acct: argument `x` of `shaped` must be { owner: Account }, got map (`owner.name` is missing)\n", "{}", bad_err);
     // A tool, through the MCP door.
     let _one = serial();
     let src = format!(

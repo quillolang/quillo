@@ -2728,6 +2728,42 @@ fn an_outage_whose_requests_fail_slowly_is_waited_out_and_said() {
     }
 }
 
+// Q-1410 (FEEDBACK91.md): after a 20 s-class outage the live backoff is capped at 8 s (4–12 s
+// spread) instead of 30 s, and regaining window focus while disconnected wakes sleeping reconnect
+// waits right away.
+#[test]
+fn live_reconnect_caps_backoff_and_wakes_on_focus() {
+    let body = format!(
+        r##"{MOVES_JS}
+    window.__down = true;
+    for (const s of window.__socks) s.close();
+    await tick(16000);
+    window.__down = false;
+    const next = +$("va").textContent + 1;
+    await write("a", next);
+    const catchUp = await until("a", next, 12500);
+    const open = () => window.__socks.some((s) => s.readyState === 1);
+    for (let i = 0; i < 400 && !open(); i++) await tick(20);
+    // Disconnect again until plain-request backoff is sleeping (`asks >= 2`), then wake with `focus`.
+    const asks0 = window.__asks.length;
+    window.__down = true;
+    for (const s of window.__socks) if (s.readyState === 1) s.close();
+    for (let i = 0; i < 500 && window.__asks.length < asks0 + 2; i++) await tick(20);
+    await tick(150);
+    window.__down = false;
+    await write("a", next + 1);
+    window.dispatchEvent(new Event("focus"));
+    const focusCatchUp = await until("a", next + 1, 2500);
+    return {{ catchUp, socketReopened: open(), focusCatchUp }};"##
+    );
+    let Some(rs) = in_pages_for("q1410-outage", PAGES_MOVED, &["/outage/a?d=0"], &body, false, 60_000) else { return };
+    let r = &rs[0];
+    assert!(r["catchUp"].as_u64().is_some_and(|ms| ms <= 12_500), "catchUp too slow: {}", r);
+    assert_eq!(r["socketReopened"], serde_json::json!(true), "{}", r);
+    assert!(r["focusCatchUp"].as_u64().is_some_and(|ms| ms <= 2_500), "focusCatchUp too slow: {}", r);
+    assert_eq!(r["remade"], serde_json::json!(0), "{}", r);
+}
+
 // The race behind 89e34a6, made certain (CI's coverage gate found that the outage test went through
 // it only by chance): a plain request answered again, after failures, while a socket is still trying,
 // so the loop is in no wait to end. It marks the server as back (`st.revived`), and when that socket

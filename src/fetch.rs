@@ -1311,6 +1311,7 @@ fn json_body(v: &Value, line: u32) -> Result<Result<Vec<u8>, Value>, Ctrl> {
     match v.json_into_held(&mut out, crate::builtins::JSON_MOST, crate::builtins::JSON_DEEPEST) {
         Ok(()) => Ok(Ok(out)),
         Err(None) => Err(crate::httpd::OverMemory.at(line)),
+        Err(Some(why)) if crate::httpd::is_compute_stop(&why) => crate::interp::fail(line, why),
         Err(Some(why)) => Ok(Err(Value::err(Value::str(format!("http: the body: {}", why))))),
     }
 }

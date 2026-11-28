@@ -1193,3 +1193,53 @@ fn rows_past_max_memory_end_a_push_request() {
     assert_eq!((a.status, a.body.as_str()), (200, r#"{"state":"default"}"#));
     assert!(!s.log_with("").contains("--max-memory allows"));
 }
+
+/// Service worker carries `pushsubscriptionchange` and `/_quillo/push` replaces the rotated
+/// endpoint when owned by the active session (including `notification.user`-bound guest tickets),
+/// while refusing unowned replacements after sign-out (src/client/sw.js, src/push.rs;
+/// FEEDBACK76.md Q-1139).
+#[test]
+fn sw_handles_pushsubscriptionchange_and_replaces_endpoint() {
+    let guest_prog = format!(
+        "{}\nroute GET /guest/:id {{\n    set_session({{ g: id }})\n    notification.user(id)\n}}\n",
+        PUSHER
+    );
+    let d = dir("sw-renew", &guest_prog);
+    let sink = sink();
+    let s = run(&d, &[], &[]);
+    let sw = support::send(s.port, "GET", "/_quillo/sw.js", &[], "");
+    assert_eq!(sw.status, 200);
+    assert!(sw.body.contains("pushsubscriptionchange") && sw.body.contains("replace:"), "{}", sw.body);
+    let host = format!("127.0.0.1:{}", s.port);
+    let ana = sign_in(s.port, "ana");
+    let old_ep = sink.endpoint("/push/old-1");
+    let new_ep = sink.endpoint("/push/new-1");
+    assert_eq!(bind(s.port, &old_ep, &ana).status, 200);
+    // Signed-in user renews subscription with `replace: old_ep`: old endpoint removed, new delivers.
+    let body = serde_json::json!({ "endpoint": new_ep, "keys": { "p256dh": P256DH, "auth": AUTH }, "user": null, "replace": old_ep });
+    let r = support::send(s.port, "POST", "/_quillo/push", &with_cookie(&ana, &host), &body.to_string());
+    assert_eq!((r.status, r.body.as_str()), (200, r#"{"ok":true}"#));
+    let one = serde_json::json!({ "title": "renewed" });
+    assert_eq!(send_to(s.port, "ana", one.clone()), serde_json::json!({ "sent": 1, "gone": 0 }));
+    assert_eq!(sink.got().iter().map(|g| g.path.clone()).collect::<Vec<_>>(), ["/push/new-1"]);
+    sink.reset();
+    // Guest ticket (`notification.user`) preserves its binding on renewal only for the same session.
+    let g1 = support::send(s.port, "GET", "/guest/g1", &[], "");
+    assert_eq!(g1.status, 200, "{}", g1.body);
+    let g1_cookie = session_cookie(&g1).expect("guest session cookie");
+    let g_old = sink.endpoint("/push/g-old");
+    let g_new = sink.endpoint("/push/g-new");
+    let g_bind = serde_json::json!({ "endpoint": g_old, "keys": { "p256dh": P256DH, "auth": AUTH }, "user": g1.body });
+    assert_eq!(support::send(s.port, "POST", "/_quillo/push", &with_cookie(&g1_cookie, &host), &g_bind.to_string()).status, 200);
+    let g_renew = serde_json::json!({ "endpoint": g_new, "keys": { "p256dh": P256DH, "auth": AUTH }, "user": null, "replace": g_old });
+    let r = support::send(s.port, "POST", "/_quillo/push", &with_cookie(&g1_cookie, &host), &g_renew.to_string());
+    assert_eq!((r.status, r.body.as_str()), (200, r#"{"ok":true}"#));
+    assert_eq!(send_to(s.port, "g1", one), serde_json::json!({ "sent": 1, "gone": 0 }));
+    assert_eq!(sink.got().iter().map(|g| g.path.clone()).collect::<Vec<_>>(), ["/push/g-new"]);
+    // Another guest session cannot hijack or renew using `g1`'s endpoint.
+    let g2 = support::send(s.port, "GET", "/guest/g2", &[], "");
+    let g2_cookie = session_cookie(&g2).expect("g2 session cookie");
+    let steal = serde_json::json!({ "endpoint": sink.endpoint("/push/forged"), "keys": { "p256dh": P256DH, "auth": AUTH }, "user": null, "replace": g_new });
+    let r = support::send(s.port, "POST", "/_quillo/push", &with_cookie(&g2_cookie, &host), &steal.to_string());
+    assert_eq!(r.status, 403, "{}", r.body);
+}

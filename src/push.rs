@@ -587,12 +587,35 @@ fn bind(it: &mut Interp, req: &HttpRequest, endpoint: &str, j: &serde_json::Valu
     // The origin the page was on: navigate's, and VAPID's `sub`.
     let origin = origin_of(it, req).ok_or_else(|| bad("the request names no host to send its pages from".into()))?;
     let place = crate::session::place(it);
+    let replace = j["replace"].as_str().filter(|s| !s.is_empty());
+    let on = table_on(it, true).map_err(|e| (500, Fail::Said(e)))?.ok_or((500, Fail::Said("no table".to_string())))?;
     let who = match &j["user"] {
-        serde_json::Value::Null => person(it).ok_or_else(|| (403, Fail::Said("no one to send to: the visitor is not signed in (session().user), and ask was given no user: notification.user(x), made on the server, says who".to_string())))?,
+        serde_json::Value::Null => match person(it) {
+            Some(p) => p,
+            None => {
+                // `pushsubscriptionchange` renewal from a session originally bound via
+                // `notification.user(x)` keeps that target only while this same active session
+                // (`owner`) still holds `replace` in `_quillo_push`.
+                let mut inherited = None;
+                if let Some(old) = replace {
+                    if let Ok(Value::List(l)) = sql(
+                        it,
+                        on,
+                        true,
+                        vec![Value::str("select who from _quillo_push where endpoint = ? and place = ? and session = ?"), Value::str(old), Value::str(&place), Value::str(owner)],
+                    ) {
+                        inherited = l.iter().find_map(|r| match r {
+                            Value::Map(m) => Some(text(m, "who")).filter(|w| !w.is_empty()),
+                            _ => None,
+                        });
+                    }
+                }
+                inherited.ok_or_else(|| (403, Fail::Said("no one to send to: the visitor is not signed in (session().user), and ask was given no user: notification.user(x), made on the server, says who".to_string())))?
+            }
+        },
         serde_json::Value::String(t) => sealed_user(t, &place, owner, person(it).as_deref()).ok_or_else(|| (403, Fail::Said("the user given to notification.ask is not one notification.user made here, for this session, in the last 30 days: make it on the server with notification.user(x) and give it to the page".to_string())))?,
         _ => return Err((403, Fail::Said("the user given to notification.ask is made on the server with notification.user(x), so that a page cannot name someone else".into()))),
     };
-    let on = table_on(it, true).map_err(|e| (500, Fail::Said(e)))?.ok_or((500, Fail::Said("no table".to_string())))?;
     let row = |endpoint: &str| {
         vec![
             Value::str("insert into _quillo_push (endpoint, p256dh, auth, who, session, origin, place, created, succeeded) values (?, ?, ?, ?, ?, ?, ?, ?, 0)"),
@@ -623,6 +646,20 @@ fn bind(it: &mut Interp, req: &HttpRequest, endpoint: &str, j: &serde_json::Valu
     }
     if let Some(e) = last {
         return Err((500, e));
+    }
+    if let Some(old) = replace.filter(|o| *o != endpoint) {
+        let _ = sql(
+            it,
+            on,
+            false,
+            vec![
+                Value::str("delete from _quillo_push where endpoint = ? and place = ? and (who = ? or session = ?)"),
+                Value::str(old),
+                Value::str(&place),
+                Value::str(&who),
+                Value::str(owner),
+            ],
+        );
     }
     keep_newest(it, on, &who, &place).map_err(|e| (500, e))
 }

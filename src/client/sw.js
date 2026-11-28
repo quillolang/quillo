@@ -389,6 +389,34 @@ self.addEventListener("fetch", (e) => {
   })).catch(() => {}));
 });
 
+// Renews the server's push binding when the browser or push service rotates a subscription
+// (FEEDBACK76.md, Q-1139): uses `newSubscription` or re-subscribes with the server's VAPID key and
+// replaces the old endpoint atomically on the server when the session still holds it.
+self.addEventListener("pushsubscriptionchange", (e) => {
+  e.waitUntil((async () => {
+    const oldSub = e.oldSubscription;
+    let sub = e.newSubscription;
+    if (!sub) {
+      let key = oldSub && oldSub.options && oldSub.options.applicationServerKey;
+      if (!key) {
+        const kr = await fetch(BASE + "/_quillo/push", { credentials: "same-origin" }).catch(() => null);
+        const k = kr && kr.ok ? (await kr.json().catch(() => ({}))).key : null;
+        if (!k) return;
+        const bin = atob(k.replace(/-/g, "+").replace(/_/g, "/"));
+        key = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+      }
+      sub = await self.registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }).catch(() => null);
+    }
+    if (!sub) return;
+    await fetch(BASE + "/_quillo/push", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...sub.toJSON(), replace: (oldSub && oldSub.endpoint) || null }),
+    }).catch(() => {});
+  })());
+});
+
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
   const home = new URL(BASE + "/", location.origin);
