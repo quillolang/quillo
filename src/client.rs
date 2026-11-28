@@ -476,6 +476,12 @@ fn push_feature_inits(it: &Interp, program: &mut String, uses_json_attr: bool, a
     if it.routes.iter().any(|r| r.offline) || program.contains("B.ask") || program.contains("B.notify") {
         program.push_str("useSw();\n");
     }
+    if all_dom || program.contains("W.t(") || program.contains("W.frag") || program.contains("W.c(") || program.contains("W.view(") || program.contains("W.Html") || program.contains("B.html") || program.contains("\"children\"") {
+        program.push_str("useHtml();\n");
+    }
+    if all_dom || program.contains("W.component(") || program.contains("W.c(") || program.contains("W.view(") || program.contains("W.live(") || program.contains("W.gs(") || program.contains("W.each(") || program.contains("W.klist(") || program.contains("W.choose(") {
+        program.push_str("useInst();\n");
+    }
     if all_dom || program.contains("W.live") { program.push_str("useLive();\n"); }
     if all_dom || program.contains("\"style\"") || program.contains("W.spread") || program.contains("W.csst") || program.contains("B.css") || program.contains("W.Html") || program.contains("B.html") {
         program.push_str("useStyle();\n");
@@ -483,7 +489,7 @@ fn push_feature_inits(it: &Interp, program: &mut String, uses_json_attr: bool, a
     if all_dom || program.contains("[\"select\"") || program.contains("[\"option\"") || program.contains("[\"optgroup\"") || program.contains("W.Html") || program.contains("B.html") || ast_has_tag(it, &["select", "option", "optgroup"]) {
         program.push_str("useSelect();\n");
     }
-    if all_dom || program.contains("[\"table\"") || program.contains("[\"thead\"") || program.contains("[\"tbody\"") || program.contains("[\"tfoot\"") || program.contains("[\"tr\"") || program.contains("[\"colgroup\"") || program.contains("[\"select\"") || program.contains("[\"datalist\"") || program.contains("[\"optgroup\"") || ast_has_tag(it, &["table", "thead", "tbody", "tfoot", "tr", "colgroup", "select", "datalist", "optgroup"]) {
+    if all_dom || program.contains("[\"table\"") || program.contains("[\"thead\"") || program.contains("[\"tbody\"") || program.contains("[\"tfoot\"") || program.contains("[\"tr\"") || program.contains("[\"colgroup\"") || program.contains("[\"select\"") || program.contains("[\"datalist\"") || program.contains("[\"optgroup\"") || program.contains("[\"svg\"") || ast_has_tag(it, &["table", "thead", "tbody", "tfoot", "tr", "colgroup", "select", "datalist", "optgroup", "svg"]) {
         program.push_str("useMarked();\n");
     }
     if all_dom || program.contains("\"children\"") || program.contains("W.Html") || program.contains("B.html") {
@@ -1111,6 +1117,14 @@ mod dev {
         }
         pieces.push(Piece { path: "boot.js".into(), code: boot, source: None });
 
+        prelude.push_str(&{
+            let mut prog = String::new();
+            for b in &c.blocks { prog.push_str(b); prog.push('\n'); }
+            for d in c.defs.iter().chain(c.view_defs.iter()) { prog.push_str(d); prog.push('\n'); }
+            let n = prog.len();
+            super::push_feature_inits(it, &mut prog, true, true);
+            prog.split_off(n)
+        });
         // The runtime and the program's blocks in one function, as in production, whose
         // names reach the program's files through one handover rather than as the page's
         // globals: a page's own `function report()` or a later script's `function run()`
@@ -2220,6 +2234,8 @@ enum Local {
     Var(String, Option<bool>),
     /// Component state: a signal, read `x.v` and set with `x.set(v)`.
     State(String),
+    /// Slot-compiled component state: stored directly on `$s["name"]`.
+    SlotState(String),
     /// What follows state (a memo, a row's item): read `x.v`.
     Reactive(String),
     /// A component's or view's parameter, read from its props: `$p.name`.
@@ -2337,6 +2353,7 @@ fn wait_mark(n: usize) -> String {
 enum Resolved {
     Local(String, Option<bool>),
     State(String),
+    SlotState(String),
     Reactive(String),
     Prop(String),
     /// JS expression and whether calling it waits on the server.
@@ -3949,7 +3966,7 @@ impl<'a> Compiler<'a> {
         for ctx in self.ctxs.iter().rev() {
             for scope in ctx.scopes.iter().rev() {
                 if let Some(l) = scope.get(name) {
-                    return matches!(l, Local::State(_));
+                    return matches!(l, Local::State(_) | Local::SlotState(_));
                 }
             }
         }
@@ -3963,6 +3980,7 @@ impl<'a> Compiler<'a> {
                 match scope.get(name) {
                     Some(Local::Var(js, f)) => found = Some((ci, Resolved::Local(js.clone(), *f))),
                     Some(Local::State(js)) => found = Some((ci, Resolved::State(js.clone()))),
+                    Some(Local::SlotState(js)) => found = Some((ci, Resolved::SlotState(js.clone()))),
                     Some(Local::Reactive(js)) => found = Some((ci, Resolved::Reactive(js.clone()))),
                     Some(Local::Prop(n)) => found = Some((ci, Resolved::Prop(n.clone()))),
                     None => continue,
@@ -3975,12 +3993,12 @@ impl<'a> Compiler<'a> {
             // it gives (`find(xs, (x) => x.id == wanted)`), or a function of
             // the component's own.
             self.last_here = self.ctxs[ci].component.is_some();
-            if matches!(r, Resolved::State(_) | Resolved::Reactive(_) | Resolved::Prop(_)) {
+            if matches!(r, Resolved::State(_) | Resolved::SlotState(_) | Resolved::Reactive(_) | Resolved::Prop(_)) {
                 self.reactive = true;
             }
             if let Some(log) = &mut self.read_log {
                 match &r {
-                    Resolved::State(js) | Resolved::Reactive(js) => log.push(js.clone()),
+                    Resolved::State(js) | Resolved::SlotState(js) | Resolved::Reactive(js) => log.push(js.clone()),
                     Resolved::Prop(_) => log.push("*".into()),
                     _ => {}
                 }
@@ -4144,6 +4162,12 @@ impl<'a> Compiler<'a> {
                 let (defs_before, known): (usize, HashSet<String>) = (self.defs.len(), self.globals.keys().cloned().collect());
                 let (views_before, view_defs_before) = (self.views.clone(), self.view_defs.len());
                 let mut assume_async = false;
+                let use_slot = def.component
+                    && self.slot_eligible(&def)
+                    && {
+                        let f = draw_facts(&self.it.globals, &def, &mut self.facts);
+                        f.0.is_empty() && !f.1
+                    };
                 let (code, is_async) = loop {
                     self.globals.insert(name.to_string(), (js.clone(), assume_async));
                     let saved_ctxs = std::mem::take(&mut self.ctxs);
@@ -4161,7 +4185,13 @@ impl<'a> Compiler<'a> {
                     // variable added to one renumbered every later one's (FEEDBACK54.md, Q-688;
                     // branch hmr).
                     let saved_counter = std::mem::replace(&mut self.counter, 0);
-                    let res = if def.component { self.component(&def) } else { self.function(&def) };
+                    let res = if use_slot {
+                        self.slot_component(&def).map(|s| (s, false))
+                    } else if def.component {
+                        self.component(&def)
+                    } else {
+                        self.function(&def)
+                    };
                     self.counter = saved_counter;
                     self.ctxs = saved_ctxs;
                     self.what = saved_what;
@@ -4182,7 +4212,9 @@ impl<'a> Compiler<'a> {
                     }
                     break (code, is_async);
                 };
-                let code = if def.component {
+                let code = if use_slot {
+                    format!("{} = {};", js, code)
+                } else if def.component {
                     // What its draw reads and does, for a failed draw's probe, when it reads page
                     // states or writes (see `draw_facts`).
                     let facts = draw_facts(&self.it.globals, &def, &mut self.facts);
@@ -4470,6 +4502,547 @@ impl<'a> Compiler<'a> {
     fn component(&mut self, def: &FnDef) -> Result<(String, bool), QuilloError> {
         let code = self.setup(def, false)?;
         Ok((format!("[{}], {}", def.params.iter().map(|p| js_str(&p.name)).collect::<Vec<_>>().join(", "), code), false))
+    }
+
+    fn slot_eligible(&self, def: &FnDef) -> bool {
+        fn expr_reads_any(e: &Expr, names: &HashSet<String>) -> bool {
+            let mut hit = false;
+            each_expr(e, &mut |x| {
+                if let Expr::Ident(n, _) = x {
+                    if names.contains(n.as_str()) { hit = true; }
+                }
+            });
+            hit
+        }
+        fn expr_disallowed(e: &Expr, it: &Interp, seen: &mut HashSet<String>) -> bool {
+            let mut bad = false;
+            each_expr(e, &mut |x| match x {
+                Expr::Html(..) | Expr::Try(..) => bad = true,
+                Expr::Call(callee, _, _) => {
+                    if let Expr::Ident(n, _) = &**callee {
+                        if matches!(n.as_str(), "live" | "every" | "run_after" | "listen" | "on_cleanup" | "channel" | "waiting" | "probe" | "ask" | "receive" | "parallel" | "markdown" | "js" | "js_new" | "html") {
+                            bad = true;
+                        } else {
+                            match lookup(&it.globals, n) {
+                                Some(Value::Func(f)) if !f.def.server && !f.def.component => {
+                                    if seen.insert(n.to_string()) && expr_disallowed(&f.def.body, it, seen) {
+                                        bad = true;
+                                    }
+                                }
+                                Some(Value::Builtin(..)) => {}
+                                _ => bad = true,
+                            }
+                        }
+                    } else {
+                        bad = true;
+                    }
+                }
+                _ => {}
+            });
+            bad
+        }
+        fn html_ok(el: &HtmlEl, states: &HashSet<String>, it: &Interp, seen: &mut HashSet<String>) -> bool {
+            if el.tag.starts_with(|c: char| c.is_uppercase())
+                || el.tag.contains('-')
+                || matches!(el.tag.as_str(), "svg" | "select" | "option" | "optgroup" | "textarea" | "script" | "style" | "foreignObject" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "colgroup" | "datalist")
+            {
+                return false;
+            }
+            if let Some(id) = &el.id {
+                if expr_disallowed(id, it, seen) { return false; }
+            }
+            for c in &el.classes {
+                if expr_disallowed(c, it, seen) { return false; }
+            }
+            for (name, v) in &el.attrs {
+                if name == "key" || name == "@mount" || name.starts_with("bind:") { return false; }
+                match v {
+                    AttrVal::Spread(_) => return false,
+                    AttrVal::Bool => if name.starts_with('@') { return false; },
+                    AttrVal::Expr(e) => {
+                        if name.starts_with('@') {
+                            if matches!(name.as_str(), "@load" | "@error") || expr_disallowed(e, it, seen) { return false; }
+                        } else if name == "style" {
+                            if !matches!(fixed(e), Some(Lit::Str(_))) { return false; }
+                        } else if name == "class" {
+                            if expr_disallowed(e, it, seen) { return false; }
+                        } else if fixed(e).is_none() {
+                            if !matches!(name.as_str(), "id" | "checked" | "disabled" | "hidden" | "title" | "placeholder") {
+                                return false;
+                            }
+                            if expr_disallowed(e, it, seen) { return false; }
+                        }
+                    }
+                }
+            }
+            let all_els = el.children.iter().all(|c| match c {
+                HtmlChild::El(_) => true,
+                HtmlChild::Expr(Expr::Lit(Lit::Str(s))) => s.trim().is_empty(),
+                _ => false,
+            });
+            if all_els {
+                return el.children.iter().all(|c| match c {
+                    HtmlChild::El(sub) => html_ok(sub, states, it, seen),
+                    _ => true,
+                });
+            }
+            el.children.iter().all(|c| match c {
+                HtmlChild::El(_) => false,
+                HtmlChild::Expr(e) => !has_markup(e) && !expr_disallowed(e, it, seen),
+            })
+        }
+
+        if self.dev || def.effects.is_some() || def.server || def.ret.is_some() || def.err.is_some() || def.runs_by_itself() {
+            return false;
+        }
+        if def.params.iter().any(|p| p.default.is_some() || p.name.as_ref() == "children") {
+            return false;
+        }
+        let Expr::Block(stmts) = &def.body else { return false };
+        let Some((last, head)) = stmts.split_last() else { return false };
+        let root = match last {
+            Stmt::Expr(Expr::Html(el, _)) | Stmt::Return(Some(Expr::Html(el, _)), _) => el,
+            _ => return false,
+        };
+        let mut assigned = HashSet::new();
+        collect_assigned(stmts, &mut assigned);
+        let mut states = HashSet::new();
+        let mut seen = HashSet::new();
+        for s in head {
+            match s {
+                Stmt::State(name, init, _) => {
+                    if expr_disallowed(init, self.it, &mut seen) { return false; }
+                    states.insert(name.to_string());
+                }
+                Stmt::Let(Pattern::Bind(name), e, _) => {
+                    if assigned.contains(name.as_str()) || expr_reads_any(e, &states) || expr_disallowed(e, self.it, &mut seen) {
+                        return false;
+                    }
+                }
+                _ => return false,
+            }
+        }
+        html_ok(root, &states, self.it, &mut seen)
+    }
+
+    fn slot_compile_tree(&mut self, root: &HtmlEl, root_expr: &str, klist: bool) -> Result<(String, String, String, String), QuilloError> {
+        fn esc_html(s: &str, attr: bool, out: &mut String) {
+            for ch in s.chars() {
+                match ch {
+                    '&' => out.push_str("&amp;"),
+                    '<' => out.push_str("&lt;"),
+                    '>' => out.push_str("&gt;"),
+                    '"' if attr => out.push_str("&quot;"),
+                    _ => out.push(ch),
+                }
+            }
+        }
+        fn has_dyn_text(span: &[&Expr]) -> bool {
+            span.iter().any(|e| !matches!(fixed(e), Some(Lit::Str(_))))
+        }
+        fn build_html(el: &HtmlEl, klist: bool, out: &mut String) {
+            out.push('<');
+            out.push_str(&el.tag);
+            if let Some(id) = &el.id {
+                if let Some(Lit::Str(s)) = fixed(id) {
+                    out.push_str(" id=\"");
+                    esc_html(&s, true, out);
+                    out.push('"');
+                }
+            }
+            if (!el.classes.is_empty() || el.attrs.iter().any(|(a, _)| a == "class"))
+                && el.classes.iter().all(|e| matches!(fixed(e), Some(Lit::Str(_))))
+                && !el.attrs.iter().any(|(a, v)| a == "class" && !matches!(v, AttrVal::Expr(e) if matches!(fixed(e), Some(Lit::Str(_)))))
+            {
+                let mut cls: Vec<&str> = el.classes.iter().filter_map(|e| match fixed(e) {
+                    Some(Lit::Str(s)) if !s.is_empty() => Some(&**s),
+                    _ => None,
+                }).collect();
+                for (a, v) in &el.attrs {
+                    if a == "class" {
+                        if let AttrVal::Expr(e) = v {
+                            if let Some(Lit::Str(s)) = fixed(e) {
+                                if !s.is_empty() { cls.push(&s); }
+                            }
+                        }
+                    }
+                }
+                if !cls.is_empty() {
+                    out.push_str(" class=\"");
+                    esc_html(&cls.join(" "), true, out);
+                    out.push('"');
+                }
+            }
+            for (name, v) in &el.attrs {
+                if name == "class" || name == "key" || name.starts_with('@') || name.starts_with("bind:") {
+                    continue;
+                }
+                match v {
+                    AttrVal::Bool if !matches!(name.as_str(), "value" | "checked" | "selected") => {
+                        out.push(' ');
+                        out.push_str(name);
+                    }
+                    AttrVal::Expr(e) if !matches!(name.as_str(), "value" | "checked" | "selected") => {
+                        if let Some(l) = fixed(e) {
+                            match l {
+                                Lit::Nil => {}
+                                Lit::Bool(false) if crate::interp::bool_attr_text(name, false).is_none() => {}
+                                Lit::Bool(true) if crate::interp::bool_attr_text(name, true).is_none() => {
+                                    out.push(' ');
+                                    out.push_str(name);
+                                }
+                                Lit::Bool(b) => {
+                                    if let Some(t) = crate::interp::bool_attr_text(name, *b) {
+                                        out.push(' ');
+                                        out.push_str(name);
+                                        out.push_str("=\"");
+                                        esc_html(t, true, out);
+                                        out.push('"');
+                                    }
+                                }
+                                Lit::Str(s) => {
+                                    out.push(' ');
+                                    out.push_str(name);
+                                    out.push_str("=\"");
+                                    esc_html(&s, true, out);
+                                    out.push('"');
+                                }
+                                Lit::Int(n) => {
+                                    out.push(' ');
+                                    out.push_str(name);
+                                    out.push_str("=\"");
+                                    out.push_str(&n.to_string());
+                                    out.push('"');
+                                }
+                                Lit::Float(f) => {
+                                    out.push(' ');
+                                    out.push_str(name);
+                                    out.push_str("=\"");
+                                    out.push_str(&f.to_string());
+                                    out.push('"');
+                                }
+                                Lit::Dec(d) => {
+                                    out.push(' ');
+                                    out.push_str(name);
+                                    out.push_str("=\"");
+                                    esc_html(&d.to_string(), true, out);
+                                    out.push('"');
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push('>');
+            if matches!(el.tag.as_str(), "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta" | "source" | "track" | "wbr") {
+                return;
+            }
+            if el.children.iter().any(|c| matches!(c, HtmlChild::El(_))) {
+                let mut span: Vec<&Expr> = Vec::new();
+                for c in &el.children {
+                    match c {
+                        HtmlChild::El(sub) => {
+                            if klist && !span.is_empty() && !has_dyn_text(&span) {
+                                for e in &span {
+                                    if let Expr::Lit(Lit::Str(s)) = e {
+                                        esc_html(s, false, out);
+                                    }
+                                }
+                            }
+                            span.clear();
+                            build_html(sub, klist, out);
+                        }
+                        HtmlChild::Expr(e) => span.push(e),
+                    }
+                }
+                if klist && !span.is_empty() && !has_dyn_text(&span) {
+                    for e in &span {
+                        if let Expr::Lit(Lit::Str(s)) = e {
+                            esc_html(s, false, out);
+                        }
+                    }
+                }
+            } else if el.children.iter().all(|c| matches!(c, HtmlChild::Expr(e) if matches!(fixed(e), Some(Lit::Str(_))))) {
+                for c in &el.children {
+                    if let HtmlChild::Expr(Expr::Lit(Lit::Str(s))) = c {
+                        esc_html(s, false, out);
+                    }
+                }
+            }
+            out.push_str("</");
+            out.push_str(&el.tag);
+            out.push('>');
+        }
+
+        struct Walk<'a, 'b> {
+            c: &'a mut Compiler<'b>,
+            klist: bool,
+            mis: &'static str,
+            els: usize,
+            texts: usize,
+            vals: usize,
+            walk: String,
+            caches: String,
+            patches: String,
+        }
+        fn emit_text_patch(w: &mut Walk, span: &[&Expr], tvar: &str) -> Result<(), QuilloError> {
+            let mut parts = Vec::new();
+            for e in span {
+                if let Some(Lit::Str(s)) = fixed(e) {
+                    parts.push(js_str(&s));
+                } else {
+                    let ej = w.c.expr(e)?;
+                    parts.push(format!("W.slotText({ej})"));
+                }
+            }
+            let txt_js = if parts.len() == 1 { parts.pop().unwrap() } else { format!("({})", parts.join(" + ")) };
+            let vn = format!("_v{}", w.vals);
+            let tn = format!("_n{}", w.vals);
+            w.vals += 1;
+            let _ = writeln!(w.caches, "let {vn},{tn};");
+            let _ = writeln!(w.patches, "if({vn}!==({tn}={txt_js})){{{vn}={tn};if($c&&{tvar}.data!=={tn}){mis};else if(!$c){tvar}.data={tn};}}", mis = w.mis);
+            Ok(())
+        }
+        fn walk_el(w: &mut Walk, el: &HtmlEl, parent_expr: &str, force_bind: bool) -> Result<bool, QuilloError> {
+            let my_id = w.els;
+            let my_var = format!("$e{}", my_id);
+            w.els += 1;
+            let mut body = String::new();
+            let mut need_me = force_bind;
+
+            if let Some(id) = &el.id {
+                if fixed(id).is_none() {
+                    need_me = true;
+                    let expr_js = w.c.expr(id)?;
+                    let vn = format!("_v{}", w.vals);
+                    let tn = format!("_n{}", w.vals);
+                    w.vals += 1;
+                    let _ = writeln!(w.caches, "let {vn},{tn};");
+                    let _ = writeln!(w.patches, "if({vn}!==({tn}=({expr_js}))){{{vn}={tn};if(!$c){{if({tn}==null||{tn}===false){my_var}.removeAttribute(\"id\");else {my_var}.setAttribute(\"id\",W.slotText({tn}));}}}}");
+                }
+            }
+            let mut classes: Vec<&Expr> = el.classes.iter().collect();
+            for (a, v) in &el.attrs {
+                if let ("class", AttrVal::Expr(e)) = (a.as_str(), v) {
+                    classes.push(e);
+                }
+            }
+            if !classes.iter().all(|e| matches!(fixed(e), Some(Lit::Str(_)))) {
+                need_me = true;
+                let parts: Vec<String> = classes.iter().map(|e| w.c.expr(e)).collect::<Result<_, _>>()?;
+                let cls_js = if parts.len() == 1 {
+                    format!("W.cls1({})", parts[0])
+                } else {
+                    format!("W.cls([{}])", parts.join(", "))
+                };
+                let vn = format!("_v{}", w.vals);
+                let tn = format!("_n{}", w.vals);
+                w.vals += 1;
+                let _ = writeln!(w.caches, "let {vn},{tn};");
+                let _ = writeln!(w.patches, "if({vn}!==({tn}={cls_js})){{{vn}={tn};if(!$c){my_var}.className={tn};}}");
+            }
+            for (name, v) in &el.attrs {
+                if name == "class" || name == "key" || name.starts_with("bind:") {
+                    continue;
+                }
+                if let Some(ev) = name.strip_prefix('@') {
+                    need_me = true;
+                    let f = match v {
+                        AttrVal::Expr(e @ Expr::Lambda(d)) if w.klist => {
+                            let saved = w.c.handler.replace(&**d as *const FnDef);
+                            let code = w.c.expr(e);
+                            w.c.handler = saved;
+                            code?
+                        }
+                        AttrVal::Expr(e) => w.c.expr(e)?,
+                        _ => "true".into(),
+                    };
+                    if w.klist {
+                        let _ = writeln!(body, "W.listen({my_var}, {}, {});", js_str(event_name(ev)), f);
+                    } else {
+                        let _ = writeln!(body, "W.slotOn({my_var}, {}, {}, $upd);", js_str(event_name(ev)), f);
+                    }
+                    continue;
+                }
+                if let AttrVal::Expr(e) = v {
+                    if matches!(name.as_str(), "value" | "checked") || fixed(e).is_none() {
+                        need_me = true;
+                        let expr_js = w.c.expr(e)?;
+                        match name.as_str() {
+                            "value" => {
+                                let vn = format!("_v{}", w.vals);
+                                let tn = format!("_n{}", w.vals);
+                                w.vals += 1;
+                                let _ = writeln!(w.caches, "let {vn},{tn};");
+                                let _ = writeln!(w.patches, "if({vn}!==({tn}=W.slotText({expr_js}))){{{vn}={tn};if(!$c&&{my_var}.value!=={tn}){my_var}.value={tn};}}");
+                            }
+                            "checked" if w.klist => {
+                                let tn = format!("_ck{}", w.vals);
+                                w.vals += 1;
+                                let _ = writeln!(w.patches, "const {tn}=!!W.truthy({expr_js});if(!$c&&{my_var}.checked!=={tn}){my_var}.checked={tn};");
+                            }
+                            "checked" => {
+                                let vn = format!("_v{}", w.vals);
+                                let tn = format!("_n{}", w.vals);
+                                w.vals += 1;
+                                let _ = writeln!(w.caches, "let {vn},{tn};");
+                                let _ = writeln!(w.patches, "if({vn}!==({tn}=!!W.truthy({expr_js}))){{{vn}={tn};if(!$c){my_var}.checked={tn};}}");
+                            }
+                            "disabled" | "hidden" => {
+                                let vn = format!("_v{}", w.vals);
+                                let tn = format!("_n{}", w.vals);
+                                w.vals += 1;
+                                let _ = writeln!(w.caches, "let {vn},{tn};");
+                                let _ = writeln!(w.patches, "if({vn}!==({tn}=!!W.truthy({expr_js}))){{{vn}={tn};if(!$c){my_var}.{name}={tn};}}");
+                            }
+                            _ => {
+                                let vn = format!("_v{}", w.vals);
+                                let tn = format!("_n{}", w.vals);
+                                w.vals += 1;
+                                let _ = writeln!(w.caches, "let {vn},{tn};");
+                                let _ = writeln!(w.patches, "if({vn}!==({tn}=({expr_js}))){{{vn}={tn};if(!$c){{if({tn}==null||{tn}===false){my_var}.removeAttribute({an});else {my_var}.setAttribute({an},W.slotText({tn}));}}}}", an = js_str(name));
+                            }
+                        }
+                    }
+                }
+            }
+            let hdr_pos = w.walk.len();
+            if el.children.iter().any(|c| matches!(c, HtmlChild::El(_))) {
+                let mut child_idx = 0usize;
+                let mut span: Vec<&Expr> = Vec::new();
+                let mut prev_el: Option<String> = None;
+                let flush_span = |w: &mut Walk, span: &mut Vec<&Expr>, prev_el: &Option<String>, my_var: &str, need_me: &mut bool| -> Result<(), QuilloError> {
+                    if has_dyn_text(span) {
+                        *need_me = true;
+                        let tid = w.texts;
+                        w.texts += 1;
+                        let tvar = format!("$tx{tid}");
+                        let ptr = match prev_el {
+                            Some(pe) => format!("{pe}.nextSibling"),
+                            None => format!("{my_var}.firstChild"),
+                        };
+                        let _ = writeln!(w.walk, "const {tvar} = {ptr} && {ptr}.nodeType === 3 ? {ptr} : {my_var}.insertBefore(docText(\"\"), {ptr});");
+                        emit_text_patch(w, span, &tvar)?;
+                    }
+                    span.clear();
+                    Ok(())
+                };
+                // Walk element children and mixed dynamic text spans in source order.
+                let items = &el.children;
+                for i in 0..items.len() {
+                    match &items[i] {
+                        HtmlChild::El(sub) => {
+                            if w.klist {
+                                flush_span(w, &mut span, &prev_el, &my_var, &mut need_me)?;
+                            } else {
+                                span.clear();
+                            }
+                            // Force-bind this child element if a dynamic text span follows immediately.
+                            let mut next_has_dyn = false;
+                            if w.klist {
+                                for k in (i + 1)..items.len() {
+                                    match &items[k] {
+                                        HtmlChild::El(_) => break,
+                                        HtmlChild::Expr(e) if fixed(e).is_none() => { next_has_dyn = true; break; }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            let sub_id = w.els;
+                            let sub_used = walk_el(w, sub, &format!("{my_var}.children[{child_idx}]"), next_has_dyn)?;
+                            need_me |= sub_used;
+                            prev_el = if sub_used { Some(format!("$e{sub_id}")) } else { None };
+                            child_idx += 1;
+                        }
+                        HtmlChild::Expr(e) => span.push(e),
+                    }
+                }
+                if w.klist {
+                    flush_span(w, &mut span, &prev_el, &my_var, &mut need_me)?;
+                }
+            } else if el.children.iter().any(|c| matches!(c, HtmlChild::Expr(e) if fixed(e).is_none())) {
+                need_me = true;
+                let tid = w.texts;
+                w.texts += 1;
+                let tvar = format!("$tx{tid}");
+                let _ = writeln!(body, "const {tvar} = {my_var}.firstChild || {my_var}.appendChild(docText(\"\"));");
+                let span: Vec<&Expr> = el.children.iter().filter_map(|c| match c {
+                    HtmlChild::Expr(e) => Some(e),
+                    _ => None,
+                }).collect();
+                emit_text_patch(w, &span, &tvar)?;
+            }
+            if need_me {
+                let hdr = if parent_expr == my_var {
+                    format!("if ($c && (!{my_var} || {my_var}.localName !== {tag})) {mis};\n{body}", tag = js_str(&el.tag.to_ascii_lowercase()), mis = w.mis)
+                } else {
+                    format!("const {my_var} = {parent_expr}; if ($c && (!{my_var} || {my_var}.localName !== {tag})) {mis};\n{body}", tag = js_str(&el.tag.to_ascii_lowercase()), mis = w.mis)
+                };
+                w.walk.insert_str(hdr_pos, &hdr);
+            }
+            Ok(need_me)
+        }
+
+        let mut html_str = String::new();
+        build_html(root, klist, &mut html_str);
+        let mis = if klist { "W.klistMis()" } else { "W.slotMis()" };
+        let mut w = Walk { c: self, klist, mis, els: 0, texts: 0, vals: 0, walk: String::new(), caches: String::new(), patches: String::new() };
+        let _ = walk_el(&mut w, root, root_expr, klist)?;
+        Ok((html_str, w.walk, w.caches, w.patches))
+    }
+
+    fn slot_component(&mut self, def: &FnDef) -> Result<String, QuilloError> {
+        self.new_ctx(Some(def.name.clone()), false);
+        let saved = (std::mem::take(&mut self.mutable), std::mem::replace(&mut self.reactive, false));
+        let mut pre = String::new();
+        let fname = js_str(&def.name);
+        for p in &def.params {
+            self.declare_as(&p.name, Local::Prop(p.name.to_string()));
+            let _ = writeln!(pre, "if ($p.{} === undefined) W.missing({}, {});", p.name, js_str(&p.name), fname);
+            if let Some(ty) = &p.ty {
+                self.need_types_in(ty)?;
+                let _ = writeln!(pre, "W.argty($p.{}, {}, {}, {});", p.name, ty_js(&Some(ty.clone())), js_str(&p.name), fname);
+            }
+        }
+        let Expr::Block(stmts) = &def.body else { unreachable!() };
+        let (last, head) = stmts.split_last().unwrap();
+        let root = match last {
+            Stmt::Expr(Expr::Html(el, _)) | Stmt::Return(Some(Expr::Html(el, _)), _) => el,
+            _ => unreachable!(),
+        };
+        for s in head {
+            match s {
+                Stmt::State(name, init, _) => {
+                    let init_js = self.expr(init)?;
+                    let k = js_str(name);
+                    let _ = writeln!(pre, "if (!hasOwn($s, {k})) $s[{k}] = {init_js};");
+                    self.declare_as(name, Local::SlotState(format!("$s[{k}]")));
+                }
+                Stmt::Let(Pattern::Bind(name), e, _) => {
+                    let v = self.expr(e)?;
+                    let js = self.declare(name, None);
+                    let _ = writeln!(pre, "const {js} = {v};");
+                }
+                _ => unreachable!(),
+            }
+        }
+        let (html_str, walk, caches, patches) = self.slot_compile_tree(root, "$el.firstElementChild", false)?;
+        let ctx = self.ctxs.pop().unwrap();
+        self.mutable = saved.0;
+        self.reactive = saved.1;
+        let params: Vec<String> = def.params.iter().map(|p| js_str(&p.name)).collect();
+        Ok(format!(
+            "W.slot({}, [{}], {}, function ($el, $s, $p, $upd, $c) {{\n{}{}{}{}\nreturn function ($c) {{\n{}}};\n}})",
+            fname,
+            params.join(", "),
+            js_str(&html_str),
+            Self::temps_decl(ctx.temps),
+            pre,
+            walk,
+            caches,
+            patches,
+        ))
     }
 
     /// A component's code, or (with `view`) a view's for `<Name .../>`: it
@@ -4794,7 +5367,7 @@ impl<'a> Compiler<'a> {
                     let answer = self.set_answer(e, before);
                     let target = self.resolve(name)?;
                     let cur = match &target {
-                        Resolved::Local(js, _) => js.clone(),
+                        Resolved::Local(js, _) | Resolved::SlotState(js) => js.clone(),
                         Resolved::State(js) => format!("{}.v", js),
                         Resolved::Reactive(_) | Resolved::Prop(_) => {
                             return self.err(format!(
@@ -4849,6 +5422,9 @@ impl<'a> Compiler<'a> {
                         }
                         (Resolved::State(js), None) => {
                             let _ = writeln!(body, "W.put({}, {});", js, v);
+                        }
+                        (Resolved::SlotState(js), None) => {
+                            let _ = writeln!(body, "{} = {};", js, v);
                         }
                         _ => {
                             let _ = writeln!(body, "{} = {};", cur, v);
@@ -5303,7 +5879,7 @@ impl<'a> Compiler<'a> {
             Expr::Ident(n, line) => {
                 self.line = *line;
                 match self.resolve(n)? {
-                    Resolved::Local(js, _) => js,
+                    Resolved::Local(js, _) | Resolved::SlotState(js) => js,
                     Resolved::State(js) | Resolved::Reactive(js) => format!("{}.v", js),
                     Resolved::Prop(n) => format!("$p.{}", n),
                     // Passed around, it could be called with any name.
@@ -5752,6 +6328,7 @@ impl<'a> Compiler<'a> {
             for scope in ctx.scopes.iter().rev() {
                 match scope.get(name) {
                     Some(Local::Var(js, _)) => return js.clone(),
+                    Some(Local::SlotState(js)) => return js.clone(),
                     Some(Local::State(js) | Local::Reactive(js)) => return format!("{}.v", js),
                     Some(Local::Prop(n)) => return format!("$p.{}", n),
                     None => {}
@@ -5779,6 +6356,7 @@ impl<'a> Compiler<'a> {
             self.line = *line;
             return Ok(match self.resolve(n)? {
                 Resolved::Local(js, f) => (js, f.unwrap_or(false), f.is_some()),
+                Resolved::SlotState(js) => (js, false, false),
                 Resolved::State(js) | Resolved::Reactive(js) => (format!("{}.v", js), false, false),
                 Resolved::Prop(n) => (format!("$p.{}", n), false, false),
                 Resolved::Global(js, a) => {
@@ -6341,6 +6919,32 @@ impl<'a> Compiler<'a> {
             }
             None => "null".into(),
         };
+        if let (false, Pattern::Bind(var_name), Some(el), Some(k_expr)) = (self.dev, pat, root, &key) {
+            if !key_reads && self.klist_eligible(el, var_name) {
+                let saved_r = self.reactive;
+                self.push_scope();
+                self.declare_as(var_name, Local::Var("$r.v".into(), None));
+                let saved_row = self.row.take();
+                let res = self.slot_compile_tree(el, "$e0", true);
+                self.row = saved_row;
+                self.pop_scope();
+                self.reactive = saved_r;
+                if let Ok((html_str, walk, caches, patches)) = res {
+                    let klist = format!(
+                        "W.klist(() => ({}), {}, {}, {}, function ($e0, $r, $c) {{\n{}{}\nreturn function ($c) {{\n{}}};\n}})",
+                        list,
+                        key_js,
+                        js_str(&html_str),
+                        js_str(&el.tag.to_ascii_lowercase()),
+                        walk,
+                        caches,
+                        patches,
+                    );
+                    let _ = k_expr;
+                    return Ok(self.stamped(klist));
+                }
+            }
+        }
         let x = self.fresh("row");
         self.push_scope();
         let mut binds = String::new();
@@ -6373,6 +6977,83 @@ impl<'a> Compiler<'a> {
         self.pop_scope();
         let each = format!("W.each(() => ({}), {}, ({}) => {{ {}return {}; }}{})", list, key_js, x, binds, row?, if key_reads { ", true" } else { "" });
         Ok(self.stamped(each))
+    }
+
+    fn klist_eligible(&self, root: &HtmlEl, row_var: &str) -> bool {
+        fn expr_bad(e: &Expr, it: &Interp, allow_outer: bool, compiler: &Compiler, row_var: &str) -> bool {
+            let mut bad = false;
+            each_expr(e, &mut |x| match x {
+                Expr::Html(..) | Expr::Try(..) => bad = true,
+                Expr::Ident(n, _) if !allow_outer && n.as_str() != row_var => {
+                    // Disallow reading outer component state, reactive locals, or props in row DOM expressions
+                    // so W.klist never misses updates when outer signals change.
+                    let saved = compiler.ctxs.iter().rev().find_map(|ctx| {
+                        ctx.scopes.iter().rev().find_map(|s| s.get(n.as_str()))
+                    });
+                    if matches!(saved, Some(Local::State(_) | Local::SlotState(_) | Local::Reactive(_) | Local::Prop(_))) {
+                        bad = true;
+                    }
+                }
+                Expr::Call(callee, _, _) if !allow_outer => {
+                    if let Expr::Ident(n, _) = &**callee {
+                        if matches!(n.as_str(), "live" | "every" | "run_after" | "listen" | "on_cleanup" | "channel" | "waiting" | "probe" | "ask" | "receive" | "parallel" | "markdown" | "js" | "js_new" | "html") {
+                            bad = true;
+                        } else {
+                            match lookup(&it.globals, n) {
+                                Some(Value::Func(f)) if !f.def.server && !f.def.component => {}
+                                Some(Value::Builtin(..)) => {}
+                                _ => bad = true,
+                            }
+                        }
+                    } else {
+                        bad = true;
+                    }
+                }
+                _ => {}
+            });
+            bad
+        }
+        fn html_ok(el: &HtmlEl, it: &Interp, compiler: &Compiler, row_var: &str) -> bool {
+            if el.tag.starts_with(|c: char| c.is_uppercase())
+                || el.tag.contains('-')
+                || matches!(el.tag.as_str(), "svg" | "select" | "option" | "optgroup" | "textarea" | "script" | "style" | "foreignObject" | "table" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th" | "colgroup" | "datalist")
+            {
+                return false;
+            }
+            if let Some(id) = &el.id {
+                if expr_bad(id, it, false, compiler, row_var) { return false; }
+            }
+            for c in &el.classes {
+                if expr_bad(c, it, false, compiler, row_var) { return false; }
+            }
+            for (name, v) in &el.attrs {
+                if name == "key" { continue; }
+                if name == "@mount" || name.starts_with("bind:") { return false; }
+                match v {
+                    AttrVal::Spread(_) => return false,
+                    AttrVal::Bool => if name.starts_with('@') { return false; },
+                    AttrVal::Expr(e) => {
+                        if name.starts_with('@') {
+                            if matches!(name.as_str(), "@load" | "@error") || expr_bad(e, it, true, compiler, row_var) { return false; }
+                        } else if name == "style" {
+                            if !matches!(fixed(e), Some(Lit::Str(_))) { return false; }
+                        } else if name == "class" {
+                            if expr_bad(e, it, false, compiler, row_var) { return false; }
+                        } else if fixed(e).is_none() {
+                            if !matches!(name.as_str(), "id" | "value" | "checked" | "disabled" | "hidden" | "title" | "placeholder") {
+                                return false;
+                            }
+                            if expr_bad(e, it, false, compiler, row_var) { return false; }
+                        }
+                    }
+                }
+            }
+            el.children.iter().all(|c| match c {
+                HtmlChild::El(sub) => html_ok(sub, it, compiler, row_var),
+                HtmlChild::Expr(e) => !has_markup(e) && !expr_bad(e, it, false, compiler, row_var),
+            })
+        }
+        html_ok(root, self.it, self, row_var)
     }
 
     /// `match` in markup: the arm is chosen by the subject (a memo), and
@@ -6820,7 +7501,7 @@ impl<'a> Compiler<'a> {
                     // A set as any other: it claims the state (FEEDBACK55.md, Q-800).
                     Resolved::State(js) if field == "value" && !number && !el.tag.contains('-') => (format!("() => {}.v", js), format!("W.put({}, W.typed({}, {}))", js, js, read)),
                     Resolved::State(js) => (format!("() => {}.v", js), format!("W.put({}, {})", js, read)),
-                    Resolved::Local(js, _) => (js.clone(), format!("({} = {})", js, read)),
+                    Resolved::Local(js, _) | Resolved::SlotState(js) => (js.clone(), format!("({} = {})", js, read)),
                     _ => return self.err(format!("`bind:{}` needs component state, like `state {}`", prop, var)),
                 };
                 self.reactive = saved;

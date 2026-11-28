@@ -787,7 +787,7 @@ route GET / = <html><body><List/></body></html>
     let at = page.find("/_quillo/b/").expect(&page);
     let js = get(&mut it, &page[at..at + page[at..].find('"').unwrap()]).text();
     // `tidy` is defined before the component, not in its loop.
-    let rows = &js[js.find("W.each(").expect("the loop follows its list")..];
+    let rows = &js[js.find("W.each(").or_else(|| js.find("W.klist(")).expect("the loop follows its list")..];
     assert!(!rows.contains("zzparam"), "{}", rows);
 }
 

@@ -824,6 +824,9 @@ const numText = (v) => {
   return (neg ? "-" : "") + text;
 };
 
+let HTML_FN = null;
+function useHtml() { HTML_FN = { f: frag, t: htmlText }; }
+
 function repr(v) {
   if (isNil(v)) return "null";
   if (typeof v === "string") return JSON.stringify(v);
@@ -839,7 +842,7 @@ function repr(v) {
   // it again for that (FEEDBACK55.md, Q-773; branch feedback55).
   if (v instanceof Err) return "err(" + (v.own || ERRORS_SHOWN ? repr(v.error) : "\"internal error\"") + ")";
   // Its markup, as on the server (FEEDBACK55.md, Q-779; branch feedback55).
-  if (v instanceof Html) return htmlText(v);
+  if (HTML_FN && v instanceof Html) return HTML_FN.t(v);
   if (v instanceof Css) return JSON.stringify(v.valueOf());
   if (isEvent(v)) return "<event " + v.type + ">";
   // In the order set (FEEDBACK55.md, Q-875; branch feedback55).
@@ -964,7 +967,7 @@ function add(a, b) {
   if (a instanceof Dec || b instanceof Dec) return DEC.arith(a, b, "+", "add");
   if (a instanceof Fl || b instanceof Fl) return flArith(a, b, "+", "add");
   if (typeof a === "bigint" || typeof b === "bigint") return bigArith(a, b, "+", "add");
-  if (a instanceof Html && b instanceof Html) return frag([a, b]);
+  if (HTML_FN && a instanceof Html && b instanceof Html) return HTML_FN.f([a, b]);
   if (Array.isArray(a) && Array.isArray(b)) return a.concat(b);
   if (isMap(a) && isMap(b)) return (MONEY && MONEY.op(a, b, false)) ?? mmerge(a, b);
   fail(`cannot add ${typeName(a)} and ${typeName(b)}`);
@@ -7459,8 +7462,8 @@ function errShown(v) {
   // The component whose code made it (`Scope.comp`), else the one it is in (a list's rows are
   // scopes of their own; found in review).
   let c = Writer !== null ? Writer : Owner ? Owner.comp : null;
-  for (let s = Owner; s && !(c instanceof Inst); s = s.up) if (s instanceof Inst) c = s;
-  const named = c instanceof Inst ? c.def.$name : null;
+  for (let s = Owner; s && !(c && c.def); s = s.up) if (s && s.def) c = s;
+  const named = c && c.def ? c.def.$name : null;
   const text = v.own || ERRORS_SHOWN ? display(v.error) : "internal error";
   // Neither a name nor a word here is one of the runtime's: a bundle takes every function whose
   // name its code holds, strings too (client.rs, `shake`), and `comp` and `match` written here
@@ -9186,6 +9189,133 @@ function delegated(ev) {
 // changed. Rows that must move are moved: the fewest that leave the others
 // in order, so a swap moves two and a removal none.
 
+function klist(list, key, tpl, tag, row) {
+  return new Html((c, out) => {
+    const st = { rows: [], end: null, made: 0, size: 0, failing: false, failed: false, get nodes() { return this.rows.map((r) => r.el); } };
+    let first = true, blank = null;
+    const mkTpl = () => { if (!blank) { const tp = docDo("createElement", "template"); tp.innerHTML = tpl; blank = tp.content.firstChild; } };
+    const make = (items) => {
+      first = false;
+      const at = out.length;
+      if (!c.claim && items.length) mkTpl();
+      st.rows = items.map((x) => {
+        const k = keyOf(st, key, x);
+        let el;
+        if (c.claim) {
+          el = c.n;
+          if (!el || el.nodeType !== 1 || el.localName !== tag) throw new Mismatch("element");
+          c.n = el.nextSibling;
+        } else el = blank.cloneNode(true);
+        const r = { key: k, v: x, el, nodes: [el], patch: null };
+        r.patch = row(el, r, c.claim);
+        r.patch(c.claim);
+        out.push(el);
+        return r;
+      });
+      st.end = docText("");
+      st.end.__part = st;
+      partsMade++;
+      st.made = partsMade;
+      st.size = out.length - at;
+      if (c.claim) c.p.insertBefore(st.end, c.n);
+      out.push(st.end);
+    };
+    onCleanup(() => { removing++; try { for (const r of st.rows) if (r.el.parentNode) r.el.parentNode.removeChild(r.el); } finally { removing--; } st.rows.length = 0; });
+    effect(() => {
+      st.failed = st.failing;
+      st.failing = false;
+      let items;
+      try { items = iter(list()); } catch (e) { if (first) untrack(() => make([])); throw e; }
+      untrack(() => {
+        if (first) { make(items); return; }
+        if (items.length) mkTpl();
+        reconcileK(st, items, key, blank, row);
+      });
+    });
+  });
+}
+
+function reconcileK(st, items, key, blank, row) {
+  const end = st.end, p = end.parentNode, n = items.length;
+  if (!p) return;
+  let old = st.rows, w = old.length;
+  if (n === 0) {
+    if (w) {
+      removing++;
+      try {
+        if (p.firstChild === old[0].el && p.lastChild === end) { p.textContent = ""; p.appendChild(end); }
+        else for (const r of old) if (r.el.parentNode) r.el.parentNode.removeChild(r.el);
+      } finally { removing--; }
+      st.rows = [];
+    }
+    return;
+  }
+  const keys = new Array(n);
+  let same = n === w;
+  for (let i = 0; i < n; i++) {
+    const k = keyOf(st, key, items[i]);
+    keys[i] = k;
+    if (same && old[i].key !== k) same = false;
+  }
+  if (same) {
+    for (let i = 0; i < n; i++) { const r = old[i]; if (r.v !== items[i]) { r.v = items[i]; r.patch(false); } }
+    return;
+  }
+  const from = new Int32Array(n).fill(-1), used = new Uint8Array(w);
+  let left = 0;
+  for (let i = 0; i < n; i++) {
+    if (i < w && old[i].key === keys[i]) { from[i] = i; used[i] = 1; } else left++;
+  }
+  if (left > 0 && w > 0) {
+    const byKey = new Map();
+    for (let j = w - 1; j >= 0; j--) if (!used[j]) byKey.set(old[j].key, j);
+    for (let i = 0; i < n; i++) {
+      if (from[i] >= 0) continue;
+      const j = byKey.get(keys[i]);
+      if (j !== undefined && !used[j]) { from[i] = j; used[j] = 1; byKey.delete(keys[i]); left--; }
+    }
+  }
+  removing++;
+  try {
+    if (left === n && w > 0) {
+      if (p.firstChild === old[0].el && p.lastChild === end) { p.textContent = ""; p.appendChild(end); }
+      else for (const r of old) if (r.el.parentNode) r.el.parentNode.removeChild(r.el);
+      old = []; w = 0;
+    } else for (let j = 0; j < w; j++) if (!used[j] && old[j].el.parentNode) old[j].el.parentNode.removeChild(old[j].el);
+  } finally { removing--; }
+  let moved = false, last = -1;
+  for (let i = 0; i < n; i++) { const j = from[i]; if (j < 0) continue; if (j < last) moved = true; else last = j; }
+  const stay = moved ? inOrder(from) : null;
+  const back = moved ? focusBack(p) : null;
+  const scrolls = moved && !p.moveBefore && scrolled.length ? scrollBack(p, old, from, stay) : null;
+  const rows = new Array(n);
+  let after = end, pend = null;
+  for (let i = n - 1; i >= 0; i--) {
+    const j = w ? from[i] : -1;
+    let r;
+    if (j < 0) {
+      const el = blank.cloneNode(true);
+      r = { key: keys[i], v: items[i], el, nodes: [el], patch: null };
+      r.patch = row(el, r, false);
+      r.patch(false);
+      if (!pend) pend = docDo("createDocumentFragment");
+      pend.insertBefore(el, pend.firstChild);
+    } else {
+      if (pend) { const f = pend.firstChild; p.insertBefore(pend, after); if (f) after = f; pend = null; }
+      r = old[j];
+      r.key = keys[i];
+      if (r.v !== items[i]) { r.v = items[i]; r.patch(false); }
+      if (moved && !stay[i]) moveNode(p, r.el, after);
+      after = r.el;
+    }
+    rows[i] = r;
+  }
+  if (pend) p.insertBefore(pend, after);
+  st.rows = rows;
+  if (back) back();
+  if (scrolls) scrolls();
+}
+
 // `follows`: the key reads state, and the rows follow it (see below).
 function each(list, key, row, follows) {
   return new Html((c, out) => {
@@ -9961,13 +10091,13 @@ function heldProps(p, inst) {
 // Islands on the page: <quillo-island>, or, inside a table or a select
 // (where the browser's parser moves other elements out), the component's
 // own root element, marked data-qi.
-const ISLANDS = "quillo-island,[data-qi]";
-const ownRoot = (el) => el.localName !== "quillo-island";
+const ISLANDS = "quillo-isl" + "and,[data-qi]";
+const ownRoot = (el) => el.localName !== "quillo-isl" + "and";
 // The parts src/island.rs lists (a text node's localName is undefined).
 const TABLE_PART = /^(t[rdh]|thead|tbody|tfoot|caption|colgroup|option|optgroup)$/;
 // A <quillo-island> the page makes, which stands anywhere.
 function wrapper(name) {
-  const w = docDo("createElement", "quillo-island");
+  const w = docDo("createElement", "quillo-isl" + "and");
   w.style.display = "contents";
   w.dataset.c = name;
   w.__q = true;
@@ -10052,7 +10182,7 @@ function islandsIn(el, marked) {
   const found = [], w = docDo("createTreeWalker", el, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT);
   for (let n = w.nextNode(); n; n = w.nextNode()) {
     if (n.nodeType === 8) { if (MARKED && isMarked(n)) found.push(MARKED.d(n)); }
-    else if (n.localName === "quillo-island" || n.hasAttribute("data-qi")) found.push(n);
+    else if (n.localName === "quillo-isl" + "and" || n.hasAttribute("data-qi")) found.push(n);
   }
   return found;
 }
@@ -10072,6 +10202,7 @@ function island(def, props, h, c, out) {
     outOfBody(c);
     intoBody(c, null);
   }
+  if (def.$slot) { slotIsland(def, props, h, c, out); return; }
   if (c.claim && MARKED && isMarked(c.n)) { MARKED.c(def, props, h, c, out); return; }
   let inst = new Inst(def, props, h && h.s, h && h.l);
   // Made again in a swap (FEEDBACK54.md, A.2): its states as they were, while their kind holds.
@@ -10952,6 +11083,64 @@ function hotMorph(html, qn) {
 // the state the server wrote, on the HTML it wrote.
 let RAW_HTML = null;
 function useRawHtml() { RAW_HTML = rawHtml; }
+let INST_RESUME = null, SLOT_EFFECT = null;
+function useInst() { INST_RESUME = instResume; SLOT_EFFECT = effect; }
+const slotText = (v) => (isNil(v) || typeof v === "boolean" || typeof v === "function" ? "" : v instanceof Err ? (errShown(v), "") : Array.isArray(v) ? v.map(slotText).join("") : noNul(display(v)));
+function slotOn(el, t, f, u) {
+  el.addEventListener(t, (ev) => {
+    if (t === "submit") ev.preventDefault();
+    const x = ev.target;
+    if (x && x.value !== undefined) { ev.$value = x.value; ev.$checked = !!x.checked; }
+    try { const r = f.length > 0 ? f(ev) : f(); if (r && typeof r.then === "function") r.then(() => u(), report); } catch (e) { report(e); }
+    u();
+  });
+}
+const SLOT_MIS = {};
+function slotMis() { throw SLOT_MIS; }
+function slotMount(inst, el, claim) {
+  for (const k of Object.keys(inst.s0)) if (inst.s0[k] instanceof PropOf) inst.s0[k] = inst.props[inst.s0[k].name];
+  let dirty = false, patch;
+  const upd = () => { if (dirty) return; dirty = true; try { patch(false); } finally { dirty = false; } };
+  const init = (c) => {
+    patch = inst.def.$slot(el, inst.s0, inst.props, upd, c);
+    if (c) patch(true);
+    if (inst.reactive && SLOT_EFFECT && inst.def.$p.length) {
+      SLOT_EFFECT(() => patch(false));
+    } else if (!c) {
+      patch(false);
+    }
+  };
+  try { init(claim); } catch (e) {
+    if (e !== SLOT_MIS) throw e;
+    QW.remade = (QW.remade || 0) + 1;
+    if (TOOLS) TOOLS.say("remade", Object.assign({ name: inst.def.$name }, TOOLS.wanted()));
+    el.innerHTML = inst.def.$html;
+    init(false);
+  }
+}
+function slotIsland(def, props, h, c, out) {
+  let el;
+  if (c.claim) { el = c.n; el.__q = true; c.n = el.nextSibling; }
+  else { el = wrapper(def.$name); el.innerHTML = def.$html; }
+  const inst = { def, el, props, s0: (h && h.s) || {}, dead: false, up: Owner, reactive: true };
+  if (TOOLS) TOOLS.ids.set(inst, TOOLS.next++);
+  slotMount(inst, el, c.claim);
+  onCleanup(() => { inst.dead = true; if (TOOLS) TOOLS.gone(inst); });
+  if (TOOLS) TOOLS.made(inst);
+  out.push(el);
+}
+function slotResume(el, def) {
+  const props = islandJSON(el.dataset.p, {}), given = islandJSON(el.dataset.s, {});
+  let state = given;
+  if (DEV) state = keptFor(el, state); // dev
+  const inst = { def, el, props, s0: state, dead: false, up: null };
+  if (TOOLS) TOOLS.ids.set(inst, TOOLS.next++);
+  if (DEV || QW.ip) { el.__qi = inst; el.__qp = props; }
+  slotMount(inst, el, true);
+  QW.resumed = (QW.resumed || 0) + 1;
+  if (TOOLS) TOOLS.made(inst);
+  for (const f of el.querySelectorAll("input, textarea, select")) if (!asParsed(f)) { f.dispatchEvent(new Event("input", { bubbles: true })); f.dispatchEvent(new Event("change", { bubbles: true })); }
+}
 
 function resume(el) {
   // Still waiting for its deferred state, which the server sends after the page
@@ -10963,6 +11152,11 @@ function resume(el) {
   el.__q = true;
   const def = C[el.dataset.c];
   if (!def) { report(`unknown component <${el.dataset.c}>`); return; }
+  if (def.$slot) { slotResume(el, def); return; }
+  INST_RESUME(el, def);
+}
+
+function instResume(el, def) {
   // Those inside it the server marked by comments too, found once (FEEDBACK61.md, Q-892; branch
   // feedback61).
   const inside = islandsIn(el, el.hasAttribute("data-qm")).filter(ownIsland);
@@ -11084,8 +11278,8 @@ function boot() {
   // An island runs by itself when one inside it does: the inner one starts
   // with its outer one (FEEDBACK5.md, Q-046; branch stays-fixes).
   const byItself = (i) => i.hasAttribute("data-e") || i.hasAttribute("data-l");
-  for (const island of outer) {
-    if (byItself(island) || island.parentElement === body || [...island.querySelectorAll(ISLANDS)].some(byItself)) resume(island);
+  for (const el of outer) {
+    if (byItself(el) || el.parentElement === body || [...el.querySelectorAll(ISLANDS)].some(byItself)) resume(el);
   }
   // The island someone reached for, which brought the bundle, and the one
   // that has the focus.
@@ -11291,6 +11485,9 @@ W.hand = (f, e, i) => {
 };
 W.frag = frag;
 W.each = each;
+W.klist = klist;
+W.klistMis = () => { throw new Mismatch("element"); };
+W.listen = listen;
 // The key of a row that shows nothing (see `row_key` in src/client.rs): one no program can give,
 // as `null` was, a row keyed `null` taking a hidden row's place (FEEDBACK61.md, Q-897's review of
 // 06cda99; branch feedback61).
@@ -11299,6 +11496,10 @@ W.choose = choose;
 W.keyed = keyed;
 W.c = comp;
 W.lazy = lazyMod;
+W.slot = (name, params, html, setup) => { const f = ($i, $p) => {}; f.$name = name; f.$p = params; f.$comp = true; f.$html = html; f.$slot = setup; C[name] = f; return f; };
+W.slotText = slotText;
+W.slotOn = slotOn;
+W.slotMis = slotMis;
 W.memo = memo;
 // The page's states (FEEDBACK68.md; branch global-state).
 W.gs = pageState;
